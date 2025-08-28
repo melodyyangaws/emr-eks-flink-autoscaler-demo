@@ -1,0 +1,3 @@
+operatorPod:
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: c5d9b

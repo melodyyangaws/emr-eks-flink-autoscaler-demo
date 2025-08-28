@@ -1,0 +1,41 @@
+kube-prometheus-stack:
+  prometheus:
+    serviceAccount:
+      create: true
+      name: "amp-iamproxy-ingest-service-account"
+      annotations:
+          eks.amazonaws.com/role-arn: "arn:aws:iam::021732063925:role/eks-test-prometheus-ingest"
+  prometheusSpec:
+    remoteWrite:
+      - url: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/ws-cce9491c-095b-4cac-94cd-201ee65d7d33/api/v1/remote_write
+        sigv4:
+          region: us-west-2
+        queueConfig:
+          maxSamplesPerSend: 1000
+          maxShards: 200
+          capacity: 2500
+# kube-prometheus-stack:
+#   prometheus:
+#     enabled: true
+#     serviceAccount:
+#         create: true
+#         name: "emr-containers-sa-flink-operator"
+#         annotations:
+#             eks.amazonaws.com/role-arn: "arn:aws:iam::021732063925:role/eks-test-prometheus-ingest"
+#   prometheusSpec:
+#     remoteWrite:
+#         - url: https://aps-workspaces.us-west-2.amazonaws.com/workspaces/ws-cce9491c-095b-4cac-94cd-201ee65d7d33/api/v1/remote_write
+#           sigv4:
+#               region: us-west-2
+#           queueConfig:
+#               maxSamplesPerSend: 1000
+#               maxShards: 200
+#               capacity: 2500
+# defaultConfiguration:
+#   flink-conf.yaml: |+
+#     kubernetes.operator.metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+#     kubernetes.operator.metrics.reporter.prom.port: 9999
+#     kubernetes.operator.metrics.reporter.slf4j.factory.class: org.apache.flink.metrics.slf4j.Slf4jReporterFactory
+#     kubernetes.operator.metrics.reporter.slf4j.interval: 5 MINUTE
+#     kubernetes.operator.reconcile.interval: 15 s
+#     kubernetes.operator.observer.progress-check.interval: 5 s

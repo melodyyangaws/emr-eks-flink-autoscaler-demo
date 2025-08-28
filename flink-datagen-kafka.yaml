@@ -1,0 +1,100 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: flink-datagen-kafka
+spec:
+  flinkVersion: v1_19
+  executionRoleArn: arn:aws:iam::021732063925:role/emr-on-eks-test-execution-role
+  image: 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-flink-datgen-msk:latest
+  imagePullPolicy: Always
+  emrReleaseLabel: "emr-7.9.0-flink-latest"
+  flinkConfiguration:
+    fs.s3a.endpoint.region: us-west-2
+    # Autoscaler parameters
+    job.autoscaler.enabled: "true"
+    # job.autoscaler.scale-down.interval: "10m"
+    # lower these settings to trigger autoscaling earlier
+    kubernetes.operator.job.autoscaler.stabilization.interval: "1m"
+    kubernetes.operator.job.autoscaler.metrics.window: "2m"
+    kubernetes.operator.job.autoscaler.target.utilization: "0.6"
+    kubernetes.operator.job.autoscaler.target.utilization.boundary: "0.2"
+    kubernetes.operator.job.autoscaler.restart.time: "1m"
+    kubernetes.operator.job.autoscaler.catch-up.duration: "5m"
+    kubernetes.operator.job.autoscaler.vertex.exclude.ids: ""
+    pipeline.max-parallelism: "36"
+    pipeline.operator-chaining: "true"
+    # local-recovery
+    execution.checkpointing.interval: "3000"
+    state.backend.local-recovery: "true"
+    kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit: 10Gi
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    # log-based incremental checkpoint
+    state.backend.changelog.enabled: "false"
+    state.backend.changelog.storage: filesystem
+    dstl.dfs.base-path: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+    state.backend: rocksdb
+    state.backend.incremental: "true"
+    # Fine-grained recovery
+    jobmanager.execution.failover-strategy: region
+    restart-strategy: fixed-delay
+    restart-strategy.fixed-delay.attempts: "10"
+    restart-strategy.fixed-delay.delay: "3s"
+    # graceful decommisioning
+    cluster.taskmanager.graceful-decommission.enabled: "true"
+    jobmanager.adaptive-scheduler.combined-restart.enabled: "true"
+    jobmanager.adaptive-scheduler.combined-restart.window-interval : "1m"
+    # scheduler
+    jobmanager.scheduler: adaptive
+    taskmanager.numberOfTaskSlots: "4"
+    state.savepoints.dir: s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/ 
+    state.checkpoints.dir: s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+  jobManager:
+    highAvailabilityEnabled: true
+    storageDir: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+    replicas: 2
+    resource:
+      memory: "1024m"
+      cpu: 1
+    podTemplate:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: default
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                  - key: "karpenter.k8s.aws/instance-family"
+                    operator: "In"
+                    values: ["m5","m6","c5","c6","r5","r6"]
+                  - key: "karpenter.k8s.aws/instance-cpu"
+                    operator: "In"
+                    values: ["8", "16", "32"]
+  taskManager:
+    resource:
+      memory: "1024m"
+      cpu: 1
+    podTemplate:
+      spec:
+        schedulerName: my-scheduler
+        nodeSelector:
+          karpenter.sh/capacity-type: spot
+          karpenter.sh/nodepool: default
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                  - key: "karpenter.k8s.aws/instance-family"
+                    operator: "In"
+                    values: ["m5","m6","c5","c6","r5","r6"]
+                  - key: "karpenter.k8s.aws/instance-cpu"
+                    operator: "In"
+                    values: ["8", "16", "32"]
+  job:
+    jarURI: "s3://emr-on-eks-test-021732063925-us-west-2/flink/script/datagen-kafka-script-flink-1-19.py"
+    entryClass: "org.apache.flink.client.python.PythonDriver"
+    args: ["-py", "/opt/flink/usrlib/datagen-kafka-script-flink-1-19.py","200000","b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092"]
+    parallelism: 4
+    upgradeMode: last-state

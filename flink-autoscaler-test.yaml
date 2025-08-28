@@ -1,0 +1,115 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: stateless-flink-autoscaler
+spec:
+  flinkVersion: v1_20
+  executionRoleArn: arn:aws:iam::021732063925:role/emr-on-eks-test-execution-role
+  image: 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-autoscaler:flink-1-20
+  imagePullPolicy: Always
+  emrReleaseLabel: "emr-7.9.0-flink-latest"
+  flinkConfiguration:
+    # Autoscaler parameters
+    fs.s3a.endpoint.region: us-west-2
+    # scale down instantly
+    job.autoscaler.scale-down.interval: "0"
+    # restart with local-recovery is still needed
+    # in order to redistribute states, update DAG etc by adaptive-scheduler
+    job.autoscaler.restart.time-tracking.enabled: true
+    pipeline.auto-watermark-interval: "1s"
+    # job.autoscaler.debug.logs.interval": "60s"
+    job.autoscaler.scaling.enabled: true
+
+     # Autoscaler parameters
+    job.autoscaler.enabled: true
+    job.autoscaler.stabilization.interval: "1m"
+    job.autoscaler.metrics.window: "15m"
+    # lower these settings to trigger autoscaling earlier
+    job.autoscaler.target.utilization: "0.5"
+    job.autoscaler.target.utilization.boundary: "0.3"
+    job.autoscaler.restart.time: "2m"
+    job.autoscaler.catch-up.duration: "5m"
+    job.autoscaler.vertex.exclude.ids: ""
+    pipeline.max-parallelism: "32"
+    pipeline.operator-chaining: false
+    # local-recovery
+    execution.checkpointing.interval: "30000"
+    state.backend.local-recovery: true
+    # ebs local-recovery
+    task.local-recovery.ebs.enable: true
+    kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit: 10Gi
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    # log-based incremental checkpoint
+    state.backend.incremental: true
+    state.backend.changelog.enabled: true
+    state.backend.changelog.storage: filesystem
+    dstl.dfs.base-path: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+    dstl.dfs.upload.timeout: 5s
+    state.backend: rocksdb
+    state.backend.rocksdb.localdir: /tmp/rocksdb/
+    # Fine-grained recovery
+    jobmanager.execution.failover-strategy: region
+    restart-strategy.type: fixed-delay
+    restart-strategy.fixed-delay.attempts: "100"
+    restart-strategy.fixed-delay.delay: "30s"
+    # graceful decommisioning
+    cluster.taskmanager.graceful-decommission.enabled: true
+    jobmanager.adaptive-scheduler.combined-restart.enabled: true
+    jobmanager.adaptive-scheduler.combined-restart.window-interval : "1m"
+    # scheduler
+    jobmanager.scheduler: adaptive
+    taskmanager.numberOfTaskSlots: "4"
+    state.savepoints.dir: s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/
+    state.checkpoints.dir: s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+  jobManager:
+    highAvailabilityEnabled: true
+    storageDir: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+    replicas: 2
+    resource:
+      memory: "2048m"
+      cpu: 0.5
+    podTemplate:
+      spec:
+        schedulerName: my-scheduler
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: default
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                  - key: "karpenter.k8s.aws/instance-family"
+                    operator: "In"
+                    values: ["m5","m6","c5","c6"]
+                  - key: "karpenter.k8s.aws/instance-cpu"
+                    operator: "In"
+                    values: ["8", "16", "32"]
+  taskManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        schedulerName: my-scheduler
+        nodeSelector:
+          karpenter.sh/capacity-type: spot
+          karpenter.sh/nodepool: default
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                  - key: "karpenter.k8s.aws/instance-family"
+                    operator: "In"
+                    values: ["m5","m6","c5","c6","r5","r6"]
+                  - key: "karpenter.k8s.aws/instance-cpu"
+                    operator: "In"
+                    values: ["8","16","32","64"]
+  job:
+    jarURI: local:///opt/flink/usrlib/autoscaling.jar
+    entryClass: autoscaling.LoadSimulationPipeline
+    args: 
+    - --maxLoadPerTask "1;2;4;8;16;\n16;8;4;2;1\n8;4;16;1;2" --repeatsAfterMinutes "60"
+    parallelism: 1
+    upgradeMode: stateless

@@ -1,0 +1,925 @@
++ COMMAND_STANDALONE=standalone-job
++ COMMAND_HISTORY_SERVER=history-server
+++ hostname -f
++ JOB_MANAGER_RPC_ADDRESS=flink-kafka-s3-749dc8874-4lvw7
++ CONF_FILE=/usr/lib/flink/conf/flink-conf.yaml
++ maybe_enable_jemalloc
++ '[' false == false ']'
+++ uname -m
++ JEMALLOC_PATH=/usr/lib/x86_64-linux-gnu/libjemalloc.so
++ JEMALLOC_FALLBACK=/usr/lib64/libjemalloc.so
++ '[' -f /usr/lib/x86_64-linux-gnu/libjemalloc.so ']'
++ '[' -f /usr/lib64/libjemalloc.so ']'
++ export LD_PRELOAD=:/usr/lib64/libjemalloc.so
++ LD_PRELOAD=:/usr/lib64/libjemalloc.so
++ copy_plugins_if_required
++ '[' -z '' ']'
++ return 0
++ prepare_configuration
++ set_config_option jobmanager.rpc.address flink-kafka-s3-749dc8874-4lvw7
++ local option=jobmanager.rpc.address
++ local value=flink-kafka-s3-749dc8874-4lvw7
+++ echo jobmanager.rpc.address
+++ sed -e 's/\./\\./g'
++ local 'escaped_option=jobmanager\.rpc\.address'
++ grep -E '^jobmanager\.rpc\.address:.*' /usr/lib/flink/conf/flink-conf.yaml
++ echo 'jobmanager.rpc.address: flink-kafka-s3-749dc8874-4lvw7'
+/docker-entrypoint.sh: line 65: /usr/lib/flink/conf/flink-conf.yaml: Permission denied
++ set_config_option blob.server.port 6124
++ local option=blob.server.port
++ local value=6124
+++ echo blob.server.port
+++ sed -e 's/\./\\./g'
++ local 'escaped_option=blob\.server\.port'
++ grep -E '^blob\.server\.port:.*' /usr/lib/flink/conf/flink-conf.yaml
++ sed -i -e 's/blob\.server\.port:.*/blob.server.port: 6124/g' /usr/lib/flink/conf/flink-conf.yaml
+sed: couldn't open temporary file /usr/lib/flink/conf/sedKF23zd: Read-only file system
++ set_config_option query.server.port 6125
++ local option=query.server.port
++ local value=6125
+++ echo query.server.port
+++ sed -e 's/\./\\./g'
++ local 'escaped_option=query\.server\.port'
++ grep -E '^query\.server\.port:.*' /usr/lib/flink/conf/flink-conf.yaml
++ echo 'query.server.port: 6125'
+/docker-entrypoint.sh: line 65: /usr/lib/flink/conf/flink-conf.yaml: Permission denied
++ '[' -n '' ']'
++ '[' -n '' ']'
++ envsubst
+/docker-entrypoint.sh: line 81: /usr/lib/flink/conf/flink-conf.yaml.tmp: Read-only file system
++ args=("$@")
++ '[' bash = help ']'
++ '[' bash = jobmanager ']'
++ [[ bash -c kubernetes-jobmanager.sh kubernetes-application  == *\k\u\b\e\r\n\e\t\e\s\-\j\o\b\m\a\n\a\g\e\r* ]]
++ echo 'Starting Job Manager on K8s'
+Starting Job Manager on K8s
++ CMD=("${args[@]}")
++ DISABLE_STDOUT_STDERR=0
++ '[' -z /var/log/flink/user/stdout ']'
++ '[' -z /var/log/flink/user/stderr ']'
++ mkdir -p /var/log/flink/user/stderr /var/log/flink/user/stdout
++ chmod 777 /var/log/flink/user/stderr /var/log/flink/user/stdout
++ '[' -z '' ']'
++ echo 'Not enabling AWS Glue Catalog support...'
++ '[' -z '' ']'
++ echo 'Not enabling Hudi support'
+Not enabling AWS Glue Catalog support...
+Not enabling Hudi support
++ '[' -z '' ']'
++ echo 'Not enabling Delta Lake support...'
+Not enabling Delta Lake support...
+Not enabling Iceberg support...
++ '[' -z '' ']'
++ echo 'Not enabling Iceberg support...'
++ (( 0 ))
++ exec /usr/bin/tini -s -- bash -c 'kubernetes-jobmanager.sh kubernetes-application '
+++ tee /dev/fd/63
++++ multilog s2147483648 n10 /var/log/flink/user/stdout
+++ tee /dev/fd/62
++++ multilog s2147483648 n10 /var/log/flink/user/stderr
+Setting HADOOP_CONF_DIR=/etc/hadoop/conf because no HADOOP_CONF_DIR or HADOOP_CLASSPATH was set.
+Setting HADOOP_CONF_DIR=/etc/hadoop/conf because no HADOOP_CONF_DIR or HADOOP_CLASSPATH was set.
+Starting kubernetes-application as a console application on host flink-kafka-s3-749dc8874-4lvw7.
+2025-08-14 13:00:29,643 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - --------------------------------------------------------------------------------
+2025-08-14 13:00:29,644 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Preconfiguration: 
+2025-08-14 13:00:29,644 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - 
+
+
+RESOURCE_PARAMS extraction logs:
+jvm_params: -Xmx1530082096 -Xms1530082096 -XX:MaxMetaspaceSize=268435456
+dynamic_configs: -D jobmanager.memory.off-heap.size=134217728b -D jobmanager.memory.jvm-overhead.min=214748368b -D jobmanager.memory.jvm-metaspace.size=268435456b -D jobmanager.memory.heap.size=1530082096b -D jobmanager.memory.jvm-overhead.max=214748368b
+logs: WARNING: sun.reflect.Reflection.getCallerClass is not supported. This will impact performance.
+INFO  [] - Using legacy YAML parser to load flink configuration file from /usr/lib/flink/conf/flink-conf.yaml.
+WARN  [] - Error while trying to split key and value in configuration file /usr/lib/flink/conf/flink-conf.yaml:35: Line is not a key-value pair (missing space after ':'?)
+INFO  [] - Loading configuration property: job.autoscaler.enabled, true
+INFO  [] - Loading configuration property: task.local-recovery.ebs.enable, true
+INFO  [] - Loading configuration property: kubernetes.jobmanager.replicas, 2
+INFO  [] - Loading configuration property: kubernetes.taskmanager.service-account, emr-containers-sa-flink-taskmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: execution.submit-failed-job-on-application-error, true
+INFO  [] - Loading configuration property: pipeline.operator-chaining, false
+INFO  [] - Loading configuration property: restart-strategy.type, fixed-delay
+INFO  [] - Loading configuration property: high-availability.cluster-id, flink-kafka-s3
+INFO  [] - Loading configuration property: pipeline.max-parallelism, 96
+INFO  [] - Loading configuration property: kubernetes.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: kubernetes.cluster-id, flink-kafka-s3
+INFO  [] - Loading configuration property: dstl.dfs.base-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+INFO  [] - Loading configuration property: high-availability.storageDir, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+INFO  [] - Loading configuration property: kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit, 10Gi
+INFO  [] - Loading configuration property: kubernetes.taskmanager.cpu.amount, 1.0
+INFO  [] - Loading configuration property: parallelism.default, 1
+INFO  [] - Loading configuration property: kubernetes.namespace, emr-flink
+INFO  [] - Loading configuration property: fs.s3a.aws.credentials.provider, software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+INFO  [] - Loading configuration property: kubernetes.jobmanager.owner.reference, kind:FlinkDeployment,uid:b63f4e46-2d7e-4acc-9921-ea87a9d9352a,name:flink-kafka-s3,controller:false,blockOwnerDeletion:true,apiVersion:flink.apache.org/v1beta1
+INFO  [] - Loading configuration property: dstl.dfs.upload.timeout, 5s
+INFO  [] - Loading configuration property: job.autoscaler.scaling.enabled, true
+INFO  [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.window-interval, 1m
+INFO  [] - Loading configuration property: kubernetes.container.image.ref, 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-flink-msk-s3:maven
+INFO  [] - Loading configuration property: taskmanager.memory.process.size, 4 gb
+INFO  [] - Loading configuration property: kubernetes.internal.jobmanager.entrypoint.class, org.apache.flink.kubernetes.entrypoint.KubernetesApplicationClusterEntrypoint
+INFO  [] - Loading configuration property: job.autoscaler.restart.time-tracking.enabled, true
+INFO  [] - Loading configuration property: pipeline.name, flink-kafka-s3
+INFO  [] - Loading configuration property: cluster.taskmanager.graceful-decommission.enabled, true
+INFO  [] - Loading configuration property: state.backend.local-recovery, true
+INFO  [] - Loading configuration property: state.backend.rocksdb.localdir, /tmp/rocksdb/
+INFO  [] - Loading configuration property: kubernetes.pod-template-file.taskmanager, /tmp/flink_op_generated_podTemplate_1389898535621920293.yaml
+INFO  [] - Loading configuration property: state.backend.incremental, true
+INFO  [] - Loading configuration property: web.cancel.enable, false
+INFO  [] - Loading configuration property: execution.shutdown-on-application-finish, false
+INFO  [] - Loading configuration property: execution.checkpointing.interval, 30000
+INFO  [] - Loading configuration property: job.autoscaler.metrics.window, 2m
+INFO  [] - Loading configuration property: kubernetes.container.image.pull-policy, Always
+INFO  [] - Loading configuration property: kubernetes.jobmanager.cpu.amount, 1.0
+INFO  [] - Loading configuration property: job-result-store.delete-on-commit, false
+INFO  [] - Loading configuration property: restart-strategy.fixed-delay.delay, 30s
+INFO  [] - Loading configuration property: $internal.pipeline.job-id, b9ead6bbbd1af3b385e07c6595539899
+INFO  [] - Loading configuration property: kubernetes.taskmanager.labels, emr-containers.amazonaws.com/component:flink.taskmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+INFO  [] - Loading configuration property: kubernetes.jobmanager.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: state.backend, rocksdb
+INFO  [] - Loading configuration property: $internal.flink.version, v1_20
+INFO  [] - Loading configuration property: kubernetes.pod-template-file.jobmanager, /tmp/flink_op_generated_podTemplate_10866686593946337522.yaml
+INFO  [] - Loading configuration property: blob.server.port, 6124
+INFO  [] - Loading configuration property: kubernetes.jobmanager.annotations, flinkdeployment.flink.apache.org/generation:2
+INFO  [] - Loading configuration property: job-result-store.storage-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha//job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+INFO  [] - Loading configuration property: job.autoscaler.restart.time, 2m
+INFO  [] - Loading configuration property: high-availability.type, kubernetes
+INFO  [] - Loading configuration property: jobmanager.execution.failover-strategy, region
+INFO  [] - Loading configuration property: state.backend.changelog.enabled, true
+INFO  [] - Loading configuration property: pipeline.auto-watermark-interval, 1s
+INFO  [] - Loading configuration property: kubernetes.jobmanager.labels, emr-containers.amazonaws.com/component:flink.jobmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+INFO  [] - Loading configuration property: state.savepoints.dir, s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/
+INFO  [] - Loading configuration property: job.autoscaler.catch-up.duration, 5m
+INFO  [] - Loading configuration property: job.autoscaler.scale-down.interval, 0
+INFO  [] - Loading configuration property: $internal.application.program-args, -py;/opt/flink/usrlib/kafka-s3-sink-flink1-19.py;b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092;flink-consumer-g1;earliest-offset;s3://emr-on-eks-test-021732063925-us-west-2/orders_data_parquet/
+INFO  [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.enabled, true
+INFO  [] - Loading configuration property: taskmanager.numberOfTaskSlots, 4
+INFO  [] - Loading configuration property: kubernetes.rest-service.exposed.type, ClusterIP
+INFO  [] - Loading configuration property: high-availability.jobmanager.port, 6123
+INFO  [] - Loading configuration property: job.autoscaler.target.utilization.boundary, 0.1
+INFO  [] - Loading configuration property: $internal.application.main, org.apache.flink.client.python.PythonDriver
+INFO  [] - Loading configuration property: job.autoscaler.stabilization.interval, 1m
+INFO  [] - Loading configuration property: restart-strategy.fixed-delay.attempts, 100
+INFO  [] - Loading configuration property: execution.target, kubernetes-application
+INFO  [] - Loading configuration property: jobmanager.memory.process.size, 2 gb
+INFO  [] - Loading configuration property: taskmanager.rpc.port, 6122
+INFO  [] - Loading configuration property: job.autoscaler.target.utilization, 0.6
+INFO  [] - Loading configuration property: state.backend.changelog.storage, filesystem
+INFO  [] - Loading configuration property: internal.cluster.execution-mode, NORMAL
+INFO  [] - Loading configuration property: jobmanager.scheduler, adaptive
+INFO  [] - Loading configuration property: execution.checkpointing.externalized-checkpoint-retention, RETAIN_ON_CANCELLATION
+INFO  [] - Loading configuration property: pipeline.jars, local:///opt/flink/usrlib/kafka-s3-sink-flink1-19.py
+INFO  [] - Loading configuration property: fs.s3a.endpoint.region, us-west-2
+INFO  [] - Loading configuration property: state.checkpoints.dir, s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+INFO  [] - Final Master Memory configuration:
+INFO  [] -   Total Process Memory: 2.000gb (2147483648 bytes)
+INFO  [] -     Total Flink Memory: 1.550gb (1664299824 bytes)
+INFO  [] -       JVM Heap:         1.425gb (1530082096 bytes)
+INFO  [] -       Off-heap:         128.000mb (134217728 bytes)
+INFO  [] -     JVM Metaspace:      256.000mb (268435456 bytes)
+INFO  [] -     JVM Overhead:       204.800mb (214748368 bytes)
+
+2025-08-14 13:00:29,645 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - --------------------------------------------------------------------------------
+2025-08-14 13:00:29,645 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Starting KubernetesApplicationClusterEntrypoint (Version: 1.20.0-amzn-3, Scala: 2.12, Rev:b741e9c, Date:2025-05-06T16:18:37+02:00)
+2025-08-14 13:00:29,645 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  OS current user: hadoop
+2025-08-14 13:00:29,645 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Current Hadoop/Kerberos user: <no hadoop dependency found>
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  JVM: OpenJDK 64-Bit Server VM - Amazon.com Inc. - 17/17.0.15+6-LTS
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Arch: amd64
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Maximum heap size: 1411 MiBytes
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  JAVA_HOME: /usr/lib/jvm/java-17-amazon-corretto
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  No Hadoop Dependency available
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  JVM Options:
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Xmx1530082096
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Xms1530082096
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -XX:MaxMetaspaceSize=268435456
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=java.base/sun.net.util=ALL-UNNAMED
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED
+2025-08-14 13:00:29,646 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-exports=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.lang=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.net=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.io=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.nio=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.text=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.time=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.util=ALL-UNNAMED
+2025-08-14 13:00:29,647 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Dlog.file=/usr/lib/flink/log/flink--kubernetes-application-0-flink-kafka-s3-749dc8874-4lvw7.log
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Dlog4j.configuration=file:/usr/lib/flink/conf/log4j-console.properties
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Dlog4j.configurationFile=file:/usr/lib/flink/conf/log4j-console.properties
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -Dlogback.configurationFile=file:/usr/lib/flink/conf/logback-console.xml
+2025-08-14 13:00:29,648 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Program Arguments:
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -D
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     jobmanager.memory.off-heap.size=134217728b
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -D
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     jobmanager.memory.jvm-overhead.min=214748368b
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -D
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     jobmanager.memory.jvm-metaspace.size=268435456b
+2025-08-14 13:00:29,709 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -D
+2025-08-14 13:00:29,710 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     jobmanager.memory.heap.size=1530082096b
+2025-08-14 13:00:29,710 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     -D
+2025-08-14 13:00:29,710 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -     jobmanager.memory.jvm-overhead.max=214748368b
+2025-08-14 13:00:29,710 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] -  Classpath: /usr/lib/flink/lib/flink-cep-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-connector-files-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-csv-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-json-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-scala_2.12-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-sql-connector-kafka.jar:/usr/lib/flink/lib/flink-sql-parquet-1.20.0.jar:/usr/lib/flink/lib/flink-table-api-java-uber-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-table-api-scala-bridge_2.12-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-table-planner-loader-1.20.0-amzn-3.jar:/usr/lib/flink/lib/flink-table-runtime-1.20.0-amzn-3.jar:/usr/lib/flink/lib/log4j-1.2-api-2.17.1.jar:/usr/lib/flink/lib/log4j-api-2.17.1.jar:/usr/lib/flink/lib/log4j-core-2.17.1.jar:/usr/lib/flink/lib/log4j-slf4j-impl-2.17.1.jar:/usr/lib/flink/lib/flink-dist-1.20.0-amzn-3.jar:::/etc/hadoop/conf:
+2025-08-14 13:00:29,710 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - --------------------------------------------------------------------------------
+2025-08-14 13:00:29,711 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Registered UNIX signal handlers for [TERM, HUP, INT]
+2025-08-14 13:00:29,719 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Using legacy YAML parser to load flink configuration file from /usr/lib/flink/conf/flink-conf.yaml.
+2025-08-14 13:00:29,720 WARN  org.apache.flink.configuration.GlobalConfiguration           [] - Error while trying to split key and value in configuration file /usr/lib/flink/conf/flink-conf.yaml:35: Line is not a key-value pair (missing space after ':'?)
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.enabled, true
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: task.local-recovery.ebs.enable, true
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.replicas, 2
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.service-account, emr-containers-sa-flink-taskmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.submit-failed-job-on-application-error, true
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.operator-chaining, false
+2025-08-14 13:00:29,721 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.type, fixed-delay
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.cluster-id, flink-kafka-s3
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.max-parallelism, 96
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.cluster-id, flink-kafka-s3
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: dstl.dfs.base-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.storageDir, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit, 10Gi
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.cpu.amount, 1.0
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: parallelism.default, 1
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.namespace, emr-flink
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: fs.s3a.aws.credentials.provider, software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+2025-08-14 13:00:29,722 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.owner.reference, kind:FlinkDeployment,uid:b63f4e46-2d7e-4acc-9921-ea87a9d9352a,name:flink-kafka-s3,controller:false,blockOwnerDeletion:true,apiVersion:flink.apache.org/v1beta1
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: dstl.dfs.upload.timeout, 5s
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.scaling.enabled, true
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.window-interval, 1m
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.container.image.ref, 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-flink-msk-s3:maven
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.memory.process.size, 4 gb
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.internal.jobmanager.entrypoint.class, org.apache.flink.kubernetes.entrypoint.KubernetesApplicationClusterEntrypoint
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.restart.time-tracking.enabled, true
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.name, flink-kafka-s3
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: cluster.taskmanager.graceful-decommission.enabled, true
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.local-recovery, true
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.rocksdb.localdir, /tmp/rocksdb/
+2025-08-14 13:00:29,723 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.pod-template-file.taskmanager, /tmp/flink_op_generated_podTemplate_1389898535621920293.yaml
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.incremental, true
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: web.cancel.enable, false
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.shutdown-on-application-finish, false
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.checkpointing.interval, 30000
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.metrics.window, 2m
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.container.image.pull-policy, Always
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.cpu.amount, 1.0
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job-result-store.delete-on-commit, false
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.fixed-delay.delay, 30s
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.pipeline.job-id, b9ead6bbbd1af3b385e07c6595539899
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.labels, emr-containers.amazonaws.com/component:flink.taskmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+2025-08-14 13:00:29,724 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend, rocksdb
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.flink.version, v1_20
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.pod-template-file.jobmanager, /tmp/flink_op_generated_podTemplate_10866686593946337522.yaml
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: blob.server.port, 6124
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.annotations, flinkdeployment.flink.apache.org/generation:2
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job-result-store.storage-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha//job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.restart.time, 2m
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.type, kubernetes
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.execution.failover-strategy, region
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.changelog.enabled, true
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.auto-watermark-interval, 1s
+2025-08-14 13:00:29,725 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.labels, emr-containers.amazonaws.com/component:flink.jobmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.savepoints.dir, s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.catch-up.duration, 5m
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.scale-down.interval, 0
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.application.program-args, -py;/opt/flink/usrlib/kafka-s3-sink-flink1-19.py;b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092;flink-consumer-g1;earliest-offset;s3://emr-on-eks-test-021732063925-us-west-2/orders_data_parquet/
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.enabled, true
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.numberOfTaskSlots, 4
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.rest-service.exposed.type, ClusterIP
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.jobmanager.port, 6123
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.target.utilization.boundary, 0.1
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.application.main, org.apache.flink.client.python.PythonDriver
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.stabilization.interval, 1m
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.fixed-delay.attempts, 100
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.target, kubernetes-application
+2025-08-14 13:00:29,726 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.memory.process.size, 2 gb
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.rpc.port, 6122
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.target.utilization, 0.6
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.changelog.storage, filesystem
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: internal.cluster.execution-mode, NORMAL
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.scheduler, adaptive
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.checkpointing.externalized-checkpoint-retention, RETAIN_ON_CANCELLATION
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.jars, local:///opt/flink/usrlib/kafka-s3-sink-flink1-19.py
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: fs.s3a.endpoint.region, us-west-2
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.checkpoints.dir, s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading dynamic configuration property: jobmanager.memory.off-heap.size, 134217728b
+2025-08-14 13:00:29,727 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading dynamic configuration property: jobmanager.memory.jvm-overhead.min, 214748368b
+2025-08-14 13:00:29,728 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading dynamic configuration property: jobmanager.memory.jvm-metaspace.size, 268435456b
+2025-08-14 13:00:29,728 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading dynamic configuration property: jobmanager.memory.heap.size, 1530082096b
+2025-08-14 13:00:29,728 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading dynamic configuration property: jobmanager.memory.jvm-overhead.max, 214748368b
+2025-08-14 13:00:29,939 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Install default filesystem for fetching user artifacts in Kubernetes Application Mode.
+2025-08-14 13:00:29,943 INFO  org.apache.flink.core.fs.FileSystem                          [] - Hadoop is not in the classpath/dependencies. The extended set of supported File Systems via Hadoop is not available.
+2025-08-14 13:00:29,961 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: external-resource-gpu
+2025-08-14 13:00:29,965 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: flink-s3-fs-presto
+2025-08-14 13:00:29,965 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-datadog
+2025-08-14 13:00:29,965 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-graphite
+2025-08-14 13:00:29,966 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-influx
+2025-08-14 13:00:29,966 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-jmx
+2025-08-14 13:00:29,966 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-prometheus
+2025-08-14 13:00:29,966 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-slf4j
+2025-08-14 13:00:29,966 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-statsd
+2025-08-14 13:00:30,009 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: s3
+2025-08-14 13:00:30,216 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Install security context.
+2025-08-14 13:00:30,231 INFO  org.apache.flink.runtime.security.modules.HadoopModuleFactory [] - Cannot create Hadoop Security Module because Hadoop cannot be found in the Classpath.
+2025-08-14 13:00:30,312 INFO  org.apache.flink.runtime.security.modules.JaasModule         [] - Jaas file will be created as /tmp/jaas-3371444998967489576.conf.
+2025-08-14 13:00:30,318 INFO  org.apache.flink.runtime.security.contexts.HadoopSecurityContextFactory [] - Cannot install HadoopSecurityContext because Hadoop cannot be found in the Classpath.
+2025-08-14 13:00:30,453 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Starting KubernetesApplicationClusterEntrypoint.
+2025-08-14 13:00:30,515 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Install default filesystem.
+2025-08-14 13:00:30,516 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: external-resource-gpu
+2025-08-14 13:00:30,516 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: flink-s3-fs-presto
+2025-08-14 13:00:30,516 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-datadog
+2025-08-14 13:00:30,516 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-graphite
+2025-08-14 13:00:30,516 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-influx
+2025-08-14 13:00:30,517 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-jmx
+2025-08-14 13:00:30,517 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-prometheus
+2025-08-14 13:00:30,517 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-slf4j
+2025-08-14 13:00:30,517 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: metrics-statsd
+2025-08-14 13:00:30,517 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID not found, creating it: s3
+2025-08-14 13:00:30,623 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Install security context.
+2025-08-14 13:00:30,624 INFO  org.apache.flink.runtime.security.modules.HadoopModuleFactory [] - Cannot create Hadoop Security Module because Hadoop cannot be found in the Classpath.
+2025-08-14 13:00:30,625 INFO  org.apache.flink.runtime.security.contexts.HadoopSecurityContextFactory [] - Cannot install HadoopSecurityContext because Hadoop cannot be found in the Classpath.
+2025-08-14 13:00:30,627 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Initializing cluster services.
+2025-08-14 13:00:30,630 INFO  org.apache.flink.runtime.entrypoint.ClusterEntrypoint        [] - Using working directory: WorkingDirectory(/tmp/jm_45fc7d4eba15513acfc736eb28141bf5).
+2025-08-14 13:00:30,941 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcServiceUtils      [] - Trying to start actor system, external address 192.168.100.23:6123, bind address 0.0.0.0:6123.
+2025-08-14 13:00:31,658 INFO  org.apache.pekko.event.slf4j.Slf4jLogger                     [] - Slf4jLogger started
+2025-08-14 13:00:31,718 INFO  org.apache.pekko.remote.RemoteActorRefProvider               [] - Pekko Cluster not in use - enabling unsafe features anyway because `pekko.remote.use-unsafe-remote-features-outside-cluster` has been enabled.
+2025-08-14 13:00:31,718 INFO  org.apache.pekko.remote.Remoting                             [] - Starting remoting
+2025-08-14 13:00:32,010 INFO  org.apache.pekko.remote.Remoting                             [] - Remoting started; listening on addresses :[pekko.tcp://flink@192.168.100.23:6123]
+2025-08-14 13:00:32,211 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcServiceUtils      [] - Actor system started at pekko.tcp://flink@192.168.100.23:6123
+2025-08-14 13:00:32,225 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Loading delegation token providers
+2025-08-14 13:00:32,228 INFO  org.apache.flink.runtime.security.token.hadoop.HadoopFSDelegationTokenProvider [] - Hadoop FS is not available (not packaged with this application): NoClassDefFoundError : "org/apache/hadoop/conf/Configuration".
+2025-08-14 13:00:32,228 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation token provider hadoopfs loaded and initialized
+2025-08-14 13:00:32,230 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation token provider hbase loaded and initialized
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: external-resource-gpu
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: flink-s3-fs-presto
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-datadog
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-graphite
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-influx
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-jmx
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-prometheus
+2025-08-14 13:00:32,230 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-slf4j
+2025-08-14 13:00:32,231 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-statsd
+2025-08-14 13:00:32,231 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: s3
+2025-08-14 13:00:32,233 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation token provider s3-presto loaded and initialized
+2025-08-14 13:00:32,234 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation token provider s3-hadoop loaded and initialized
+2025-08-14 13:00:32,234 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation token providers loaded successfully
+2025-08-14 13:00:32,235 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Loading delegation token receivers
+2025-08-14 13:00:32,236 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Delegation token receiver hadoopfs loaded and initialized
+2025-08-14 13:00:32,237 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Delegation token receiver hbase loaded and initialized
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: external-resource-gpu
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: flink-s3-fs-presto
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-datadog
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-graphite
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-influx
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-jmx
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-prometheus
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-slf4j
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: metrics-statsd
+2025-08-14 13:00:32,237 INFO  org.apache.flink.core.plugin.DefaultPluginManager            [] - Plugin loader with ID found, reusing it: s3
+2025-08-14 13:00:32,238 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Delegation token receiver s3-presto loaded and initialized
+2025-08-14 13:00:32,240 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Delegation token receiver s3-hadoop loaded and initialized
+2025-08-14 13:00:32,240 INFO  org.apache.flink.runtime.security.token.DelegationTokenReceiverRepository [] - Delegation token receivers loaded successfully
+2025-08-14 13:00:32,240 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Checking provider and receiver instances consistency
+2025-08-14 13:00:32,240 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Provider and receiver instances are consistent
+2025-08-14 13:00:32,240 WARN  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Multiple providers loaded with the same prefix: s3. This might lead to unintended consequences, please consider using only one of them.
+2025-08-14 13:00:32,240 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Obtaining delegation tokens
+2025-08-14 13:00:32,242 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Delegation tokens obtained successfully
+2025-08-14 13:00:32,242 WARN  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - No tokens obtained so skipping notifications
+2025-08-14 13:00:32,945 INFO  org.apache.flink.fs.s3.common.token.AbstractS3DelegationTokenReceiver [] - Updating Hadoop configuration
+2025-08-14 13:00:32,947 INFO  org.apache.flink.fs.s3.common.token.AbstractS3DelegationTokenReceiver [] - Updated Hadoop configuration successfully
+2025-08-14 13:00:33,313 WARN  org.apache.hadoop.metrics2.impl.MetricsConfig                [] - Cannot locate configuration: tried hadoop-metrics2-s3a-file-system.properties,hadoop-metrics2.properties
+2025-08-14 13:00:33,330 INFO  org.apache.hadoop.metrics2.impl.MetricsSystemImpl            [] - Scheduled Metric snapshot period at 10 second(s).
+2025-08-14 13:00:33,330 INFO  org.apache.hadoop.metrics2.impl.MetricsSystemImpl            [] - s3a-file-system metrics system started
+2025-08-14 13:00:33,412 WARN  org.apache.hadoop.util.NativeCodeLoader                      [] - Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+2025-08-14 13:00:34,422 INFO  org.apache.flink.kubernetes.kubeclient.Fabric8FlinkKubeClient [] - Creating configmap shared watcher for flink-kafka-s3-cluster-config-map.
+2025-08-14 13:00:35,211 INFO  org.apache.flink.runtime.blob.BlobServer                     [] - Created BLOB server storage directory /tmp/jm_45fc7d4eba15513acfc736eb28141bf5/blobStorage
+2025-08-14 13:00:35,212 INFO  org.apache.flink.runtime.blob.BlobServer                     [] - Started BLOB server at 0.0.0.0:6124 - max concurrent requests: 50 - max backlog: 1000
+2025-08-14 13:00:35,223 INFO  org.apache.flink.runtime.metrics.MetricRegistryImpl          [] - No metrics reporter configured, no metrics will be exposed/reported.
+2025-08-14 13:00:35,223 INFO  org.apache.flink.runtime.metrics.MetricRegistryImpl          [] - No trace reporter configured, no metrics will be exposed/reported.
+2025-08-14 13:00:35,226 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcServiceUtils      [] - Trying to start actor system, external address 192.168.100.23:0, bind address 0.0.0.0:0.
+2025-08-14 13:00:35,243 INFO  org.apache.pekko.event.slf4j.Slf4jLogger                     [] - Slf4jLogger started
+2025-08-14 13:00:35,245 INFO  org.apache.pekko.remote.RemoteActorRefProvider               [] - Pekko Cluster not in use - enabling unsafe features anyway because `pekko.remote.use-unsafe-remote-features-outside-cluster` has been enabled.
+2025-08-14 13:00:35,246 INFO  org.apache.pekko.remote.Remoting                             [] - Starting remoting
+2025-08-14 13:00:35,311 INFO  org.apache.pekko.remote.Remoting                             [] - Remoting started; listening on addresses :[pekko.tcp://flink-metrics@192.168.100.23:44873]
+2025-08-14 13:00:35,316 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcServiceUtils      [] - Actor system started at pekko.tcp://flink-metrics@192.168.100.23:44873
+2025-08-14 13:00:35,325 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcService           [] - Starting RPC endpoint for org.apache.flink.runtime.metrics.dump.MetricQueryService at pekko://flink-metrics/user/rpc/MetricQueryService .
+2025-08-14 13:00:35,447 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - Upload directory /tmp/flink-web-9afd8e06-c9f4-435c-a9f1-69ff5cb5fbf3/flink-web-upload does not exist. 
+2025-08-14 13:00:35,448 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - Created directory /tmp/flink-web-9afd8e06-c9f4-435c-a9f1-69ff5cb5fbf3/flink-web-upload for file uploads.
+2025-08-14 13:00:35,449 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - Starting rest endpoint.
+2025-08-14 13:00:35,525 WARN  org.apache.flink.configuration.Configuration                 [] - Config uses deprecated configuration key 'state.savepoints.dir' instead of proper key 'execution.checkpointing.savepoint-dir'
+2025-08-14 13:00:35,546 INFO  org.apache.flink.runtime.webmonitor.WebMonitorUtils          [] - Determined location of main cluster component log file: /usr/lib/flink/log/flink--kubernetes-application-0-flink-kafka-s3-749dc8874-4lvw7.log
+2025-08-14 13:00:35,546 INFO  org.apache.flink.runtime.webmonitor.WebMonitorUtils          [] - Determined location of main cluster component stdout file: /usr/lib/flink/log/flink--kubernetes-application-0-flink-kafka-s3-749dc8874-4lvw7.out
+2025-08-14 13:00:35,742 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - Rest endpoint listening at 192.168.100.23:8081
+2025-08-14 13:00:35,746 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesLeaderElector [] - Create KubernetesLeaderElector on lock ConfigMapLock: emr-flink - flink-kafka-s3-cluster-config-map (360d0e6c-1f4a-4e54-bc1b-bfb4ae899a7a).
+2025-08-14 13:00:35,748 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesConfigMapSharedInformer [] - Starting to watch for emr-flink/flink-kafka-s3-cluster-config-map, watching id:d083d954-1f06-441b-93d8-05734a9db643
+2025-08-14 13:00:35,749 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesLeaderElector [] - Triggered leader election on lock ConfigMapLock: emr-flink - flink-kafka-s3-cluster-config-map (360d0e6c-1f4a-4e54-bc1b-bfb4ae899a7a).
+2025-08-14 13:00:35,749 INFO  org.apache.flink.runtime.leaderelection.DefaultLeaderElectionService [] - A connection to the HA backend was established through LeaderElectionDriver KubernetesLeaderElectionDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,749 INFO  org.apache.flink.runtime.leaderelection.DefaultLeaderElectionService [] - LeaderContender has been registered under component 'restserver' for KubernetesLeaderElectionDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,749 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - Web frontend listening at http://192.168.100.23:8081.
+2025-08-14 13:00:35,818 WARN  org.apache.flink.kubernetes.entrypoint.KubernetesResourceManagerFactory [] - Configured size for 'taskmanager.memory.process.size' is ignored. Total memory size for TaskManagers are dynamically decided in fine-grained resource management.
+2025-08-14 13:00:35,822 INFO  org.apache.flink.runtime.leaderelection.DefaultLeaderElectionService [] - LeaderContender has been registered under component 'dispatcher' for KubernetesLeaderElectionDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,822 INFO  org.apache.flink.runtime.resourcemanager.ResourceManagerServiceImpl [] - Starting resource manager service.
+2025-08-14 13:00:35,823 INFO  org.apache.flink.runtime.leaderelection.DefaultLeaderElectionService [] - LeaderContender has been registered under component 'resourcemanager' for KubernetesLeaderElectionDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,824 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesConfigMapSharedInformer [] - Starting to watch for emr-flink/flink-kafka-s3-cluster-config-map, watching id:ef7a1958-1a04-4cfe-ab40-98c5b70c8e1d
+2025-08-14 13:00:35,824 INFO  org.apache.flink.runtime.leaderretrieval.DefaultLeaderRetrievalService [] - Starting DefaultLeaderRetrievalService with KubernetesLeaderRetrievalDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,824 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesConfigMapSharedInformer [] - Starting to watch for emr-flink/flink-kafka-s3-cluster-config-map, watching id:1797b497-9e4f-4691-b429-4a3d06125816
+2025-08-14 13:00:35,824 INFO  org.apache.flink.runtime.leaderretrieval.DefaultLeaderRetrievalService [] - Starting DefaultLeaderRetrievalService with KubernetesLeaderRetrievalDriver{configMapName='flink-kafka-s3-cluster-config-map'}.
+2025-08-14 13:00:35,920 INFO  org.apache.flink.kubernetes.kubeclient.resources.KubernetesLeaderElector [] - New leader elected 360d0e6c-1f4a-4e54-bc1b-bfb4ae899a7a for flink-kafka-s3-cluster-config-map.
+2025-08-14 13:00:35,922 INFO  org.apache.flink.runtime.resourcemanager.ResourceManagerServiceImpl [] - Resource manager service is granted leadership with session id 895c091d-dc1d-458b-8509-5cad9135b501.
+2025-08-14 13:00:35,922 INFO  org.apache.flink.runtime.jobmaster.MiniDispatcherRestEndpoint [] - http://192.168.100.23:8081 was granted leadership with leaderSessionID=895c091d-dc1d-458b-8509-5cad9135b501
+2025-08-14 13:00:36,024 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Using legacy YAML parser to load flink configuration file from /usr/lib/flink/conf/flink-conf.yaml.
+2025-08-14 13:00:36,024 WARN  org.apache.flink.configuration.GlobalConfiguration           [] - Error while trying to split key and value in configuration file /usr/lib/flink/conf/flink-conf.yaml:35: Line is not a key-value pair (missing space after ':'?)
+2025-08-14 13:00:36,025 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.enabled, true
+2025-08-14 13:00:36,025 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: task.local-recovery.ebs.enable, true
+2025-08-14 13:00:36,025 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.replicas, 2
+2025-08-14 13:00:36,025 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.service-account, emr-containers-sa-flink-taskmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:36,025 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.submit-failed-job-on-application-error, true
+2025-08-14 13:00:36,026 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.operator-chaining, false
+2025-08-14 13:00:36,026 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.type, fixed-delay
+2025-08-14 13:00:36,026 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.cluster-id, flink-kafka-s3
+2025-08-14 13:00:36,026 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.max-parallelism, 96
+2025-08-14 13:00:36,027 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:36,027 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.cluster-id, flink-kafka-s3
+2025-08-14 13:00:36,027 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: dstl.dfs.base-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+2025-08-14 13:00:36,027 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.storageDir, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit, 10Gi
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.cpu.amount, 1.0
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: parallelism.default, 1
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.namespace, emr-flink
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: fs.s3a.aws.credentials.provider, software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.owner.reference, kind:FlinkDeployment,uid:b63f4e46-2d7e-4acc-9921-ea87a9d9352a,name:flink-kafka-s3,controller:false,blockOwnerDeletion:true,apiVersion:flink.apache.org/v1beta1
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: dstl.dfs.upload.timeout, 5s
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.scaling.enabled, true
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.window-interval, 1m
+2025-08-14 13:00:36,028 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.container.image.ref, 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-flink-msk-s3:maven
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.memory.process.size, 4 gb
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.internal.jobmanager.entrypoint.class, org.apache.flink.kubernetes.entrypoint.KubernetesApplicationClusterEntrypoint
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.restart.time-tracking.enabled, true
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.name, flink-kafka-s3
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: cluster.taskmanager.graceful-decommission.enabled, true
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.local-recovery, true
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.rocksdb.localdir, /tmp/rocksdb/
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.pod-template-file.taskmanager, /tmp/flink_op_generated_podTemplate_1389898535621920293.yaml
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.incremental, true
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: web.cancel.enable, false
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.shutdown-on-application-finish, false
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.checkpointing.interval, 30000
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.metrics.window, 2m
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.container.image.pull-policy, Always
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.cpu.amount, 1.0
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job-result-store.delete-on-commit, false
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.fixed-delay.delay, 30s
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.pipeline.job-id, b9ead6bbbd1af3b385e07c6595539899
+2025-08-14 13:00:36,029 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.taskmanager.labels, emr-containers.amazonaws.com/component:flink.taskmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend, rocksdb
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.flink.version, v1_20
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.pod-template-file.jobmanager, /tmp/flink_op_generated_podTemplate_10866686593946337522.yaml
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: blob.server.port, 6124
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.annotations, flinkdeployment.flink.apache.org/generation:2
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job-result-store.storage-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha//job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.restart.time, 2m
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.type, kubernetes
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.execution.failover-strategy, region
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.changelog.enabled, true
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.auto-watermark-interval, 1s
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.jobmanager.labels, emr-containers.amazonaws.com/component:flink.jobmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.savepoints.dir, s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.catch-up.duration, 5m
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.scale-down.interval, 0
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.application.program-args, -py;/opt/flink/usrlib/kafka-s3-sink-flink1-19.py;b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092;flink-consumer-g1;earliest-offset;s3://emr-on-eks-test-021732063925-us-west-2/orders_data_parquet/
+2025-08-14 13:00:36,030 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.enabled, true
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.numberOfTaskSlots, 4
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: kubernetes.rest-service.exposed.type, ClusterIP
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: high-availability.jobmanager.port, 6123
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.target.utilization.boundary, 0.1
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: $internal.application.main, org.apache.flink.client.python.PythonDriver
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.stabilization.interval, 1m
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: restart-strategy.fixed-delay.attempts, 100
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.target, kubernetes-application
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.memory.process.size, 2 gb
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: taskmanager.rpc.port, 6122
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: job.autoscaler.target.utilization, 0.6
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.backend.changelog.storage, filesystem
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: internal.cluster.execution-mode, NORMAL
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: jobmanager.scheduler, adaptive
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: execution.checkpointing.externalized-checkpoint-retention, RETAIN_ON_CANCELLATION
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: pipeline.jars, local:///opt/flink/usrlib/kafka-s3-sink-flink1-19.py
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: fs.s3a.endpoint.region, us-west-2
+2025-08-14 13:00:36,109 INFO  org.apache.flink.configuration.GlobalConfiguration           [] - Loading configuration property: state.checkpoints.dir, s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+2025-08-14 13:00:36,115 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcService           [] - Starting RPC endpoint for org.apache.flink.runtime.resourcemanager.active.ActiveResourceManager at pekko://flink/user/rpc/resourcemanager_0 .
+2025-08-14 13:00:36,122 INFO  org.apache.flink.runtime.dispatcher.runner.DefaultDispatcherRunner [] - DefaultDispatcherRunner was granted leadership with leader id 895c091d-dc1d-458b-8509-5cad9135b501. Creating new DispatcherLeaderProcess.
+2025-08-14 13:00:36,128 INFO  org.apache.flink.runtime.resourcemanager.active.ActiveResourceManager [] - Starting the resource manager.
+2025-08-14 13:00:36,131 INFO  org.apache.flink.runtime.dispatcher.runner.SessionDispatcherLeaderProcess [] - Start SessionDispatcherLeaderProcess.
+2025-08-14 13:00:36,132 INFO  org.apache.flink.runtime.highavailability.FileSystemJobResultStore [] - Creating highly available job result storage directory at s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+2025-08-14 13:00:36,211 INFO  org.apache.flink.runtime.resourcemanager.slotmanager.FineGrainedSlotManager [] - Starting the slot manager.
+2025-08-14 13:00:36,214 INFO  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Starting tokens update task
+2025-08-14 13:00:36,214 WARN  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - No tokens obtained so skipping notifications
+2025-08-14 13:00:36,214 WARN  org.apache.flink.runtime.security.token.DefaultDelegationTokenManager [] - Tokens update task not started because either no tokens obtained or none of the tokens specified its renewal date
+2025-08-14 13:00:37,610 INFO  org.apache.flink.kubernetes.KubernetesResourceManagerDriver  [] - Recovered 0 pods from previous attempts, current attempt id is 1.
+2025-08-14 13:00:37,610 INFO  org.apache.flink.runtime.resourcemanager.active.ActiveResourceManager [] - Recovered 0 workers from previous attempt.
+2025-08-14 13:00:38,009 INFO  org.apache.flink.runtime.highavailability.FileSystemJobResultStore [] - Created highly available job result storage directory at s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+2025-08-14 13:00:38,022 INFO  org.apache.flink.kubernetes.KubernetesResourceManagerDriver  [] - Create watch on TaskManager pods successfully.
+2025-08-14 13:00:38,217 INFO  org.apache.flink.runtime.dispatcher.runner.SessionDispatcherLeaderProcess [] - Recover all persisted job graphs that are not finished, yet.
+2025-08-14 13:00:38,225 INFO  org.apache.flink.runtime.jobmanager.DefaultJobGraphStore     [] - Retrieved job ids [] from KubernetesStateHandleStore{configMapName='flink-kafka-s3-cluster-config-map'}
+2025-08-14 13:00:38,225 INFO  org.apache.flink.runtime.dispatcher.runner.SessionDispatcherLeaderProcess [] - Successfully recovered 0 persisted job graphs.
+2025-08-14 13:00:38,236 INFO  org.apache.flink.runtime.rpc.pekko.PekkoRpcService           [] - Starting RPC endpoint for org.apache.flink.runtime.dispatcher.StandaloneDispatcher at pekko://flink/user/rpc/dispatcher_1 .
+2025-08-14 13:00:38,328 INFO  org.apache.flink.client.ClientUtils                          [] - Starting program (detached: true)
+2025-08-14 13:00:38,521 INFO  org.apache.flink.client.python.PythonEnvUtils                [] - Starting Python process with environment variables: {PATH=/usr/lib/jvm/java-17-amazon-corretto/bin:/usr/lib/flink/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin, FLINK_DATAGEN_KAFKA_REST_PORT=tcp://10.100.79.156:8081, FLINK_OPERATOR_WEBHOOK_SERVICE_PORT=tcp://10.100.60.73:443, FLINK_PLUGINS_DIR=/usr/lib/flink/plugins, HADOOP_USER_HOME=/home/hadoop, K8S_FLINK_LOG_URL_STDERR=/var/log/flink/user/stderr, FLINK_KAFKA_S3_REST_PORT_8081_TCP=tcp://10.100.125.120:8081, FLINK_KAFKA_S3_REST_PORT_8081_TCP_PROTO=tcp, FLINK_CONF_DIR=/usr/lib/flink/conf, FLINK_ENV_JAVA_OPTS=--add-exports=java.base/sun.net.util=ALL-UNNAMED --add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED --add-exports=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED, PWD=/usr/lib/flink, FLINK_KAFKA_S3_REST_PORT_8081_TCP_ADDR=10.100.125.120, KUBERNETES_PORT_443_TCP=tcp://10.100.0.1:443, PYTHONPATH=/tmp/pyflink/787dd049-a40b-496e-95e8-3e45abc9fbf5/b071347a-4429-4b38-b734-510deaf759d4:/usr/lib/flink/opt/python/cloudpickle-2.2.0-src.zip:/usr/lib/flink/opt/python/py4j-0.10.9.7-src.zip:/usr/lib/flink/opt/python/pyflink.zip, AWS_REGION=us-west-2, FLINK_DATAGEN_KAFKA_REST_PORT_8081_TCP_PROTO=tcp, FLINK_KAFKA_S3_REST_PORT=tcp://10.100.125.120:8081, K8S_FLINK_LOG_URL_STDOUT=/var/log/flink/user/stdout, FLINK_KAFKA_S3_REST_SERVICE_HOST=10.100.125.120, MAX_LOG_FILE_NUMBER=10, DYNAMIC_PARAMETERS=-D jobmanager.memory.off-heap.size=134217728b -D jobmanager.memory.jvm-overhead.min=214748368b -D jobmanager.memory.jvm-metaspace.size=268435456b -D jobmanager.memory.heap.size=1530082096b -D jobmanager.memory.jvm-overhead.max=214748368b, AWS_STS_REGIONAL_ENDPOINTS=regional, FLINK_DATAGEN_KAFKA_REST_SERVICE_PORT_REST=8081, FLINK_KAFKA_S3_REST_SERVICE_PORT_REST=8081, FLINK_KAFKA_S3_REST_PORT_8081_TCP_PORT=8081, KUBERNETES_SERVICE_PORT_HTTPS=443, SHLVL=0, FLINK_BIN_DIR=/usr/lib/flink/bin, FLINK_OPERATOR_WEBHOOK_SERVICE_SERVICE_HOST=10.100.60.73, FLINK_OPERATOR_WEBHOOK_SERVICE_PORT_443_TCP_PORT=443, JAVA_RUN=/usr/lib/jvm/java-17-amazon-corretto/bin/java, MULTILOG_SIZE_KEY=s2147483648, KUBERNETES_PORT=tcp://10.100.0.1:443, ROOT_LOG_LEVEL=INFO, AWS_ROLE_ARN=arn:aws:iam::021732063925:role/emr-on-eks-test-execution-role, AWS_DEFAULT_REGION=us-west-2, JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto, FLINK_DATAGEN_KAFKA_REST_PORT_8081_TCP_ADDR=10.100.79.156, _POD_IP_ADDRESS=192.168.100.23, KUBERNETES_SERVICE_HOST=10.100.0.1, FLINK_DATAGEN_KAFKA_REST_SERVICE_PORT=8081, FLINK_OPERATOR_WEBHOOK_SERVICE_PORT_443_TCP_PROTO=tcp, FLINK_KAFKA_S3_REST_SERVICE_PORT=8081, FLINK_OPERATOR_WEBHOOK_SERVICE_PORT_443_TCP_ADDR=10.100.60.73, FLINK_OPERATOR_WEBHOOK_SERVICE_SERVICE_PORT=443, FLINK_OPT_DIR=/usr/lib/flink/opt, KUBERNETES_PORT_443_TCP_ADDR=10.100.0.1, AWS_WEB_IDENTITY_TOKEN_FILE=/var/run/secrets/eks.amazonaws.com/serviceaccount/token, FLINK_HOME=/usr/lib/flink, KUBERNETES_PORT_443_TCP_PROTO=tcp, FLINK_LIB_DIR=/usr/lib/flink/lib, FLINK_DATAGEN_KAFKA_REST_SERVICE_HOST=10.100.79.156, FLINK_OPERATOR_WEBHOOK_SERVICE_PORT_443_TCP=tcp://10.100.60.73:443, PYFLINK_GATEWAY_PORT=41135, KUBERNETES_SERVICE_PORT=443, FLINK_DATAGEN_KAFKA_REST_PORT_8081_TCP=tcp://10.100.79.156:8081, FLINK_INHERITED_LOGS=
+
+
+RESOURCE_PARAMS extraction logs:
+jvm_params: -Xmx1530082096 -Xms1530082096 -XX:MaxMetaspaceSize=268435456
+dynamic_configs: -D jobmanager.memory.off-heap.size=134217728b -D jobmanager.memory.jvm-overhead.min=214748368b -D jobmanager.memory.jvm-metaspace.size=268435456b -D jobmanager.memory.heap.size=1530082096b -D jobmanager.memory.jvm-overhead.max=214748368b
+logs: WARNING: sun.reflect.Reflection.getCallerClass is not supported. This will impact performance.
+INFO  [] - Using legacy YAML parser to load flink configuration file from /usr/lib/flink/conf/flink-conf.yaml.
+WARN  [] - Error while trying to split key and value in configuration file /usr/lib/flink/conf/flink-conf.yaml:35: Line is not a key-value pair (missing space after ':'?)
+INFO  [] - Loading configuration property: job.autoscaler.enabled, true
+INFO  [] - Loading configuration property: task.local-recovery.ebs.enable, true
+INFO  [] - Loading configuration property: kubernetes.jobmanager.replicas, 2
+INFO  [] - Loading configuration property: kubernetes.taskmanager.service-account, emr-containers-sa-flink-taskmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: execution.submit-failed-job-on-application-error, true
+INFO  [] - Loading configuration property: pipeline.operator-chaining, false
+INFO  [] - Loading configuration property: restart-strategy.type, fixed-delay
+INFO  [] - Loading configuration property: high-availability.cluster-id, flink-kafka-s3
+INFO  [] - Loading configuration property: pipeline.max-parallelism, 96
+INFO  [] - Loading configuration property: kubernetes.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: kubernetes.cluster-id, flink-kafka-s3
+INFO  [] - Loading configuration property: dstl.dfs.base-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
+INFO  [] - Loading configuration property: high-availability.storageDir, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha/
+INFO  [] - Loading configuration property: kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit, 10Gi
+INFO  [] - Loading configuration property: kubernetes.taskmanager.cpu.amount, 1.0
+INFO  [] - Loading configuration property: parallelism.default, 1
+INFO  [] - Loading configuration property: kubernetes.namespace, emr-flink
+INFO  [] - Loading configuration property: fs.s3a.aws.credentials.provider, software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider
+INFO  [] - Loading configuration property: kubernetes.jobmanager.owner.reference, kind:FlinkDeployment,uid:b63f4e46-2d7e-4acc-9921-ea87a9d9352a,name:flink-kafka-s3,controller:false,blockOwnerDeletion:true,apiVersion:flink.apache.org/v1beta1
+INFO  [] - Loading configuration property: dstl.dfs.upload.timeout, 5s
+INFO  [] - Loading configuration property: job.autoscaler.scaling.enabled, true
+INFO  [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.window-interval, 1m
+INFO  [] - Loading configuration property: kubernetes.container.image.ref, 021732063925.dkr.ecr.us-west-2.amazonaws.com/emr-7.9.0-flink-msk-s3:maven
+INFO  [] - Loading configuration property: taskmanager.memory.process.size, 4 gb
+INFO  [] - Loading configuration property: kubernetes.internal.jobmanager.entrypoint.class, org.apache.flink.kubernetes.entrypoint.KubernetesApplicationClusterEntrypoint
+INFO  [] - Loading configuration property: job.autoscaler.restart.time-tracking.enabled, true
+INFO  [] - Loading configuration property: pipeline.name, flink-kafka-s3
+INFO  [] - Loading configuration property: cluster.taskmanager.graceful-decommission.enabled, true
+INFO  [] - Loading configuration property: state.backend.local-recovery, true
+INFO  [] - Loading configuration property: state.backend.rocksdb.localdir, /tmp/rocksdb/
+INFO  [] - Loading configuration property: kubernetes.pod-template-file.taskmanager, /tmp/flink_op_generated_podTemplate_1389898535621920293.yaml
+INFO  [] - Loading configuration property: state.backend.incremental, true
+INFO  [] - Loading configuration property: web.cancel.enable, false
+INFO  [] - Loading configuration property: execution.shutdown-on-application-finish, false
+INFO  [] - Loading configuration property: execution.checkpointing.interval, 30000
+INFO  [] - Loading configuration property: job.autoscaler.metrics.window, 2m
+INFO  [] - Loading configuration property: kubernetes.container.image.pull-policy, Always
+INFO  [] - Loading configuration property: kubernetes.jobmanager.cpu.amount, 1.0
+INFO  [] - Loading configuration property: job-result-store.delete-on-commit, false
+INFO  [] - Loading configuration property: restart-strategy.fixed-delay.delay, 30s
+INFO  [] - Loading configuration property: $internal.pipeline.job-id, b9ead6bbbd1af3b385e07c6595539899
+INFO  [] - Loading configuration property: kubernetes.taskmanager.labels, emr-containers.amazonaws.com/component:flink.taskmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+INFO  [] - Loading configuration property: kubernetes.jobmanager.service-account, emr-containers-sa-flink-jobmanager-021732063925-1sseqknnoni14bdu6yyw9n3ft32986beoj10gadqfez009x
+INFO  [] - Loading configuration property: state.backend, rocksdb
+INFO  [] - Loading configuration property: $internal.flink.version, v1_20
+INFO  [] - Loading configuration property: kubernetes.pod-template-file.jobmanager, /tmp/flink_op_generated_podTemplate_10866686593946337522.yaml
+INFO  [] - Loading configuration property: blob.server.port, 6124
+INFO  [] - Loading configuration property: kubernetes.jobmanager.annotations, flinkdeployment.flink.apache.org/generation:2
+INFO  [] - Loading configuration property: job-result-store.storage-path, s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/ha//job-result-store/flink-kafka-s3/9514b235-e9af-4587-9b17-85a9971a9d8b
+INFO  [] - Loading configuration property: job.autoscaler.restart.time, 2m
+INFO  [] - Loading configuration property: high-availability.type, kubernetes
+INFO  [] - Loading configuration property: jobmanager.execution.failover-strategy, region
+INFO  [] - Loading configuration property: state.backend.changelog.enabled, true
+INFO  [] - Loading configuration property: pipeline.auto-watermark-interval, 1s
+INFO  [] - Loading configuration property: kubernetes.jobmanager.labels, emr-containers.amazonaws.com/component:flink.jobmanager,emr-containers.amazonaws.com/resource.type:flink.operator
+INFO  [] - Loading configuration property: state.savepoints.dir, s3://emr-on-eks-test-021732063925-us-west-2/autoscaling/savepoint/
+INFO  [] - Loading configuration property: job.autoscaler.catch-up.duration, 5m
+INFO  [] - Loading configuration property: job.autoscaler.scale-down.interval, 0
+INFO  [] - Loading configuration property: $internal.application.program-args, -py;/opt/flink/usrlib/kafka-s3-sink-flink1-19.py;b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092;flink-consumer-g1;earliest-offset;s3://emr-on-eks-test-021732063925-us-west-2/orders_data_parquet/
+INFO  [] - Loading configuration property: jobmanager.adaptive-scheduler.combined-restart.enabled, true
+INFO  [] - Loading configuration property: taskmanager.numberOfTaskSlots, 4
+INFO  [] - Loading configuration property: kubernetes.rest-service.exposed.type, ClusterIP
+INFO  [] - Loading configuration property: high-availability.jobmanager.port, 6123
+INFO  [] - Loading configuration property: job.autoscaler.target.utilization.boundary, 0.1
+INFO  [] - Loading configuration property: $internal.application.main, org.apache.flink.client.python.PythonDriver
+INFO  [] - Loading configuration property: job.autoscaler.stabilization.interval, 1m
+INFO  [] - Loading configuration property: restart-strategy.fixed-delay.attempts, 100
+INFO  [] - Loading configuration property: execution.target, kubernetes-application
+INFO  [] - Loading configuration property: jobmanager.memory.process.size, 2 gb
+INFO  [] - Loading configuration property: taskmanager.rpc.port, 6122
+INFO  [] - Loading configuration property: job.autoscaler.target.utilization, 0.6
+INFO  [] - Loading configuration property: state.backend.changelog.storage, filesystem
+INFO  [] - Loading configuration property: internal.cluster.execution-mode, NORMAL
+INFO  [] - Loading configuration property: jobmanager.scheduler, adaptive
+INFO  [] - Loading configuration property: execution.checkpointing.externalized-checkpoint-retention, RETAIN_ON_CANCELLATION
+INFO  [] - Loading configuration property: pipeline.jars, local:///opt/flink/usrlib/kafka-s3-sink-flink1-19.py
+INFO  [] - Loading configuration property: fs.s3a.endpoint.region, us-west-2
+INFO  [] - Loading configuration property: state.checkpoints.dir, s3p://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/checkpoint/
+INFO  [] - Final Master Memory configuration:
+INFO  [] -   Total Process Memory: 2.000gb (2147483648 bytes)
+INFO  [] -     Total Flink Memory: 1.550gb (1664299824 bytes)
+INFO  [] -       JVM Heap:         1.425gb (1530082096 bytes)
+INFO  [] -       Off-heap:         128.000mb (134217728 bytes)
+INFO  [] -     JVM Metaspace:      256.000mb (268435456 bytes)
+INFO  [] -     JVM Overhead:       204.800mb (214748368 bytes)
+, FLINK_DATAGEN_KAFKA_REST_PORT_8081_TCP_PORT=8081, HOSTNAME=flink-kafka-s3-749dc8874-4lvw7, JVM_ARGS= -Xmx1530082096 -Xms1530082096 -XX:MaxMetaspaceSize=268435456, LD_PRELOAD=:/usr/lib64/libjemalloc.so, KUBERNETES_PORT_443_TCP_PORT=443, HOME=/home/hadoop, MULTILOG_NUM_KEY=n10}, command: python -u /opt/flink/usrlib/kafka-s3-sink-flink1-19.py b-2.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092,b-1.emrstreamdemo.5uk6mr.c1.kafka.us-west-2.amazonaws.com:9092 flink-consumer-g1 earliest-offset s3://emr-on-eks-test-021732063925-us-west-2/orders_data_parquet/
+2025-08-14 13:00:38,523 INFO  org.apache.flink.client.python.PythonDriver                  [] - --------------------------- Python Process Started --------------------------
+2025-08-14 13:00:39,320 WARN  org.apache.flink.configuration.Configuration                 [] - Config uses deprecated configuration key 'state.checkpoints.dir' instead of proper key 'execution.checkpointing.dir'
+2025-08-14 13:00:39,323 WARN  org.apache.flink.configuration.Configuration                 [] - Config uses deprecated configuration key 'state.backend' instead of proper key 'state.backend.type'
+2025-08-14 13:00:41,311 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlCreateCatalog does not contain a setter for field catalogName
+2025-08-14 13:00:41,311 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlCreateCatalog cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,312 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterCatalogOptions does not contain a setter for field propertyList
+2025-08-14 13:00:41,312 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterCatalogOptions cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,312 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterCatalogReset does not contain a getter for field propertyKeyList
+2025-08-14 13:00:41,312 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterCatalogReset does not contain a setter for field propertyKeyList
+2025-08-14 13:00:41,312 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterCatalogReset cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,313 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterCatalogComment does not contain a setter for field comment
+2025-08-14 13:00:41,313 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterCatalogComment cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,313 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlCreateView does not contain a setter for field viewName
+2025-08-14 13:00:41,314 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlCreateView cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,314 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterViewRename does not contain a getter for field newViewIdentifier
+2025-08-14 13:00:41,314 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterViewRename does not contain a setter for field newViewIdentifier
+2025-08-14 13:00:41,314 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterViewRename cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,315 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterViewProperties does not contain a setter for field propertyList
+2025-08-14 13:00:41,315 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterViewProperties cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,315 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterViewAs does not contain a setter for field newQuery
+2025-08-14 13:00:41,315 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterViewAs cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,316 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAddPartitions does not contain a setter for field ifPartitionNotExists
+2025-08-14 13:00:41,316 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAddPartitions cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,316 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlDropPartitions does not contain a setter for field ifExists
+2025-08-14 13:00:41,316 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlDropPartitions cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,317 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowPartitions does not contain a getter for field tableIdentifier
+2025-08-14 13:00:41,317 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowPartitions does not contain a setter for field tableIdentifier
+2025-08-14 13:00:41,317 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlShowPartitions cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,317 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dml.SqlTruncateTable does not contain a getter for field tableNameIdentifier
+2025-08-14 13:00:41,317 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dml.SqlTruncateTable does not contain a setter for field tableNameIdentifier
+2025-08-14 13:00:41,318 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dml.SqlTruncateTable cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,318 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowFunctions does not contain a setter for field requireUser
+2025-08-14 13:00:41,318 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlShowFunctions cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,318 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowProcedures does not contain a getter for field databaseName
+2025-08-14 13:00:41,319 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowProcedures does not contain a setter for field databaseName
+2025-08-14 13:00:41,319 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlShowProcedures cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,319 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlReplaceTableAs does not contain a setter for field tableName
+2025-08-14 13:00:41,319 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlReplaceTableAs cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,320 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowDatabases does not contain a setter for field preposition
+2025-08-14 13:00:41,320 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlShowDatabases cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowCreateCatalog does not contain a getter for field sqlIdentifier
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlShowCreateCatalog does not contain a setter for field sqlIdentifier
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlShowCreateCatalog cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlDescribeCatalog does not contain a getter for field catalogName
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlDescribeCatalog does not contain a setter for field catalogName
+2025-08-14 13:00:41,321 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlDescribeCatalog cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,322 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlDescribeJob does not contain a getter for field jobId
+2025-08-14 13:00:41,322 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.dql.SqlDescribeJob does not contain a setter for field jobId
+2025-08-14 13:00:41,322 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.dql.SqlDescribeJob cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,323 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlCreateMaterializedTable does not contain a setter for field tableName
+2025-08-14 13:00:41,323 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlCreateMaterializedTable cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,323 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableRefresh does not contain a setter for field partitionSpec
+2025-08-14 13:00:41,323 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableRefresh cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,324 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableSuspend does not contain a getter for field tableIdentifier
+2025-08-14 13:00:41,324 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableSuspend does not contain a setter for field tableIdentifier
+2025-08-14 13:00:41,324 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableSuspend cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,324 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableResume does not contain a setter for field propertyList
+2025-08-14 13:00:41,324 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlAlterMaterializedTableResume cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+2025-08-14 13:00:41,325 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlDropMaterializedTable does not contain a getter for field tableIdentifier
+2025-08-14 13:00:41,325 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.sql.parser.ddl.SqlDropMaterializedTable does not contain a setter for field tableIdentifier
+2025-08-14 13:00:41,325 INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.sql.parser.ddl.SqlDropMaterializedTable cannot be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance and schema evolution.
+Traceback (most recent call last):
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] - Traceback (most recent call last):
+  File "/opt/flink/usrlib/kafka-s3-sink-flink1-19.py", line 94, in <module>
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/opt/flink/usrlib/kafka-s3-sink-flink1-19.py", line 94, in <module>
+    sink_app(bootstrap_servers,consumer_group,startup_mode,s3_path)
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -     sink_app(bootstrap_servers,consumer_group,startup_mode,s3_path)
+  File "/opt/flink/usrlib/kafka-s3-sink-flink1-19.py", line 67, in sink_app
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/opt/flink/usrlib/kafka-s3-sink-flink1-19.py", line 67, in sink_app
+    table_result = t_env.execute_sql("""
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -     table_result = t_env.execute_sql("""
+  File "/usr/lib/flink/opt/python/pyflink.zip/pyflink/table/table_environment.py", line 837, in execute_sql
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/usr/lib/flink/opt/python/pyflink.zip/pyflink/table/table_environment.py", line 837, in execute_sql
+  File "/usr/lib/flink/opt/python/py4j-0.10.9.7-src.zip/py4j/java_gateway.py", line 1322, in __call__
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/usr/lib/flink/opt/python/py4j-0.10.9.7-src.zip/py4j/java_gateway.py", line 1322, in __call__
+  File "/usr/lib/flink/opt/python/pyflink.zip/pyflink/util/exceptions.py", line 146, in deco
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/usr/lib/flink/opt/python/pyflink.zip/pyflink/util/exceptions.py", line 146, in deco
+  File "/usr/lib/flink/opt/python/py4j-0.10.9.7-src.zip/py4j/protocol.py", line 326, in get_return_value
+2025-08-14 13:00:45,014 INFO  org.apache.flink.client.python.PythonDriver                  [] -   File "/usr/lib/flink/opt/python/py4j-0.10.9.7-src.zip/py4j/protocol.py", line 326, in get_return_value
+py4j.protocol.Py4JJavaError: An error occurred while calling o8.executeSql.
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - py4j.protocol.Py4JJavaError: An error occurred while calling o8.executeSql.
+: java.lang.NoClassDefFoundError: org/apache/hadoop/conf/Configuration
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - : java.lang.NoClassDefFoundError: org/apache/hadoop/conf/Configuration
+	at org.apache.flink.formats.parquet.ParquetFileFormatFactory.getParquetConfiguration(ParquetFileFormatFactory.java:113)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.formats.parquet.ParquetFileFormatFactory.getParquetConfiguration(ParquetFileFormatFactory.java:113)
+	at org.apache.flink.formats.parquet.ParquetFileFormatFactory.access$000(ParquetFileFormatFactory.java:58)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.formats.parquet.ParquetFileFormatFactory.access$000(ParquetFileFormatFactory.java:58)
+	at org.apache.flink.formats.parquet.ParquetFileFormatFactory$1.createRuntimeEncoder(ParquetFileFormatFactory.java:101)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.formats.parquet.ParquetFileFormatFactory$1.createRuntimeEncoder(ParquetFileFormatFactory.java:101)
+	at org.apache.flink.formats.parquet.ParquetFileFormatFactory$1.createRuntimeEncoder(ParquetFileFormatFactory.java:95)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.formats.parquet.ParquetFileFormatFactory$1.createRuntimeEncoder(ParquetFileFormatFactory.java:95)
+	at org.apache.flink.connector.file.table.FileSystemTableSink.createWriter(FileSystemTableSink.java:390)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.connector.file.table.FileSystemTableSink.createWriter(FileSystemTableSink.java:390)
+	at org.apache.flink.connector.file.table.FileSystemTableSink.createStreamingSink(FileSystemTableSink.java:222)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.connector.file.table.FileSystemTableSink.createStreamingSink(FileSystemTableSink.java:222)
+	at org.apache.flink.connector.file.table.FileSystemTableSink.consume(FileSystemTableSink.java:161)
+2025-08-14 13:00:45,015 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.connector.file.table.FileSystemTableSink.consume(FileSystemTableSink.java:161)
+	at org.apache.flink.connector.file.table.FileSystemTableSink.access$000(FileSystemTableSink.java:95)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.connector.file.table.FileSystemTableSink.access$000(FileSystemTableSink.java:95)
+	at org.apache.flink.connector.file.table.FileSystemTableSink$1.consumeDataStream(FileSystemTableSink.java:143)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.connector.file.table.FileSystemTableSink$1.consumeDataStream(FileSystemTableSink.java:143)
+	at org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecSink.applySinkProvider(CommonExecSink.java:455)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecSink.applySinkProvider(CommonExecSink.java:455)
+	at org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecSink.createSinkTransformation(CommonExecSink.java:213)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.plan.nodes.exec.common.CommonExecSink.createSinkTransformation(CommonExecSink.java:213)
+	at org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecSink.translateToPlanInternal(StreamExecSink.java:214)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecSink.translateToPlanInternal(StreamExecSink.java:214)
+	at org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase.translateToPlan(ExecNodeBase.java:168)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase.translateToPlan(ExecNodeBase.java:168)
+	at org.apache.flink.table.planner.delegation.StreamPlanner.$anonfun$translateToPlan$1(StreamPlanner.scala:85)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.delegation.StreamPlanner.$anonfun$translateToPlan$1(StreamPlanner.scala:85)
+	at scala.collection.TraversableLike.$anonfun$map$1(TraversableLike.scala:286)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.TraversableLike.$anonfun$map$1(TraversableLike.scala:286)
+	at scala.collection.Iterator.foreach(Iterator.scala:943)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.Iterator.foreach(Iterator.scala:943)
+	at scala.collection.Iterator.foreach$(Iterator.scala:943)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.Iterator.foreach$(Iterator.scala:943)
+	at scala.collection.AbstractIterator.foreach(Iterator.scala:1431)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.AbstractIterator.foreach(Iterator.scala:1431)
+	at scala.collection.IterableLike.foreach(IterableLike.scala:74)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.IterableLike.foreach(IterableLike.scala:74)
+	at scala.collection.IterableLike.foreach$(IterableLike.scala:73)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.IterableLike.foreach$(IterableLike.scala:73)
+	at scala.collection.AbstractIterable.foreach(Iterable.scala:56)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.AbstractIterable.foreach(Iterable.scala:56)
+	at scala.collection.TraversableLike.map(TraversableLike.scala:286)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.TraversableLike.map(TraversableLike.scala:286)
+	at scala.collection.TraversableLike.map$(TraversableLike.scala:279)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.TraversableLike.map$(TraversableLike.scala:279)
+	at scala.collection.AbstractTraversable.map(Traversable.scala:108)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at scala.collection.AbstractTraversable.map(Traversable.scala:108)
+	at org.apache.flink.table.planner.delegation.StreamPlanner.translateToPlan(StreamPlanner.scala:84)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.delegation.StreamPlanner.translateToPlan(StreamPlanner.scala:84)
+	at org.apache.flink.table.planner.delegation.PlannerBase.translate(PlannerBase.scala:180)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.planner.delegation.PlannerBase.translate(PlannerBase.scala:180)
+	at org.apache.flink.table.api.internal.TableEnvironmentImpl.translate(TableEnvironmentImpl.java:1308)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.api.internal.TableEnvironmentImpl.translate(TableEnvironmentImpl.java:1308)
+	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeInternal(TableEnvironmentImpl.java:874)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeInternal(TableEnvironmentImpl.java:874)
+	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeInternal(TableEnvironmentImpl.java:1109)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeInternal(TableEnvironmentImpl.java:1109)
+	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeSql(TableEnvironmentImpl.java:735)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.table.api.internal.TableEnvironmentImpl.executeSql(TableEnvironmentImpl.java:735)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+	at org.apache.flink.api.python.shaded.py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)
+	at org.apache.flink.api.python.shaded.py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+2025-08-14 13:00:45,016 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)
+	at org.apache.flink.api.python.shaded.py4j.Gateway.invoke(Gateway.java:282)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.Gateway.invoke(Gateway.java:282)
+	at org.apache.flink.api.python.shaded.py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)
+	at org.apache.flink.api.python.shaded.py4j.commands.CallCommand.execute(CallCommand.java:79)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.commands.CallCommand.execute(CallCommand.java:79)
+	at org.apache.flink.api.python.shaded.py4j.GatewayConnection.run(GatewayConnection.java:238)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at org.apache.flink.api.python.shaded.py4j.GatewayConnection.run(GatewayConnection.java:238)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/java.lang.Thread.run(Thread.java:840)
+Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.conf.Configuration
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - Caused by: java.lang.ClassNotFoundException: org.apache.hadoop.conf.Configuration
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:641)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:641)
+	at java.base/jdk.internal.loader.ClassLoaders$AppClassLoader.loadClass(ClassLoaders.java:188)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/jdk.internal.loader.ClassLoaders$AppClassLoader.loadClass(ClassLoaders.java:188)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:525)
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:525)
+	... 41 more
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 	... 41 more
+
+2025-08-14 13:00:45,017 INFO  org.apache.flink.client.python.PythonDriver                  [] - 
+2025-08-14 13:00:45,036 INFO  org.apache.flink.client.python.PythonDriver                  [] - --------------------------- Python Process Exited ---------------------------
+2025-08-14 13:00:45,036 ERROR org.apache.flink.client.python.PythonDriver                  [] - Run python process failed
+java.lang.RuntimeException: Python process exits with code: 1
+	at org.apache.flink.client.python.PythonDriver.main(PythonDriver.java:124) ~[flink-python-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method) ~[?:?]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77) ~[?:?]
+	at jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43) ~[?:?]
+	at java.lang.reflect.Method.invoke(Method.java:569) ~[?:?]
+	at org.apache.flink.client.program.PackagedProgram.callMainMethod(PackagedProgram.java:356) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.program.PackagedProgram.invokeInteractiveModeForExecution(PackagedProgram.java:223) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.ClientUtils.executeProgram(ClientUtils.java:113) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.runApplicationEntryPoint(ApplicationDispatcherBootstrap.java:301) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.lambda$runApplicationAsync$2(ApplicationDispatcherBootstrap.java:254) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:539) ~[?:?]
+	at java.util.concurrent.FutureTask.run(FutureTask.java:264) ~[?:?]
+	at org.apache.flink.runtime.concurrent.pekko.ActorSystemScheduledExecutorAdapter$ScheduledFutureTask.run(ActorSystemScheduledExecutorAdapter.java:172) ~[?:?]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:68) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.lambda$withContextClassLoader$0(ClassLoadingUtils.java:41) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.TaskInvocation.run(AbstractDispatcher.scala:59) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.ForkJoinExecutorConfigurator$PekkoForkJoinTask.exec(ForkJoinExecutorConfigurator.scala:57) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at java.util.concurrent.ForkJoinTask.doExec(ForkJoinTask.java:373) [?:?]
+	at java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(ForkJoinPool.java:1182) [?:?]
+	at java.util.concurrent.ForkJoinPool.scan(ForkJoinPool.java:1655) [?:?]
+	at java.util.concurrent.ForkJoinPool.runWorker(ForkJoinPool.java:1622) [?:?]
+	at java.util.concurrent.ForkJoinWorkerThread.run(ForkJoinWorkerThread.java:165) [?:?]
+2025-08-14 13:00:45,111 INFO  org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap [] - Application FAILED: 
+java.util.concurrent.CompletionException: org.apache.flink.client.deployment.application.UnsuccessfulExecutionException: Application Status: FAILED
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.lambda$unwrapJobResultException$7(ApplicationDispatcherBootstrap.java:403) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.CompletableFuture$UniApply.tryFire(CompletableFuture.java:646) ~[?:?]
+	at java.util.concurrent.CompletableFuture.postComplete(CompletableFuture.java:510) ~[?:?]
+	at java.util.concurrent.CompletableFuture.complete(CompletableFuture.java:2147) ~[?:?]
+	at org.apache.flink.client.deployment.application.JobStatusPollingUtils.lambda$null$2(JobStatusPollingUtils.java:101) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.CompletableFuture.uniWhenComplete(CompletableFuture.java:863) ~[?:?]
+	at java.util.concurrent.CompletableFuture$UniWhenComplete.tryFire(CompletableFuture.java:841) ~[?:?]
+	at java.util.concurrent.CompletableFuture.postComplete(CompletableFuture.java:510) ~[?:?]
+	at java.util.concurrent.CompletableFuture.complete(CompletableFuture.java:2147) ~[?:?]
+	at org.apache.flink.runtime.rpc.pekko.PekkoInvocationHandler.lambda$invokeRpc$1(PekkoInvocationHandler.java:268) ~[?:?]
+	at java.util.concurrent.CompletableFuture.uniWhenComplete(CompletableFuture.java:863) ~[?:?]
+	at java.util.concurrent.CompletableFuture$UniWhenComplete.tryFire(CompletableFuture.java:841) ~[?:?]
+	at java.util.concurrent.CompletableFuture.postComplete(CompletableFuture.java:510) ~[?:?]
+	at java.util.concurrent.CompletableFuture.complete(CompletableFuture.java:2147) ~[?:?]
+	at org.apache.flink.util.concurrent.FutureUtils.doForward(FutureUtils.java:1287) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.lambda$null$1(ClassLoadingUtils.java:93) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:68) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.lambda$guardCompletionWithContextClassLoader$2(ClassLoadingUtils.java:92) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.CompletableFuture.uniWhenComplete(CompletableFuture.java:863) ~[?:?]
+	at java.util.concurrent.CompletableFuture$UniWhenComplete.tryFire(CompletableFuture.java:841) ~[?:?]
+	at java.util.concurrent.CompletableFuture.postComplete(CompletableFuture.java:510) ~[?:?]
+	at java.util.concurrent.CompletableFuture.complete(CompletableFuture.java:2147) ~[?:?]
+	at org.apache.flink.runtime.concurrent.pekko.ScalaFutureUtils$1.onComplete(ScalaFutureUtils.java:47) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.OnComplete.internal(Future.scala:310) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.OnComplete.internal(Future.scala:307) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.japi$CallbackBridge.apply(Future.scala:234) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.japi$CallbackBridge.apply(Future.scala:231) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:64) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.pekko.ScalaFutureUtils$DirectExecutionContext.execute(ScalaFutureUtils.java:65) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.CallbackRunnable.executeWithValue(Promise.scala:72) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.Promise$DefaultPromise.$anonfun$tryComplete$1(Promise.scala:288) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.Promise$DefaultPromise.$anonfun$tryComplete$1$adapted(Promise.scala:288) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.Promise$DefaultPromise.tryComplete(Promise.scala:288) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.pattern.PromiseActorRef.$bang(AskSupport.scala:629) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.pattern.PipeToSupport$PipeableFuture$$anonfun$pipeTo$1.applyOrElse(PipeToSupport.scala:34) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.pattern.PipeToSupport$PipeableFuture$$anonfun$pipeTo$1.applyOrElse(PipeToSupport.scala:33) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.Future.$anonfun$andThen$1(Future.scala:536) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.Promise.liftedTree1$1(Promise.scala:33) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.Promise.$anonfun$transform$1(Promise.scala:33) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.impl.CallbackRunnable.run(Promise.scala:64) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.BatchingExecutor$AbstractBatch.processBatch(BatchingExecutor.scala:73) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.BatchingExecutor$BlockableBatch.$anonfun$run$1(BatchingExecutor.scala:110) ~[flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:23) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at scala.concurrent.BlockContext$.withBlockContext(BlockContext.scala:85) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.BatchingExecutor$BlockableBatch.run(BatchingExecutor.scala:110) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.TaskInvocation.run(AbstractDispatcher.scala:59) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at org.apache.pekko.dispatch.ForkJoinExecutorConfigurator$PekkoForkJoinTask.exec(ForkJoinExecutorConfigurator.scala:57) [flink-rpc-akkad46c76d6-2612-430f-b705-336b11bb66fc.jar:1.20.0-amzn-3]
+	at java.util.concurrent.ForkJoinTask.doExec(ForkJoinTask.java:373) [?:?]
+	at java.util.concurrent.ForkJoinPool$WorkQueue.topLevelExec(ForkJoinPool.java:1182) [?:?]
+	at java.util.concurrent.ForkJoinPool.scan(ForkJoinPool.java:1655) [?:?]
+	at java.util.concurrent.ForkJoinPool.runWorker(ForkJoinPool.java:1622) [?:?]
+	at java.util.concurrent.ForkJoinWorkerThread.run(ForkJoinWorkerThread.java:165) [?:?]
+Caused by: org.apache.flink.client.deployment.application.UnsuccessfulExecutionException: Application Status: FAILED
+	at org.apache.flink.client.deployment.application.UnsuccessfulExecutionException.fromJobResult(UnsuccessfulExecutionException.java:71) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	... 52 more
+Caused by: org.apache.flink.runtime.client.JobExecutionException: Job execution failed.
+	at org.apache.flink.runtime.jobmaster.JobResult.toJobExecutionResult(JobResult.java:144) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.UnsuccessfulExecutionException.fromJobResult(UnsuccessfulExecutionException.java:60) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	... 52 more
+Caused by: org.apache.flink.client.program.ProgramAbortException: java.lang.RuntimeException: Python process exits with code: 1
+	at org.apache.flink.client.python.PythonDriver.main(PythonDriver.java:134) ~[?:?]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method) ~[?:?]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77) ~[?:?]
+	at jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43) ~[?:?]
+	at java.lang.reflect.Method.invoke(Method.java:569) ~[?:?]
+	at org.apache.flink.client.program.PackagedProgram.callMainMethod(PackagedProgram.java:356) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.program.PackagedProgram.invokeInteractiveModeForExecution(PackagedProgram.java:223) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.ClientUtils.executeProgram(ClientUtils.java:113) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.runApplicationEntryPoint(ApplicationDispatcherBootstrap.java:301) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.lambda$runApplicationAsync$2(ApplicationDispatcherBootstrap.java:254) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:539) ~[?:?]
+	at java.util.concurrent.FutureTask.run(FutureTask.java:264) ~[?:?]
+	at org.apache.flink.runtime.concurrent.pekko.ActorSystemScheduledExecutorAdapter$ScheduledFutureTask.run(ActorSystemScheduledExecutorAdapter.java:172) ~[?:?]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:68) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.lambda$withContextClassLoader$0(ClassLoadingUtils.java:41) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	... 7 more
+Caused by: java.lang.RuntimeException: Python process exits with code: 1
+	at org.apache.flink.client.python.PythonDriver.main(PythonDriver.java:124) ~[?:?]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method) ~[?:?]
+	at jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77) ~[?:?]
+	at jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43) ~[?:?]
+	at java.lang.reflect.Method.invoke(Method.java:569) ~[?:?]
+	at org.apache.flink.client.program.PackagedProgram.callMainMethod(PackagedProgram.java:356) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.program.PackagedProgram.invokeInteractiveModeForExecution(PackagedProgram.java:223) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.ClientUtils.executeProgram(ClientUtils.java:113) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.runApplicationEntryPoint(ApplicationDispatcherBootstrap.java:301) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.client.deployment.application.ApplicationDispatcherBootstrap.lambda$runApplicationAsync$2(ApplicationDispatcherBootstrap.java:254) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:539) ~[?:?]
+	at java.util.concurrent.FutureTask.run(FutureTask.java:264) ~[?:?]
+	at org.apache.flink.runtime.concurrent.pekko.ActorSystemScheduledExecutorAdapter$ScheduledFutureTask.run(ActorSystemScheduledExecutorAdapter.java:172) ~[?:?]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.runWithContextClassLoader(ClassLoadingUtils.java:68) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	at org.apache.flink.runtime.concurrent.ClassLoadingUtils.lambda$withContextClassLoader$0(ClassLoadingUtils.java:41) ~[flink-dist-1.20.0-amzn-3.jar:1.20.0-amzn-3]
+	... 7 more

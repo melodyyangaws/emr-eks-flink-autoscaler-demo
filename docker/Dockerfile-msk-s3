@@ -1,0 +1,14 @@
+ARG EMR_VERSION
+FROM public.ecr.aws/emr-on-eks/flink/emr-${EMR_VERSION}-flink:latest
+
+USER root
+ENV FLINK_HOME="/usr/lib/flink/"
+RUN mkdir -p ${FLINK_HOME}/lib && \
+curl -o /tmp/flink-sql-connector-kafka.jar https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.3.0-1.20/flink-sql-connector-kafka-3.3.0-1.20.jar && \
+curl -o /tmp/flink-sql-parquet.jar https://dxs9dnjebzm6y.cloudfront.net/tmp/flink-parquet-fat-1.8.0.jar && \
+# curl -o /tmp/flink-sql-parquet.jar https://repo1.maven.org/maven2/org/apache/flink/flink-sql-parquet/1.20.0/flink-sql-parquet-1.20.0.jar && \
+mv /tmp/flink-sql-connector-kafka.jar $FLINK_HOME/lib/flink-sql-connector-kafka.jar &&  \
+mv /tmp/flink-sql-parquet.jar $FLINK_HOME/lib/flink-sql-parquet.jar
+
+# Use hadoop user and group
+USER hadoop:hadoop
