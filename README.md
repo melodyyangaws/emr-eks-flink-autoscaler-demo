@@ -2,9 +2,9 @@
 
 # Architecture Diagram
 
-<img src="img/demo.png" width="350">
+<img src="img/flink-demo.png" width="350">
 
-# Setup Instruction
+# Get Started
 
 1. Manually create a "provisioned" MSK cluster via AWS console. Make sure it's in the same VPC as the EKS cluster. 
 
