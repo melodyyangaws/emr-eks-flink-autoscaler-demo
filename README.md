@@ -55,7 +55,7 @@ oci://public.ecr.aws/emr-on-eks/flink-kubernetes-operator \
 
 ```
 
-4. Install kafka client tool in your terminal:
+4. Install kafka client tool on the EC2 or Cloud9 environment:
 ```bash
 wget https://archive.apache.org/dist/kafka/2.8.1/kafka_2.12-2.10.1.tgz .
 tar -xvzf  kafka_2.12-2.10.1.tgz
