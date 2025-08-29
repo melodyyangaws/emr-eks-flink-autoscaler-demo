@@ -8,7 +8,7 @@
 
 1. Manually create a "provisioned" MSK cluster via AWS console. Make sure it's in the same VPC as the EKS cluster. 
 
-2. Go to an EC2 or Cloud9, setup the environment variables and ensure you can connect to the kafka cluster and an existing EKS cluster:
+2. Go to an EC2 or Cloud9 or on your local machine, setup the environment variables and ensure you can connect to the kafka cluster and an existing EKS cluster:
 ```bash
 
 sudo yum install -y bash-completion jq
@@ -35,7 +35,7 @@ MSK_BROKER=$(aws kafka get-bootstrap-brokers --cluster-arn $MSK_ARN |jq -r .Boot
 
 echo -e " $NAMESPACE \n $BUCKET_NAME \n $CHECKPOINT_S3_STORAGE_PATH \n $SAVEPOINT_S3_STORAGE_PATH \n $HIGH_AVAILABILITY_STORAGE_PATH \n $EMR_EXECUTION_ROLE_ARN \n $JOB_SCRIPT_FILE \n $JOB_SCRIPT_FILE_NAME \n $MSK_BROKER \n $ORDER_DATA_TOPIC_NAME \n$ORDER_DATA_AGG_TOPIC_NAME \n $EMR_VERSION"
 ```
-3. Install the latest Flink Operator (emr7.9) in EKS cluster
+3. Install the latest Flink Operator (emr7.9) from the EC2 or Cloud9
 ```bash
 
 kubectl config set-context --current --namespace $NAMESPACE
@@ -97,7 +97,7 @@ chmod +x karpenter.sh
 bash karpenter.sh
 ```
 
-7. Build 2 docker multi-platform image
+7. Build 2 docker multi-platform images
 ```bash
 #login to ecr
 aws ecr get-login-password --region ${AWS_REGION} |docker login --username AWS --password-stdin ${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com
