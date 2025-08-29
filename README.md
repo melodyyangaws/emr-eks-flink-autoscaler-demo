@@ -134,14 +134,21 @@ kubectl apply -f flink-datagen-kafka.yaml  -n $NAMESPACE
 # also aggregate the raw data then output to kafka
 kubectl apply -f flink-kafka-s3.yaml  -n $NAMESPACE
 ```
-10. Validate in Kafka:
+10. Validate the data output from Kafka:
 ```bash
 # source topic
 bin/kafka-console-consumer.sh --bootstrap-server  $MSK_BROKER  --topic $ORDER_DATA_TOPIC_NAME
 #output topic
 bin/kafka-console-consumer.sh --bootstrap-server  $MSK_BROKER  --topic $$ORDER_DATA_AGG_TOPIC_NAME
 ```
-11. [OPTIONAL] Create a Flink WebUI ingress (public) or simply port-forward
+11. Monitor job progress and autoscaling behavior via CLI:
+```bash
+# watch the autoscaling progress from flink operator's log
+kubectl logs flink-kubernetes-operator-985469df5-wmpzq | grep flink-kafka | grep scaling
+# Monitor the latency caused by restart
+kubectl logs flink-kubernetes-operator-985469df5-wmpzq | grep flink-kafka | grep "Restart time"
+```
+12. [OPTIONAL] Create a Flink WebUI ingress (public) or simply port-forward to monitor the autoscaling
 ```bash
 kubectl port-forward svc/flink-kafka-s3-rest 8081  -n $NAMESPACE
 
@@ -151,7 +158,7 @@ kubectl -f ingress/ingress-public-kafka-s3.yaml
 kubectl -f ingress/ingress-private-kafka-s3.yaml
 ```
 
-12. Clean up
+13. Clean up
 ```bash
 kubectl delete -f flink-datagen-kafka.yaml  -n $NAMESPACE
 kubectl delete -f flink-kafka-s3.yaml  -n $NAMESPACE
