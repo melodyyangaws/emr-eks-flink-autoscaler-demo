@@ -8,7 +8,7 @@
 
 1. Manually create a "provisioned" MSK cluster via AWS console. Make sure it's in the same VPC as the EKS cluster. 
 
-2. Go to an EC2 or Cloud9, setup the environment variables and ensure you can connect to the kafka cluster:
+2. Go to an EC2 or Cloud9, setup the environment variables and ensure you can connect to the kafka cluster and an existing EKS cluster:
 ```bash
 
 sudo yum install -y bash-completion jq
