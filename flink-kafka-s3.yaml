@@ -16,14 +16,14 @@ spec:
     job.autoscaler.scale-down.interval: "1m"
     # restart with local-recovery is still needed
     # in order to redistribute states, update DAG etc due to adaptive-scheduler
-    job.autoscaler.restart.time-tracking.enabled: true
+    job.autoscaler.restart.time-tracking.enabled: "true"
     # job.autoscaler.decision.interval: "30s"
     pipeline.auto-watermark-interval: "1s"
     # job.autoscaler.debug.logs.interval": "60s"
-    job.autoscaler.scaling.enabled: true
+    job.autoscaler.scaling.enabled: "true"
 
      # Autoscaler parameters
-    job.autoscaler.enabled: true
+    job.autoscaler.enabled: "true"
     job.autoscaler.stabilization.interval: "1m"
     job.autoscaler.metrics.window: "2m"
     # lower these settings to trigger autoscaling earlier
@@ -33,7 +33,7 @@ spec:
     job.autoscaler.catch-up.duration: "5m"
     job.autoscaler.vertex.exclude.ids: ""
     pipeline.max-parallelism: "96"
-    pipeline.operator-chaining: false
+    pipeline.operator-chaining.enabled: false
     # local-recovery
     execution.checkpointing.interval: "30000"
     state.backend.local-recovery: true
@@ -47,7 +47,7 @@ spec:
     state.backend.changelog.storage: filesystem
     dstl.dfs.base-path: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
     dstl.dfs.upload.timeout: 5s
-    state.backend: rocksdb
+    state.backend.type: rocksdb
     state.backend.rocksdb.localdir: /tmp/rocksdb/
     # Fine-grained recovery
     jobmanager.execution.failover-strategy: region

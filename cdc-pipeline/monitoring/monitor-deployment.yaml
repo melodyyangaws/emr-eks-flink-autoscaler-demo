@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-cdc-monitor-config
+  namespace: emr-flink
+data:
+  PAIMON_FLINK_URL: "http://flink-cdc-paimon-rest:8081"
+  ICEBERG_FLINK_URL: "http://flink-cdc-iceberg-rest:8081"
+  AWS_REGION: "us-west-2"
+  PAIMON_GLUE_DB: "flink_paimon_db"
+  ICEBERG_GLUE_DB: "flink_iceberg_db"
+  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimon-warehouse/"
+  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/iceberg-warehouse/"
+  CDC_TABLES: "customers,products,orders,order_items"
+  MONITOR_DURATION: "120"
+  POLL_INTERVAL: "10"
+  REPEAT_INTERVAL: "300"
+  RUN_MODE: "continuous"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-cdc-monitor
+  namespace: emr-flink
+  labels:
+    app: flink-cdc-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink-cdc-monitor
+  template:
+    metadata:
+      labels:
+        app: flink-cdc-monitor
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: monitor
+        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/flink-cdc-monitor:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: flink-cdc-monitor-config
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import os, signal; os.kill(1, 0)"]
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        readinessProbe:
+          exec:
+            command: ["python", "-c", "print('ready')"]
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        volumeMounts:
+        - name: reports
+          mountPath: /tmp/reports
+      volumes:
+      - name: reports
+        emptyDir:
+          sizeLimit: 500Mi
+      restartPolicy: Always

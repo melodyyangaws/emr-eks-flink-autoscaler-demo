@@ -1,0 +1,58 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  namespace: emr-flink
+  name: glue-catalog-test
+spec:
+  flinkVersion: v1_20
+  executionRoleArn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role
+  image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:7.12.0
+  imagePullPolicy: Always
+  emrReleaseLabel: "emr-7.12.0-flink-latest"
+
+  flinkConfiguration:
+    # ─── Enable EMR's built-in Glue Data Catalog integration ───
+    aws.glue.enabled: "true"
+    table.catalog-store.kind: glue
+    taskmanager.numberOfTaskSlots: "1"
+    parallelism.default: "1"
+    aws.region: ${AWS_REGION}
+
+  jobManager:
+    highAvailabilityEnabled: false
+    replicas: 1
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: default
+
+  taskManager:
+    resource:
+      memory: "2048m"
+      cpu: 1
+    podTemplate:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: spot
+          karpenter.sh/nodepool: default
+
+  job:
+    jarURI: s3://${BUCKET_NAME}/flink/scripts/glue-catalog-test.py
+    entryClass: "org.apache.flink.client.python.PythonDriver"
+    args:
+      - "-py"
+      - "/opt/flink/usrlib/glue-catalog-test.py"
+    parallelism: 1
+    upgradeMode: stateless
+
+  monitoringConfiguration:
+    s3MonitoringConfiguration:
+      logUri: s3://${BUCKET_NAME}/flink/logs/glue-catalog-test
+    sideCarResources:
+      limits:
+        cpuLimit: 500m
+        memoryLimit: 250Mi

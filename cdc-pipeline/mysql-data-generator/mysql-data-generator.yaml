@@ -1,0 +1,435 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-data-generator-script
+  namespace: emr-flink
+data:
+  generate_data.py: |
+    #!/usr/bin/env python3
+    """
+    MySQL Data Generator - Simulates transactional e-commerce data
+    Generates continuous INSERT, UPDATE, DELETE operations to simulate real CDC workload
+    """
+    import mysql.connector
+    import os
+    import time
+    import uuid
+    import random
+    import string
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+
+    # Database configuration from environment variables
+    DB_CONFIG = {
+        'host': os.environ.get('MYSQL_HOST'),
+        'user': os.environ.get('MYSQL_USER'),
+        'password': os.environ.get('MYSQL_PASSWORD'),
+        'database': os.environ.get('MYSQL_DATABASE', 'ecommerce'),
+        'autocommit': True
+    }
+
+    # Data generation parameters
+    BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '10'))
+    SLEEP_SECONDS = int(os.environ.get('SLEEP_SECONDS', '5'))
+
+    # Sample data
+    FIRST_NAMES = ['John', 'Jane', 'Michael', 'Emily', 'David', 'Sarah', 'Robert', 'Lisa',
+                   'James', 'Mary', 'William', 'Patricia', 'Richard', 'Jennifer', 'Thomas']
+    LAST_NAMES = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller',
+                  'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Gonzalez']
+    CITIES = ['Seattle', 'Portland', 'San Francisco', 'Los Angeles', 'San Diego', 'Phoenix',
+              'Denver', 'Austin', 'Houston', 'Dallas', 'Chicago', 'New York', 'Boston', 'Miami']
+    STATES = ['WA', 'OR', 'CA', 'AZ', 'CO', 'TX', 'IL', 'NY', 'MA', 'FL']
+    PRODUCT_CATEGORIES = ['Electronics', 'Clothing', 'Books', 'Home & Garden', 'Sports',
+                          'Toys', 'Food & Beverage', 'Health & Beauty', 'Automotive']
+    PRODUCT_NAMES = {
+        'Electronics': ['Laptop', 'Smartphone', 'Tablet', 'Headphones', 'Smart Watch', 'Camera'],
+        'Clothing': ['T-Shirt', 'Jeans', 'Dress', 'Jacket', 'Shoes', 'Hat'],
+        'Books': ['Fiction Novel', 'Programming Guide', 'Cookbook', 'Biography', 'Self-Help Book'],
+        'Home & Garden': ['Lamp', 'Rug', 'Vase', 'Plant', 'Tool Set', 'Furniture'],
+        'Sports': ['Basketball', 'Tennis Racket', 'Yoga Mat', 'Dumbbell Set', 'Running Shoes'],
+        'Toys': ['Action Figure', 'Board Game', 'Puzzle', 'Doll', 'Building Blocks'],
+        'Food & Beverage': ['Coffee', 'Tea', 'Snacks', 'Organic Juice', 'Energy Drink'],
+        'Health & Beauty': ['Shampoo', 'Moisturizer', 'Vitamin Supplements', 'Perfume'],
+        'Automotive': ['Car Polish', 'Floor Mats', 'Phone Mount', 'Air Freshener']
+    }
+    ORDER_STATUSES = ['PENDING', 'CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED']
+    PAYMENT_METHODS = ['CREDIT_CARD', 'DEBIT_CARD', 'PAYPAL', 'APPLE_PAY', 'GOOGLE_PAY']
+
+    def get_connection():
+        """Create database connection with retry logic"""
+        max_retries = 5
+        retry_delay = 5
+
+        for attempt in range(max_retries):
+            try:
+                conn = mysql.connector.connect(**DB_CONFIG)
+                conn.autocommit = True
+                print(f"✓ Connected to MySQL at {DB_CONFIG['host']}")
+                return conn
+            except mysql.connector.Error as err:
+                print(f"✗ Connection attempt {attempt + 1} failed: {err}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    raise
+
+    def ensure_connection(conn):
+        """Check connection health and reconnect if needed"""
+        try:
+            conn.ping(reconnect=True, attempts=3, delay=2)
+            return conn
+        except mysql.connector.Error:
+            print("  ⚠ Connection lost, reconnecting...")
+            return get_connection()
+
+    def generate_email(first_name, last_name):
+        """Generate random email address"""
+        domains = ['gmail.com', 'yahoo.com', 'outlook.com', 'icloud.com', 'company.com']
+        unique_id = uuid.uuid4().hex[:8]
+        return f"{first_name.lower()}.{last_name.lower()}.{unique_id}@{random.choice(domains)}"
+
+    def generate_phone():
+        """Generate random phone number"""
+        return f"+1-{random.randint(200, 999)}-{random.randint(200, 999)}-{random.randint(1000, 9999)}"
+
+    def insert_customers(cursor, count):
+        """Insert random customers"""
+        sql = """
+        INSERT INTO customers (customer_name, email, phone, address, city, state, country, zip_code)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        customers = []
+        for _ in range(count):
+            first_name = random.choice(FIRST_NAMES)
+            last_name = random.choice(LAST_NAMES)
+            city = random.choice(CITIES)
+            state = random.choice(STATES)
+
+            customer = (
+                f"{first_name} {last_name}",
+                generate_email(first_name, last_name),
+                generate_phone(),
+                f"{random.randint(100, 9999)} {random.choice(['Main', 'Oak', 'Maple', 'Cedar'])} St",
+                city,
+                state,
+                'USA',
+                f"{random.randint(10000, 99999)}"
+            )
+            customers.append(customer)
+
+        try:
+            cursor.executemany(sql, customers)
+            print(f"  → Inserted {count} customers")
+        except mysql.connector.errors.IntegrityError as e:
+            print(f"  → Skipped duplicate customer batch: {e}")
+            return 0
+        return count
+
+    def insert_products(cursor, count):
+        """Insert random products"""
+        sql = """
+        INSERT INTO products (product_name, category, price, stock_quantity, description)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        products = []
+        for _ in range(count):
+            category = random.choice(PRODUCT_CATEGORIES)
+            product_name = random.choice(PRODUCT_NAMES[category])
+
+            product = (
+                f"{product_name} - Model {random.randint(100, 999)}",
+                category,
+                Decimal(str(round(random.uniform(9.99, 999.99), 2))),
+                random.randint(0, 1000),
+                f"High-quality {product_name.lower()} with premium features"
+            )
+            products.append(product)
+
+        cursor.executemany(sql, products)
+        print(f"  → Inserted {count} products")
+
+    def insert_orders(cursor, count):
+        """Insert random orders with order items"""
+        # Get random customer IDs
+        cursor.execute("SELECT customer_id FROM customers ORDER BY RAND() LIMIT %s", (count,))
+        customer_ids = [row[0] for row in cursor.fetchall()]
+
+        if not customer_ids:
+            print("  → No customers available for orders")
+            return
+
+        # Get random product IDs
+        cursor.execute("SELECT product_id, price FROM products WHERE stock_quantity > 0 ORDER BY RAND() LIMIT 100")
+        products = cursor.fetchall()
+
+        if not products:
+            print("  → No products available for orders")
+            return
+
+        order_sql = """
+        INSERT INTO orders (customer_id, order_date, total_amount, order_status, payment_method, shipping_address)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """
+
+        item_sql = """
+        INSERT INTO order_items (order_id, product_id, quantity, unit_price, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+
+        orders_created = 0
+        for customer_id in customer_ids:
+            # Create order
+            order_status = random.choice(ORDER_STATUSES)
+            payment_method = random.choice(PAYMENT_METHODS)
+            shipping_address = f"{random.randint(100, 9999)} Delivery Lane, {random.choice(CITIES)}, {random.choice(STATES)}"
+
+            # Calculate total from order items
+            num_items = random.randint(1, 5)
+            selected_products = random.sample(products, min(num_items, len(products)))
+
+            total_amount = Decimal('0.00')
+            order_items = []
+
+            for product_id, price in selected_products:
+                quantity = random.randint(1, 5)
+                unit_price = Decimal(str(price))
+                subtotal = unit_price * quantity
+                total_amount += subtotal
+                order_items.append((product_id, quantity, unit_price, subtotal))
+
+            # Insert order
+            order_date = datetime.now()
+            cursor.execute(order_sql, (customer_id, order_date, total_amount, order_status, payment_method, shipping_address))
+            order_id = cursor.lastrowid
+
+            # Insert order items
+            item_created_at = datetime.now()
+            for product_id, quantity, unit_price, _subtotal in order_items:
+                cursor.execute(item_sql, (order_id, product_id, quantity, unit_price, item_created_at))
+
+            orders_created += 1
+
+        print(f"  → Inserted {orders_created} orders with items")
+
+    def update_orders(cursor, count):
+        """Update random order statuses"""
+        cursor.execute("""
+            SELECT order_id FROM orders
+            WHERE order_status != 'DELIVERED' AND order_status != 'CANCELLED'
+            ORDER BY RAND() LIMIT %s
+        """, (count,))
+        order_ids = [row[0] for row in cursor.fetchall()]
+
+        if not order_ids:
+            print("  → No orders available for update")
+            return
+
+        sql = "UPDATE orders SET order_status = %s WHERE order_id = %s"
+
+        # Progress order statuses
+        status_progression = {
+            'PENDING': 'CONFIRMED',
+            'CONFIRMED': 'SHIPPED',
+            'SHIPPED': 'DELIVERED'
+        }
+
+        updates = []
+        for order_id in order_ids:
+            cursor.execute("SELECT order_status FROM orders WHERE order_id = %s", (order_id,))
+            current_status = cursor.fetchone()[0]
+            new_status = status_progression.get(current_status, 'DELIVERED')
+            updates.append((new_status, order_id))
+
+        cursor.executemany(sql, updates)
+        print(f"  → Updated {len(updates)} order statuses")
+
+    def update_product_stock(cursor, count):
+        """Update product stock quantities"""
+        cursor.execute("SELECT product_id FROM products ORDER BY RAND() LIMIT %s", (count,))
+        product_ids = [row[0] for row in cursor.fetchall()]
+
+        if not product_ids:
+            return
+
+        sql = "UPDATE products SET stock_quantity = stock_quantity + %s WHERE product_id = %s"
+        updates = [(random.randint(-10, 50), pid) for pid in product_ids]
+        cursor.executemany(sql, updates)
+        print(f"  → Updated {len(updates)} product stock levels")
+
+    def delete_old_cancelled_orders(cursor):
+        """Delete old cancelled orders (simulate data cleanup)"""
+        cursor.execute("""
+            DELETE FROM order_items WHERE order_id IN (
+              SELECT t.order_id FROM (
+                SELECT order_id FROM orders
+                WHERE order_status = 'CANCELLED'
+                AND updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+                LIMIT 5
+              ) AS t
+            )
+        """)
+
+        cursor.execute("""
+            DELETE FROM orders
+            WHERE order_status = 'CANCELLED'
+            AND updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+            LIMIT 5
+        """)
+
+        deleted = cursor.rowcount
+        if deleted > 0:
+            print(f"  → Deleted {deleted} old cancelled orders")
+
+    def print_statistics(cursor):
+        """Print current database statistics"""
+        cursor.execute("SELECT COUNT(*) FROM customers")
+        customer_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM products")
+        product_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM orders")
+        order_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM order_items")
+        order_item_count = cursor.fetchone()[0]
+
+        cursor.execute("SELECT SUM(total_amount) FROM orders WHERE order_status != 'CANCELLED'")
+        total_revenue = cursor.fetchone()[0] or Decimal('0.00')
+
+        print(f"\n Database Statistics:")
+        print(f"   Customers: {customer_count:,}")
+        print(f"   Products: {product_count:,}")
+        print(f"   Orders: {order_count:,}")
+        print(f"   Order Items: {order_item_count:,}")
+        print(f"   Total Revenue: ${total_revenue:,.2f}")
+
+    def main():
+        """Main data generation loop"""
+        print("="*60)
+        print("MySQL Transactional Data Generator")
+        print("="*60)
+        print(f"Target: {DB_CONFIG['host']}/{DB_CONFIG['database']}")
+        print(f"Batch Size: {BATCH_SIZE}")
+        print(f"Interval: {SLEEP_SECONDS} seconds")
+        print("="*60)
+
+        conn = get_connection()
+        iteration = 0
+
+        try:
+            while True:
+                iteration += 1
+
+                print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Iteration #{iteration}")
+
+                conn = ensure_connection(conn)
+                cursor = conn.cursor()
+
+                ops = [
+                    ("insert_customers", lambda: insert_customers(cursor, random.randint(1, BATCH_SIZE))),
+                    ("insert_products", lambda: insert_products(cursor, random.randint(1, BATCH_SIZE))),
+                    ("insert_orders", lambda: insert_orders(cursor, random.randint(2, BATCH_SIZE * 2))),
+                    ("update_orders", lambda: update_orders(cursor, random.randint(1, BATCH_SIZE))),
+                    ("update_product_stock", lambda: update_product_stock(cursor, random.randint(1, BATCH_SIZE))),
+                ]
+                if iteration % 10 == 0:
+                    ops.append(("delete_old_cancelled_orders", lambda: delete_old_cancelled_orders(cursor)))
+
+                for op_name, op_fn in ops:
+                    try:
+                        op_fn()
+                        conn.commit()
+                    except mysql.connector.Error as e:
+                        print(f"  ⚠ {op_name} failed: {e}")
+                    except Exception as e:
+                        print(f"  ⚠ {op_name} unexpected error: {e}")
+
+                if iteration % 5 == 0:
+                    try:
+                        print_statistics(cursor)
+                    except Exception as e:
+                        print(f"  ⚠ Statistics failed: {e}")
+
+                cursor.close()
+
+                print(f"✓ Batch completed. Sleeping for {SLEEP_SECONDS}s...\n")
+                time.sleep(SLEEP_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\n\n⚠ Shutting down gracefully...")
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+            raise
+        finally:
+            if conn.is_connected():
+                conn.close()
+                print("✓ Database connection closed")
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-data-generator
+  namespace: emr-flink
+  labels:
+    app: mysql-data-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-data-generator
+  template:
+    metadata:
+      labels:
+        app: mysql-data-generator
+    spec:
+      containers:
+      - name: generator
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            pip install mysql-connector-python
+            python /scripts/generate_data.py
+        env:
+        - name: MYSQL_HOST
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: hostname
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: username
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: password
+        - name: MYSQL_DATABASE
+          value: "ecommerce"
+        - name: BATCH_SIZE
+          value: "10"
+        - name: SLEEP_SECONDS
+          value: "5"
+        volumeMounts:
+        - name: script-volume
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: script-volume
+        configMap:
+          name: mysql-data-generator-script

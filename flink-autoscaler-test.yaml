@@ -15,13 +15,12 @@ spec:
     job.autoscaler.scale-down.interval: "0"
     # restart with local-recovery is still needed
     # in order to redistribute states, update DAG etc by adaptive-scheduler
-    job.autoscaler.restart.time-tracking.enabled: true
+    job.autoscaler.restart.time-tracking.enabled: "true"
     pipeline.auto-watermark-interval: "1s"
-    # job.autoscaler.debug.logs.interval": "60s"
-    job.autoscaler.scaling.enabled: true
+    job.autoscaler.scaling.enabled: "true"
 
      # Autoscaler parameters
-    job.autoscaler.enabled: true
+    job.autoscaler.enabled: "true"
     job.autoscaler.stabilization.interval: "1m"
     job.autoscaler.metrics.window: "15m"
     # lower these settings to trigger autoscaling earlier
@@ -40,12 +39,12 @@ spec:
     kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit: 10Gi
     execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
     # log-based incremental checkpoint
-    state.backend.incremental: true
-    state.backend.changelog.enabled: true
+    state.backend.incremental: "true"
+    state.backend.changelog.enabled: "true"
     state.backend.changelog.storage: filesystem
     dstl.dfs.base-path: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
     dstl.dfs.upload.timeout: 5s
-    state.backend: rocksdb
+    state.backend.type: rocksdb
     state.backend.rocksdb.localdir: /tmp/rocksdb/
     # Fine-grained recovery
     jobmanager.execution.failover-strategy: region
@@ -53,7 +52,7 @@ spec:
     restart-strategy.fixed-delay.attempts: "100"
     restart-strategy.fixed-delay.delay: "30s"
     # graceful decommisioning
-    cluster.taskmanager.graceful-decommission.enabled: true
+    cluster.taskmanager.graceful-decommission.enabled: "true"
     jobmanager.adaptive-scheduler.combined-restart.enabled: true
     jobmanager.adaptive-scheduler.combined-restart.window-interval : "1m"
     # scheduler

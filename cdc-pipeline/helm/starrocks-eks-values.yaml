@@ -1,0 +1,51 @@
+# StarRocks Helm Values for EKS Deployment
+# Optimized for lakehouse analytics on Paimon and Iceberg
+
+starrocksFESpec:
+  replicas: 3
+  image:
+    repository: starrocks/fe-ubuntu
+    tag: "3.2.2"
+  resources:
+    requests:
+      cpu: 2
+      memory: 8Gi
+    limits:
+      cpu: 4
+      memory: 16Gi
+  service:
+    type: LoadBalancer
+    ports:
+      - name: http
+        port: 8030
+      - name: query
+        port: 9030
+  storageSpec:
+    storageClassName: gp3
+    storageSize: 100Gi
+  nodeSelector:
+    karpenter.sh/capacity-type: on-demand
+
+starrocksBeSpec:
+  replicas: 3
+  image:
+    repository: starrocks/be-ubuntu
+    tag: "3.2.2"
+  resources:
+    requests:
+      cpu: 4
+      memory: 16Gi
+    limits:
+      cpu: 8
+      memory: 32Gi
+  storageSpec:
+    storageClassName: gp3
+    storageSize: 500Gi
+  nodeSelector:
+    karpenter.sh/capacity-type: spot
+
+operator:
+  enabled: true
+  image:
+    repository: starrocks/operator
+    tag: "1.8.7"

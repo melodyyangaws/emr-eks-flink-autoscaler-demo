@@ -1,0 +1,76 @@
+###############################################################################
+# Paimon CDC Action — MySQL to Paimon on EMR on EKS 7.12
+#
+# This image includes:
+# - Flink 1.20.x (from EMR 7.12)
+# - Paimon CDC Action for automatic MySQL-to-Paimon database sync
+# - MySQL CDC Connector for full snapshot + incremental sync
+# - Apache Paimon for S3-based lakehouse storage
+# - AWS Glue Data Catalog native integration (paimon-aws-glue)
+# - AWS S3 dependencies
+#
+# Optimizations:
+# - Multi-stage build to reduce final image size
+# - Cleanup of temporary files and caches
+###############################################################################
+ARG EMR_VERSION=7.12.0
+
+# ============================================================================
+# Stage 1: Download Flink connector JARs
+# ============================================================================
+FROM public.ecr.aws/amazonlinux/amazonlinux:2023 AS downloader
+ENV FLINK_VERSION=1.20 \
+    PAIMON_VERSION=1.3.0 \
+    MYSQL_CDC_VERSION=3.5.0 \
+    SCALA_VERSION=2.12
+
+RUN dnf swap -y curl-minimal curl && \
+    mkdir -p /tmp/jars && \
+    curl -fsSL -o /tmp/jars/flink-sql-connector-mysql-cdc-${MYSQL_CDC_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-mysql-cdc/${MYSQL_CDC_VERSION}/flink-sql-connector-mysql-cdc-${MYSQL_CDC_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/paimon-flink-${FLINK_VERSION}-${PAIMON_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/paimon/paimon-flink-${FLINK_VERSION}/${PAIMON_VERSION}/paimon-flink-${FLINK_VERSION}-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/paimon-flink-action.jar \
+        https://repo1.maven.org/maven2/org/apache/paimon/paimon-flink-action/${PAIMON_VERSION}/paimon-flink-action-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/paimon-s3-${PAIMON_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/paimon/paimon-s3/${PAIMON_VERSION}/paimon-s3-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/paimon-hive-catalog-${PAIMON_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-catalog/${PAIMON_VERSION}/paimon-hive-catalog-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/paimon-hive-connector-${PAIMON_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-connector-3.1/${PAIMON_VERSION}/paimon-hive-connector-3.1-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/mysql-connector-j-8.4.0.jar \
+        https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar && \
+    dnf clean all && \
+    ls -lh /tmp/jars/ && \
+    echo "All JARs downloaded successfully ($(du -sh /tmp/jars | cut -f1))"
+
+# ============================================================================
+# Stage 2: Get an OSS Glue Data Catalog Client
+# ============================================================================
+FROM sdaberdaku/spark-with-glue-builder:v3.5.1 AS glue-builder
+
+# ============================================================================
+# Stage 3: Final image
+# ============================================================================
+FROM public.ecr.aws/emr-on-eks/flink/emr-${EMR_VERSION}-flink:latest
+USER root
+
+COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar ${FLINK_LIB_DIR}
+COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar /usr/share/aws/emr/emrfs/auxlib
+COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-hive3-client/target/aws-glue-datacatalog-hive3-client-*.jar ${FLINK_LIB_DIR}
+# COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-client-common/target/aws-glue-datacatalog-client-common-*.jar ${FLINK_LIB_DIR}
+
+ENV FLINK_CLASSPATH="/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*"
+ENV FLINK_ENV_JAVA_OPTS="${FLINK_ENV_JAVA_OPTS} -Djava.class.path=${FLINK_CLASSPATH}"
+ENV HADOOP_CLASSPATH="/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*"
+
+RUN cp /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar ${FLINK_LIB_DIR} && \
+    chown -R hadoop:hadoop ${FLINK_LIB_DIR}/iceberg-flink-runtime.jar && \
+    rm -rf ${FLINK_HOME}/examples && \
+    rm -rf /tmp/* /var/tmp/* && \
+    dnf clean all 2>/dev/null || true
+
+USER hadoop:hadoop
+# enable flink-sql-client
+RUN mkdir -p /mnt/tmp
+WORKDIR $FLINK_HOME

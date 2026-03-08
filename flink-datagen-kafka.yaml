@@ -32,7 +32,7 @@ spec:
     state.backend.changelog.enabled: "false"
     state.backend.changelog.storage: filesystem
     dstl.dfs.base-path: s3://emr-on-eks-test-021732063925-us-west-2/flink/autoscaling/changelog/
-    state.backend: rocksdb
+    state.backend.type: rocksdb
     state.backend.incremental: "true"
     # Fine-grained recovery
     jobmanager.execution.failover-strategy: region

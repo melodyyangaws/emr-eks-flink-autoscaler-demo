@@ -1,0 +1,142 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  namespace: emr-flink
+  name: flink-cdc-paimon
+spec:
+  flinkVersion: v1_20
+  executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
+  image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${EMR_VERSION}
+  imagePullPolicy: IfNotPresent
+  emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
+
+  flinkConfiguration:
+    aws.glue.enabled: "true"    
+    aws.region: us-west-2
+    # table.catalog-store.kind: glue
+    # S3 Configuration
+    fs.s3a.endpoint.region: us-west-2
+    # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
+    # job.autoscaler.scale-down.interval: "0"
+    # # restart with local-recovery is still needed
+    # # in order to redistribute states, update DAG etc by adaptive-scheduler
+    # job.autoscaler.restart.time-tracking.enabled: "true"
+    # Autoscaler parameters
+    job.autoscaler.scaling.enabled: "false"
+    job.autoscaler.enabled: "false"
+    # job.autoscaler.stabilization.interval: "1m"
+    # job.autoscaler.metrics.window: "15m"
+    # # lower these settings to trigger autoscaling earlier
+    # job.autoscaler.target.utilization: "0.5"
+    # job.autoscaler.target.utilization.boundary: "0.3"
+    # job.autoscaler.restart.time: "2m"
+    # job.autoscaler.catch-up.duration: "5m"
+    # job.autoscaler.vertex.exclude.ids: ""
+    pipeline.operator-chaining.enabled: "false"
+    pipeline.auto-watermark-interval: "1s"
+    # local-recovery
+    execution.checkpointing.interval: "30000"
+    state.backend.local-recovery: "true"
+    # ebs local-recovery
+    task.local-recovery.ebs.enable: "true"
+    kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit: 10Gi
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    # log-based incremental checkpoint
+    state.backend.incremental: "true"
+    state.changelog.enabled: "true"
+    state.backend.changelog.storage: filesystem
+    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-paimon/changelog/
+    dstl.dfs.upload.timeout: 5s
+    state.backend.type: rocksdb
+    state.backend.rocksdb.localdir: /tmp/rocksdb/
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon/checkpoints/
+    state.savepoints.dir: s3://${BUCKET_NAME}/flink/cdc-paimon/savepoints/
+
+    # Restart Strategy
+    jobmanager.execution.failover-strategy: region
+    restart-strategy.type: fixed-delay
+    restart-strategy.fixed-delay.attempts: "100"
+    restart-strategy.fixed-delay.delay: "30s"
+    # graceful decommisioning
+    cluster.taskmanager.graceful-decommission.enabled: "true"
+    jobmanager.adaptive-scheduler.combined-restart.enabled: "true"
+    jobmanager.adaptive-scheduler.combined-restart.window-interval : "1m"
+    jobmanager.adaptive-scheduler.resource-wait-timeout: "10m"
+    # Scheduler
+    jobmanager.scheduler: adaptive
+    taskmanager.numberOfTaskSlots: "4"
+    # Parallelism
+    parallelism.default: "2"
+    pipeline.max-parallelism: "128"
+    # Table Configuration
+    table.exec.source.idle-timeout: "30s"
+    # SQL Client Configuration
+    sql-client.execution.result-mode: tableau
+    table.dml-sync: "false"
+    kubernetes.transactional-operation.max-retries: "10"
+
+  jobManager:
+    highAvailabilityEnabled: true
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon/ha/
+    replicas: 1
+    resource:
+      memory: "4096m"
+      cpu: 2
+    podTemplate:
+      spec:
+        schedulerName: custom-scheduler-eks
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: default
+        containers:
+        - name: flink-main-container
+          env:
+          - name: MYSQL_HOST
+            value: "${MYSQL_HOST}"
+          - name: MYSQL_USER
+            value: "${MYSQL_USER}"
+          - name: MYSQL_PASSWORD
+            value: "${MYSQL_PASSWORD}"
+          - name: PAIMON_WAREHOUSE
+            value: "s3://${BUCKET_NAME}/paimon-warehouse/"
+          - name: AWS_REGION
+            value: "${AWS_REGION}"  
+          - name: GLUE_DATABASE
+            value: "flink_paimon_db"
+  taskManager:
+    resource:
+      memory: "4096m"
+      cpu: 2
+    podTemplate:
+      spec:
+        schedulerName: custom-scheduler-eks
+        nodeSelector:
+          karpenter.sh/capacity-type: spot
+          karpenter.sh/nodepool: default
+
+  job:
+    jarURI: s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/usrlib/flink-cdc-executor.py"
+      - "--sql-dir"
+      - "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/"
+      # - "--checkpoint-interval"
+      # - "60s"
+      # - "--parallelism"
+      # - "4"
+    parallelism: 4
+    upgradeMode: last-state
+
+  monitoringConfiguration:
+    s3MonitoringConfiguration:
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon
+    sideCarResources:
+      limits:
+        cpuLimit: 500m
+        memoryLimit: 250Mi
+    containerLogRotationConfiguration:
+        rotationSize: 2GB
+        maxFilesToKeep: "10"
+                 

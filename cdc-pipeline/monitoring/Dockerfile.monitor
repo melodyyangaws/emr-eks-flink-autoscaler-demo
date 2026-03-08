@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for pyiceberg/s3fs native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY flink_cdc_monitor.py .
+COPY entrypoint.py .
+
+# Create non-root user with writable HOME (boto3/pyiceberg need ~/.cache)
+RUN useradd -m -r monitor
+USER monitor
+ENV HOME=/home/monitor
+
+ENTRYPOINT ["python", "entrypoint.py"]
