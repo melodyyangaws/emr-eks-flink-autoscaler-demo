@@ -46,6 +46,9 @@ spec:
     dstl.dfs.upload.timeout: 5s
     state.backend.type: rocksdb
     state.backend.rocksdb.localdir: /tmp/rocksdb/
+    # increase from default 50s to 3min to tolerate GC pauses during heavy commits
+    heartbeat.timeout: "180000"
+    heartbeat.interval: "10000"
     state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/checkpoints/
     state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/savepoints/
     # Restart Strategy

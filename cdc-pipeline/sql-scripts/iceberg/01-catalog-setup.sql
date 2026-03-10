@@ -26,7 +26,7 @@ CREATE CATALOG iceberg_catalog WITH (
     'catalog-name' = 'iceberg_glue_catalog',
     'catalog-database' = '${GLUE_DATABASE:flink_iceberg_db}',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
-    'format-version' = '3'
+    'format-version' = '2'
 );
 
 -- Switch to Iceberg catalog

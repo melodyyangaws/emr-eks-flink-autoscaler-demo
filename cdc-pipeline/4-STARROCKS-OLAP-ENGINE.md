@@ -66,8 +66,12 @@ aws glue get-tables --database-name flink_iceberg_db --region $AWS_REGION
 Open Athena Console → Data source: `AwsDataCatalog` → Database: `flink_iceberg_db`
 
 ```sql
--- Basic query
-SELECT * FROM flink_iceberg_db.customers LIMIT 10;
+-- Get totla rows
+SELECT
+    (SELECT COUNT(*) FROM flink_iceberg_db.customers) as customers,
+    (SELECT COUNT(*) FROM flink_iceberg_db.products) as products,
+    (SELECT COUNT(*) FROM flink_iceberg_db.orders) as orders,
+    (SELECT COUNT(*) FROM flink_iceberg_db.order_items) as order_items;
 
 -- Daily revenue
 SELECT

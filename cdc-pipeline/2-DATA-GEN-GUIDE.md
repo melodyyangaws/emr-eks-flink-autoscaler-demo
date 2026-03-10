@@ -181,7 +181,7 @@ Adjust batch size and interval:
 
 ```bash
 # Generate 20 records every 2 seconds (faster)
-./mysql-data-generator/deploy-data-generator.sh config 20 2
+  ./mysql-data-generator/deploy-data-generator.sh config 20 2
 
 # Generate 5 records every 10 seconds (slower)
 ./mysql-data-generator/deploy-data-generator.sh config 5 10
@@ -213,14 +213,24 @@ SELECT
     (SELECT COUNT(*) FROM orders) as orders,
     (SELECT COUNT(*) FROM order_items) as order_items;
 
-# Check recent activity
+# Check recent activity (Athena Spark)
 SELECT
-    DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') as minute,
-    COUNT(*) as new_customers
-FROM customers
-WHERE created_at >= NOW() - INTERVAL 1 HOUR
-GROUP BY DATE_FORMAT(created_at, '%Y-%m-%d %H:%i')
+    date_format(date_trunc('minute', created_at), 'yyyy-MM-dd HH:mm') AS minute,
+    COUNT(*) AS new_customers
+FROM paimon_iceberg.flink_paimon_db.customers
+WHERE created_at >= current_timestamp() - INTERVAL 8 HOUR
+GROUP BY date_trunc('minute', created_at)
 ORDER BY minute DESC
+LIMIT 10;
+
+# in Athena SQL
+SELECT
+    date_format(created_at, '%Y-%m-%d %H:%i') AS minute,
+    COUNT(*) AS new_customers
+FROM flink_iceberg_db.customers
+WHERE created_at >= NOW() - INTERVAL '2' HOUR
+GROUP BY date_format(created_at, '%Y-%m-%d %H:%i')
+ORDER BY 1 DESC
 LIMIT 10;
 ```
 
@@ -404,7 +414,7 @@ FROM ecommerce.customers;
 ./mysql-data-generator/deploy-data-generator.sh deploy
 
 # Stop
-./mysql-data-generator/deploy-data-generator.shstop
+./mysql-data-generator/deploy-data-generator.sh stop
 
 # Status
 ./mysql-data-generator/deploy-data-generator.sh status

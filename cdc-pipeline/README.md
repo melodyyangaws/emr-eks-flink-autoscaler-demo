@@ -145,6 +145,7 @@ export LAKEHOUSE_FORMAT=both  # paimon | iceberg | both
 # deploy Flink CDC pipelines: flink-cdc-iceberg-sql.yaml & flink-cdc-paimon-sql.yaml
 ./build-deploy-generic.sh deploy
 # or deploy individual CDC pipelines
+# above deployment need to run first to produced deployed yaml iles)
 kubectl apply -f flink-cdc-iceberg-deployed.yaml
 kubectl apply -f flink-cdc-paimon-deployed.yaml
 
@@ -192,6 +193,7 @@ source mysql-cdc-env.sh
 | DELETE old cancelled orders | Every 10th iteration |
 
 **Scaling:** `./mysql-data-generator/deploy-data-generator.sh scale 3`
+
 **Rate tuning:** `./mysql-data-generator/deploy-data-generator.sh config 20 2`
 
 ### Step 3 — Monitoring
@@ -204,7 +206,10 @@ Deploy a custom monitor pod in EKS that continuously tracks both Paimon and Iceb
 bash ./monitoring/deploy-monitor.sh
 
 # Or deploy without rebuilding docker image ( in seconds)
-kubectl apply -f monitoring/monitor-deployment.yaml
+kubectl apply -f monitoring/monitor-deployment-deployed.yaml
+
+# Stop the monitoring
+kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 
 # View logs
 kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
@@ -219,15 +224,24 @@ The monitor reads table stats via:
 ### Step 4 — OLAP Query Layer (Athena + StarRocks)
 > Guide: [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md)
 
-**Athena (Icebergv3)** — query via Athena Spark in Sagemaker Unified Studio:
+**Athena (Icebergv2)** — query via Athena Console directly:
 ```sql
 SELECT * FROM flink_iceberg_db.customers LIMIT 10;
 ```
 
-**Athena (Paimon)** — Glue catalog has `table_type = Iceberg` setup ( Iceberg Compatible mode):
+**Athena (Paimon)** — query via Athena Notebook :
+```json
+# custom spark properties
+{
+    "spark.sql.catalog.paimon_iceberg": "org.apache.iceberg.spark.SparkSessionCatalog",
+    "spark.sql.catalog.paimon_iceberg.type": "hadoop",
+    "spark.sql.catalog.paimon_iceberg.warehouse": "s3://$PAIMON_WAREHOUSE/iceberg"
+}
+```
+
 ```sql
--- directly query Icberg table as usual
-SELECT * FROM flink_paimon_db.customers LIMIT 10;
+spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+spark.sql("SELECT * FROM paimon_iceberg.flink_paimon_db.customers LIMIT 10").show()
 ```
 
 **StarRocks on EKS** — native support for both Paimon and Iceberg:

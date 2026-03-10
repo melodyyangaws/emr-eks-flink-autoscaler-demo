@@ -3,13 +3,12 @@ set -euo pipefail
 
 # ── Variables ────────────────────────────────────────────────────────────────
 export AWS_REGION="${AWS_REGION:-us-west-2}"
-export AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-export BUCKET_NAME="${BUCKET_NAME:-emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}}"
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+export BUCKET_NAME="emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}"
 export IMAGE_NAME="flink-cdc-monitor"
-export IMAGE_TAG="${1:-latest}"
 export ECR_REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${IMAGE_NAME}"
 export NAMESPACE="${NAMESPACE:-emr-flink}"
-export EMR_EXECUTION_ROLE_ARN="${EMR_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role}"
+export EMR_EXECUTION_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOYMENT_TEMPLATE="${SCRIPT_DIR}/monitor-deployment.yaml"
@@ -21,7 +20,7 @@ echo "════════════════════════�
 echo "  Region:    ${AWS_REGION}"
 echo "  Account:   ${AWS_ACCOUNT_ID}"
 echo "  Bucket:    ${BUCKET_NAME}"
-echo "  Image:     ${ECR_REPO}:${IMAGE_TAG}"
+echo "  Image:     ${ECR_REPO}:latest"
 echo "  Namespace: ${NAMESPACE}"
 echo "  IAM Role:  ${EMR_EXECUTION_ROLE_ARN}"
 echo "═══════════════════════════════════════════════════════════════"
@@ -48,12 +47,11 @@ echo "  AWS_REGION  : \${AWS_REGION}  → ${AWS_REGION}"
 echo "  BUCKET_NAME : \${BUCKET_NAME} → ${BUCKET_NAME}"
 
 # ── Build & Push (multi-arch) ────────────────────────────────────────────────
-echo "Building ${ECR_REPO}:${IMAGE_TAG}..."
+echo "Building ${ECR_REPO}..."
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --push -t "${ECR_REPO}:${IMAGE_TAG}" \
+  --push -t "${ECR_REPO}:latest" \
   -f "${BUILD_DIR}/Dockerfile.monitor" \
   "${BUILD_DIR}"
-
 # ── IRSA ─────────────────────────────────────────────────────────────────────
 echo "Annotating default SA with IAM role..."
 kubectl annotate serviceaccount -n "${NAMESPACE}" default \
@@ -61,11 +59,8 @@ kubectl annotate serviceaccount -n "${NAMESPACE}" default \
 
 # ── Resolve variables in deployment manifest and apply ───────────────────────
 echo "Resolving variables in monitor-deployment.yaml..."
-envsubst '${AWS_ACCOUNT_ID} ${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${IMAGE_TAG}' \
+envsubst '${AWS_ACCOUNT_ID} ${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE}' \
   < "${DEPLOYMENT_TEMPLATE}" > "${DEPLOYED_MANIFEST}"
-
-echo "Resolved manifest values:"
-grep -n 's3://\|\.ecr\.\|namespace:' "${DEPLOYED_MANIFEST}" | head -10
 
 echo "Applying ${DEPLOYED_MANIFEST}..."
 kubectl apply -f "${DEPLOYED_MANIFEST}"

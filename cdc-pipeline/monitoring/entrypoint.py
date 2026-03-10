@@ -34,13 +34,26 @@ REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports")
 RUN_MODE = os.environ.get("RUN_MODE", "continuous")
 
 
-def build_monitor(flink_url, glue_db, warehouse, tables):
-    catalog_config = {
+def build_monitor(flink_url, glue_db, warehouse, tables, catalog_type="glue"):
+    """Build a FlinkCDCMonitor with the appropriate pyiceberg catalog.
+
+    catalog_type:
+      - "glue"   : Iceberg tables registered natively in Glue (table_type=ICEBERG)
+      - "hadoop" : Read Iceberg metadata directly from S3 (for Paimon tables)
+    """
+    if catalog_type == "hadoop":
+        catalog_config = {
+            "type": "hadoop",
+            "warehouse": warehouse,
+            "s3.region": AWS_REGION,
+        }
+    else:
+        catalog_config = {
         "type": "glue",
         "warehouse": warehouse,
         "region_name": AWS_REGION,
         "s3.region": AWS_REGION,
-    }
+        }
     return FlinkCDCMonitor(
         flink_url=flink_url,
         catalog_config=catalog_config,
@@ -65,8 +78,10 @@ def run_single_cycle():
     log.info("Starting monitoring cycle at %s", datetime.utcnow().isoformat())
     log.info("=" * 70)
 
-    paimon_monitor = build_monitor(PAIMON_FLINK_URL, PAIMON_GLUE_DB, PAIMON_WAREHOUSE, CDC_TABLES)
-    iceberg_monitor = build_monitor(ICEBERG_FLINK_URL, ICEBERG_GLUE_DB, ICEBERG_WAREHOUSE, CDC_TABLES)
+    paimon_monitor = build_monitor(
+        PAIMON_FLINK_URL, PAIMON_GLUE_DB, PAIMON_WAREHOUSE, CDC_TABLES, catalog_type="hadoop")
+    iceberg_monitor = build_monitor(
+        ICEBERG_FLINK_URL, ICEBERG_GLUE_DB, ICEBERG_WAREHOUSE, CDC_TABLES, catalog_type="glue")
 
     paimon_report = paimon_monitor.generate_report(
         label="paimon-cdc",

@@ -1,14 +1,21 @@
 -- ============================================================================
--- Paimon Sink Tables — Glue Catalog + Iceberg Compat + Deletion Vectors
+-- Paimon Sink Tables — Streaming CDC Optimized
 -- ============================================================================
--- Creates Apache Paimon sink tables with:
---   - Deletion vectors: marks deleted rows in a bitmap instead of rewriting
---     entire data files — reduces write amplification for CDC workloads
+-- Creates Apache Paimon sink tables optimized for low-latency CDC:
+--   - Deletion vectors: bitmap-based row deletes without rewriting data files
 --   - Deduplicate merge engine (default): last-write-wins upsert via PK
---   - Iceberg compatibility: IcebergHiveMetadataCommitter registers read-only
---     Iceberg metadata in the same Glue catalog via EMR's /glue/confs/ dirs.
---     Iceberg readers (Athena/Trino/Spark) see clean data after DV resolution.
+--   - ZSTD compression for better ratio on CDC payloads
+--   - Tuned compaction, write buffers, and snapshot retention for 60s checkpoints
+--   - Iceberg compatibility: IcebergHiveMetadataCommitter writes read-only
+--     Iceberg V2 metadata to Glue for Athena/Spark queries via Hadoop catalog
 --   - Input changelog producer for downstream CDC consumers
+--
+-- Streaming best practices applied:
+--   1. Spillable write buffers to prevent backpressure during burst writes
+--   2. Smaller target file sizes (32-64MB) to match checkpoint-driven writes
+--   3. Tuned compaction triggers to balance write amp vs read performance
+--   4. Manifest merging to keep read planning fast
+--   5. Async snapshot expiration to avoid checkpoint latency spikes
 --
 -- Valid metadata.iceberg.* options (Paimon 1.3.0):
 --   storage, uri, hive-conf-dir, hadoop-conf-dir, format-version,
@@ -24,8 +31,11 @@ USE CATALOG paimon_catalog;
 USE ${GLUE_DATABASE:flink_paimon_db};
 
 -- ============================================================================
--- Table: customers (Dimension Table)
+-- Table: customers (Dimension Table — unpartitioned)
 -- ============================================================================
+-- Low cardinality, frequent updates (address/phone changes).
+-- Fewer buckets (4) since total data volume is small.
+-- Smaller file target (32MB) and write buffer to save memory.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
     customer_name VARCHAR,
@@ -40,30 +50,43 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'bucket' = '4',
+    'bucket' = '2',
     'changelog-producer' = 'input',
-    -- 'deletion-vectors.enabled' = 'true',
-    -- Iceberg compatibility via EMR Glue conf
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.manifest-legacy-version' = 'true',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'fs.s3.impl' = 'org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- 'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    -- 'metadata.iceberg.hadoop-conf-dir' = '/glue/confs/hadoop/conf',
-    'metadata.iceberg.format-version' = '3',
-    -- Compaction
+    'deletion-vectors.enabled' = 'true',
+    -- File format & compression
+    'file.format' = 'parquet',
+    'file.compression' = 'zstd',
+    'file.compression.zstd-level' = '1',
+    -- Write tuning: 32MB target, spillable buffer for burst writes
+    'target-file-size' = '32mb',
+    'write-buffer-size' = '128mb',
+    'write-buffer-spillable' = 'true',
+    -- Compaction: trigger after 4 sorted runs, cap at 8 to prevent stalls
     'num-sorted-run.compaction-trigger' = '4',
-    -- Snapshot retention
+    'compaction.max.file-num' = '8',
+    -- Snapshot retention: 1hr / 5-10 snapshots, async expiration
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
-    -- register table as Iceberg table in Glue to enable Athena query
-    'table_type' = 'ICEBERG'
+    'snapshot.expire.execution-mode' = 'async',
+    -- Manifest optimization
+    'manifest.target-file-size' = '8mb',
+    'manifest.merge-min-count' = '5',
+    -- Iceberg compatibility via EMR Glue conf
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
+    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.manifest-compression' = 'zstd'
 );
 
 -- ============================================================================
 -- Table: products (Dimension Table — partitioned by category)
 -- ============================================================================
+-- Medium cardinality, frequent stock_quantity and price updates.
+-- Partitioned by category for query pruning (WHERE category = 'Electronics').
 CREATE TABLE IF NOT EXISTS products (
     product_id INT,
     product_name VARCHAR,
@@ -75,30 +98,39 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'bucket' = '4',
+    'bucket' = '2',
     'changelog-producer' = 'input',
-    -- 'deletion-vectors.enabled' = 'true',
-    -- Iceberg compatibility via EMR Glue conf
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.manifest-legacy-version' = 'true',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'fs.s3.impl' = 'org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- 'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    -- 'metadata.iceberg.hadoop-conf-dir' = '/glue/confs/hadoop/conf',
-    'metadata.iceberg.format-version' = '3',
-    -- Compaction
+    'deletion-vectors.enabled' = 'true',
+    'file.format' = 'parquet',
+    'file.compression' = 'zstd',
+    'file.compression.zstd-level' = '1',
+    'target-file-size' = '32mb',
+    'write-buffer-size' = '128mb',
+    'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    -- Snapshot retention
+    'compaction.max.file-num' = '8',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
-    -- register table as Iceberg table in Glue to enable Athena query
-    'table_type' = 'ICEBERG'
+    'snapshot.expire.execution-mode' = 'async',
+    'manifest.target-file-size' = '8mb',
+    'manifest.merge-min-count' = '5',
+    -- Iceberg compatibility via EMR Glue conf
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
+    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.manifest-compression' = 'zstd'
 );
 
 -- ============================================================================
 -- Table: orders (Fact Table — partitioned by date)
 -- ============================================================================
+-- High write volume, mostly inserts + status updates.
+-- 8 buckets to handle higher throughput per partition.
+-- Larger file target (64MB) and write buffer for sustained throughput.
 CREATE TABLE IF NOT EXISTS orders (
     order_id INT,
     customer_id INT,
@@ -111,30 +143,40 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
-    'bucket' = '8',
+    'bucket' = '4',
     'changelog-producer' = 'input',
-    -- 'deletion-vectors.enabled' = 'true',
-    -- Iceberg compatibility via EMR Glue conf
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.manifest-legacy-version' = 'true',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'fs.s3.impl' = 'org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- 'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    -- 'metadata.iceberg.hadoop-conf-dir' = '/glue/confs/hadoop/conf',
-    'metadata.iceberg.format-version' = '3',
-    -- Compaction
+    'deletion-vectors.enabled' = 'true',
+    'file.format' = 'parquet',
+    'file.compression' = 'zstd',
+    'file.compression.zstd-level' = '1',
+    -- 64MB target for high-volume fact table
+    'target-file-size' = '64mb',
+    'write-buffer-size' = '256mb',
+    'write-buffer-spillable' = 'true',
+    -- Compaction: more aggressive for fact tables with updates (order_status)
     'num-sorted-run.compaction-trigger' = '4',
-    -- Snapshot retention
+    'compaction.max.file-num' = '10',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
-    -- register table as Iceberg table in Glue to enable Athena query
-    'table_type' = 'ICEBERG'
+    'snapshot.expire.execution-mode' = 'async',
+    'manifest.target-file-size' = '8mb',
+    'manifest.merge-min-count' = '5',
+    -- Iceberg compatibility via EMR Glue conf
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
+    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.manifest-compression' = 'zstd'
 );
 
 -- ============================================================================
 -- Table: order_items (Fact Table — partitioned by date)
 -- ============================================================================
+-- Highest write volume (multiple items per order), append-heavy.
+-- 8 buckets for parallelism. Largest write buffer.
 CREATE TABLE IF NOT EXISTS order_items (
     order_item_id INT,
     order_id INT,
@@ -146,23 +188,29 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_date_str VARCHAR,
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
-    'bucket' = '8',
+    'bucket' = '4',
     'changelog-producer' = 'input',
-    -- 'deletion-vectors.enabled' = 'true',
-    -- Iceberg compatibility via EMR Glue conf
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.manifest-legacy-version' = 'true',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'fs.s3.impl' = 'org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- 'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    -- 'metadata.iceberg.hadoop-conf-dir' = '/glue/confs/hadoop/conf',
-    'metadata.iceberg.format-version' = '3',
-    -- Compaction
+    'deletion-vectors.enabled' = 'true',
+    'file.format' = 'parquet',
+    'file.compression' = 'zstd',
+    'file.compression.zstd-level' = '1',
+    'target-file-size' = '64mb',
+    'write-buffer-size' = '256mb',
+    'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    -- Snapshot retention
+    'compaction.max.file-num' = '10',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
-    -- register table as Iceberg table in Glue to enable Athena query
-    'table_type' = 'ICEBERG'
+    'snapshot.expire.execution-mode' = 'async',
+    'manifest.target-file-size' = '8mb',
+    'manifest.merge-min-count' = '5',
+    -- Iceberg compatibility via EMR Glue conf
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
+    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.manifest-compression' = 'zstd'
 );
