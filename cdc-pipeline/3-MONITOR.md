@@ -46,9 +46,10 @@ cd cdc-pipeline
 bash ./monitoring/deploy-monitor.sh
 ```
 
-This builds the Docker image (multi-arch: amd64+arm64), pushes to ECR, and deploys the K8s Deployment.
+NOTE: This builds the Docker image (multi-arch: amd64+arm64), pushes to ECR, and deploys the K8s Deployment.
 
-### Deploy Monitor (Image Already Built)
+### Deploy Monitor 
+Once docker image is published to ECR, in the case of rerun the montioring process, we can avoid rebuilding the docker image and directly run the monitor deployment as below:
 
 ```bash
 kubectl apply -f monitoring/monitor-deployment.yaml

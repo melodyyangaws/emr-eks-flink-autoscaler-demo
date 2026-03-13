@@ -115,7 +115,7 @@ export LAKEHOUSE_FORMAT=both
 
 ### 2. Build and Deploy
 ```bash
-# build docker images, upload assets to s3
+# build docker images, upload assets to s3 (one-off)
 ./build-deploy-generic.sh build
 # deploy PyFlink(FlinkSQL) jobs to EKS
 ./build-deploy-generic.sh deploy

@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS customers (
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
     'bucket' = '2',
-    'changelog-producer' = 'input',
+    'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     -- File format & compression
     'file.format' = 'parquet',
@@ -79,7 +79,8 @@ CREATE TABLE IF NOT EXISTS customers (
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd'
+    'metadata.iceberg.manifest-compression' = 'zstd',
+    'sink.writer-coordinator.enabled' = 'true'
 );
 
 -- ============================================================================
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS products (
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
     'bucket' = '2',
-    'changelog-producer' = 'input',
+    'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
@@ -122,7 +123,8 @@ CREATE TABLE IF NOT EXISTS products (
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd'
+    'metadata.iceberg.manifest-compression' = 'zstd',
+    'sink.writer-coordinator.enabled' = 'true'
 );
 
 -- ============================================================================
@@ -144,7 +146,7 @@ CREATE TABLE IF NOT EXISTS orders (
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
     'bucket' = '4',
-    'changelog-producer' = 'input',
+    'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
@@ -169,7 +171,9 @@ CREATE TABLE IF NOT EXISTS orders (
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd'
+    'metadata.iceberg.manifest-compression' = 'zstd',
+    'sink.writer-coordinator.enabled' = 'true'
+
 );
 
 -- ============================================================================
@@ -189,7 +193,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
     'bucket' = '4',
-    'changelog-producer' = 'input',
+    'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
@@ -212,5 +216,6 @@ CREATE TABLE IF NOT EXISTS order_items (
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd'
+    'metadata.iceberg.manifest-compression' = 'zstd',
+    'sink.writer-coordinator.enabled' = 'true'
 );

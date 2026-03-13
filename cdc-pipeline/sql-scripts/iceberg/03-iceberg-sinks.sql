@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS customers (
     'history.expire.min-snapshots-to-keep' = '5',
     -- Metadata cleanup: critical for streaming to prevent S3 file explosion
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '5',
+    'write.metadata.previous-versions-max' = '3',
     -- Manifest optimization: merge small manifests to speed up read planning
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',

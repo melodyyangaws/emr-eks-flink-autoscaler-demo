@@ -16,7 +16,7 @@ spec:
     # table.catalog-store.kind: glue
     # S3 Configuration
     fs.s3a.endpoint.region: us-west-2
-    # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
+    # # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
     # job.autoscaler.scale-down.interval: "0"
     # # restart with local-recovery is still needed
     # # in order to redistribute states, update DAG etc by adaptive-scheduler
@@ -69,7 +69,7 @@ spec:
     jobmanager.scheduler: adaptive
     taskmanager.numberOfTaskSlots: "4"
     # Parallelism
-    parallelism.default: "2"
+    parallelism.default: "4"
     pipeline.max-parallelism: "128"
     # Table Configuration
     table.exec.source.idle-timeout: "30s"
@@ -83,7 +83,7 @@ spec:
     storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon/ha/
     replicas: 1
     resource:
-      memory: "4096m"
+      memory: "8192m"
       cpu: 2
     podTemplate:
       spec:
@@ -108,7 +108,7 @@ spec:
             value: "flink_paimon_db"
   taskManager:
     resource:
-      memory: "4096m"
+      memory: "8192m"
       cpu: 2
     podTemplate:
       spec:
@@ -127,9 +127,9 @@ spec:
       - "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/"
       # - "--checkpoint-interval"
       # - "60s"
-      # - "--parallelism"
-      # - "4"
-    parallelism: 4
+      - "--parallelism"
+      - "8"
+    parallelism: 8
     upgradeMode: last-state
 
   monitoringConfiguration:
