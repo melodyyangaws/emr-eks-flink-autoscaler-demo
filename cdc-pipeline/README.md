@@ -297,10 +297,10 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 |--------|-------|
 | Initial Load Speed | ~10K rows/sec (depends on RDS instance) |
 | CDC Latency | < 1 second (binlog → lakehouse) |
-| Throughput | ~5K events/sec per TaskManager |
+| Throughput | ~3K events/sec per TaskManager |
 | Checkpoint Interval | 60 seconds |
-| Checkpoint Duration | < 10 seconds (typical) |
-| Storage Format | Parquet (compressed) |
+| Checkpoint Duration | < 15 seconds (typical) |
+| Storage Format | Parquet (zstd compression) |
 
 ---
 
@@ -310,13 +310,12 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 |-------|----------|
 | FlinkDeployment won't start | Check IAM role, secrets, image pull, ECR auth |
 | CDC not capturing changes | Verify binlog enabled, CDC user has REPLICATION SLAVE |
-| Duplicate email crash | Data generator uses UUID-based emails (fixed) |
-| `LIMIT & IN/ALL/ANY/SOME subquery` | Wrap LIMIT subquery in derived table |
-| Generated column error (subtotal) | Don't INSERT into `order_items.subtotal` |
+| Duplicate email crash | Data generator uses UUID-based emails |
+| Calculated column error (subtotal) | Don't INSERT into `order_items.subtotal` |
 | Data generator connects but no data | Check pod logs for per-operation errors; ensure ConfigMap is redeployed |
 | Monitor `PaimonStorageHandler` error | Monitor uses Glue API fallback for Paimon tables |
-| Monitor `PyArrowFileIO` error | Ensure `pyarrow` is in requirements.txt |
-| Athena can't read Paimon tables | Use Hadoop catalog in Athena Spark; set `metadata.iceberg.format-version = '2'` |
+| Athena Spark can't read Paimon tables | Use Hadoop catalog in Athena Spark; set `metadata.iceberg.format-version = '2'` |
+| Athena SQL can't read Paimon tables | Manually change table_type property to `Icberg` in Glue Catalog |
 | StarRocks SA conflict | Annotate existing SA with Helm release metadata |
 | Docker image platform mismatch | Build with `--platform linux/amd64,linux/arm64` |
 | Monitor pod `ImagePullBackOff` | Use `docker buildx build --platform` for multi-arch |
@@ -327,13 +326,12 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 ## Resources Created
 
 - ☑️ 1 RDS MySQL instance (binlog-enabled, CDC user configured)
-- ☑️ 1 ECR repository (multi-arch Flink CDC image)
-- ☑️ 1 ECR repository (multi-arch monitor image)
+- ☑️ 2 ECR repository (multi-arch Flink CDC & monitor images)
 - ☑️ 2 FlinkDeployments (Paimon + Iceberg pipelines)
 - ☑️ 1 Data generator Deployment (ConfigMap-based Python script)
 - ☑️ 1 Monitor Deployment (Flink REST API + Glue/pyiceberg stats)
 - ☑️ 4 Paimon tables on S3 (with Iceberg compatibility metadata)
-- ☑️ 4 Iceberg tables on S3 (Glue catalog, format V3)
+- ☑️ 4 Iceberg tables on S3 (Glue catalog, format V2)
 - ☑️ 1 StarRocks cluster on EKS (FE + BE pods)
 - ☑️ S3 checkpoint and HA storage
 - ☑️ Kubernetes secrets for MySQL credentials
@@ -341,7 +339,7 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 ---
 
 **Status**: ✅ Production Ready
-**Last Updated**: 2026-03-08
+**Last Updated**: 2026-03-11
 **EMR Version**: 7.12.0
 **Flink Version**: 1.20
 **Paimon Version**: 1.3.0
