@@ -13,7 +13,7 @@
 -- mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 
 -- Create Paimon catalog
-CREATE EXTERNAL CATALOG paimon_catalog
+CREATE EXTERNAL CATALOG paimon_catalogv3
 PROPERTIES (
     "type" = "paimon",
     "paimon.catalog.type" = "filesystem",
@@ -23,7 +23,7 @@ PROPERTIES (
 );
 
 -- Switch to Paimon catalog
-SET CATALOG paimon_catalog;
+SET CATALOG paimon_catalogv3;
 
 -- Show databases
 SHOW DATABASES;

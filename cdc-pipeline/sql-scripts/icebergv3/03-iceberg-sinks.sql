@@ -1,8 +1,8 @@
 -- ============================================================================
--- Iceberg V2 Sink Tables — Streaming CDC Optimized
+-- Iceberg V3 Sink Tables — Streaming CDC Optimized
 -- ============================================================================
--- Creates Apache Iceberg V2 sink tables optimized for low-latency CDC:
---   - Position delete files for row-level deletes/updates (merge-on-read)
+-- Creates Apache Iceberg V3 sink tables optimized for low-latency CDC:
+--   - Deletion vectors (V3) for efficient row-level deletes
 --   - UPSERT enabled with hash distribution for PK-based dedup
 --   - ZSTD compression for better ratio on CDC payloads
 --   - Tuned snapshot retention and metadata cleanup for 60s checkpoints
@@ -15,25 +15,20 @@
 --   4. Manifest merging to keep read planning fast as snapshots accumulate
 --   5. Full column metrics for predicate pushdown in query engines
 --
--- Partitioning: Flink SQL does NOT support Iceberg hidden partition transforms
--- (days(), months(), bucket()). Those require Spark SQL or the Java catalog API.
--- We use explicit DATE partition columns computed via DATE_FORMAT() in the
--- pipeline INSERT statements (04-cdc-pipelines.sql).
---
--- Required environment variables:
---   GLUE_DATABASE: AWS Glue database name (default: flink_iceberg_db)
+-- Partitioning: Explicit DATE STRING partition columns computed via
+-- DATE_FORMAT() in the pipeline INSERT statements (04-cdc-pipelines.sql).
+-- Partition columns MUST be in PRIMARY KEY for hash distribution + upsert.
 -- ============================================================================
 
 -- Switch to Iceberg catalog
-USE CATALOG iceberg_catalog;
-USE ${GLUE_DATABASE:flink_iceberg_db};
+USE CATALOG icebergv3_catalog;
+USE ${GLUE_DATABASE:flink_icebergv3_db};
 
 -- ============================================================================
 -- Table: customers (Dimension Table — unpartitioned)
 -- ============================================================================
 -- Low cardinality, frequent updates (address/phone changes).
 -- Unpartitioned: small enough that partition overhead isn't justified.
--- Smaller file target (32MB) since total table size is small.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
     customer_name STRING,
@@ -48,28 +43,22 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'format-version' = '2',
-    -- Merge-on-read: writes are fast (append delete files), reads reconcile
+    'format-version' = '3',
+    'write.delete.vector.enabled' = 'true',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
-    -- Hash distribution: same PK → same writer → proper upsert dedup
     'write.distribution-mode' = 'hash',
-    -- File tuning: 32MB for small dimension table with 60s checkpoints
     'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
     'write.parquet.row-group-size-bytes' = '8388608',
-    -- Snapshot retention: keep 1hr / 5-10 snapshots for time-travel
     'history.expire.max-snapshot-age-ms' = '3600000',
     'history.expire.min-snapshots-to-keep' = '5',
-    -- Metadata cleanup: critical for streaming to prevent S3 file explosion
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '3',
-    -- Manifest optimization: merge small manifests to speed up read planning
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    -- Full column stats for Athena/Spark predicate pushdown
     'write.metadata.metrics.default' = 'full'
 );
 
@@ -89,7 +78,8 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'format-version' = '2',
+    'format-version' = '3',
+    'write.delete.vector.enabled' = 'true',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
@@ -111,9 +101,7 @@ CREATE TABLE IF NOT EXISTS products (
 -- Table: orders (Fact Table — partitioned by order_dt)
 -- ============================================================================
 -- High write volume, mostly inserts + status updates.
--- Partitioned by date string for time-range query pruning.
--- Larger file target (64MB) to reduce file count at scale.
--- Explicit DATE STRING column computed from order_date in 04-cdc-pipelines.sql.
+-- Explicit order_dt STRING column computed from order_date via DATE_FORMAT().
 CREATE TABLE IF NOT EXISTS orders (
     order_id INT,
     customer_id INT,
@@ -126,13 +114,13 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (order_dt, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_dt) WITH (
-    'format-version' = '2',
+    'format-version' = '3',
+    'write.delete.vector.enabled' = 'true',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 64MB for high-volume fact table: balances file count vs checkpoint latency
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     'write.parquet.row-group-size-bytes' = '16777216',
@@ -149,8 +137,7 @@ CREATE TABLE IF NOT EXISTS orders (
 -- Table: order_items (Fact Table — partitioned by created_dt)
 -- ============================================================================
 -- Highest write volume (multiple items per order), append-heavy.
--- Partitioned by date string for time-range query pruning.
--- Explicit DATE STRING column computed from created_at in 04-cdc-pipelines.sql.
+-- Explicit created_dt STRING column computed from created_at via DATE_FORMAT().
 CREATE TABLE IF NOT EXISTS order_items (
     order_item_id INT,
     order_id INT,
@@ -162,7 +149,8 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_dt STRING,
     PRIMARY KEY (created_dt, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_dt) WITH (
-    'format-version' = '2',
+    'format-version' = '3',
+    'write.delete.vector.enabled' = 'true',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',

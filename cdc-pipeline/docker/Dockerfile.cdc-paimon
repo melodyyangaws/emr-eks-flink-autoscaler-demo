@@ -40,6 +40,8 @@ RUN dnf swap -y curl-minimal curl && \
         https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-connector-3.1/${PAIMON_VERSION}/paimon-hive-connector-3.1-${PAIMON_VERSION}.jar && \
     curl -fsSL -o /tmp/jars/mysql-connector-j-8.4.0.jar \
         https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar && \
+    # curl -fsSL -o /tmp/jars/iceberg-flink-1.20-1.10.0.jar \
+    #     https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-1.20/1.10.0/iceberg-flink-1.20-1.10.0.jar && \
     dnf clean all && \
     ls -lh /tmp/jars/ && \
     echo "All JARs downloaded successfully ($(du -sh /tmp/jars | cut -f1))"
@@ -47,7 +49,7 @@ RUN dnf swap -y curl-minimal curl && \
 # ============================================================================
 # Stage 2: Get an OSS Glue Data Catalog Client
 # ============================================================================
-FROM sdaberdaku/spark-with-glue-builder:v3.5.1 AS glue-builder
+# FROM sdaberdaku/spark-with-glue-builder:v3.5.1 AS glue-builder
 
 # ============================================================================
 # Stage 3: Final image
@@ -57,16 +59,16 @@ USER root
 
 COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar ${FLINK_LIB_DIR}
 COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar /usr/share/aws/emr/emrfs/auxlib
-COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-hive3-client/target/aws-glue-datacatalog-hive3-client-*.jar ${FLINK_LIB_DIR}
-# COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-client-common/target/aws-glue-datacatalog-client-common-*.jar ${FLINK_LIB_DIR}
+# COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-hive3-client/target/aws-glue-datacatalog-hive3-client-*.jar ${FLINK_LIB_DIR}
 
 ENV FLINK_CLASSPATH="/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*"
 ENV FLINK_ENV_JAVA_OPTS="${FLINK_ENV_JAVA_OPTS} -Djava.class.path=${FLINK_CLASSPATH}"
-ENV HADOOP_CLASSPATH="/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*"
+ENV HADOOP_CLASSPATH="${FLINK_CLASSPATH}:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*"
 
 RUN cp /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar ${FLINK_LIB_DIR} && \
     chown -R hadoop:hadoop ${FLINK_LIB_DIR}/iceberg-flink-runtime.jar && \
     rm -rf ${FLINK_HOME}/examples && \
+    rm /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar && \
     rm -rf /tmp/* /var/tmp/* && \
     dnf clean all 2>/dev/null || true
 

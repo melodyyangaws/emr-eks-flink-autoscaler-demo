@@ -29,12 +29,15 @@ log = logging.getLogger(__name__)
 @dataclass
 class TableSnapshot:
     name: str
+    format_version: int = 0
     snapshot_count: int = 0
     total_records: int = 0
     total_data_files: int = 0
     total_size_bytes: int = 0
     total_delete_files: int = 0
     total_position_deletes: int = 0
+    total_equality_deletes: int = 0
+    added_delete_files: int = 0
     added_records: int = 0
     added_data_files: int = 0
     added_files_size: int = 0
@@ -79,6 +82,8 @@ class PipelineReport:
     total_new_snapshots: int = 0
     total_new_data_files: int = 0
     total_new_delete_files: int = 0
+    total_new_position_deletes: int = 0
+    total_new_equality_deletes: int = 0
     total_new_records_in_tables: int = 0
     total_new_bytes_in_tables: int = 0
     failed_checkpoints: int = 0
@@ -244,15 +249,24 @@ class FlinkCDCMonitor:
                 current = snapshots[-1]
                 ts.current_snapshot_id = current.snapshot_id
                 s = current.summary or {}
-                log.info("Iceberg snapshot summary for %s.%s (snap_id=%s): %s",
+                log.info("Iceberg snapshot summary for %s.%s (snap_id=%s): %s | deletes: %s",
                          self.glue_database, table_name, current.snapshot_id,
                          {k: s.get(k) for k in ["total-records", "total-data-files",
-                          "total-file-size-in-bytes", "total-delete-files"]})
+                          "total-file-size-in-bytes", "total-delete-files"]},
+                         {k: s.get(k, "0") for k in ["total-delete-files",
+                          "added-delete-files", "total-position-deletes",
+                          "total-equality-deletes"]})
+
+                # V3 format version from table metadata
+                ts.format_version = getattr(tbl.metadata, "format_version", 0)
+
                 ts.total_records = int(s.get("total-records") or 0)
                 ts.total_data_files = int(s.get("total-data-files") or 0)
                 ts.total_size_bytes = int(s.get("total-file-size-in-bytes") or 0)
                 ts.total_delete_files = int(s.get("total-delete-files") or 0)
                 ts.total_position_deletes = int(s.get("total-position-deletes") or 0)
+                ts.total_equality_deletes = int(s.get("total-equality-deletes") or 0)
+                ts.added_delete_files = int(s.get("added-delete-files") or 0)
                 ts.added_records = int(s.get("added-records") or 0)
                 ts.added_data_files = int(s.get("added-data-files") or 0)
                 ts.added_files_size = int(s.get("added-files-size") or 0)
@@ -567,6 +581,8 @@ class FlinkCDCMonitor:
                     report.total_new_snapshots += max(0, e.snapshot_count - s.snapshot_count)
                 report.total_new_data_files += max(0, e.total_data_files - s.total_data_files)
                 report.total_new_delete_files += max(0, e.total_delete_files - s.total_delete_files)
+                report.total_new_position_deletes += max(0, e.total_position_deletes - s.total_position_deletes)
+                report.total_new_equality_deletes += max(0, e.total_equality_deletes - s.total_equality_deletes)
                 report.total_new_records_in_tables += max(0, e.total_records - s.total_records)
                 # Paimon: estimate new-data bytes from record delta × avg record size.
                 # bytes_added_in_window (S3 LastModified) is inflated by compaction
@@ -578,10 +594,13 @@ class FlinkCDCMonitor:
                     report.total_new_bytes_in_tables += int(new_records * avg_bytes_per_record)
                 else:
                     report.total_new_bytes_in_tables += max(0, e.total_size_bytes - s.total_size_bytes)
-                log.info("Table %s: records %d→%d files %d→%d deletes %d→%d snapshots %d→%d snap_id %s→%s",
-                         t, s.total_records, e.total_records,
+                log.info("Table %s (v%d): records %d→%d files %d→%d deletes %d→%d "
+                         "pos_del %d→%d eq_del %d→%d snapshots %d→%d snap_id %s→%s",
+                         t, e.format_version, s.total_records, e.total_records,
                          s.total_data_files, e.total_data_files,
                          s.total_delete_files, e.total_delete_files,
+                         s.total_position_deletes, e.total_position_deletes,
+                         s.total_equality_deletes, e.total_equality_deletes,
                          s.snapshot_count, e.snapshot_count,
                          s.current_snapshot_id, e.current_snapshot_id)
 
@@ -650,6 +669,10 @@ class FlinkCDCMonitor:
              report_a.total_new_data_files, report_b.total_new_data_files, ""],
             ["New Delete Files",
              report_a.total_new_delete_files, report_b.total_new_delete_files, ""],
+            ["  ↳ Position Deletes (Δ)",
+             f"{report_a.total_new_position_deletes:,}", f"{report_b.total_new_position_deletes:,}", ""],
+            ["  ↳ Equality Deletes (Δ)",
+             f"{report_a.total_new_equality_deletes:,}", f"{report_b.total_new_equality_deletes:,}", ""],
             ["New Records in Tables",
              f"{report_a.total_new_records_in_tables:,}",
              f"{report_b.total_new_records_in_tables:,}",
@@ -703,6 +726,8 @@ class FlinkCDCMonitor:
             "total_new_snapshots": report.total_new_snapshots,
             "total_new_data_files": report.total_new_data_files,
             "total_new_delete_files": report.total_new_delete_files,
+            "total_new_position_deletes": report.total_new_position_deletes,
+            "total_new_equality_deletes": report.total_new_equality_deletes,
             "total_new_records_in_tables": report.total_new_records_in_tables,
             "total_new_bytes_in_tables": report.total_new_bytes_in_tables,
             "errors": report.errors,
@@ -713,11 +738,14 @@ class FlinkCDCMonitor:
             e = report.table_snapshots_end.get(t)
             if s and e:
                 d["table_details"][t] = {
+                    "format_version": e.format_version,
                     "snapshots_delta": e.snapshot_count - s.snapshot_count,
                     "records_delta": e.total_records - s.total_records,
                     "data_files_delta": e.total_data_files - s.total_data_files,
                     "delete_files_delta": e.total_delete_files - s.total_delete_files,
                     "position_deletes_delta": e.total_position_deletes - s.total_position_deletes,
+                    "equality_deletes_delta": e.total_equality_deletes - s.total_equality_deletes,
+                    "added_delete_files": e.added_delete_files,
                     "bytes_delta": e.total_size_bytes - s.total_size_bytes,
                 }
         return json.dumps(d, indent=2)

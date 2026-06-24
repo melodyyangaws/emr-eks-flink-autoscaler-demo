@@ -2,7 +2,7 @@ apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
   namespace: emr-flink
-  name: flink-cdc-iceberg
+  name: flink-cdc-icebergv3
 spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
@@ -31,7 +31,9 @@ spec:
     pipeline.operator-chaining.enabled: "false"
     pipeline.auto-watermark-interval: "1s"
     # local-recovery
-    execution.checkpointing.interval: "30000"
+    execution.checkpointing.interval: "60s"
+    execution.checkpointing.timeout: "600s"
+    execution.checkpointing.min-pause: "30s"
     state.backend.local-recovery: "true"
     # ebs local-recovery
     task.local-recovery.ebs.enable: "true"
@@ -41,15 +43,16 @@ spec:
     state.backend.incremental: "true"
     state.changelog.enabled: "true"
     state.backend.changelog.storage: filesystem
-    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-iceberg/changelog/
+    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-icebergv3/changelog/
     dstl.dfs.upload.timeout: 5s
     state.backend.type: rocksdb
     state.backend.rocksdb.localdir: /tmp/rocksdb/
     # increase from default 50s to 3min to tolerate GC pauses during heavy commits
-    heartbeat.timeout: "180000"
-    heartbeat.interval: "10000"
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/checkpoints/
-    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/savepoints/
+    heartbeat.timeout: "180s"
+    heartbeat.interval: "20s"
+    heartbeat.rpc-failure-threshold: "10"
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-icebergv3/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-icebergv3/savepoints/
     # Restart Strategy
     jobmanager.execution.failover-strategy: region
     restart-strategy.type: fixed-delay
@@ -74,7 +77,7 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cdc-iceberg/ha
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-icebergv3/ha
     replicas: 1
     resource:
       memory: "8192m"
@@ -95,11 +98,11 @@ spec:
           - name: MYSQL_PASSWORD
             value: "${MYSQL_PASSWORD}"
           - name: ICEBERG_WAREHOUSE
-            value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
+            value: "s3://${BUCKET_NAME}/icebergv3-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
           - name: GLUE_DATABASE
-            value: "flink_iceberg_db"
+            value: "flink_icebergv3_db"
   taskManager:
     resource:
       memory: "8192m"
@@ -118,17 +121,17 @@ spec:
       - "-py"
       - "/opt/flink/usrlib/flink-cdc-executor.py"
       - "--sql-dir"
-      - "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/"
+      - "s3://${BUCKET_NAME}/flink/sql-scripts/icebergv3/"
       # - "--checkpoint-interval"
       # - "60s"
       - "--parallelism"
-      - "8"
-    parallelism: 8
+      - "16"
+    parallelism: 16
     upgradeMode: last-state
 
   monitoringConfiguration:
     s3MonitoringConfiguration:
-      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-iceberg
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-icebergv3
     sideCarResources:
       limits:
         cpuLimit: 500m

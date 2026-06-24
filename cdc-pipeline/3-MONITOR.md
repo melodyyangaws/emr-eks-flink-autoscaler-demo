@@ -116,8 +116,8 @@ monitoring/
 |---------|---------|-------------|
 | `PAIMON_FLINK_URL` | `http://flink-cdc-paimon-rest:8081` | Paimon Flink REST endpoint |
 | `ICEBERG_FLINK_URL` | `http://flink-cdc-iceberg-rest:8081` | Iceberg Flink REST endpoint |
-| `PAIMON_GLUE_DB` | `flink_paimon_db` | Paimon Glue database name |
-| `ICEBERG_GLUE_DB` | `flink_iceberg_db` | Iceberg Glue database name |
+| `PAIMON_GLUE_DB` | `flink_paimonv3_db` | Paimon Glue database name |
+| `ICEBERG_GLUE_DB` | `flink_icebergv3_db` | Iceberg Glue database name |
 | `PAIMON_WAREHOUSE` | `s3://<BUCKET>/paimon-warehouse/` | Paimon S3 warehouse path |
 | `ICEBERG_WAREHOUSE` | `s3://<BUCKET>/iceberg-warehouse/` | Iceberg S3 warehouse path |
 | `CDC_TABLES` | `customers,products,orders,order_items` | Tables to monitor |
@@ -215,12 +215,12 @@ kubectl logs -f -l app=flink-cdc-paimon -n emr-flink -c flink-main-container
 kubectl logs -f -l app=flink-cdc-iceberg -n emr-flink -c flink-main-container
 
 # Access Flink Web UI
-kubectl port-forward svc/flink-cdc-paimon-rest 8081:8081 -n emr-flink
+kubectl port-forward svc/flink-cdc-paimonv3-rest 8081:8081 -n emr-flink
 # Open: http://localhost:8081
 
 # Check S3 data freshness
-aws s3 ls s3://${BUCKET_NAME}/paimon-warehouse/ --recursive | tail -10
-aws s3 ls s3://${BUCKET_NAME}/iceberg-warehouse/ --recursive | tail -10
+aws s3 ls s3://${BUCKET_NAME}/paimonv3-warehouse/ --recursive | tail -10
+aws s3 ls s3://${BUCKET_NAME}/icebergv3-warehouse/ --recursive | tail -10
 ```
 
 ---

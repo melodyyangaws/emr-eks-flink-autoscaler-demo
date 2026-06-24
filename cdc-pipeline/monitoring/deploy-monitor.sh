@@ -20,7 +20,7 @@ echo "════════════════════════�
 echo "  Region:    ${AWS_REGION}"
 echo "  Account:   ${AWS_ACCOUNT_ID}"
 echo "  Bucket:    ${BUCKET_NAME}"
-echo "  Image:     ${ECR_REPO}:latest"
+echo "  Image:     ${ECR_REPO}:icebergv3"
 echo "  Namespace: ${NAMESPACE}"
 echo "  IAM Role:  ${EMR_EXECUTION_ROLE_ARN}"
 echo "═══════════════════════════════════════════════════════════════"
@@ -49,7 +49,7 @@ echo "  BUCKET_NAME : \${BUCKET_NAME} → ${BUCKET_NAME}"
 # ── Build & Push (multi-arch) ────────────────────────────────────────────────
 echo "Building ${ECR_REPO}..."
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --push -t "${ECR_REPO}:latest" \
+  --push -t "${ECR_REPO}:icebergv3" \
   -f "${BUILD_DIR}/Dockerfile.monitor" \
   "${BUILD_DIR}"
 # ── IRSA ─────────────────────────────────────────────────────────────────────

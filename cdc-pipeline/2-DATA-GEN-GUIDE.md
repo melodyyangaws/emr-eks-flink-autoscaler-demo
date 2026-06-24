@@ -217,7 +217,7 @@ SELECT
 SELECT
     date_format(date_trunc('minute', created_at), 'yyyy-MM-dd HH:mm') AS minute,
     COUNT(*) AS new_customers
-FROM paimon_iceberg.flink_paimon_db.customers
+FROM paimon_iceberg.flink_paimonv3_db.customers
 WHERE created_at >= current_timestamp() - INTERVAL 8 HOUR
 GROUP BY date_trunc('minute', created_at)
 ORDER BY minute DESC
@@ -227,7 +227,7 @@ LIMIT 10;
 SELECT
     date_format(created_at, '%Y-%m-%d %H:%i') AS minute,
     COUNT(*) AS new_customers
-FROM flink_iceberg_db.customers
+FROM flink_icebergv3_db.customers
 WHERE created_at >= NOW() - INTERVAL '2' HOUR
 GROUP BY date_format(created_at, '%Y-%m-%d %H:%i')
 ORDER BY 1 DESC

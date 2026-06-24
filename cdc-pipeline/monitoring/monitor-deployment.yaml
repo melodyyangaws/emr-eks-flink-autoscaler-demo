@@ -1,21 +1,21 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: flink-cdc-monitor-config
+  name: flink-cdc-monitor-configv3
   namespace: emr-flink
 data:
-  PAIMON_FLINK_URL: "http://flink-cdc-paimon-rest:8081"
-  ICEBERG_FLINK_URL: "http://flink-cdc-iceberg-rest:8081"
+  PAIMON_FLINK_URL: "http://flink-cdc-paimonv3-rest:8081"
+  ICEBERG_FLINK_URL: "http://flink-cdc-icebergv3-rest:8081"
   AWS_REGION: ${AWS_REGION}
-  PAIMON_GLUE_DB: "flink_paimon_db"
-  ICEBERG_GLUE_DB: "flink_iceberg_db"
+  PAIMON_GLUE_DB: "flink_paimonv3_db"
+  ICEBERG_GLUE_DB: "flink_icebergv3_db"
   # Paimon native warehouse root — S3 scan reads <db>.db/<table>/snapshot/ and bucket-N/
-  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimon-warehouse"
-  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/iceberg-warehouse/"
+  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimonv3-warehouse"
+  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/icebergv3-warehouse/"
   CDC_TABLES: "customers,products,orders,order_items"
   MONITOR_DURATION: "120"
-  POLL_INTERVAL: "10"
-  REPEAT_INTERVAL: "300"
+  POLL_INTERVAL: "20"
+  REPEAT_INTERVAL: "60"
   RUN_MODE: "continuous"
 ---
 apiVersion: apps/v1
@@ -38,11 +38,11 @@ spec:
       serviceAccountName: default
       containers:
       - name: monitor
-        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/flink-cdc-monitor:latest
+        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/flink-cdc-monitor:icebergv3
         imagePullPolicy: Always
         envFrom:
         - configMapRef:
-            name: flink-cdc-monitor-config
+            name: flink-cdc-monitor-configv3
         resources:
           requests:
             cpu: 250m

@@ -64,8 +64,8 @@ check_env_vars() {
     # Check lakehouse-specific vars
     if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
         if [[ -z "${GLUE_DATABASE}" ]]; then
-            warn "GLUE_DATABASE not set, using default: flink_iceberg_db"
-            export GLUE_DATABASE="flink_iceberg_db"
+            warn "GLUE_DATABASE not set, using default: flink_icebergv3_db"
+            export GLUE_DATABASE="flink_icebergv3_db"
         fi
     fi
 
@@ -88,11 +88,11 @@ display_config() {
     echo "  Lakehouse Format: ${LAKEHOUSE_FORMAT}"
 
     if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
-        echo "  Paimon Warehouse: s3://${BUCKET_NAME}/paimon-warehouse/"
+        echo "  Paimon Warehouse: s3://${BUCKET_NAME}/paimonv3-warehouse/"
     fi
 
     if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
-        echo "  Iceberg Warehouse: s3://${BUCKET_NAME}/iceberg-warehouse/"
+        echo "  Iceberg Warehouse: s3://${BUCKET_NAME}/icebergv3-warehouse/"
         echo "  Glue Database:     ${GLUE_DATABASE}"
     fi
 }
@@ -117,7 +117,7 @@ create_ecr_repo() {
 build_and_push_image() {
     local emr_version=${EMR_VERSION:-7.12.0}
     local repo_name="emr-flink-cdc-paimon"
-    local image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:${emr_version}"
+    local image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:oss-iceberg"
 
     log "Building Docker image..."
 
@@ -161,26 +161,26 @@ upload_scripts_to_s3() {
 
    # Upload Paimon scripts if needed
     if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
-        aws s3 sync sql-scripts/paimon/ "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/" \
+        aws s3 sync sql-scripts/paimonv3/ "s3://${BUCKET_NAME}/flink/sql-scripts/paimonv3/" \
             --region "$AWS_REGION" --delete || \
             error "Failed to upload Paimon SQL scripts"
 
         # Copy common scripts to Paimon directory
         aws s3 cp "s3://${BUCKET_NAME}/flink/sql-scripts/common/02-cdc-sources.sql" \
-            "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/02-cdc-sources.sql" \
+            "s3://${BUCKET_NAME}/flink/sql-scripts/paimonv3/02-cdc-sources.sql" \
             --region "$AWS_REGION"
         log "✓ Paimon SQL scripts uploaded"
     fi
 
     # Upload Iceberg scripts if needed
     if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
-        aws s3 sync sql-scripts/iceberg/ "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/" \
+        aws s3 sync sql-scripts/icebergv3/ "s3://${BUCKET_NAME}/flink/sql-scripts/icebergv3/" \
             --region "$AWS_REGION" --delete || \
             error "Failed to upload Iceberg SQL scripts"
         
         # Copy common scripts to Iceberg directory
         aws s3 cp "s3://${BUCKET_NAME}/flink/sql-scripts/common/02-cdc-sources.sql" \
-            "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/02-cdc-sources.sql" \
+            "s3://${BUCKET_NAME}/flink/sql-scripts/icebergv3/02-cdc-sources.sql" \
             --region "$AWS_REGION"    
         log "✓ Iceberg SQL scripts uploaded"
     fi
@@ -188,7 +188,7 @@ upload_scripts_to_s3() {
 
 # Create AWS Glue database for Iceberg
 create_glue_database() {
-    local glue_db=${GLUE_DATABASE:-flink_iceberg_db}
+    local glue_db=${GLUE_DATABASE:-flink_icebergv3_db}
 
     log "Creating AWS Glue database: $glue_db"
 
@@ -221,7 +221,7 @@ generate_flink_deployment() {
         -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
         -e "s|\${EMR_EXECUTION_ROLE_ARN}|${EMR_EXECUTION_ROLE_ARN}|g" \
         -e "s|\${EMR_VERSION}|${EMR_VERSION:-7.12.0}|g" \
-        -e "s|\${GLUE_DATABASE}|${GLUE_DATABASE:-flink_iceberg_db}|g" \
+        -e "s|\${GLUE_DATABASE}|${GLUE_DATABASE:-flink_icebergv3_db}|g" \
         -e "s|\${MYSQL_HOST}|${MYSQL_HOST}|g" \
         -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
         -e "s|\${MYSQL_PASSWORD}|${MYSQL_PASSWORD}|g" \
@@ -316,13 +316,14 @@ main() {
         deploy)
             check_env_vars
             display_config
+            # upload_scripts_to_s3
             # create_mysql_secret
 
             if [[ "$format" == "paimon" || "$format" == "both" ]]; then
                 log "Deploying Paimon lakehouse..."
                 manifest=$(generate_flink_deployment "paimon")
                 deploy_flink_job "$manifest"
-                monitor_deployment "flink-cdc-paimon"
+                monitor_deployment "flink-cdc-paimonv3"
             fi
 
             if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
@@ -330,7 +331,7 @@ main() {
                 create_glue_database
                 manifest=$(generate_flink_deployment "iceberg")
                 deploy_flink_job "$manifest"
-                monitor_deployment "flink-cdc-iceberg"
+                monitor_deployment "flink-cdc-icebergv3"
             fi
             ;;
 
@@ -402,7 +403,7 @@ main() {
             echo "  EMR_EXECUTION_ROLE_ARN, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD"
             echo ""
             echo "Optional for Iceberg:"
-            echo "  GLUE_DATABASE (default: flink_iceberg_db)"
+            echo "  GLUE_DATABASE (default: flink_icebergv3_db)"
             echo ""
             echo "Examples:"
             echo "  # Deploy Paimon only"

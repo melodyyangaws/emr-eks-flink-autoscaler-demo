@@ -6,8 +6,8 @@
 --   - Deduplicate merge engine (default): last-write-wins upsert via PK
 --   - ZSTD compression for better ratio on CDC payloads
 --   - Tuned compaction, write buffers, and snapshot retention for 60s checkpoints
---   - Iceberg compatibility: IcebergHiveMetadataCommitter writes read-only
---     Iceberg V2 metadata to Glue for Athena/Spark queries via Hadoop catalog
+--   - Iceberg compatibility: IcebergHadoopMetadataCommitter writes read-only
+--     Iceberg V3 metadata (deletion vectors) to S3 for Athena/Spark queries
 --   - Input changelog producer for downstream CDC consumers
 --
 -- Streaming best practices applied:
@@ -23,18 +23,18 @@
 --
 -- Required: 'aws.glue.enabled: "true"' in flinkConfiguration
 -- Required environment variables:
---   GLUE_DATABASE: Glue database name (default: flink_paimon_db)
+--   GLUE_DATABASE: Glue database name (default: flink_paimonv3_db)
 -- ============================================================================
 
 -- Switch to Paimon catalog
-USE CATALOG paimon_catalog;
-USE ${GLUE_DATABASE:flink_paimon_db};
+USE CATALOG paimon_catalogv3;
+USE ${GLUE_DATABASE:flink_paimonv3_db};
 
 -- ============================================================================
 -- Table: customers (Dimension Table — unpartitioned)
 -- ============================================================================
 -- Low cardinality, frequent updates (address/phone changes).
--- Fewer buckets (4) since total data volume is small.
+-- Fewer buckets (2) since total data volume is small.
 -- Smaller file target (32MB) and write buffer to save memory.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
@@ -50,35 +50,29 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'bucket' = '2',
+    'bucket' = '-1',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
-    -- File format & compression
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
-    -- Write tuning: 32MB target, spillable buffer for burst writes
     'target-file-size' = '32mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
-    -- Compaction: trigger after 4 sorted runs, cap at 8 to prevent stalls
     'num-sorted-run.compaction-trigger' = '4',
     'compaction.max.file-num' = '8',
-    -- Snapshot retention: 1hr / 5-10 snapshots, async expiration
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
     'snapshot.expire.execution-mode' = 'async',
-    -- Manifest optimization
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
     -- Iceberg compatibility via EMR Glue conf
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.format-version' = '3',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );
@@ -99,7 +93,7 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'bucket' = '2',
+    'bucket' = '-1',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
@@ -116,13 +110,11 @@ CREATE TABLE IF NOT EXISTS products (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
-    -- Iceberg compatibility via EMR Glue conf
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.format-version' = '3',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );
@@ -131,7 +123,7 @@ CREATE TABLE IF NOT EXISTS products (
 -- Table: orders (Fact Table — partitioned by date)
 -- ============================================================================
 -- High write volume, mostly inserts + status updates.
--- 8 buckets to handle higher throughput per partition.
+-- 4 buckets to handle higher throughput per partition.
 -- Larger file target (64MB) and write buffer for sustained throughput.
 CREATE TABLE IF NOT EXISTS orders (
     order_id INT,
@@ -145,17 +137,15 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
-    'bucket' = '4',
+    'bucket' = '-1',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
-    -- 64MB target for high-volume fact table
     'target-file-size' = '64mb',
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
-    -- Compaction: more aggressive for fact tables with updates (order_status)
     'num-sorted-run.compaction-trigger' = '4',
     'compaction.max.file-num' = '10',
     'snapshot.time-retained' = '1h',
@@ -164,23 +154,20 @@ CREATE TABLE IF NOT EXISTS orders (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
-    -- Iceberg compatibility via EMR Glue conf
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.format-version' = '3',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
-
 );
 
 -- ============================================================================
 -- Table: order_items (Fact Table — partitioned by date)
 -- ============================================================================
 -- Highest write volume (multiple items per order), append-heavy.
--- 8 buckets for parallelism. Largest write buffer.
+-- 4 buckets for parallelism. Largest write buffer.
 CREATE TABLE IF NOT EXISTS order_items (
     order_item_id INT,
     order_id INT,
@@ -192,7 +179,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_date_str VARCHAR,
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
-    'bucket' = '4',
+    'bucket' = '-1',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
@@ -209,13 +196,11 @@ CREATE TABLE IF NOT EXISTS order_items (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
-    -- Iceberg compatibility via EMR Glue conf
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    -- 'metadata.iceberg.manifest-legacy-version' = 'true',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '2',
+    'metadata.iceberg.format-version' = '3',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );

@@ -1,0 +1,9 @@
+# Local environment / credentials
+cdc-pipeline/mysql-cdc-env.sh
+
+# Deployed snapshots with resolved secrets
+cdc-pipeline/*-deployed.yaml
+cdc-pipeline/monitoring/*-deployed.yaml
+
+# Runtime logs
+*.log

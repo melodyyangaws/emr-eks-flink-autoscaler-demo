@@ -259,29 +259,84 @@ data:
         cursor.executemany(sql, updates)
         print(f"  → Updated {len(updates)} product stock levels")
 
-    def delete_old_cancelled_orders(cursor):
-        """Delete old cancelled orders (simulate data cleanup)"""
+    def delete_cancelled_orders(cursor, count):
+        """Delete cancelled orders and their items (simulate order cleanup)"""
         cursor.execute("""
-            DELETE FROM order_items WHERE order_id IN (
-              SELECT t.order_id FROM (
-                SELECT order_id FROM orders
-                WHERE order_status = 'CANCELLED'
-                AND updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
-                LIMIT 5
-              ) AS t
-            )
-        """)
-
-        cursor.execute("""
-            DELETE FROM orders
+            SELECT order_id FROM orders
             WHERE order_status = 'CANCELLED'
-            AND updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
-            LIMIT 5
-        """)
+            ORDER BY RAND() LIMIT %s
+        """, (count,))
+        order_ids = [row[0] for row in cursor.fetchall()]
 
-        deleted = cursor.rowcount
-        if deleted > 0:
-            print(f"  → Deleted {deleted} old cancelled orders")
+        if not order_ids:
+            print("  → No cancelled orders to delete")
+            return
+
+        placeholders = ','.join(['%s'] * len(order_ids))
+        cursor.execute(f"DELETE FROM order_items WHERE order_id IN ({placeholders})", order_ids)
+        items_deleted = cursor.rowcount
+        cursor.execute(f"DELETE FROM orders WHERE order_id IN ({placeholders})", order_ids)
+        orders_deleted = cursor.rowcount
+        print(f"  → Deleted {orders_deleted} cancelled orders and {items_deleted} related items")
+
+    def delete_customers(cursor, count):
+        """Delete random customers without orders (simulate account closure)"""
+        cursor.execute("""
+            SELECT c.customer_id FROM customers c
+            LEFT JOIN orders o ON c.customer_id = o.customer_id
+            WHERE o.order_id IS NULL
+            ORDER BY RAND() LIMIT %s
+        """, (count,))
+        customer_ids = [row[0] for row in cursor.fetchall()]
+
+        if not customer_ids:
+            print("  → No orphan customers to delete")
+            return
+
+        placeholders = ','.join(['%s'] * len(customer_ids))
+        cursor.execute(f"DELETE FROM customers WHERE customer_id IN ({placeholders})", customer_ids)
+        print(f"  → Deleted {cursor.rowcount} customers (account closure)")
+
+    def delete_order_items(cursor, count):
+        """Delete random order items from pending orders (simulate item removal)"""
+        cursor.execute("""
+            SELECT oi.order_item_id, oi.order_id, oi.subtotal
+            FROM order_items oi
+            JOIN orders o ON oi.order_id = o.order_id
+            WHERE o.order_status = 'PENDING'
+            ORDER BY RAND() LIMIT %s
+        """, (count,))
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("  → No order items to delete")
+            return
+
+        for item_id, order_id, subtotal in rows:
+            cursor.execute("DELETE FROM order_items WHERE order_item_id = %s", (item_id,))
+            cursor.execute(
+                "UPDATE orders SET total_amount = GREATEST(0, total_amount - %s) WHERE order_id = %s",
+                (subtotal, order_id)
+            )
+        print(f"  → Deleted {len(rows)} order items (item removal from pending orders)")
+
+    def delete_products(cursor, count):
+        """Delete random products with zero stock and no order references"""
+        cursor.execute("""
+            SELECT p.product_id FROM products p
+            LEFT JOIN order_items oi ON p.product_id = oi.product_id
+            WHERE p.stock_quantity = 0 AND oi.order_item_id IS NULL
+            ORDER BY RAND() LIMIT %s
+        """, (count,))
+        product_ids = [row[0] for row in cursor.fetchall()]
+
+        if not product_ids:
+            print("  → No zero-stock orphan products to delete")
+            return
+
+        placeholders = ','.join(['%s'] * len(product_ids))
+        cursor.execute(f"DELETE FROM products WHERE product_id IN ({placeholders})", product_ids)
+        print(f"  → Deleted {cursor.rowcount} products (discontinued, zero stock)")
 
     def print_statistics(cursor):
         """Print current database statistics"""
@@ -335,9 +390,12 @@ data:
                     ("insert_orders", lambda: insert_orders(cursor, random.randint(2, BATCH_SIZE * 2))),
                     ("update_orders", lambda: update_orders(cursor, random.randint(1, BATCH_SIZE))),
                     ("update_product_stock", lambda: update_product_stock(cursor, random.randint(1, BATCH_SIZE))),
+                    ("delete_cancelled_orders", lambda: delete_cancelled_orders(cursor, random.randint(1, 3))),
+                    ("delete_order_items", lambda: delete_order_items(cursor, random.randint(1, 5))),
                 ]
-                if iteration % 10 == 0:
-                    ops.append(("delete_old_cancelled_orders", lambda: delete_old_cancelled_orders(cursor)))
+                if iteration % 5 == 0:
+                    ops.append(("delete_customers", lambda: delete_customers(cursor, random.randint(1, 3))))
+                    ops.append(("delete_products", lambda: delete_products(cursor, random.randint(1, 3))))
 
                 for op_name, op_fn in ops:
                     try:

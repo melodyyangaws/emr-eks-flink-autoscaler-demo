@@ -87,7 +87,7 @@ MySQL CDC → Flink
 
 #### Paimon
 ```python
-CREATE CATALOG paimon_catalog WITH (
+CREATE CATALOG paimon_catalogv3 WITH (
     'type' = 'paimon',
     'warehouse' = 's3://bucket/paimon-warehouse/'
     # Glue integration
@@ -112,7 +112,7 @@ CREATE CATALOG paimon_catalog WITH (
 
 #### Iceberg
 ```python
-CREATE CATALOG iceberg_catalog WITH (
+CREATE CATALOG icebergv3_catalog WITH (
     'type' = 'iceberg',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
     'warehouse' = 's3://bucket/iceberg-warehouse/'
@@ -255,7 +255,7 @@ CREATE TABLE orders (...) WITH (
 **Manual or scheduled compaction:**
 ```sql
 -- Call compaction procedure (Spark/Flink)
-CALL iceberg_catalog.system.rewrite_data_files(
+CALL icebergv3_catalog.system.rewrite_data_files(
     table => 'orders',
     strategy => 'binpack',
     options => map('target-file-size-bytes','536870912') --default to 512MB
@@ -325,7 +325,7 @@ SELECT * FROM orders /*+ OPTIONS(
 #### Iceberg
 ```sql
 -- Query by snapshot ID
-SELECT * FROM "flink_iceberg_db"."orders$snapshots"
+SELECT * FROM "flink_icebergv3_db"."orders$snapshots"
 
 SELECT * FROM orders FOR VERSION AS OF 123456789;
 -- Query by timestamp
@@ -490,15 +490,15 @@ SELECT * FROM orders FOR TIMESTAMP AS OF '2024-01-01 00:00:00';
 ### From Paimon to Iceberg
 ```sql
 -- Export from Paimon
-INSERT INTO iceberg_catalog.db.customers
-SELECT * FROM paimon_catalog.db.customers;
+INSERT INTO icebergv3_catalog.db.customers
+SELECT * FROM paimon_catalogv3.db.customers;
 ```
 
 ### From Iceberg to Paimon
 ```sql
 -- Import to Paimon
-INSERT INTO paimon_catalog.db.customers
-SELECT * FROM iceberg_catalog.db.customers;
+INSERT INTO paimon_catalogv3.db.customers
+SELECT * FROM icebergv3_catalog.db.customers;
 ```
 
 **Note:** Both require full table rewrite. Plan for downtime or dual-write period.

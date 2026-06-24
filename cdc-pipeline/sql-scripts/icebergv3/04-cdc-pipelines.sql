@@ -2,18 +2,13 @@
 -- Iceberg CDC Streaming Pipelines
 -- ============================================================================
 -- Reads from MySQL CDC sources and writes to Iceberg V3 tables.
--- Computes explicit partition columns via DATE_FORMAT() because Flink SQL
--- does NOT support Iceberg hidden partition transforms (days(), months()).
---
--- Required environment variables:
---   GLUE_DATABASE: AWS Glue database name (default: flink_iceberg_db)
---   MYSQL_DATABASE: MySQL database name (default: ecommerce)
+-- Explicit DATE STRING partition columns computed via DATE_FORMAT().
 -- ============================================================================
 
 -- ============================================================================
 -- Pipeline 1: Customers (Dimension Table — unpartitioned)
 -- ============================================================================
-INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.customers
+INSERT INTO icebergv3_catalog.${GLUE_DATABASE:flink_icebergv3_db}.customers
 SELECT
     customer_id,
     customer_name,
@@ -31,7 +26,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_customers;
 -- ============================================================================
 -- Pipeline 2: Products (Dimension Table — partitioned by category)
 -- ============================================================================
-INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.products
+INSERT INTO icebergv3_catalog.${GLUE_DATABASE:flink_icebergv3_db}.products
 SELECT
     product_id,
     product_name,
@@ -46,8 +41,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_products;
 -- ============================================================================
 -- Pipeline 3: Orders (Fact Table — partitioned by order_dt)
 -- ============================================================================
--- DATE_FORMAT computes the explicit partition column order_dt from order_date.
-INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.orders
+INSERT INTO icebergv3_catalog.${GLUE_DATABASE:flink_icebergv3_db}.orders
 SELECT
     order_id,
     customer_id,
@@ -63,8 +57,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_orders;
 -- ============================================================================
 -- Pipeline 4: Order Items (Fact Table — partitioned by created_dt)
 -- ============================================================================
--- DATE_FORMAT computes the explicit partition column created_dt from created_at.
-INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.order_items
+INSERT INTO icebergv3_catalog.${GLUE_DATABASE:flink_icebergv3_db}.order_items
 SELECT
     order_item_id,
     order_id,

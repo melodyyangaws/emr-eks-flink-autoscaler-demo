@@ -6,14 +6,14 @@
 -- Prerequisites:
 --   - Iceberg tables created by Flink CDC
 --   - StarRocks cluster running on EKS with AWS IAM role
---   - AWS Glue database: flink_iceberg_db
+--   - AWS Glue database: flink_icebergv3_db
 -- ============================================================================
 
 -- Connect to StarRocks
 -- mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 
 -- Create Iceberg catalog with AWS Glue
-CREATE EXTERNAL CATALOG iceberg_catalog
+CREATE EXTERNAL CATALOG icebergv3_catalog
 PROPERTIES (
     "type" = "iceberg",
     "iceberg.catalog.type" = "glue",
@@ -24,13 +24,13 @@ PROPERTIES (
 );
 
 -- Switch to Iceberg catalog
-SET CATALOG iceberg_catalog;
+SET CATALOG icebergv3_catalog;
 
 -- Show databases
 SHOW DATABASES;
 
 -- Use Glue database
-USE flink_iceberg_db;
+USE flink_icebergv3_db;
 
 -- Show tables
 SHOW TABLES;

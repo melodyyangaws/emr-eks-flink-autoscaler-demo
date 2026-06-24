@@ -59,7 +59,7 @@ check_prerequisites() {
 
 # Create IAM service account for StarRocks
 create_iam_service_account() {
-    local cluster_name=${EKS_CLUSTER_NAME:-my-eks-cluster}
+    local cluster_name=${EKS_CLUSTER_NAME}
 
     log "Creating IAM service account for StarRocks..."
 

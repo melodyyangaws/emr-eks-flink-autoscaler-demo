@@ -63,11 +63,11 @@ cdc-pipeline/
 ├── sql-scripts/
 │   ├── common/
 │   │   └── 02-cdc-sources.sql          ← MySQL CDC source table definitions
-│   ├── paimon/
+│   ├── paimonv3/
 │   │   ├── 01-catalog-setup.sql        ← Paimon catalog (Hive/Glue metastore)
 │   │   ├── 03-paimon-sinks.sql         ← Paimon tables (DV + Iceberg compat)
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
-│   ├── iceberg/
+│   ├── icebergv3/
 │   │   ├── 01-catalog-setup.sql        ← Iceberg catalog (Glue)
 │   │   ├── 03-iceberg-sinks.sql        ← Iceberg V3 tables (merge-on-read)
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
@@ -138,6 +138,9 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
 export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
 export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role
 export LAKEHOUSE_FORMAT=both  # paimon | iceberg | both
+
+# upload flink sql-scripts to s3
+aws s3 sync sql-scripts/ s3://emr-on-eks-test-021732063925-us-west-2/flink/sql-scripts/
 
 # build and push docker image to ECR
 ./build-deploy-generic.sh build
@@ -226,7 +229,7 @@ The monitor reads table stats via:
 
 **Athena (Icebergv2)** — query via Athena Console directly:
 ```sql
-SELECT * FROM flink_iceberg_db.customers LIMIT 10;
+SELECT * FROM flink_icebergv3_db.customers LIMIT 10;
 ```
 
 **Athena (Paimon)** — query via Athena Notebook :
@@ -241,7 +244,7 @@ SELECT * FROM flink_iceberg_db.customers LIMIT 10;
 
 ```sql
 spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
-spark.sql("SELECT * FROM paimon_iceberg.flink_paimon_db.customers LIMIT 10").show()
+spark.sql("SELECT * FROM paimon_iceberg.flink_paimonv3_db.customers LIMIT 10").show()
 ```
 
 **StarRocks on EKS** — native support for both Paimon and Iceberg:

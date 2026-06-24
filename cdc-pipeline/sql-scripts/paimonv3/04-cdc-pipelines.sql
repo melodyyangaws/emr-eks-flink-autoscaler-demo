@@ -8,13 +8,13 @@
 --
 -- Note: These are long-running streaming INSERT statements
 -- ============================================================================
--- SET 'execution.checkpointing.interval' = '10s';
+-- SET 'execution.checkpointing.interval' = '60s';
 -- SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
 -- SET 'table.exec.sink.upsert-materialize' = 'NONE';
 -- ============================================================================
 -- Pipeline 1: Customers (Dimension Table)
 -- ============================================================================
-INSERT INTO paimon_catalog.${GLUE_DATABASE:flink_paimon_db}.customers
+INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.customers
 SELECT
     customer_id,
     customer_name,
@@ -32,7 +32,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_customers;
 -- ============================================================================
 -- Pipeline 2: Products (Dimension Table)
 -- ============================================================================
-INSERT INTO paimon_catalog.${GLUE_DATABASE:flink_paimon_db}.products
+INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.products
 SELECT
     product_id,
     product_name,
@@ -47,7 +47,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_products;
 -- ============================================================================
 -- Pipeline 3: Orders (Fact Table with Date Partitioning)
 -- ============================================================================
-INSERT INTO paimon_catalog.${GLUE_DATABASE:flink_paimon_db}.orders
+INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.orders
 SELECT
     order_id,
     customer_id,
@@ -63,7 +63,7 @@ FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_orders;
 -- ============================================================================
 -- Pipeline 4: Order Items (Fact Table with Date Partitioning)
 -- ============================================================================
-INSERT INTO paimon_catalog.${GLUE_DATABASE:flink_paimon_db}.order_items
+INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.order_items
 SELECT
     order_item_id,
     order_id,
