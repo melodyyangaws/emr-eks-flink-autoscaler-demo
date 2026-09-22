@@ -21,11 +21,19 @@ log = logging.getLogger("monitor-entrypoint")
 
 PAIMON_FLINK_URL = os.environ.get("PAIMON_FLINK_URL", "http://flink-cdc-paimonv3-rest:8081")
 ICEBERG_FLINK_URL = os.environ.get("ICEBERG_FLINK_URL", "http://flink-cdc-icebergv3-rest:8081")
-AWS_REGION = os.environ.get("AWS_REGION", "${AWS_REGION}")
+AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 PAIMON_GLUE_DB = os.environ.get("PAIMON_GLUE_DB", "flink_paimonv3_db")
 ICEBERG_GLUE_DB = os.environ.get("ICEBERG_GLUE_DB", "flink_icebergv3_db")
-PAIMON_WAREHOUSE = os.environ.get("PAIMON_WAREHOUSE", "s3://emr-on-eks-test-021732063925-us-west-2/paimonv3-warehouse")
-ICEBERG_WAREHOUSE = os.environ.get("ICEBERG_WAREHOUSE", "s3://emr-on-eks-test-021732063925-us-west-2/icebergv3-warehouse")
+# No bucket is hardcoded here: the warehouse roots come from the ConfigMap
+# flink-cdc-monitor-configv3, which deploy-monitor.sh renders from $BUCKET_NAME.
+# A stale literal here silently pointed the monitor at another account's bucket,
+# so if the vars are missing we fail fast instead of reading the wrong data.
+PAIMON_WAREHOUSE = os.environ.get("PAIMON_WAREHOUSE")
+ICEBERG_WAREHOUSE = os.environ.get("ICEBERG_WAREHOUSE")
+if not PAIMON_WAREHOUSE or not ICEBERG_WAREHOUSE:
+    log.error("PAIMON_WAREHOUSE and ICEBERG_WAREHOUSE must be set "
+              "(see monitoring/monitor-deployment.yaml)")
+    sys.exit(1)
 CDC_TABLES = os.environ.get("CDC_TABLES", "customers,products,orders,order_items").split(",")
 MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "120"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))

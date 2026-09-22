@@ -39,9 +39,9 @@ A **flexible, SQL-driven** approach to Flink CDC that eliminates the need to reb
         │  (File Catalog)    │   │  (AWS Glue)       │
         └────────┬───────────┘   └───────┬───────────┘
                  │                       │
-        ┌────────┴────────┐     ┌────────┴────────┐
-        │  Spark Query    │     │  Athena Query   │
-        └─────────────────┘     └─────────────────┘
+        ┌────────┴───-─────┐     ┌────────┴────────┐
+        │Spark/Athena Query│     │  Athena Query   │
+        └────────────-─────┘     └─────────────────┘
 ```
 
 ---

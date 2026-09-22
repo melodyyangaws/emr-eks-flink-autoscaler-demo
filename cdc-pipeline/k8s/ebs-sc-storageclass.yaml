@@ -1,0 +1,30 @@
+# StorageClass for Flink task-local recovery by EBS volume mount.
+#
+# The name MUST be exactly "ebs-sc". EMR on EKS hardcodes it: when
+# `task.local-recovery.ebs.enable: "true"` is set (see flink-cdc-paimon-sql.yaml
+# and flink-cdc-iceberg-sql.yaml), the operator auto-creates one PVC per
+# TaskManager named ebs-claim-<deployment>-taskmanager-<n>-<slot> with
+# storageClassName: ebs-sc. There is no Flink config key to change that name —
+# only the size (kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit).
+# Without this class the TaskManager pods stay Pending with
+#   "failed to get storage class, StorageClass storage.k8s.io \"ebs-sc\" not found".
+# See https://docs.aws.amazon.com/emr/latest/EMR-on-EKS-DevelopmentGuide/jobruns-flink-restart.html
+#
+# The AWS doc's version is provisioner + volumeBindingMode only, which defaults
+# to gp2. We back it with gp3 instead: same price per GB, 3000 IOPS / 125 MB/s
+# baseline included, which matters because this volume holds the RocksDB local
+# state copy that local recovery reads on restart.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+provisioner: ebs.csi.aws.com
+# Bind only once a TaskManager pod is scheduled, so the volume is created in the
+# same AZ as the pod (Karpenter picks the AZ, not the PVC).
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+parameters:
+  type: gp3
+  fstype: ext4
+  encrypted: "true"

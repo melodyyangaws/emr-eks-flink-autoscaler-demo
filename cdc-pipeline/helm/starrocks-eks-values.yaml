@@ -1,51 +1,69 @@
-# StarRocks Helm Values for EKS Deployment
-# Optimized for lakehouse analytics on Paimon and Iceberg
-
-starrocksFESpec:
-  replicas: 3
-  image:
-    repository: starrocks/fe-ubuntu
-    tag: "3.2.2"
-  resources:
-    requests:
-      cpu: 2
-      memory: 8Gi
-    limits:
-      cpu: 4
-      memory: 16Gi
-  service:
-    type: LoadBalancer
-    ports:
-      - name: http
-        port: 8030
-      - name: query
-        port: 9030
-  storageSpec:
-    storageClassName: gp3
-    storageSize: 100Gi
-  nodeSelector:
-    karpenter.sh/capacity-type: on-demand
-
-starrocksBeSpec:
-  replicas: 3
-  image:
-    repository: starrocks/be-ubuntu
-    tag: "3.2.2"
-  resources:
-    requests:
-      cpu: 4
-      memory: 16Gi
-    limits:
-      cpu: 8
-      memory: 32Gi
-  storageSpec:
-    storageClassName: gp3
-    storageSize: 500Gi
-  nodeSelector:
-    karpenter.sh/capacity-type: spot
+# StarRocks Helm Values for EKS Deployment (kube-starrocks chart >= 1.11)
+# Optimized for lakehouse analytics on Paimon and Iceberg.
+#
+# Notes for this environment (loadtest-mcp / us-west-2 / 633458367150):
+#   - Chart 1.11.x nests component specs under the `starrocks:` key. Earlier
+#     charts (<= 1.8) used top-level starrocksFESpec/starrocksBeSpec.
+#   - Image tag is left empty so the chart's appVersion is used. The sink tables
+#     are Iceberg format-version 3 and Paimon 1.3 with deletion vectors, which
+#     need a recent StarRocks — do not pin back to 3.2.x.
+#   - S3/Glue access uses IRSA: the pods run with a ServiceAccount annotated
+#     with the EMR execution role, which already carries the S3 + Glue read
+#     permissions the external catalogs need. The catalogs therefore use
+#     aws.s3.use_aws_sdk_default_behavior (web identity), NOT use_instance_profile
+#     — the node instance profile has no S3/Glue access on this cluster.
 
 operator:
   enabled: true
-  image:
-    repository: starrocks/operator
-    tag: "1.8.7"
+
+# The chart does NOT create the FE/BE pod ServiceAccount — it only references an
+# existing one by name (starrocksFESpec.serviceAccount / starrocksBeSpec.serviceAccount).
+# Create it out-of-band with the IRSA annotation before installing:
+#
+#   kubectl create serviceaccount starrocks-sa -n emr-flink
+#   kubectl annotate serviceaccount starrocks-sa -n emr-flink \
+#     eks.amazonaws.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role
+#
+# That role's trust policy already allows system:serviceaccount:emr-flink:*, which
+# is why StarRocks is installed into emr-flink rather than its own namespace.
+
+starrocks:
+  nameOverride: "kube-starrocks"
+
+  starrocksFESpec:
+    replicas: 1
+    image:
+      repository: starrocks/fe-ubuntu
+      tag: ""
+    serviceAccount: starrocks-sa
+    resources:
+      requests:
+        cpu: 2
+        memory: 8Gi
+      limits:
+        cpu: 4
+        memory: 16Gi
+    storageSpec:
+      name: fe
+      storageClassName: gp3
+      storageSize: 50Gi
+    service:
+      type: ClusterIP
+
+  starrocksBeSpec:
+    replicas: 3
+    image:
+      repository: starrocks/be-ubuntu
+      tag: ""
+    serviceAccount: starrocks-sa
+    resources:
+      requests:
+        cpu: 4
+        memory: 16Gi
+      limits:
+        cpu: 6
+        memory: 24Gi
+    storageSpec:
+      name: be
+      storageClassName: gp3
+      storageSize: 200Gi

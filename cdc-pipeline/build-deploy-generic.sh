@@ -113,34 +113,113 @@ create_ecr_repo() {
     fi
 }
 
-# Build and push Docker image
+# Build and push the Flink CDC image.
+#
+# The build always runs in-cluster with Kaniko — there is no local-docker path.
+# The image is ~6 GB, more than a typical laptop has free, and building remotely
+# means no Docker daemon, no ECR docker login, and no dependence on the laptop's
+# architecture. Requires ServiceAccount image-builder-sa in $NAMESPACE (IRSA ->
+# a role allowed to push to ECR and read the build context from S3).
 build_and_push_image() {
     local emr_version=${EMR_VERSION:-7.12.0}
     local repo_name="emr-flink-cdc-paimon"
-    local image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:oss-iceberg"
+    # Tag must match the image reference in flink-cdc-*-sql.yaml (:${IMAGE_TAG})
+    local image_tag=${IMAGE_TAG:-$emr_version}
+    local image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:${image_tag}"
 
-    log "Building Docker image..."
-
-    # Login to ECR
-    log "Logging into ECR..."
-    aws ecr get-login-password --region "$AWS_REGION" | \
-        docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" || \
-        error "Failed to login to ECR"
-
-    # Create repository
     create_ecr_repo "$repo_name"
-
-    # Build multi-platform image
-    log "Building and pushing multi-platform image (amd64, arm64)..."
-    docker buildx build \
-        --platform linux/amd64,linux/arm64 \
-        -t "$image_uri" \
-        -f docker/Dockerfile.cdc-paimon \
-        --build-arg EMR_VERSION="$emr_version" \
-        --push . || error "Failed to build and push image"
+    build_image_with_kaniko "$repo_name" "$image_uri" "$emr_version"
 
     log "✓ Image built and pushed: $image_uri"
     echo "$image_uri"
+}
+
+# Build the image inside the EKS cluster with Kaniko.
+# The Dockerfile is shipped to S3 as a tarball build context, then a one-shot Pod
+# builds it and pushes straight to ECR.
+build_image_with_kaniko() {
+    local repo_name=$1
+    local image_uri=$2
+    local emr_version=$3
+    local namespace=${NAMESPACE:-emr-flink}
+    local pod_name="flink-cdc-image-build"
+    local context_s3="s3://${BUCKET_NAME}/flink/build/flink-cdc-build-context.tar.gz"
+    local context_tar="/tmp/flink-cdc-build-context.tar.gz"
+
+    log "Building image in-cluster with Kaniko (namespace: ${namespace})..."
+
+    if ! kubectl get serviceaccount image-builder-sa -n "$namespace" &>/dev/null; then
+        error "ServiceAccount image-builder-sa not found in ${namespace}. It needs an
+       eks.amazonaws.com/role-arn annotation for a role that can push to ECR."
+    fi
+
+    # Pack only the Dockerfile — every dependency is fetched from Maven/ECR at
+    # build time, so no other local file is part of the context.
+    log "Packing build context -> ${context_s3}"
+    tar -czf "$context_tar" -C docker Dockerfile.cdc-paimon || error "Failed to pack build context"
+    aws s3 cp "$context_tar" "$context_s3" --region "$AWS_REGION" >&2 || \
+        error "Failed to upload build context to S3"
+
+    kubectl delete pod "$pod_name" -n "$namespace" --ignore-not-found --timeout=120s >&2
+
+    # Kaniko is amd64-only here, hence the explicit arch nodeSelector.
+    kubectl apply -n "$namespace" -f - >&2 <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: ${namespace}
+spec:
+  restartPolicy: Never
+  serviceAccountName: image-builder-sa
+  nodeSelector:
+    kubernetes.io/arch: amd64
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.23.2
+    args:
+    - "--context=${context_s3}"
+    - "--dockerfile=Dockerfile.cdc-paimon"
+    - "--destination=${image_uri}"
+    - "--build-arg=EMR_VERSION=${emr_version}"
+    - "--cache=false"
+    - "--verbosity=info"
+    env:
+    - name: AWS_REGION
+      value: ${AWS_REGION}
+    - name: AWS_SDK_LOAD_CONFIG
+      value: "true"
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+    volumeMounts:
+    - name: workspace
+      mountPath: /kaniko/.cache
+  volumes:
+  - name: workspace
+    emptyDir:
+      sizeLimit: 40Gi
+EOF
+
+    log "Waiting for Kaniko build to finish (this takes several minutes)..."
+    local deadline=$((SECONDS + 1800))
+    local phase=""
+    while (( SECONDS < deadline )); do
+        phase=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        case "$phase" in
+            Succeeded) log "✓ Kaniko build succeeded"; return 0 ;;
+            Failed)
+                kubectl logs "$pod_name" -n "$namespace" --tail=60 >&2 || true
+                error "Kaniko build failed (pod ${pod_name})" ;;
+        esac
+        sleep 20
+    done
+
+    error "Kaniko build timed out after 30m (pod ${pod_name}, last phase: ${phase:-unknown})"
 }
 
 # Upload PyFlink executor and SQL scripts to S3
@@ -203,6 +282,59 @@ create_glue_database() {
     fi
 }
 
+# Create the "ebs-sc" StorageClass required by task-local recovery by EBS.
+#
+# One-off, cluster-scoped, idempotent: run it once per EKS cluster. Both jobs set
+# `task.local-recovery.ebs.enable: "true"`, and EMR then auto-creates one PVC per
+# TaskManager with the hardcoded storageClassName "ebs-sc" — the name is not
+# configurable. Without the class, TaskManager pods stay Pending with
+# "failed to get storage class, StorageClass storage.k8s.io \"ebs-sc\" not found".
+create_ebs_storage_class() {
+    local manifest="k8s/ebs-sc-storageclass.yaml"
+
+    if kubectl get storageclass ebs-sc &>/dev/null; then
+        log "✓ StorageClass ebs-sc already exists"
+        return 0
+    fi
+
+    log "Creating StorageClass ebs-sc (gp3) for Flink task-local recovery..."
+    [[ -f "$manifest" ]] || error "Manifest not found: $manifest"
+    kubectl apply -f "$manifest" >&2 || error "Failed to create StorageClass ebs-sc"
+    log "✓ StorageClass ebs-sc created"
+}
+
+# Install Kyverno and the single-AZ policy for Flink CDC jobs.
+#
+# One-off, cluster-scoped, idempotent: run it once per EKS cluster. Karpenter
+# chooses an AZ per node independently, so without this a job's JobManager and
+# TaskManagers land in different AZs — cross-AZ transfer cost on every heartbeat
+# and shuffle, and an unfair paimon-vs-iceberg comparison when only one of the two
+# jobs happens to be split. The policy mutates TaskManager pods with a required
+# zone podAffinity keyed on the per-deployment label
+# eks-subscription.amazonaws.com/emr.internal.id. See
+# k8s/kyverno-flink-az-affinity.yaml for the full rationale.
+install_kyverno_az_policy() {
+    local policy="k8s/kyverno-flink-az-affinity.yaml"
+
+    if kubectl get crd clusterpolicies.kyverno.io &>/dev/null; then
+        log "✓ Kyverno already installed"
+    else
+        log "Installing Kyverno via Helm..."
+        command -v helm >/dev/null || error "helm not found; needed to install Kyverno"
+        helm repo add kyverno https://kyverno.github.io/kyverno/ >&2 2>/dev/null || true
+        helm repo update kyverno >&2 || true
+        helm upgrade --install kyverno kyverno/kyverno \
+            --namespace kyverno --create-namespace --wait --timeout 10m >&2 || \
+            error "Failed to install Kyverno"
+        log "✓ Kyverno installed"
+    fi
+
+    log "Applying ClusterPolicy flink-cdc-single-az..."
+    [[ -f "$policy" ]] || error "Policy not found: $policy"
+    kubectl apply -f "$policy" >&2 || error "Failed to apply $policy"
+    log "✓ ClusterPolicy flink-cdc-single-az applied"
+}
+
 # Generate FlinkDeployment YAML
 generate_flink_deployment() {
     local format=$1
@@ -215,16 +347,23 @@ generate_flink_deployment() {
         error "Template file not found: $template_file"
     fi
 
-    # Substitute environment variables
+    # Substitute environment variables.
+    # NOTE: MYSQL_PASSWORD is deliberately NOT substituted — the manifest pulls it
+    # in via `envFrom: secretRef: ${MYSQL_ENV_SECRET_NAME}` so no credential is
+    # ever written to the generated file.
     sed -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
         -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
         -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
         -e "s|\${EMR_EXECUTION_ROLE_ARN}|${EMR_EXECUTION_ROLE_ARN}|g" \
         -e "s|\${EMR_VERSION}|${EMR_VERSION:-7.12.0}|g" \
+        -e "s|\${IMAGE_TAG}|${IMAGE_TAG:-${EMR_VERSION:-7.12.0}}|g" \
         -e "s|\${GLUE_DATABASE}|${GLUE_DATABASE:-flink_icebergv3_db}|g" \
         -e "s|\${MYSQL_HOST}|${MYSQL_HOST}|g" \
         -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
-        -e "s|\${MYSQL_PASSWORD}|${MYSQL_PASSWORD}|g" \
+        -e "s|\${MYSQL_SECRET_NAME}|${MYSQL_SECRET_NAME:-mysql-cdc-credentials}|g" \
+        -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
+        -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
+        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-executor-memorynodepool}|g" \
         "$template_file" > "$output_file"
 
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] ✓ FlinkDeployment manifest generated: $output_file" >&2
@@ -313,9 +452,43 @@ main() {
             upload_scripts_to_s3
             ;;
 
+        render)
+            # Render the manifests without applying them.
+            #
+            # `deploy both` applies paimon, waits for it to reconcile, then applies
+            # iceberg — the two jobs start ~30s apart. That is fine normally, but it
+            # invalidates a paimon-vs-iceberg benchmark: with scan.startup.mode =
+            # initial, whichever job starts first snapshots a smaller MySQL table and
+            # gets a head start on the binlog. Render first, then apply both
+            # manifests in one kubectl call so their snapshot phases overlap:
+            #
+            #   ./build-deploy-generic.sh render
+            #   kubectl apply -n emr-flink -f flink-cdc-paimon-deployed.yaml \
+            #                              -f flink-cdc-iceberg-deployed.yaml
+            check_env_vars
+            display_config
+            create_ebs_storage_class
+            install_kyverno_az_policy
+
+            if [[ "$format" == "paimon" || "$format" == "both" ]]; then
+                generate_flink_deployment "paimon" >/dev/null
+            fi
+            if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
+                create_glue_database
+                generate_flink_deployment "iceberg" >/dev/null
+            fi
+
+            info "Manifests rendered but NOT applied. Apply both at once with:"
+            echo "  kubectl apply -n ${NAMESPACE:-emr-flink} \\"
+            [[ "$format" == "paimon"  || "$format" == "both" ]] && echo "    -f flink-cdc-paimon-deployed.yaml \\"
+            [[ "$format" == "iceberg" || "$format" == "both" ]] && echo "    -f flink-cdc-iceberg-deployed.yaml"
+            ;;
+
         deploy)
             check_env_vars
             display_config
+            create_ebs_storage_class
+            install_kyverno_az_policy
             # upload_scripts_to_s3
             # create_mysql_secret
 
@@ -340,6 +513,8 @@ main() {
             display_config
             build_and_push_image
             upload_scripts_to_s3
+            create_ebs_storage_class
+            install_kyverno_az_policy
             # create_mysql_secret
 
             if [[ "$format" == "paimon" || "$format" == "both" ]]; then
@@ -381,10 +556,11 @@ main() {
             ;;
 
         help|*)
-            echo "Usage: $0 {build|deploy|all|cleanup|monitor} [FORMAT]"
+            echo "Usage: $0 {build|render|deploy|all|cleanup|monitor} [FORMAT]"
             echo ""
             echo "Commands:"
             echo "  build    - Build Docker image and upload scripts to S3"
+            echo "  render   - Render manifests only (apply both at once for a fair benchmark)"
             echo "  deploy   - Deploy Flink job to Kubernetes"
             echo "  all      - Build and deploy (complete setup)"
             echo "  cleanup  - Remove deployed resources"

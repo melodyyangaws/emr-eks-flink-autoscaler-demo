@@ -1,0 +1,97 @@
+# Keep every pod of both Flink CDC jobs in a single Availability Zone.
+#
+# Why: Karpenter picks an AZ per node independently, so a job gets spread by
+# default (the iceberg job first landed with its JobManager in us-west-2b and 3 of
+# its 4 TaskManagers in us-west-2a). That costs real money and latency here:
+#   - every TM->JM heartbeat and every shuffle byte crosses an AZ boundary
+#     (cross-AZ data transfer is billed in both directions),
+#   - and if only one of the two jobs is split, the paimon-vs-iceberg hot-data
+#     benchmark is not measuring the formats, it is measuring network topology.
+#
+# How: inject a nodeSelector pinning the pod to ${FLINK_CDC_ZONE}. Both jobs land
+# in the same zone, which also removes cross-job variance from the benchmark.
+#
+# Why a nodeSelector and NOT a podAffinity:
+#   The first version of this policy used a required podAffinity on
+#   topology.kubernetes.io/zone keyed on the per-deployment label
+#   eks-subscription.amazonaws.com/emr.internal.id. It deadlocked. Karpenter does
+#   not reliably honour an inter-pod affinity zone constraint when it decides
+#   where to launch a node: it provisioned a us-west-2b node for TaskManagers
+#   whose JobManager was already in us-west-2a, the scheduler then rejected that
+#   node ("didn't match pod affinity rules"), the TMs stayed Pending, and the
+#   adaptive scheduler's resource-wait timeout expired ->
+#   NoResourceAvailableException -> job FAILED. A nodeSelector is a hard
+#   constraint Karpenter evaluates at provisioning time, so the node it creates is
+#   in the right zone to begin with. It also needs no already-running anchor pod,
+#   which means the JobManager can carry the same rule as the TaskManagers.
+#
+# Trade-off: a pod can no longer fall back to another AZ if this zone is out of
+# spot capacity — it stays Pending instead. That is intended for a benchmark with
+# a known-uniform topology, not a general-purpose default. If the zone runs dry,
+# change the value below and redeploy rather than removing the policy, so the two
+# jobs stay comparable.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flink-cdc-single-az
+  annotations:
+    policies.kyverno.io/title: Pin Flink CDC job pods to one AZ
+    policies.kyverno.io/category: EMR on EKS / Flink
+    policies.kyverno.io/subject: Pod
+spec:
+  # Mutate only — never block a pod. If the label is missing the rule is skipped.
+  background: false
+  rules:
+  - name: flink-cdc-pods-single-zone
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          # CREATE only — this is not a cosmetic scoping choice, it is required.
+          # Without it the rule also fires on UPDATE, and the JobManager PATCHes
+          # its own pod while starting the ResourceManager. Kyverno re-injected
+          # spec.nodeSelector into that PATCH, the API server rejected it
+          # ("pod updates may not change fields other than
+          # spec.containers[*].image..."), the ResourceManager hit a fatal error,
+          # and the JM went CrashLoopBackOff with "Shutdown in progress".
+          # A nodeSelector only has meaning at scheduling time anyway, so
+          # mutating an already-scheduled pod could never do anything useful.
+          operations:
+          - CREATE
+          namespaces:
+          - emr-flink
+          selector:
+            matchExpressions:
+            # Match on `app`, which the Flink operator sets to the
+            # FlinkDeployment name and which is present in the pod spec from the
+            # moment it is submitted.
+            #
+            # An earlier version keyed on eks-subscription.amazonaws.com/emr.internal.id
+            # (Exists). Do not go back to it: EMR stamps that label
+            # asynchronously, so it is NOT reliably on the pod at admission time.
+            # Some JobManager pods carried it and some did not; for the ones that
+            # did not the rule was silently skipped and the pod was scheduled into
+            # whatever zone Karpenter picked — a skipped mutate rule fails open,
+            # so there is no error to notice, just an unpinned pod.
+            - key: app
+              operator: In
+              values:
+              - flink-cdc-paimonv3
+              - flink-cdc-icebergv3
+            # Both JobManager and TaskManager — see the nodeSelector rationale
+            # above for why the JM can safely carry the rule too.
+            - key: component
+              operator: In
+              values:
+              - jobmanager
+              - taskmanager
+    mutate:
+      patchStrategicMerge:
+        spec:
+          nodeSelector:
+            # Both nodepools (driver-nodepool for JMs, executor-memorynodepool for
+            # TMs) have capacity in this zone on this cluster. Keep it aligned with
+            # wherever the JobManagers actually land; if they are already running
+            # elsewhere, set this to their zone rather than forcing a restart.
+            topology.kubernetes.io/zone: us-west-2b

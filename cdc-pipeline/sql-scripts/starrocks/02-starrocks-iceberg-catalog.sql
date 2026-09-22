@@ -13,14 +13,19 @@
 -- mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 
 -- Create Iceberg catalog with AWS Glue
+--
+-- Credentials: use_aws_sdk_default_behavior picks up the IRSA web-identity
+-- credentials of the starrocks-sa ServiceAccount, for both Glue and S3. Do NOT
+-- use *.use_instance_profile on this cluster — the node instance profile has no
+-- S3/Glue permissions.
 CREATE EXTERNAL CATALOG icebergv3_catalog
 PROPERTIES (
     "type" = "iceberg",
     "iceberg.catalog.type" = "glue",
-    "aws.glue.region" = "us-west-2",
-    "aws.s3.region" = "us-west-2",
-    "aws.s3.use_instance_profile" = "true",
-    "client.factory" = "com.starrocks.connector.iceberg.glue.IcebergGlueCatalogFactory"
+    "aws.glue.region" = "${AWS_REGION}",
+    "aws.glue.use_aws_sdk_default_behavior" = "true",
+    "aws.s3.region" = "${AWS_REGION}",
+    "aws.s3.use_aws_sdk_default_behavior" = "true"
 );
 
 -- Switch to Iceberg catalog

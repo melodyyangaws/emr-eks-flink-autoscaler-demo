@@ -83,12 +83,11 @@ cdc-pipeline/
 │   └── mysql-data-generator.yaml       ← ConfigMap + Deployment (Python)
 │
 ├── monitoring/
-│   ├── Dockerfile.monitor              ← Monitor image (pyiceberg + boto3)
-│   ├── deploy-monitor.sh               ← Build & deploy monitor
+│   ├── deploy-monitor.sh               ← Deploy monitor (no image build)
 │   ├── flink_cdc_monitor.py            ← Flink REST API + table stats
 │   ├── entrypoint.py                   ← Continuous monitoring loop
-│   ├── monitor-deployment.yaml         ← K8s Deployment + ConfigMap
-│   └── requirements.txt
+│   ├── monitor-deployment.yaml         ← K8s Deployment (python:3.11-slim) + ConfigMap
+│   └── requirements.txt                ← pip-installed at pod boot
 │
 ├── deploy-starrocks.sh                 ← StarRocks on EKS deployment
 ├── helm/
@@ -140,7 +139,7 @@ export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-tes
 export LAKEHOUSE_FORMAT=both  # paimon | iceberg | both
 
 # upload flink sql-scripts to s3
-aws s3 sync sql-scripts/ s3://emr-on-eks-test-021732063925-us-west-2/flink/sql-scripts/
+aws s3 sync sql-scripts/ s3://${BUCKET_NAME}/flink/sql-scripts/
 
 # build and push docker image to ECR
 ./build-deploy-generic.sh build
@@ -152,7 +151,7 @@ aws s3 sync sql-scripts/ s3://emr-on-eks-test-021732063925-us-west-2/flink/sql-s
 kubectl apply -f flink-cdc-iceberg-deployed.yaml
 kubectl apply -f flink-cdc-paimon-deployed.yaml
 
-# stop two flnk CDC pipelines
+# if needed, stop two flnk CDC pipelines
 ./build-deploy-generic.sh cleanup
 # or individual CDC pipeline
 kubectl delete -f flink-cdc-iceberg-deployed.yaml
@@ -205,13 +204,14 @@ source mysql-cdc-env.sh
 Deploy a custom monitor pod in EKS that continuously tracks both Paimon and Iceberg CDC pipelines, comparing throughput, checkpoints, and table growth.
 
 ```bash
-# Build image + deploy pod ( 10 mins)
+# Deploy (no image build — runs python:3.11-slim, code from a ConfigMap)
 bash ./monitoring/deploy-monitor.sh
 
-# Or deploy without rebuilding docker image ( in seconds)
-kubectl apply -f monitoring/monitor-deployment-deployed.yaml
+# Pause / resume without redeploying
+kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=0
+kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=1
 
-# Stop the monitoring
+# Remove entirely
 kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 
 # View logs
@@ -320,8 +320,8 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 | Athena Spark can't read Paimon tables | Use Hadoop catalog in Athena Spark; set `metadata.iceberg.format-version = '2'` |
 | Athena SQL can't read Paimon tables | Manually change table_type property to `Icberg` in Glue Catalog |
 | StarRocks SA conflict | Annotate existing SA with Helm release metadata |
-| Docker image platform mismatch | Build with `--platform linux/amd64,linux/arm64` |
-| Monitor pod `ImagePullBackOff` | Use `docker buildx build --platform` for multi-arch |
+| Flink image build fails locally | Builds run in-cluster with Kaniko; no local Docker needed |
+| Monitor pod stuck `ContainerCreating`/no logs | First boot pip-installs pyiceberg+pyarrow (~2 min); check `kubectl logs` again |
 | Monitor pod can't assume role | Update IAM trust policy to allow the SA's OIDC subject |
 
 ---
@@ -329,7 +329,7 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 ## Resources Created
 
 - ☑️ 1 RDS MySQL instance (binlog-enabled, CDC user configured)
-- ☑️ 2 ECR repository (multi-arch Flink CDC & monitor images)
+- ☑️ 1 ECR repository (Flink CDC image, built in-cluster with Kaniko)
 - ☑️ 2 FlinkDeployments (Paimon + Iceberg pipelines)
 - ☑️ 1 Data generator Deployment (ConfigMap-based Python script)
 - ☑️ 1 Monitor Deployment (Flink REST API + Glue/pyiceberg stats)

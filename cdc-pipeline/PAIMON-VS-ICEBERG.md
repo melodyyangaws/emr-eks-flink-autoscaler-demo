@@ -341,15 +341,22 @@ SELECT * FROM orders FOR TIMESTAMP AS OF '2024-01-01 00:00:00';
 8. Checkpoint Tradeoff
 
 ╭────────────────────────────┬──────────────────────────────────────────┬────────────────────────────────╮
-│                            │ Paimon (5,102ms)                         │ Iceberg (870ms)                │
+│                            │ Paimon (8,822ms)                         │ Iceberg (437ms)                │
 ├────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────┤
 │ Checkpoint work            │ Compact + expire + flush + dual metadata │ Append + flush + metadata      │
-│ Post-checkpoint state      │ Clean (468 files, 0 deletes)             │ Dirty (770 files, 781 deletes) │
+│ Post-checkpoint state      │ Clean (in-file bitmap DVs, no deletes)   │ Dirty (1:1 data:delete files)  │
 │ Needs external compaction  │ No                                       │ Yes                            │
 │ Read performance over time │ Stable                                   │ Degrades without compaction    │
 ╰────────────────────────────┴──────────────────────────────────────────┴────────────────────────────────╯
 **Paimon pays upfront at checkpoint time → stable read performance.
 **Iceberg defers work → fast checkpoints but accumulates technical debt.
+
+Durations above are from the 2026-09-21 run (see [Performance Benchmarks](#performance-benchmarks)).
+One caution on the Iceberg figure: in that run Iceberg's 437 ms was the duration of
+checkpoint #5, the **last one that ever succeeded** before the V3 deletion-vector
+incompatibility began failing every subsequent commit. The "defers work" tradeoff is real,
+but on this release the deferral was total — 59 of 62 checkpoints failed and the table
+stopped advancing altogether.
 
 ---
 
@@ -421,53 +428,148 @@ SELECT * FROM orders FOR TIMESTAMP AS OF '2024-01-01 00:00:00';
 
 ## Performance Benchmarks
 
-> **Test Environment:** EMR on EKS 7.12, Flink 1.20, Paimon 1.3.0, Iceberg 1.10.0-amzn-0,
-> parallelism=4, 30s checkpoint interval, MySQL 8.0 CDC source (4 tables).
+> **Measured 2026-09-21, `loadtest-mcp` EKS cluster (us-west-2), EMR on EKS 7.12.0,
+> Flink 1.20.0-amzn-6, Paimon 1.3.0, Iceberg V3 via bundled `iceberg-flink-runtime.jar`.**
+> Job parallelism 16, 60 s checkpoint interval, MySQL 8.0 CDC source (4 tables).
+>
+> Both jobs were deployed from a clean slate **at the same time** (20:28:01 and 20:28:09
+> UTC) after emptying all four S3 prefixes and dropping both Glue databases, so their
+> snapshot phases overlap and the comparison is like-for-like. Load: 5 data generator
+> replicas, `BATCH_SIZE=220`, `SLEEP_SECONDS=2`.
+>
+> Flink figures are **deltas over a bounded 322 s window** (a 300 s target; the
+> extra 22 s is REST sampling time, and throughput is divided by the real elapsed
+> value, not the target), captured with
+> `monitoring/capture-flink-metrics.sh`. Lifetime counters are dominated by the initial
+> snapshot replay and would hide steady-state behaviour.
 
-### Write Performance
+### ⚠️ Iceberg V3 + the Flink sink are incompatible on this release
+
+The single most important result of this run is a hard failure, not a ratio.
+
+```
+java.lang.IllegalArgumentException: Must use DVs for position deletes in V3: s3://.../orders/data/...parquet
+  at org.apache.iceberg.MergingSnapshotProducer.validateNewDeleteFile(MergingSnapshotProducer.java:292)
+  at org.apache.iceberg.flink.sink.IcebergFilesCommitter.commitDeltaTxn(IcebergFilesCommitter.java:363)
+```
+
+Iceberg format-version 3 **requires** deletion vectors (Puffin) for position deletes. The
+bundled Flink sink still writes legacy positional-delete Parquet files, so Iceberg's own
+commit validator rejects every delta commit. `'write.delete.vector.enabled' = 'true'` is
+already set in the sink DDL and does not help — the writer path ignores it.
+
+What this looks like in practice, and why it is dangerous:
+
+- **59 of 62 checkpoints failed.** The last successful commit was checkpoint #5.
+- **The table froze silently.** Newest `orders.updated_at` was 58 minutes stale
+  (3,468 s) while Paimon's was 26 s.
+- **The job still reported `RUNNING`.** Two of four `IcebergFilesCommitter` tasks were
+  `FAILED`; sources, writers and the remaining committers kept running, so neither
+  `/jobs` nor the operator's `jobStatus` surfaced the problem. Only
+  `/jobs/<id>/checkpoints` and the per-vertex task states revealed it.
+- **Writers kept producing orphaned S3 objects** that no snapshot references —
+  `order_items/data/` held 6 Parquet objects while `order_items$files` reported 3.
+
+Every Iceberg number below is therefore measured against a frozen, smaller dataset.
+
+### Write Performance (322 s bounded window)
 
 | Metric | Paimon | Iceberg | Winner |
-|--------|--------|---------|--------|
-| Cumulative Records Written | 2,347,162 | 1,759,421 | 🟢 Paimon |
-| Burst Throughput (catch-up) | ~20,400 rec/s | ~2,330 rec/s | 🟢 Paimon |
-| Steady-State Throughput | ~8 rec/s | ~2.3 rec/s | 🟢 Paimon |
-| Data Files (all tables) | 468 | 770 | 🟢 Paimon |
-| Delete Files | 0 (deletion vectors) | 781 (position deletes) | 🟢 Paimon |
+|--------|-------:|--------:|--------|
+| Records written in window | 1,820,387 | 645,003 | 🟢 Paimon (2.8×) |
+| Throughput | **5,653 rec/s** | 2,003 rec/s | 🟢 Paimon (2.8×) |
+| Bytes written | 268.5 MB | 87.6 MB | 🟢 Paimon (3.1×) |
+| Lifetime records | 23,879,576 | 13,874,186 | 🟢 Paimon (1.7×) |
+| Checkpoints completed in window | **6** | **0** | 🟢 Paimon |
+| Checkpoints failed in window | **0** | **5** | 🟢 Paimon |
+| Lifetime checkpoints failed | **0 / 61** | **59 / 62** | 🟢 Paimon |
+| Last checkpoint duration | 8,822 ms | 437 ms | — (see below) |
+| Last checkpoint size | 0.91 MB | 0.05 MB | — (see below) |
 | Compaction | Automatic (LSM-tree) | Manual (`rewrite_data_files`) | 🟢 Paimon |
-| Backpressure | None | None | Tie |
 
-### Read / Query Performance
+Read the last two rows carefully — they are a trap. Iceberg's checkpoints look 20× faster
+and 18× smaller, which reads like a win. They are fast because they are **from
+checkpoint #5, the last one that ever completed**, and small because the committer that
+would carry real state is dead. A fast checkpoint on a pipeline that cannot commit is not
+a performance characteristic.
 
-| Metric | Paimon | Iceberg | Winner |
-|--------|--------|---------|--------|
+Iceberg's 2,003 rec/s is likewise not sustained ingest: writers continue to produce files,
+but none of it becomes queryable. Paimon's 5,653 rec/s is data actually visible to readers.
+
+### Data freshness — the metric that decides real-time suitability
+
+| Metric | Paimon | Iceberg |
+|---|---:|---:|
+| Newest row (`orders.updated_at`) | 2026-09-21 21:40:53 | 2026-09-21 20:38:30 |
+| Lag behind now | **26 s** | **3,468 s (58 min)** |
+| Rows in `orders` | 793,366 | 434,643 |
+| Last successful commit | continuous | 20:38 UTC, then never |
+
+### Read / Query Performance (StarRocks 4.1.4)
+
+Server-side `Time` from the StarRocks FE audit log, median of 3 runs. Full methodology,
+including why client-side timing had to be discarded, is in
+[`4-STARROCKS-OLAP-ENGINE.md`](./4-STARROCKS-OLAP-ENGINE.md#performance-comparison).
+
+| Query class | Paimon | Iceberg | Notes |
+|---|---:|---:|---|
+| Q1 COUNT(*) | 187 ms | 35 ms | Iceberg scans 241K rows vs Paimon 400K |
+| Q6 4-table JOIN | 920 ms | 283 ms | Iceberg scans 2.2M vs Paimon 3.9M |
+| **Q7 freshness (5 min)** | 351 ms | 52 ms | **Iceberg scans 61 rows — window is empty** |
+| **Q9 10-min rollup** | 235 ms | 55 ms | **Iceberg scans 61 rows — window is empty** |
+| **Q10 10-min join** | 562 ms | 111 ms | **Iceberg scans 10,927 vs Paimon 2.66M** |
+
+On static scans (Q1–Q6) Iceberg is genuinely 1.3–2.5× faster **per row scanned** — the
+expected benefit of a compacted Parquet layout with rich min/max statistics. On hot
+queries it is not faster; it is empty. That is the distinction this test was built to
+draw, and the numbers draw it sharply.
+
+| Capability | Paimon | Iceberg | Winner |
+|---|---|---|---|
 | Athena SQL | ❌ Not supported | ✅ Native via Glue | 🟢 Iceberg |
-| Athena Spark | ✅ Via Hadoop catalog | ✅ Native | 🟢 Iceberg |
-| StarRocks | ✅ Native catalog | ✅ Native catalog | Tie |
-| Query Planning Speed | Slower (binary Avro metadata) | Faster (JSON with summary stats) | 🟢 Iceberg |
-| Read Amplification (MoR) | Low (in-file bitmap DVs) | High (781 delete files to merge) | 🟢 Paimon |
-| Partition Pruning | Manual string columns | Hidden partition transforms | 🟢 Iceberg |
-| Time Travel | `scan.timestamp` hint | `VERSION AS OF` / `TIMESTAMP AS OF` | 🟢 Iceberg |
+| StarRocks external catalog | ✅ Native | ✅ Native | Tie |
+| Static scan efficiency (per row) | Baseline | 1.3–2.5× faster | 🟢 Iceberg |
+| Hot / sub-minute freshness | ✅ 26 s | ❌ frozen | 🟢 Paimon |
+| Partition pruning | Manual string columns | Hidden partition transforms | 🟢 Iceberg |
+| Time travel | `scan.timestamp` hint | `VERSION AS OF` / `TIMESTAMP AS OF` | 🟢 Iceberg |
 
 ### Storage & Metadata
 
 | Metric | Paimon | Iceberg | Winner |
-|--------|--------|---------|--------|
-| Total Storage | 59.4 MB | Managed via Glue | — |
-| File-to-Delete Ratio | 468 : 0 | 770 : 781 (~1:1) | 🟢 Paimon |
-| Snapshot Retention | 5 (auto-expired) | 107+ (accumulating) | 🟢 Paimon |
-| Metadata Format | Binary Avro | JSON with rich summary | 🟢 Iceberg |
-| Iceberg Compatibility | ✅ via `IcebergHiveMetadataCommitter` | Native | 🟢 Iceberg |
+|---|---:|---:|---|
+| S3 objects | 6,270 | 209 | — (not comparable) |
+| Total size | 252 MB | 41 MB | — (not comparable) |
+| Data : delete file ratio | n/a (in-file bitmap DVs) | **1 : 1** (43:43, 18:18, 2:2, 3:3) | 🟢 Paimon |
+| Snapshots retained | auto-expired | 2–3 (frozen, not expired) | — |
+| Metadata format | Binary Avro | JSON with rich summary | 🟢 Iceberg |
+
+The size columns are not a fair comparison: Iceberg holds 58% of the rows and stopped
+writing an hour earlier. The **1:1 data-to-delete-file ratio** is the meaningful number —
+every Iceberg data file carries a matching positional-delete file. That is the
+merge-on-read tax this test set out to quantify, and it is the same mechanism that tripped
+the V3 deletion-vector validator.
 
 ### Verdict
 
-| Strength | Winner | Why |
-|----------|--------|-----|
-| **CDC Write Throughput** | 🟢 Paimon | 8.7× higher burst, auto-compaction, zero delete files |
-| **Query Engine Support** | 🟢 Iceberg | Native Athena SQL, Spark, Trino, Presto, StarRocks |
-| **Storage Efficiency** | 🟢 Paimon | 40% fewer files, no delete file overhead, aggressive expiration |
-| **Read Performance** | 🟢 Iceberg | Rich metadata → fast planning; but degrades as delete files grow |
-| **Operational Simplicity** | 🟢 Paimon | No compaction scheduling, no delete file management |
-| **Ecosystem Maturity** | 🟢 Iceberg | Broader adoption, better tooling, native AWS integration |
+| Strength | Winner | Basis in this run |
+|---|---|---|
+| **CDC write throughput** | 🟢 Paimon | 5,653 vs 2,003 rec/s over an identical 322 s window |
+| **Write reliability on V3** | 🟢 Paimon | 61/61 checkpoints vs 3/62; Iceberg cannot commit at all |
+| **Real-time freshness** | 🟢 Paimon | 26 s vs 58 min; 3 of 4 hot queries returned nothing on Iceberg |
+| **Static scan efficiency** | 🟢 Iceberg | 1.3–2.5× faster per row scanned (on a frozen, compacted table) |
+| **Query engine support** | 🟢 Iceberg | Native Athena SQL, Spark, Trino, Presto |
+| **Operational simplicity** | 🟢 Paimon | Automatic LSM compaction; no delete-file or DV management |
+| **Failure visibility** | 🟢 Paimon | Iceberg showed `RUNNING` with a dead committer for 58 minutes |
+
+**Caveat on scope.** The Iceberg half of this comparison measures a broken pipeline. The
+V3/deletion-vector incompatibility must be resolved — either drop the sinks to
+`format-version = 2`, which accepts the positional deletes the sink actually writes, or
+upgrade `iceberg-flink-runtime.jar` to a build that writes Puffin DVs — before Iceberg's
+write throughput or hot-query latency can be fairly compared. Paimon's figures stand on
+their own; it ingested continuously with zero checkpoint failures throughout.
+
+**Still outstanding:** the post-`rewrite_data_files` compacted-Iceberg row. Compaction is
+meaningless while commits fail, so that measurement is deferred rather than skipped.
 
 ---
 

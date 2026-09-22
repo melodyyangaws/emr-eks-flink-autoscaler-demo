@@ -1,5 +1,15 @@
-boto3>=1.34.0
-pyiceberg[glue,s3fs]>=0.7.0
-pyarrow>=14.0.0
-requests>=2.31.0
-tabulate>=0.9.0
+# Pinned exactly, not >=, on purpose.
+#
+# With open ranges (boto3>=1.34.0, pyiceberg>=0.7.0) pip's resolver backtracks
+# through boto3's ~1500 published releases one metadata fetch at a time and the
+# install never finishes — it hung a builder pod for 10+ minutes and left the
+# monitor pod Running with no logs. Pinning makes it a single resolution pass,
+# which matters because these are installed at pod boot.
+#
+# Bump deliberately and re-test; pyiceberg constrains pyarrow, so move those two
+# together.
+boto3==1.40.0
+pyiceberg[glue,s3fs]==0.9.1
+pyarrow==19.0.1
+requests==2.32.3
+tabulate==0.9.0

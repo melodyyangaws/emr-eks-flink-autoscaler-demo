@@ -1,0 +1,35 @@
+stamp,suite,query,metric,paimon,iceberg,ratio_iceberg_over_paimon
+20260921T213321Z,snapshot,Q1_count,time_ms,187,35,0.19x
+20260921T213321Z,snapshot,Q1_count,scan_rows,399732,241464,0.60x
+20260921T213321Z,snapshot,Q1_count,scan_bytes,0,0,n/a
+20260921T213321Z,snapshot,Q2_group_by,time_ms,209,44,0.21x
+20260921T213321Z,snapshot,Q2_group_by,scan_rows,399732,241464,0.60x
+20260921T213321Z,snapshot,Q2_group_by,scan_bytes,0,0,n/a
+20260921T213321Z,snapshot,Q3_join,time_ms,336,114,0.34x
+20260921T213321Z,snapshot,Q3_join,scan_rows,1244185,676198,0.54x
+20260921T213321Z,snapshot,Q3_join,scan_bytes,5612258,2905889,0.52x
+20260921T213321Z,snapshot,Q4_product_sales,time_ms,668,150,0.22x
+20260921T213321Z,snapshot,Q4_product_sales,scan_rows,2704458,1551294,0.57x
+20260921T213321Z,snapshot,Q4_product_sales,scan_bytes,14090570,2778203,0.20x
+20260921T213321Z,snapshot,Q5_time_window,time_ms,203,84,0.41x
+20260921T213321Z,snapshot,Q5_time_window,scan_rows,844453,434734,0.51x
+20260921T213321Z,snapshot,Q5_time_window,scan_bytes,4481350,2664174,0.59x
+20260921T213321Z,snapshot,Q6_multi_join,time_ms,920,283,0.31x
+20260921T213321Z,snapshot,Q6_multi_join,scan_rows,3948643,2227478,0.56x
+20260921T213321Z,snapshot,Q6_multi_join,scan_bytes,20540342,3578347,0.17x
+20260921T213321Z,hot,Q7_freshness,time_ms,351,52,0.15x
+20260921T213321Z,hot,Q7_freshness,scan_rows,147837,61,0.00x
+20260921T213321Z,hot,Q7_freshness,scan_bytes,1578,0,0.00x
+20260921T213321Z,hot,Q8_hot_pk_lookup,time_ms,579,69,0.12x
+20260921T213321Z,hot,Q8_hot_pk_lookup,scan_rows,851544,434851,0.51x
+20260921T213321Z,hot,Q8_hot_pk_lookup,scan_bytes,40158,806366,20.08x
+20260921T213321Z,hot,Q9_recent_window,time_ms,235,55,0.23x
+20260921T213321Z,hot,Q9_recent_window,scan_rows,398232,61,0.00x
+20260921T213321Z,hot,Q9_recent_window,scan_bytes,1958072,0,0.00x
+20260921T213321Z,hot,Q10_hot_join,time_ms,562,111,0.20x
+20260921T213321Z,hot,Q10_hot_join,scan_rows,2663463,10927,0.00x
+20260921T213321Z,hot,Q10_hot_join,scan_bytes,16774632,44407,0.00x
+20260921T213321Z,state,customers,rows_and_files,392307,240972,ice_files=86 ice_snaps=3
+20260921T213321Z,state,products,rows_and_files,388826,232561,ice_files=36 ice_snaps=2
+20260921T213321Z,state,orders,rows_and_files,748849,434643,ice_files=4 ice_snaps=2
+20260921T213321Z,state,order_items,rows_and_files,2235533,1307630,ice_files=6 ice_snaps=3

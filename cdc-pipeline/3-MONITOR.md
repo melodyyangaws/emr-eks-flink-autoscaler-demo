@@ -39,21 +39,22 @@ export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
 export NAMESPACE=emr-flink
 ```
 
-### Deploy Monitor (Build + Deploy)
+### Deploy Monitor
 
 ```bash
 cd cdc-pipeline
 bash ./monitoring/deploy-monitor.sh
 ```
 
-NOTE: This builds the Docker image (multi-arch: amd64+arm64), pushes to ECR, and deploys the K8s Deployment.
+There is **no image to build**. The monitor runs stock `python:3.11-slim`: the
+script pushes `flink_cdc_monitor.py`, `entrypoint.py`, and `requirements.txt`
+into the `flink-cdc-monitor-code` ConfigMap (~41 KB, well under the 1 MB limit),
+and the pod `pip install`s the requirements at boot. That trades ~2 min of cold
+pod startup for dropping the whole build-and-push path — no Dockerfile, no ECR
+repository, and no `ecr:*` push grant on the execution role.
 
-### Deploy Monitor 
-Once docker image is published to ECR, in the case of rerun the montioring process, we can avoid rebuilding the docker image and directly run the monitor deployment as below:
-
-```bash
-kubectl apply -f monitoring/monitor-deployment.yaml
-```
+To pick up a code change, re-run the same script: it refreshes the ConfigMap and
+restarts the Deployment.
 
 ### View Logs
 
@@ -64,7 +65,11 @@ kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 ### Stop Monitoring
 
 ```bash
-kubectl delete -f monitoring/monitor-deployment.yaml
+# Pause (keeps the Deployment and ConfigMap, so restarting is instant)
+kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=0
+
+# Or remove entirely
+kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 ```
 
 ---
@@ -99,14 +104,14 @@ kubectl delete -f monitoring/monitor-deployment.yaml
 
 ```
 monitoring/
-├── Dockerfile.monitor          ← Multi-stage Docker image (Python 3.11)
-├── deploy-monitor.sh           ← Build (docker buildx) + push to ECR + kubectl apply
+├── deploy-monitor.sh           ← Code ConfigMap + envsubst + kubectl apply (no image build)
 ├── flink_cdc_monitor.py        ← FlinkCDCMonitor class
 │   ├── Flink REST API client   → job status, throughput, checkpoints
 │   ├── pyiceberg table reader  → Iceberg snapshot stats
 │   └── Glue API fallback       → Paimon table stats via boto3
 ├── entrypoint.py               ← Main loop: build monitors → run → sleep → repeat
-├── monitor-deployment.yaml     ← K8s Deployment + ConfigMap (env vars)
+├── monitor-deployment.yaml     ← Template: Deployment (python:3.11-slim) + ConfigMap
+├── monitor-deployment-deployed.yaml ← Rendered output of the template (gitignored)
 └── requirements.txt            ← boto3, pyiceberg[glue,s3fs], pyarrow, requests, tabulate
 ```
 

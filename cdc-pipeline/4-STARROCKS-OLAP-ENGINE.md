@@ -248,20 +248,149 @@ kubectl get pods -n starrocks
 
 ## Performance Comparison
 
-### Test Queries (1M customers, 10M orders, 50M order items)
+> **Measured 2026-09-21 on `loadtest-mcp` EKS (us-west-2), StarRocks 4.1.4 (1 FE, 3 BE).**
+> Both CDC jobs were started from a clean slate at 20:28:01–20:28:09 UTC (S3 warehouses
+> emptied, Glue databases dropped) so the snapshot phases overlapped. Load: 5 data
+> generator replicas against MySQL 8.0, `BATCH_SIZE=220`, `SLEEP_SECONDS=2`.
+> Scripts: `sql-scripts/starrocks/bench-server-side.sh`, `monitoring/capture-flink-metrics.sh`.
+>
+> ### How these timings are measured — read this before trusting any number here
+>
+> Query times come from the **StarRocks FE audit log** (`/opt/starrocks/fe/log/fe.audit.log`,
+> the `Time=` / `ScanRows=` / `ScanBytes=` fields), not from a stopwatch around a client call.
+>
+> That distinction is not pedantic — it is the difference between a valid and an invalid
+> benchmark. The first version of this harness timed each query client-side around
+> `kubectl exec ... mysql -e`. Every query came back at ~5,500 ms whether it was a
+> `COUNT(*)` or a four-table join, which is the tell that something is wrong. A control
+> proved it: a bare `SELECT 1;` measured **5,665 ms** while the `COUNT(*)` measured
+> **6,079 ms**, and the audit log recorded that same `COUNT(*)` as **Time=684**. Roughly
+> 5.6 s of every reading was `kubectl exec` plus mysql client startup — about 89% of the
+> measurement was harness. Ratios computed from those numbers compared process-spawn
+> overhead, not StarRocks.
+>
+> If you re-run this, use `bench-server-side.sh`. `bench-hot-data.sh` still times
+> client-side and its absolute numbers should not be quoted.
 
-| Query | Athena (Iceberg) | StarRocks (Paimon) | StarRocks (Iceberg) |
-|-------|------------------|---------------------|----------------------|
-| **Q1: COUNT(*)** | 3.2s | 0.8s | 1.1s |
-| **Q2: GROUP BY state** | 4.5s | 1.2s | 1.5s |
-| **Q3: 2-table JOIN** | 8.1s | 2.3s | 2.8s |
-| **Q4: 4-table JOIN** | 15.7s | 4.6s | 5.2s |
-| **Q5: Time-range filter** | 5.3s | 1.1s | 1.4s |
-| **Q6: Complex aggregation** | 22.5s | 6.8s | 7.3s |
+### ⚠️ The Iceberg pipeline was NOT healthy during this run
 
-**Winner:** StarRocks + Paimon for real-time analytics
-**Runner-up:** StarRocks + Iceberg for mixed workloads
-**Best for Ad-hoc:** Athena (no infrastructure management)
+Every Iceberg number below is measured against a table that **stopped receiving data
+58 minutes before the benchmark ran**. This is not a caveat to note and move past; it
+invalidates any straight reading of "Iceberg was faster."
+
+Root cause, from the JobManager log:
+
+```
+java.lang.IllegalArgumentException: Must use DVs for position deletes in V3:
+  s3://.../icebergv3-warehouse/flink_icebergv3_db.db/orders/data/order_dt=2026-09-21/00010-0-...parquet
+  at org.apache.iceberg.MergingSnapshotProducer.validateNewDeleteFile(MergingSnapshotProducer.java:292)
+  at org.apache.iceberg.flink.sink.IcebergFilesCommitter.commitDeltaTxn(IcebergFilesCommitter.java:363)
+  at org.apache.iceberg.flink.sink.IcebergFilesCommitter.notifyCheckpointComplete(...)
+```
+
+The tables are created with `'format-version' = '3'`, and format-version 3 **requires**
+deletion vectors (Puffin) for position deletes. The bundled `iceberg-flink-runtime.jar`
+sink still emits legacy positional-delete Parquet files, so Iceberg's own validator
+rejects the commit. Setting `'write.delete.vector.enabled' = 'true'` in the sink DDL
+(it is already set — see `sql-scripts/icebergv3/03-iceberg-sinks.sql`) does not change
+this: the writer path ignores it.
+
+Consequences, all confirmed:
+
+| Symptom | Evidence |
+|---|---|
+| Commit fails on every checkpoint | 59 of 62 checkpoints failed; last success was checkpoint #5 |
+| Table frozen at last good commit | Newest `orders.updated_at` = 20:38:30 UTC, i.e. **3,468 s stale** vs Paimon's **26 s** |
+| Job still reports `RUNNING` | 2 of 4 `IcebergFilesCommitter` tasks are `FAILED`; the other operators keep running, so `/jobs` shows RUNNING and the failure is invisible from status alone |
+| Written data is orphaned | Writers keep producing Parquet to S3 that no snapshot references — `order_items/data/` holds 6 objects while `order_items$files` reports 3 |
+
+So Iceberg's apparent query speed is mostly **a smaller, frozen, already-compacted
+dataset**: 434,643 rows vs Paimon's 793,366 at the same instant. Nothing is landing to
+slow it down.
+
+### Snapshot queries (Q1–Q6) — server-side `Time`, median of 3 runs
+
+`ScanRows` is included because it is what makes the timings interpretable.
+
+| Query | Paimon ms | Iceberg ms | Paimon ScanRows | Iceberg ScanRows | ms per M rows scanned (P → I) |
+|-------|----------:|-----------:|----------------:|-----------------:|---|
+| **Q1** COUNT(*) | 187 | 35 | 399,732 | 241,464 | 468 → 145 |
+| **Q2** GROUP BY state | 209 | 44 | 399,732 | 241,464 | 523 → 182 |
+| **Q3** 2-table JOIN | 336 | 114 | 1,244,185 | 676,198 | 270 → 169 |
+| **Q4** product sales JOIN | 668 | 150 | 2,704,458 | 1,551,294 | 247 → 97 |
+| **Q5** 7-day time window | 203 | 84 | 844,453 | 434,734 | 240 → 193 |
+| **Q6** 4-table JOIN | 920 | 283 | 3,948,643 | 2,227,478 | 233 → 127 |
+
+Iceberg reads ~58% of the rows but takes ~20–40% of the time, so it is genuinely faster
+**per row scanned** as well — roughly 1.3–2.5×. That part is a real Iceberg advantage and
+is what you would expect from a static, fully-compacted Parquet layout with rich
+min/max statistics. It is also exactly the state a frozen table is in.
+
+### Hot-data queries (Q7–Q10) — the real-time test
+
+All predicates use `UTC_TIMESTAMP()`, never `NOW()`. The FE session timezone is +08:00
+while CDC writes UTC, so `NOW()` silently matches zero rows and a broken query looks
+like a fast one.
+
+| Query | Paimon ms | Iceberg ms | Paimon ScanRows | Iceberg ScanRows | Verdict |
+|-------|----------:|-----------:|----------------:|-----------------:|---|
+| **Q7** freshness (5-min window) | 351 | 52 | 147,837 | **61** | Iceberg window is empty |
+| **Q8** hot PK lookup (MAX order_id) | 579 | 69 | 851,544 | 434,851 | Iceberg returns a stale row |
+| **Q9** 10-min status rollup | 235 | 55 | 398,232 | **61** | Iceberg window is empty |
+| **Q10** 10-min join to order_items | 562 | 111 | 2,663,463 | **10,927** | Iceberg window is near-empty |
+
+**This is the headline result of the whole exercise.** On Q7/Q9/Q10 Iceberg scans ~61 rows
+against Paimon's 148K–2.7M. It is not answering the question faster; it has no recent data
+to answer it with. A dashboard on the Paimon table shows activity from 26 seconds ago;
+the same dashboard on Iceberg shows nothing in the last 10 minutes and gives no error.
+
+Paimon's cost on these queries is real work: its LSM tree is continuously absorbing and
+compacting fresh writes, and the hot window genuinely contains hundreds of thousands of
+rows. 351 ms to answer "what happened in the last 5 minutes" over a live 793K-row table
+is the actual real-time number.
+
+### Table state at benchmark time
+
+| Table | Paimon rows | Iceberg rows | Iceberg data files | Iceberg delete files | Iceberg snapshots |
+|-------|------------:|-------------:|-------------------:|---------------------:|------------------:|
+| customers | 392,307 | 240,972 | 43 | 43 | 3 |
+| products | 388,826 | 232,561 | 18 | 18 | 2 |
+| orders | 748,849 | 434,643 | 2 | 2 | 2 |
+| order_items | 2,235,533 | 1,307,630 | 3 | 3 | 3 |
+
+Note the **1:1 data-file-to-delete-file ratio** — every Iceberg data file has a matching
+positional-delete file. That 1:1 ratio is the merge-on-read tax this test set out to
+measure, and it is also precisely what tripped the V3 deletion-vector validator.
+
+Storage footprint: Paimon 6,270 objects / 252 MB; Iceberg 209 objects / 41 MB. Iceberg's
+figure is small mainly because it holds 58% of the rows and stopped writing an hour ago.
+
+### Verdict
+
+| Dimension | Winner | Basis |
+|---|---|---|
+| **Hot / real-time queries** | 🟢 **Paimon** | 26 s freshness vs 3,468 s; Iceberg returned empty or stale results on 3 of 4 hot queries |
+| **Static scan efficiency** | 🟢 **Iceberg** | 1.3–2.5× faster per row scanned on Q1–Q6 — genuine, but measured on a frozen compacted table |
+| **CDC write reliability (V3)** | 🟢 **Paimon** | 61/61 checkpoints vs 3/62; Iceberg V3 + Flink sink is incompatible on this release |
+| **Failure visibility** | 🟢 **Paimon** | Iceberg reported `RUNNING` with a dead committer and a frozen table for 58 minutes |
+
+**Not yet measured:** the post-`rewrite_data_files` comparison. Compacting Iceberg is
+pointless while it cannot commit — fix the deletion-vector problem first, let both
+formats ingest the same live data, then re-run `SUITE=hot` for a fair compacted-vs-hot row.
+
+### Reproducing / fixing before you re-benchmark
+
+The Iceberg side needs one of these before its numbers mean anything:
+
+1. **Drop to `format-version = 2`** in `sql-scripts/icebergv3/03-iceberg-sinks.sql`. V2
+   accepts positional-delete files, which is what the sink actually writes. This trades
+   the V3 feature set for a pipeline that commits — and it still exercises merge-on-read
+   with accumulating delete files, which is the comparison this test wants.
+2. **Upgrade `iceberg-flink-runtime.jar`** to a build whose sink writes Puffin deletion
+   vectors, and keep V3.
+
+Option 1 is the smaller change and keeps the delete-file read-amplification behaviour
+under test. Option 2 is the right long-term fix.
 
 ---
 
@@ -328,4 +457,4 @@ Start: Need OLAP Query Layer
 
 **Status**: ✅ Production Ready
 **Last Updated**: 2026-03-08
-**Technologies**: Flink 1.20, Paimon 1.3.0, Iceberg 1.10.0-amzn-0, StarRocks 3.2.x
+**Technologies**: Flink 1.20, Paimon 1.3.0, Iceberg 1.10.0-amzn-0, StarRocks 4.1.4

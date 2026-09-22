@@ -57,10 +57,20 @@ RUN dnf swap -y curl-minimal curl && \
 FROM public.ecr.aws/emr-on-eks/flink/emr-${EMR_VERSION}-flink:latest
 USER root
 
+# ${FLINK_LIB_DIR} is on both FLINK_CLASSPATH and HADOOP_CLASSPATH below, so the
+# connector jars are installed there only. Do NOT also copy them into
+# /usr/share/aws/emr/emrfs/auxlib — that directory is on the same classpath, and a
+# second copy of each jar makes Flink's ServiceLoader see every table factory
+# twice ("Multiple factories for identifier ..." at TableEnvironment.create()).
 COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar ${FLINK_LIB_DIR}
-COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar /usr/share/aws/emr/emrfs/auxlib
 # COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-hive3-client/target/aws-glue-datacatalog-hive3-client-*.jar ${FLINK_LIB_DIR}
 
+# The base EMR image intentionally sets none of these three variables. We add
+# them because the PyFlink entry point (opt/flink-python), the Glue Data Catalog
+# Hive client (opt/aws-glue-datacatalog-hive3-client) and the Hive/Glue metastore
+# jars (glue/) must all be visible to the JVM. Putting opt/ on the classpath also
+# exposes jars that stock Flink deliberately keeps off it, so the conflicting ones
+# are deleted below — see the "prune opt/" RUN step.
 ENV FLINK_CLASSPATH="/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*"
 ENV FLINK_ENV_JAVA_OPTS="${FLINK_ENV_JAVA_OPTS} -Djava.class.path=${FLINK_CLASSPATH}"
 ENV HADOOP_CLASSPATH="${FLINK_CLASSPATH}:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*"
@@ -71,6 +81,28 @@ RUN cp /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar ${FLINK_LIB_DIR} && 
     rm /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar && \
     rm -rf /tmp/* /var/tmp/* && \
     dnf clean all 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Prune opt/ — remove the jars that break the job once opt/ is on the classpath
+# ---------------------------------------------------------------------------
+# flink-table-planner_2.12 is the *unshaded* planner. lib/ already ships
+# flink-table-planner-loader, and having both makes TableEnvironment.create()
+# fail with "Multiple factories for identifier 'default' that implement
+# org.apache.flink.table.delegation.ExecutorFactory" (DefaultExecutorFactory vs
+# DelegateExecutorFactory). Stock Flink keeps exactly one of the two on the
+# classpath; we keep the loader.
+#
+# flink-gs-fs-hadoop (Google Cloud Storage) bundles a protobuf/gRPC version that
+# collides with the Hadoop/AWS one, so FileSystem.initialize() dies before the
+# job even starts with "java.lang.VerifyError: Bad type on operand stack" in
+# com.google.api.ClientProto.registerAllExtensions. This pipeline only ever
+# touches s3://, so GCS (and the equally unused Azure/OSS filesystems) can go.
+RUN rm -f ${FLINK_OPT_DIR}/flink-table-planner_2.12-*.jar \
+           ${FLINK_OPT_DIR}/flink-gs-fs-hadoop-*.jar \
+           ${FLINK_OPT_DIR}/flink-azure-fs-hadoop-*.jar \
+           ${FLINK_OPT_DIR}/flink-oss-fs-hadoop-*.jar && \
+    echo "Pruned conflicting jars from ${FLINK_OPT_DIR}:" && \
+    ls ${FLINK_OPT_DIR}
 
 USER hadoop:hadoop
 # enable flink-sql-client
