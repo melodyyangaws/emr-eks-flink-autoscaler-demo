@@ -1,8 +1,8 @@
 ###############################################################################
-# Paimon CDC Action — MySQL to Paimon on EMR on EKS 7.12
+# Paimon CDC Action — MySQL to Paimon on EMR on EKS 7.13
 #
 # This image includes:
-# - Flink 1.20.x (from EMR 7.12)
+# - Flink 1.20.x (from EMR 7.13 — 1.20.0-amzn-7)
 # - Paimon CDC Action for automatic MySQL-to-Paimon database sync
 # - MySQL CDC Connector for full snapshot + incremental sync
 # - Apache Paimon for S3-based lakehouse storage
@@ -13,7 +13,7 @@
 # - Multi-stage build to reduce final image size
 # - Cleanup of temporary files and caches
 ###############################################################################
-ARG EMR_VERSION=7.12.0
+ARG EMR_VERSION=7.13.0
 
 # ============================================================================
 # Stage 1: Download Flink connector JARs

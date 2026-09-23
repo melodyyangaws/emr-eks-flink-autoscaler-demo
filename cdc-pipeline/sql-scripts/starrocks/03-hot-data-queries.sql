@@ -16,7 +16,7 @@
 --     = 4 in 03-paimon-sinks.sql), so the number of files a hot query touches
 --     stays bounded without anyone running a maintenance job.
 --
---   Iceberg V3 (merge-on-read, position deletes / deletion vectors)
+--   Iceberg (merge-on-read, position delete files)
 --     Each CDC commit writes a new data file plus delete files for the rows it
 --     supersedes. A reader must apply every delete file that overlaps the data
 --     files it reads, so cost grows with the number of commits since the last

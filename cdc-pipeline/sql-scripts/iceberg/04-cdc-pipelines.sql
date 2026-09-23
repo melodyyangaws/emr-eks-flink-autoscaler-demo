@@ -1,20 +1,14 @@
 -- ============================================================================
--- Paimon CDC Streaming Pipelines
+-- Iceberg CDC Streaming Pipelines
 -- ============================================================================
--- Reads from MySQL JDBC catalog and writes to Paimon tables.
---
--- Required environment variables:
---   MYSQL_DATABASE: Database name (default: ecommerce)
---
--- Note: These are long-running streaming INSERT statements
+-- Reads from MySQL CDC sources and writes to Iceberg tables.
+-- Explicit DATE STRING partition columns computed via DATE_FORMAT().
 -- ============================================================================
--- SET 'execution.checkpointing.interval' = '60s';
--- SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
--- SET 'table.exec.sink.upsert-materialize' = 'NONE';
+
 -- ============================================================================
--- Pipeline 1: Customers (Dimension Table)
+-- Pipeline 1: Customers (Dimension Table — unpartitioned)
 -- ============================================================================
-INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.customers
+INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.customers
 SELECT
     customer_id,
     customer_name,
@@ -30,9 +24,9 @@ SELECT
 FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_customers;
 
 -- ============================================================================
--- Pipeline 2: Products (Dimension Table)
+-- Pipeline 2: Products (Dimension Table — partitioned by category)
 -- ============================================================================
-INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.products
+INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.products
 SELECT
     product_id,
     product_name,
@@ -45,14 +39,14 @@ SELECT
 FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_products;
 
 -- ============================================================================
--- Pipeline 3: Orders (Fact Table with Date Partitioning)
+-- Pipeline 3: Orders (Fact Table — partitioned by order_dt)
 -- ============================================================================
-INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.orders
+INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.orders
 SELECT
     order_id,
     customer_id,
     order_date,
-    DATE_FORMAT(order_date, 'yyyy-MM-dd') as order_date_str,
+    DATE_FORMAT(order_date, 'yyyy-MM-dd') AS order_dt,
     total_amount,
     order_status,
     payment_method,
@@ -61,9 +55,9 @@ SELECT
 FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_orders;
 
 -- ============================================================================
--- Pipeline 4: Order Items (Fact Table with Date Partitioning)
+-- Pipeline 4: Order Items (Fact Table — partitioned by created_dt)
 -- ============================================================================
-INSERT INTO paimon_catalogv3.${GLUE_DATABASE:flink_paimonv3_db}.order_items
+INSERT INTO iceberg_catalog.${GLUE_DATABASE:flink_iceberg_db}.order_items
 SELECT
     order_item_id,
     order_id,
@@ -72,5 +66,5 @@ SELECT
     unit_price,
     subtotal,
     created_at,
-    DATE_FORMAT(created_at, 'yyyy-MM-dd') as created_date_str
+    DATE_FORMAT(created_at, 'yyyy-MM-dd') AS created_dt
 FROM mysql_catalog.${MYSQL_DATABASE:ecommerce}.mysql_src_order_items;

@@ -1,8 +1,11 @@
 # Local environment / credentials
 cdc-pipeline/mysql-cdc-env.sh
 
-# Deployed snapshots with resolved secrets
-cdc-pipeline/*-deployed.yaml
+# Deployed snapshots with resolved secrets, account IDs and bucket names.
+# Unanchored so it also catches subdirectories such as
+# monitoring/monitor-deployment-deployed.yaml — the earlier top-level-only
+# pattern let that file through as untracked, and it carries a real account ID.
+*-deployed.yaml
 
 # Runtime logs
 *.log

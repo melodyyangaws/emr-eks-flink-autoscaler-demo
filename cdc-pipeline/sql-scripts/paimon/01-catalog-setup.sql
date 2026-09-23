@@ -10,10 +10,10 @@
 -- Required environment variables:
 --   PAIMON_WAREHOUSE: S3 path for Paimon warehouse (e.g., s3://bucket/paimon/)
 --   AWS_REGION: AWS region (e.g., us-west-2)
---   GLUE_DATABASE: Glue database name (default: flink_paimonv3_db)
+--   GLUE_DATABASE: Glue database name (default: flink_paimon_db)
 -- ============================================================================
 
-CREATE CATALOG paimon_catalogv3 WITH (
+CREATE CATALOG paimon_catalog WITH (
     'type' = 'paimon',
     'lock.enabled' = 'false',
     'metastore' = 'hive',
@@ -25,6 +25,6 @@ CREATE CATALOG paimon_catalogv3 WITH (
 );
 
 -- Switch to Paimon catalog
-USE CATALOG paimon_catalogv3;
+USE CATALOG paimon_catalog;
 -- Create Glue database if not exists
-CREATE DATABASE IF NOT EXISTS ${GLUE_DATABASE:flink_paimonv3_db};
+CREATE DATABASE IF NOT EXISTS ${GLUE_DATABASE:flink_paimon_db};

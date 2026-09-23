@@ -1,0 +1,501 @@
+---
+# 40,000 rows/sec UPSERT load generator for the Paimon-vs-Iceberg CDC benchmark.
+#
+# Why this exists alongside mysql-data-generator.yaml
+# ---------------------------------------------------
+# The original generator tops out around 400 rows/sec. Two reasons, both fatal at
+# 40k:
+#   1. It issues one cursor.execute() per order AND one per order item, so a
+#      "batch" of 10 orders is ~40 round trips. At ~1ms RTT to RDS that alone
+#      caps it in the hundreds per second.
+#   2. Every operation starts with `ORDER BY RAND() LIMIT n` to pick rows. On
+#      tables of 2.4M-14M rows that is a full scan plus a sort per call — it gets
+#      slower as the benchmark runs, which is the opposite of what a load test
+#      needs.
+# Measured ceiling of the old generator on this dataset: ~777 rows / 2s.
+#
+# This generator instead:
+#   - builds ONE multi-row `INSERT ... ON DUPLICATE KEY UPDATE` per batch, so
+#     BATCH_ROWS row-modifications cost one round trip,
+#   - picks primary keys arithmetically from a known id range (sampled once at
+#     startup) instead of with ORDER BY RAND(), so cost per row is flat over time,
+#   - rate-limits with a token bucket to hit a requested rows/sec rather than
+#     running flat out, so the reported number is a target that was met rather
+#     than whatever the box happened to do.
+#
+# Why ON DUPLICATE KEY UPDATE and not UPDATE
+# ------------------------------------------
+# This is the upsert test case. A multi-row ON DUPLICATE KEY UPDATE lets a single
+# statement mix genuine inserts and genuine updates, which is what an upsert
+# stream actually is, and MySQL emits the corresponding per-row binlog events
+# either way — so Debezium/Flink CDC sees +I for new keys and -U/+U for existing
+# ones. A plain multi-row UPDATE cannot express per-row new values without one
+# statement per row, which is the round-trip problem above.
+#
+# Why the key distribution is skewed (HOT_KEY_RATIO)
+# --------------------------------------------------
+# This is the whole point of the comparison. Repeatedly upserting the SAME small
+# set of keys is what separates the two formats:
+#   - Iceberg merge-on-read writes an equality-delete file per commit per key
+#     touched; re-touching hot keys accumulates delete files that every
+#     subsequent read must apply (the monitor already shows total-delete-files
+#     climbing with total-equality-deletes == total-records).
+#   - Paimon's LSM compacts those same repeated keys away in the background.
+# A uniformly-random key stream would spread writes so thinly across 14M keys
+# that neither effect shows up, and the benchmark would measure raw ingest only.
+# So HOT_KEY_RATIO of the upserts land in a sliding window of the most recent
+# HOT_KEY_WINDOW keys, and the rest spread over the full range.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-upsert-loadgen-script
+  namespace: emr-flink
+data:
+  upsert_loadgen.py: |
+    #!/usr/bin/env python3
+    """High-throughput MySQL upsert generator for CDC load testing."""
+    import os
+    import random
+    import string
+    import sys
+    import threading
+    import time
+    from datetime import datetime
+
+    import mysql.connector
+
+    DB = {
+        'host': os.environ['MYSQL_HOST'],
+        'user': os.environ['MYSQL_USER'],
+        'password': os.environ['MYSQL_PASSWORD'],
+        'database': os.environ.get('MYSQL_DATABASE', 'ecommerce'),
+        'autocommit': True,
+        # A large multi-row INSERT is one big packet; the default 32MB client
+        # limit is fine but be explicit so a BATCH_ROWS bump cannot silently
+        # start failing with "packet too large".
+        'connection_timeout': 30,
+    }
+
+    RATE          = int(os.environ.get('RATE_PER_POD', '5000'))    # rows/sec, this pod
+    THREADS       = int(os.environ.get('THREADS', '4'))
+    BATCH_ROWS    = int(os.environ.get('BATCH_ROWS', '500'))
+    UPSERT_RATIO  = float(os.environ.get('UPSERT_RATIO', '0.8'))   # rest are pure inserts
+    HOT_KEY_RATIO = float(os.environ.get('HOT_KEY_RATIO', '0.6'))
+    HOT_WINDOW    = int(os.environ.get('HOT_KEY_WINDOW', '50000'))
+    REPORT_EVERY  = int(os.environ.get('REPORT_SECONDS', '15'))
+    DURATION      = int(os.environ.get('DURATION_SECONDS', '0'))   # 0 = run forever
+
+    CITIES = ['Seattle', 'Portland', 'San Francisco', 'Los Angeles', 'Phoenix',
+              'Denver', 'Austin', 'Houston', 'Dallas', 'Chicago', 'New York', 'Miami']
+    STATES = ['WA', 'OR', 'CA', 'AZ', 'CO', 'TX', 'IL', 'NY', 'MA', 'FL']
+    CATEGORIES = ['Electronics', 'Clothing', 'Books', 'Home & Garden', 'Sports',
+                  'Toys', 'Food & Beverage', 'Health & Beauty', 'Automotive']
+    STATUSES = ['PENDING', 'CONFIRMED', 'SHIPPED', 'DELIVERED', 'CANCELLED']
+    PAYMENTS = ['CREDIT_CARD', 'DEBIT_CARD', 'PAYPAL', 'APPLE_PAY', 'GOOGLE_PAY']
+    NAMES = ['John Smith', 'Jane Doe', 'Michael Brown', 'Emily Davis', 'David Wilson',
+             'Sarah Miller', 'Robert Jones', 'Lisa Garcia', 'James Martinez']
+
+    # ── Shared counters ─────────────────────────────────────────────────────
+    _lock = threading.Lock()
+    STATS = {'rows': 0, 'upserts': 0, 'inserts': 0, 'batches': 0, 'errors': 0}
+    PER_TABLE = {}
+
+    def bump(table, rows, upserts, inserts):
+        with _lock:
+            STATS['rows'] += rows
+            STATS['upserts'] += upserts
+            STATS['inserts'] += inserts
+            STATS['batches'] += 1
+            PER_TABLE[table] = PER_TABLE.get(table, 0) + rows
+
+    def bump_error():
+        with _lock:
+            STATS['errors'] += 1
+
+    def connect():
+        for attempt in range(6):
+            try:
+                c = mysql.connector.connect(**DB)
+                c.autocommit = True
+                return c
+            except mysql.connector.Error as e:
+                print(f"connect attempt {attempt+1} failed: {e}", flush=True)
+                time.sleep(3)
+        raise SystemExit("could not connect to MySQL")
+
+    def sample_ids():
+        """Read the current id ranges once.
+
+        Deliberately MAX(pk) and not a sampled id list: MAX(pk) on an InnoDB
+        primary key is an index-max lookup (instant), whereas pulling a list of
+        real ids would be a scan of millions of rows and would go stale anyway.
+        Customer/product ids are also sampled as real lists because orders and
+        order_items carry FOREIGN KEYs to them — an id that was deleted would
+        abort the whole multi-row statement, so inserts must use ids known to
+        exist rather than a random number below MAX.
+        """
+        conn = connect()
+        cur = conn.cursor()
+        ranges = {}
+        for table, pk in (('customers', 'customer_id'), ('products', 'product_id'),
+                          ('orders', 'order_id'), ('order_items', 'order_item_id')):
+            cur.execute(f"SELECT MAX({pk}) FROM {table}")
+            ranges[table] = cur.fetchone()[0] or 1
+
+        # FK parents: a bounded sample, taken off the primary key in id order so
+        # it is an index range scan and not a sort.
+        cur.execute("SELECT customer_id FROM customers ORDER BY customer_id DESC LIMIT 20000")
+        cust = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT product_id FROM products ORDER BY product_id DESC LIMIT 20000")
+        prod = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT order_id FROM orders ORDER BY order_id DESC LIMIT 20000")
+        ordr = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        print(f"id ranges: {ranges}", flush=True)
+        print(f"fk samples: customers={len(cust)} products={len(prod)} orders={len(ordr)}",
+              flush=True)
+        return ranges, cust, prod, ordr
+
+    def pick_key(max_id, rnd):
+        """Choose an existing primary key, skewed towards recent (hot) keys."""
+        if rnd.random() < HOT_KEY_RATIO:
+            lo = max(1, max_id - HOT_WINDOW)
+            return rnd.randint(lo, max_id)
+        return rnd.randint(1, max_id)
+
+    def plan_keys(max_id, n, rnd):
+        """Plan a batch's primary keys: existing ids ASCENDING, then inserts.
+
+        The ordering is not cosmetic, it is the deadlock fix. InnoDB takes a row
+        lock per row of a multi-row upsert, in statement order. With keys in
+        random order, two concurrent batches that both touch hot keys A and B can
+        grab them in opposite order and deadlock — measured at ~9% of batches
+        (errno 1213), and since a deadlock rolls the whole batch back that was a
+        straight 9% off the achieved rate (4,630/s against a 5,000/s target).
+        Sorting ascending means every session in every pod walks the primary key
+        in the same direction, so one simply waits for the other.
+
+        Inserts (pk None -> AUTO_INCREMENT) go last: they take the auto-inc
+        values above every existing key, so placing them at the end keeps the
+        statement monotonic in key order too.
+        """
+        keys = sorted(pick_key(max_id, rnd) for _ in range(n)
+                      if rnd.random() < UPSERT_RATIO)
+        return keys, n - len(keys)
+
+    def rand_text(rnd, n):
+        return ''.join(rnd.choice(string.ascii_lowercase) for _ in range(n))
+
+    # ── Batch builders ──────────────────────────────────────────────────────
+    # Each returns (sql, params, n_upsert, n_insert). Upsert rows carry an
+    # explicit existing PK so MySQL takes the ON DUPLICATE KEY UPDATE path;
+    # insert rows pass NULL for the AUTO_INCREMENT PK so MySQL assigns a new one.
+
+    def batch_orders(rnd, ranges, cust, prod, ordr, n):
+        rows, params = [], []
+        keys, ni = plan_keys(ranges['orders'], n, rnd)
+        nu = len(keys)
+        for pk in keys + [None] * ni:
+            rows.append("(%s,%s,%s,%s,%s,%s,%s)")
+            params.extend([
+                pk,
+                rnd.choice(cust),
+                datetime.utcnow(),
+                round(rnd.uniform(10, 5000), 2),
+                rnd.choice(STATUSES),
+                rnd.choice(PAYMENTS),
+                f"{rnd.randint(100,9999)} Load Test Way, {rnd.choice(CITIES)}",
+            ])
+        sql = (
+            "INSERT INTO orders (order_id, customer_id, order_date, total_amount,"
+            " order_status, payment_method, shipping_address) VALUES "
+            + ",".join(rows) +
+            # Changing order_status/total_amount guarantees the row differs, which
+            # is what makes `updated_at ON UPDATE CURRENT_TIMESTAMP` actually fire.
+            # MySQL skips the ON UPDATE timestamp when an update is a no-op, and
+            # the hot-window queries filter on updated_at, so a no-op upsert would
+            # be invisible to the very queries being benchmarked.
+            " ON DUPLICATE KEY UPDATE order_status=VALUES(order_status),"
+            " total_amount=VALUES(total_amount), payment_method=VALUES(payment_method),"
+            " shipping_address=VALUES(shipping_address)"
+        )
+        return sql, params, nu, ni
+
+    def batch_order_items(rnd, ranges, cust, prod, ordr, n):
+        rows, params = [], []
+        keys, ni = plan_keys(ranges['order_items'], n, rnd)
+        nu = len(keys)
+        for pk in keys + [None] * ni:
+            rows.append("(%s,%s,%s,%s,%s,%s)")
+            params.extend([
+                pk,
+                rnd.choice(ordr),
+                rnd.choice(prod),
+                rnd.randint(1, 10),
+                round(rnd.uniform(5, 900), 2),
+                datetime.utcnow(),
+            ])
+        # subtotal is GENERATED ALWAYS AS (quantity * unit_price) STORED, so it
+        # must NOT appear in the column list — MySQL rejects an explicit value for
+        # a stored generated column ("The value specified for generated column").
+        sql = (
+            "INSERT INTO order_items (order_item_id, order_id, product_id, quantity,"
+            " unit_price, created_at) VALUES "
+            + ",".join(rows) +
+            " ON DUPLICATE KEY UPDATE quantity=VALUES(quantity),"
+            " unit_price=VALUES(unit_price)"
+        )
+        return sql, params, nu, ni
+
+    def batch_customers(rnd, ranges, cust, prod, ordr, n):
+        rows, params = [], []
+        keys, ni = plan_keys(ranges['customers'], n, rnd)
+        nu = len(keys)
+        for pk in keys + [None] * ni:
+            rows.append("(%s,%s,%s,%s,%s,%s,%s,%s,%s)")
+            # email carries a UNIQUE KEY. Always generate a globally unique value
+            # so an insert cannot collide on it: a UNIQUE-key collision would take
+            # the ON DUPLICATE KEY UPDATE path against a DIFFERENT row than the PK
+            # intended, quietly corrupting the key distribution this test relies on.
+            uniq = f"{rand_text(rnd,10)}{rnd.getrandbits(48):012x}"
+            rows_city = rnd.choice(CITIES)
+            params.extend([
+                pk,
+                rnd.choice(NAMES),
+                f"{uniq}@loadtest.example.com",
+                f"+1-{rnd.randint(200,999)}-{rnd.randint(200,999)}-{rnd.randint(1000,9999)}",
+                f"{rnd.randint(100,9999)} {rnd.choice(['Main','Oak','Maple','Cedar'])} St",
+                rows_city,
+                rnd.choice(STATES),
+                'USA',
+                f"{rnd.randint(10000,99999)}",
+            ])
+        sql = (
+            "INSERT INTO customers (customer_id, customer_name, email, phone, address,"
+            " city, state, country, zip_code) VALUES "
+            + ",".join(rows) +
+            " ON DUPLICATE KEY UPDATE customer_name=VALUES(customer_name),"
+            " phone=VALUES(phone), address=VALUES(address), city=VALUES(city),"
+            " state=VALUES(state), zip_code=VALUES(zip_code)"
+        )
+        return sql, params, nu, ni
+
+    def batch_products(rnd, ranges, cust, prod, ordr, n):
+        rows, params = [], []
+        keys, ni = plan_keys(ranges['products'], n, rnd)
+        nu = len(keys)
+        for pk in keys + [None] * ni:
+            rows.append("(%s,%s,%s,%s,%s,%s)")
+            params.extend([
+                pk,
+                f"Item {rand_text(rnd,6)} Model {rnd.randint(100,999)}",
+                rnd.choice(CATEGORIES),
+                round(rnd.uniform(9.99, 999.99), 2),
+                rnd.randint(0, 1000),
+                f"Load test product {rand_text(rnd,12)}",
+            ])
+        sql = (
+            "INSERT INTO products (product_id, product_name, category, price,"
+            " stock_quantity, description) VALUES "
+            + ",".join(rows) +
+            " ON DUPLICATE KEY UPDATE product_name=VALUES(product_name),"
+            " price=VALUES(price), stock_quantity=VALUES(stock_quantity),"
+            " description=VALUES(description)"
+        )
+        return sql, params, nu, ni
+
+    # Table mix, weighted to resemble the shape of the existing data (order_items
+    # is the largest table, customers/products the smallest). The weights decide
+    # how the 40k/s is split, so all four tables get meaningful upsert traffic
+    # rather than the fact tables drowning out the dimensions.
+    MIX = [
+        (batch_order_items, 'order_items', 45),
+        (batch_orders,      'orders',      30),
+        (batch_customers,   'customers',   15),
+        (batch_products,    'products',    10),
+    ]
+    _builders = [m[0] for m in MIX]
+    _names    = [m[1] for m in MIX]
+    _weights  = [m[2] for m in MIX]
+
+    def worker(idx, ranges, cust, prod, ordr, rate, stop_at):
+        rnd = random.Random(os.getpid() * 1000 + idx)
+        conn = connect()
+        cur = conn.cursor()
+        # Token bucket: tokens accrue at `rate` rows/sec and a batch spends
+        # BATCH_ROWS of them. Sleeping for the shortfall (rather than a fixed
+        # interval) keeps the long-run average at the target even when an
+        # individual batch stalls on the server.
+        tokens = 0.0
+        last = time.monotonic()
+        while stop_at == 0 or time.monotonic() < stop_at:
+            now = time.monotonic()
+            tokens += (now - last) * rate
+            last = now
+            if tokens < BATCH_ROWS:
+                time.sleep((BATCH_ROWS - tokens) / rate)
+                continue
+            tokens -= BATCH_ROWS
+
+            builder = rnd.choices(_builders, weights=_weights, k=1)[0]
+            name = _names[_builders.index(builder)]
+            sql, params, nu, ni = builder(rnd, ranges, cust, prod, ordr, BATCH_ROWS)
+            # Deadlock (1213) and lock-wait timeout (1205) roll back the WHOLE
+            # multi-row statement, so dropping the batch costs BATCH_ROWS rows off
+            # the achieved rate — that is exactly why the first run landed at
+            # 4,630/s against a 5,000/s target. Retry the same statement instead;
+            # it is idempotent (fixed keys, fixed values) and the ascending key
+            # order in plan_keys() means the retry will not lose the race twice
+            # for the same reason.
+            for attempt in range(4):
+                try:
+                    cur.execute(sql, params)
+                    bump(name, BATCH_ROWS, nu, ni)
+                    break
+                except mysql.connector.Error as e:
+                    bump_error()
+                    if e.errno in (1213, 1205) and attempt < 3:
+                        continue
+                    # Connection genuinely gone — rebuild it and drop this batch.
+                    if e.errno in (2006, 2013, 2055):
+                        try:
+                            cur.close(); conn.close()
+                        except Exception:
+                            pass
+                        conn = connect()
+                        cur = conn.cursor()
+                        break
+                    if e.errno not in (1213, 1205):
+                        print(f"[w{idx}] {name}: {e}", flush=True)
+                    break
+        try:
+            cur.close(); conn.close()
+        except Exception:
+            pass
+
+    def main():
+        print("=" * 70, flush=True)
+        print("MySQL UPSERT load generator", flush=True)
+        print(f"  target      : {RATE} rows/sec (this pod)", flush=True)
+        print(f"  threads     : {THREADS}   batch rows: {BATCH_ROWS}", flush=True)
+        print(f"  upsert ratio: {UPSERT_RATIO}  hot-key ratio: {HOT_KEY_RATIO}"
+              f"  hot window: {HOT_WINDOW}", flush=True)
+        print(f"  table mix   : " + ", ".join(f"{n}={w}%" for _, n, w in MIX), flush=True)
+        print("=" * 70, flush=True)
+
+        ranges, cust, prod, ordr = sample_ids()
+        if not cust or not prod or not ordr:
+            raise SystemExit("FK parent samples are empty — is the database seeded?")
+
+        stop_at = (time.monotonic() + DURATION) if DURATION else 0
+        per_thread = RATE / float(THREADS)
+        threads = []
+        for i in range(THREADS):
+            t = threading.Thread(target=worker,
+                                 args=(i, ranges, cust, prod, ordr, per_thread, stop_at),
+                                 daemon=True)
+            t.start()
+            threads.append(t)
+
+        t0 = time.monotonic()
+        last_rows, last_t = 0, t0
+        while any(t.is_alive() for t in threads):
+            time.sleep(REPORT_EVERY)
+            with _lock:
+                snap = dict(STATS)
+                tables = dict(PER_TABLE)
+            now = time.monotonic()
+            inst = (snap['rows'] - last_rows) / (now - last_t)
+            avg = snap['rows'] / (now - t0)
+            last_rows, last_t = snap['rows'], now
+            mix = " ".join(f"{k}={v}" for k, v in sorted(tables.items()))
+            print(f"[{int(now - t0):5d}s] rows={snap['rows']:,} "
+                  f"inst={inst:,.0f}/s avg={avg:,.0f}/s "
+                  f"upserts={snap['upserts']:,} inserts={snap['inserts']:,} "
+                  f"batches={snap['batches']:,} errors={snap['errors']} | {mix}",
+                  flush=True)
+
+        print("load generation finished", flush=True)
+
+    if __name__ == '__main__':
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-upsert-loadgen
+  namespace: emr-flink
+  labels:
+    app: mysql-upsert-loadgen
+spec:
+  # 8 pods x RATE_PER_POD 5000 = 40,000 rows/sec aggregate.
+  # Split across pods rather than raising THREADS in one pod because a single
+  # Python process is GIL-bound: the driver spends real CPU building the
+  # multi-row statement text, so past ~4 threads a lone pod stops scaling.
+  replicas: 8
+  selector:
+    matchLabels:
+      app: mysql-upsert-loadgen
+  template:
+    metadata:
+      labels:
+        app: mysql-upsert-loadgen
+    spec:
+      # Keep the load generators off the Flink TaskManager nodepool. Sharing it
+      # would have the generator competing for CPU with the very pipeline whose
+      # throughput is being measured.
+      nodeSelector:
+        karpenter.sh/nodepool: driver-nodepool
+      containers:
+      - name: loadgen
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            pip install --quiet mysql-connector-python
+            exec python /scripts/upsert_loadgen.py
+        env:
+        # Credentials come from the existing secret; the password is never a
+        # command-line argument or a literal in this manifest.
+        - name: MYSQL_HOST
+          valueFrom:
+            secretKeyRef: { name: mysql-credentials, key: hostname }
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef: { name: mysql-credentials, key: username }
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef: { name: mysql-credentials, key: password }
+        - name: MYSQL_DATABASE
+          value: "ecommerce"
+        - name: RATE_PER_POD
+          value: "5000"
+        - name: THREADS
+          value: "4"
+        - name: BATCH_ROWS
+          value: "500"
+        - name: UPSERT_RATIO
+          value: "0.8"
+        - name: HOT_KEY_RATIO
+          value: "0.6"
+        - name: HOT_KEY_WINDOW
+          value: "50000"
+        - name: REPORT_SECONDS
+          value: "15"
+        - name: DURATION_SECONDS
+          value: "0"
+        volumeMounts:
+        - name: script
+          mountPath: /scripts
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "1"
+          limits:
+            memory: "1Gi"
+            cpu: "2"
+      volumes:
+      - name: script
+        configMap:
+          name: mysql-upsert-loadgen-script

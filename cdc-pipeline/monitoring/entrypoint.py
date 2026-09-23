@@ -19,13 +19,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor-entrypoint")
 
-PAIMON_FLINK_URL = os.environ.get("PAIMON_FLINK_URL", "http://flink-cdc-paimonv3-rest:8081")
-ICEBERG_FLINK_URL = os.environ.get("ICEBERG_FLINK_URL", "http://flink-cdc-icebergv3-rest:8081")
+PAIMON_FLINK_URL = os.environ.get("PAIMON_FLINK_URL", "http://flink-cdc-paimon-rest:8081")
+ICEBERG_FLINK_URL = os.environ.get("ICEBERG_FLINK_URL", "http://flink-cdc-iceberg-rest:8081")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
-PAIMON_GLUE_DB = os.environ.get("PAIMON_GLUE_DB", "flink_paimonv3_db")
-ICEBERG_GLUE_DB = os.environ.get("ICEBERG_GLUE_DB", "flink_icebergv3_db")
+PAIMON_GLUE_DB = os.environ.get("PAIMON_GLUE_DB", "flink_paimon_db")
+ICEBERG_GLUE_DB = os.environ.get("ICEBERG_GLUE_DB", "flink_iceberg_db")
 # No bucket is hardcoded here: the warehouse roots come from the ConfigMap
-# flink-cdc-monitor-configv3, which deploy-monitor.sh renders from $BUCKET_NAME.
+# flink-cdc-monitor-config, which deploy-monitor.sh renders from $BUCKET_NAME.
 # A stale literal here silently pointed the monitor at another account's bucket,
 # so if the vars are missing we fail fast instead of reading the wrong data.
 PAIMON_WAREHOUSE = os.environ.get("PAIMON_WAREHOUSE")

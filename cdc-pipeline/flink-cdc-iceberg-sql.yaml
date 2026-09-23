@@ -2,7 +2,7 @@ apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
   namespace: emr-flink
-  name: flink-cdc-icebergv3
+  name: flink-cdc-iceberg
 spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
@@ -43,7 +43,7 @@ spec:
     state.backend.incremental: "true"
     state.changelog.enabled: "true"
     state.backend.changelog.storage: filesystem
-    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-icebergv3/changelog/
+    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-iceberg/changelog/
     dstl.dfs.upload.timeout: 5s
     state.backend.type: rocksdb
     state.backend.rocksdb.localdir: /tmp/rocksdb/
@@ -51,8 +51,8 @@ spec:
     heartbeat.timeout: "180s"
     heartbeat.interval: "20s"
     heartbeat.rpc-failure-threshold: "10"
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-icebergv3/checkpoints/
-    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-icebergv3/savepoints/
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg/savepoints/
     # Restart Strategy
     jobmanager.execution.failover-strategy: region
     restart-strategy.type: fixed-delay
@@ -60,8 +60,12 @@ spec:
     restart-strategy.fixed-delay.delay: "30s"
     # graceful decommisioning
     cluster.taskmanager.graceful-decommission.enabled: "true"
-    jobmanager.adaptive-scheduler.combined-restart.enabled: "true" 
-    jobmanager.adaptive-scheduler.combined-restart.window-interval : "1m"
+    # Disabled: with combined-restart on, two vertices failing inside the same
+    # window-interval produce "Ignore initial restart requests with ExecutionVertex
+    # <id> not in failed state" and BOTH requests are dropped, so
+    # restart-strategy.fixed-delay.attempts is never consumed. The job then sits
+    # frozen while /jobs still reports RUNNING. Leave off for load tests.
+    jobmanager.adaptive-scheduler.combined-restart.enabled: "false"
     # Scheduler
     jobmanager.scheduler: adaptive
     taskmanager.numberOfTaskSlots: "4"
@@ -77,19 +81,15 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cdc-icebergv3/ha
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-iceberg/ha
     replicas: 1
     resource:
-      memory: "8192m"
-      cpu: 2
+      memory: 16Gi
+      cpu: 4
     podTemplate:
       spec:
         nodeSelector:
-          karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${JM_NODEPOOL}
-          # Image is built for amd64 only (see docker/Dockerfile.cdc-paimon);
-          # the nodepools also permit arm64, so pin the arch explicitly.
-          kubernetes.io/arch: amd64
         containers:
         - name: flink-main-container
           # Password is never templated into this manifest — MYSQL_PASSWORD is
@@ -107,30 +107,37 @@ spec:
           - name: MYSQL_USER
             value: "${MYSQL_USER}"
           - name: ICEBERG_WAREHOUSE
-            value: "s3://${BUCKET_NAME}/icebergv3-warehouse/"
+            value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
           - name: GLUE_DATABASE
-            value: "flink_icebergv3_db"
+            value: "flink_iceberg_db"
   taskManager:
     resource:
-      memory: "8192m"
-      cpu: 2
+      memory: 16Gi
+      cpu: 4
     podTemplate:
       spec:
+        containers:
+        - name: flink-main-container
+          env:
+          # AWS_REGION must be set on the TaskManager, not just the JobManager.
+          # Paimon's IcebergHiveMetadataCommitter and the EMR Glue client run in
+          # the TM (CommitterOperator.initializeState). Without a region the
+          # AWSGlueClientFactory logs "No region info found, using SDK default
+          # region: us-east-1" and blocks on a cross-region Glue call, which
+          # stalls initializeState until heartbeat.timeout (180s) kills the TM —
+          # the job then fails with "The heartbeat of TaskManager ... timed out"
+          # and nothing in the JM log names the real cause.
+          - name: AWS_REGION
+            value: "${AWS_REGION}"
+          # The Hadoop/Hive Glue client reads AWS_DEFAULT_REGION, the v2 SDK
+          # reads AWS_REGION. Set both so neither path falls back to us-east-1.
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
         nodeSelector:
           # karpenter.sh/capacity-type: spot
           karpenter.sh/nodepool: ${TM_NODEPOOL}
-          # Required, not optional — leave this uncommented. The image is built
-          # for amd64 only, but ${TM_NODEPOOL} also permits arm64. When this was
-          # commented out Karpenter provisioned m8g (Graviton) spot nodes, every
-          # TaskManager died instantly with
-          #   exec /docker-entrypoint.sh: exec format error
-          # (exitCode=255), the JobManager kept requesting replacements in a loop
-          # — TM index climbed past -40 in two minutes — and the job eventually
-          # failed with NoResourceAvailableException. The JobManager template has
-          # always pinned amd64, which is why only the TaskManagers were affected.
-          kubernetes.io/arch: amd64
 
   job:
     jarURI: s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py
@@ -139,9 +146,9 @@ spec:
       - "-py"
       - "/opt/flink/usrlib/flink-cdc-executor.py"
       - "--sql-dir"
-      - "s3://${BUCKET_NAME}/flink/sql-scripts/icebergv3/"
-      # - "--checkpoint-interval"
-      # - "60s"
+      - "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/"
+      - "--checkpoint-interval"
+      - "60s"
       - "--parallelism"
       - "16"
     parallelism: 16
@@ -149,7 +156,7 @@ spec:
 
   monitoringConfiguration:
     s3MonitoringConfiguration:
-      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-icebergv3
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-iceberg
     sideCarResources:
       limits:
         cpuLimit: 500m

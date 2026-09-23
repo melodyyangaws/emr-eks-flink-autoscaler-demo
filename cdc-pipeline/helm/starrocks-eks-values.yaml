@@ -1,11 +1,11 @@
 # StarRocks Helm Values for EKS Deployment (kube-starrocks chart >= 1.11)
 # Optimized for lakehouse analytics on Paimon and Iceberg.
 #
-# Notes for this environment (loadtest-mcp / us-west-2 / 633458367150):
+# Notes for this environment (loadtest-mcp / us-west-2):
 #   - Chart 1.11.x nests component specs under the `starrocks:` key. Earlier
 #     charts (<= 1.8) used top-level starrocksFESpec/starrocksBeSpec.
 #   - Image tag is left empty so the chart's appVersion is used. The sink tables
-#     are Iceberg format-version 3 and Paimon 1.3 with deletion vectors, which
+#     are Iceberg format-version 2 and Paimon 1.3 with deletion vectors, which
 #     need a recent StarRocks — do not pin back to 3.2.x.
 #   - S3/Glue access uses IRSA: the pods run with a ServiceAccount annotated
 #     with the EMR execution role, which already carries the S3 + Glue read

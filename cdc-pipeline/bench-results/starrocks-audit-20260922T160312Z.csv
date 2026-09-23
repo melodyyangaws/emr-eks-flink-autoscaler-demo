@@ -1,0 +1,35 @@
+stamp,suite,query,metric,paimon,iceberg,ratio_iceberg_over_paimon
+20260922T160312Z,snapshot,Q1_count,time_ms,212,457,2.16x
+20260922T160312Z,snapshot,Q1_count,scan_rows,5299513,13289772,2.51x
+20260922T160312Z,snapshot,Q1_count,scan_bytes,0,0,n/a
+20260922T160312Z,snapshot,Q2_group_by,time_ms,246,555,2.26x
+20260922T160312Z,snapshot,Q2_group_by,scan_rows,5299513,13289772,2.51x
+20260922T160312Z,snapshot,Q2_group_by,scan_bytes,0,0,n/a
+20260922T160312Z,snapshot,Q3_join,time_ms,666,2804,4.21x
+20260922T160312Z,snapshot,Q3_join,scan_rows,16815938,45746838,2.72x
+20260922T160312Z,snapshot,Q3_join,scan_bytes,50168185,82472764,1.64x
+20260922T160312Z,snapshot,Q4_product_sales,time_ms,1230,3992,3.25x
+20260922T160312Z,snapshot,Q4_product_sales,scan_rows,29016478,63787030,2.20x
+20260922T160312Z,snapshot,Q4_product_sales,scan_bytes,139028049,146511408,1.05x
+20260922T160312Z,snapshot,Q5_time_window,time_ms,347,2323,6.69x
+20260922T160312Z,snapshot,Q5_time_window,scan_rows,11516425,32457066,2.82x
+20260922T160312Z,snapshot,Q5_time_window,scan_bytes,53098282,84774690,1.60x
+20260922T160312Z,snapshot,Q6_multi_join,time_ms,1616,5094,3.15x
+20260922T160312Z,snapshot,Q6_multi_join,scan_rows,45832416,109533868,2.39x
+20260922T160312Z,snapshot,Q6_multi_join,scan_bytes,162816200,131433210,0.81x
+20260922T160312Z,hot,Q7_freshness,time_ms,218,1955,8.97x
+20260922T160312Z,hot,Q7_freshness,scan_rows,2752437,16249483,5.90x
+20260922T160312Z,hot,Q7_freshness,scan_bytes,31472,1698671,53.97x
+20260922T160312Z,hot,Q8_hot_pk_lookup,time_ms,480,2880,6.00x
+20260922T160312Z,hot,Q8_hot_pk_lookup,scan_rows,12042127,48762824,4.05x
+20260922T160312Z,hot,Q8_hot_pk_lookup,scan_bytes,22388,9359195,418.05x
+20260922T160312Z,hot,Q9_recent_window,time_ms,235,2378,10.12x
+20260922T160312Z,hot,Q9_recent_window,scan_rows,4829282,19358652,4.01x
+20260922T160312Z,hot,Q9_recent_window,scan_bytes,20659172,24257414,1.17x
+20260922T160312Z,hot,Q10_hot_join,time_ms,693,4422,6.38x
+20260922T160312Z,hot,Q10_hot_join,scan_rows,29583354,72966002,2.47x
+20260922T160312Z,hot,Q10_hot_join,scan_bytes,156812992,118264667,0.75x
+20260922T160312Z,state,customers,rows_and_files,3978888,3994246,ice_files=1273 ice_snaps=29
+20260922T160312Z,state,products,rows_and_files,4084032,4095398,ice_files=738 ice_snaps=30
+20260922T160312Z,state,orders,rows_and_files,9509789,9370063,ice_files=167 ice_snaps=31
+20260922T160312Z,state,order_items,rows_and_files,20706066,21012997,ice_files=181 ice_snaps=33

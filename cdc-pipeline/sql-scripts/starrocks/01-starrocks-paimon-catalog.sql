@@ -14,8 +14,8 @@
 
 -- Create Paimon catalog
 --
--- The Flink pipeline writes to s3://${BUCKET_NAME}/paimonv3-warehouse/ and
--- registers tables in the Glue database flink_paimonv3_db (metastore = hive/Glue).
+-- The Flink pipeline writes to s3://${BUCKET_NAME}/paimon-warehouse/ and
+-- registers tables in the Glue database flink_paimon_db (metastore = hive/Glue).
 -- The filesystem catalog type reads the Paimon metadata directly from S3, so the
 -- warehouse path must match the pipeline exactly.
 --
@@ -23,23 +23,23 @@
 -- credentials of the starrocks-sa ServiceAccount. Do NOT use
 -- aws.s3.use_instance_profile on this cluster — the node instance profile has
 -- no S3/Glue permissions.
-CREATE EXTERNAL CATALOG paimon_catalogv3
+CREATE EXTERNAL CATALOG paimon_catalog
 PROPERTIES (
     "type" = "paimon",
     "paimon.catalog.type" = "filesystem",
-    "paimon.catalog.warehouse" = "s3://${BUCKET_NAME}/paimonv3-warehouse/",
+    "paimon.catalog.warehouse" = "s3://${BUCKET_NAME}/paimon-warehouse/",
     "aws.s3.region" = "${AWS_REGION}",
     "aws.s3.use_aws_sdk_default_behavior" = "true"
 );
 
 -- Switch to Paimon catalog
-SET CATALOG paimon_catalogv3;
+SET CATALOG paimon_catalog;
 
 -- Show databases
 SHOW DATABASES;
 
 -- Use the Paimon lakehouse database written by the Flink CDC pipeline
-USE flink_paimonv3_db;
+USE flink_paimon_db;
 
 -- Show tables
 SHOW TABLES;

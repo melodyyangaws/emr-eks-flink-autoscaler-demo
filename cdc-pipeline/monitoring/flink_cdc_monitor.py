@@ -257,7 +257,7 @@ class FlinkCDCMonitor:
                           "added-delete-files", "total-position-deletes",
                           "total-equality-deletes"]})
 
-                # V3 format version from table metadata
+                # Table format version as reported by the metadata
                 ts.format_version = getattr(tbl.metadata, "format_version", 0)
 
                 ts.total_records = int(s.get("total-records") or 0)

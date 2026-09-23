@@ -28,10 +28,10 @@ set -uo pipefail
 
 NAMESPACE="${NAMESPACE:-emr-flink}"
 FE_POD="${FE_POD:-kube-starrocks-fe-0}"
-PAIMON_CATALOG="${PAIMON_CATALOG:-paimon_catalogv3}"
-PAIMON_DB="${PAIMON_DB:-flink_paimonv3_db}"
-ICEBERG_CATALOG="${ICEBERG_CATALOG:-icebergv3_catalog}"
-ICEBERG_DB="${ICEBERG_DB:-flink_icebergv3_db}"
+PAIMON_CATALOG="${PAIMON_CATALOG:-paimon_catalog}"
+PAIMON_DB="${PAIMON_DB:-flink_paimon_db}"
+ICEBERG_CATALOG="${ICEBERG_CATALOG:-iceberg_catalog}"
+ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db}"
 SUITE="${SUITE:-all}"          # all | snapshot | hot
 RUNS="${RUNS:-3}"              # timed runs per query
 WARMUP="${WARMUP:-1}"          # untimed runs first (StarRocks caches file lists)

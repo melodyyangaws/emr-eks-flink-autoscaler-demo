@@ -6,7 +6,7 @@
 -- Prerequisites:
 --   - Iceberg tables created by Flink CDC
 --   - StarRocks cluster running on EKS with AWS IAM role
---   - AWS Glue database: flink_icebergv3_db
+--   - AWS Glue database: flink_iceberg_db
 -- ============================================================================
 
 -- Connect to StarRocks
@@ -18,7 +18,7 @@
 -- credentials of the starrocks-sa ServiceAccount, for both Glue and S3. Do NOT
 -- use *.use_instance_profile on this cluster — the node instance profile has no
 -- S3/Glue permissions.
-CREATE EXTERNAL CATALOG icebergv3_catalog
+CREATE EXTERNAL CATALOG iceberg_catalog
 PROPERTIES (
     "type" = "iceberg",
     "iceberg.catalog.type" = "glue",
@@ -29,13 +29,13 @@ PROPERTIES (
 );
 
 -- Switch to Iceberg catalog
-SET CATALOG icebergv3_catalog;
+SET CATALOG iceberg_catalog;
 
 -- Show databases
 SHOW DATABASES;
 
 -- Use Glue database
-USE flink_icebergv3_db;
+USE flink_iceberg_db;
 
 -- Show tables
 SHOW TABLES;

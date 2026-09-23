@@ -7,7 +7,7 @@
 --   - ZSTD compression for better ratio on CDC payloads
 --   - Tuned compaction, write buffers, and snapshot retention for 60s checkpoints
 --   - Iceberg compatibility: IcebergHadoopMetadataCommitter writes read-only
---     Iceberg V3 metadata (deletion vectors) to S3 for Athena/Spark queries
+--     Iceberg V2 metadata to S3 for Athena/Spark queries
 --   - Input changelog producer for downstream CDC consumers
 --
 -- Streaming best practices applied:
@@ -23,12 +23,12 @@
 --
 -- Required: 'aws.glue.enabled: "true"' in flinkConfiguration
 -- Required environment variables:
---   GLUE_DATABASE: Glue database name (default: flink_paimonv3_db)
+--   GLUE_DATABASE: Glue database name (default: flink_paimon_db)
 -- ============================================================================
 
 -- Switch to Paimon catalog
-USE CATALOG paimon_catalogv3;
-USE ${GLUE_DATABASE:flink_paimonv3_db};
+USE CATALOG paimon_catalog;
+USE ${GLUE_DATABASE:flink_paimon_db};
 
 -- ============================================================================
 -- Table: customers (Dimension Table — unpartitioned)
@@ -72,7 +72,10 @@ CREATE TABLE IF NOT EXISTS customers (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '3',
+    -- '2', not '3'. This is the format version of the Iceberg-compatible
+    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
+    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
+    'metadata.iceberg.format-version' = '2',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );
@@ -114,7 +117,10 @@ CREATE TABLE IF NOT EXISTS products (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '3',
+    -- '2', not '3'. This is the format version of the Iceberg-compatible
+    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
+    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
+    'metadata.iceberg.format-version' = '2',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );
@@ -158,7 +164,10 @@ CREATE TABLE IF NOT EXISTS orders (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '3',
+    -- '2', not '3'. This is the format version of the Iceberg-compatible
+    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
+    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
+    'metadata.iceberg.format-version' = '2',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );
@@ -200,7 +209,10 @@ CREATE TABLE IF NOT EXISTS order_items (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    'metadata.iceberg.format-version' = '3',
+    -- '2', not '3'. This is the format version of the Iceberg-compatible
+    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
+    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
+    'metadata.iceberg.format-version' = '2',
     'metadata.iceberg.manifest-compression' = 'zstd',
     'sink.writer-coordinator.enabled' = 'true'
 );

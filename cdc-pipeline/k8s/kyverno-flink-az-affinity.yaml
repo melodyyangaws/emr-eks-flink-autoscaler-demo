@@ -1,29 +1,36 @@
-# Keep every pod of both Flink CDC jobs in a single Availability Zone.
+# Keep every pod of an EMR on EKS Flink job in a single Availability Zone.
 #
-# Why: Karpenter picks an AZ per node independently, so a job gets spread by
-# default (the iceberg job first landed with its JobManager in us-west-2b and 3 of
-# its 4 TaskManagers in us-west-2a). That costs real money and latency here:
-#   - every TM->JM heartbeat and every shuffle byte crosses an AZ boundary
-#     (cross-AZ data transfer is billed in both directions),
-#   - and if only one of the two jobs is split, the paimon-vs-iceberg hot-data
-#     benchmark is not measuring the formats, it is measuring network topology.
+# ============================================================================
+# Why this stays a nodeSelector and NOT the podAffinity from the example
+# ============================================================================
+# Two independent failures, both reproduced on this cluster:
 #
-# How: inject a nodeSelector pinning the pod to ${FLINK_CDC_ZONE}. Both jobs land
-# in the same zone, which also removes cross-job variance from the benchmark.
+# 1. The self-referencing podAffinity deadlocks with Karpenter. A required
+#    podAffinity on topology.kubernetes.io/zone keyed on the job label admits the
+#    first pod fine (a term with zero matching pods imposes no constraint), but
+#    Karpenter does not honour an inter-pod affinity zone constraint when
+#    choosing where to launch a NEW node. It provisioned a us-west-2b node for
+#    TaskManagers whose JobManager was already in us-west-2a, the scheduler then
+#    rejected that node ("didn't match pod affinity rules"), the TMs stayed
+#    Pending, and the adaptive scheduler's resource-wait timeout expired ->
+#    NoResourceAvailableException -> job FAILED. This is the difference from the
+#    Spark case: Spark executors land on nodes that already exist because the
+#    driver is running, whereas Flink TMs routinely need fresh nodes. A
+#    nodeSelector is a hard constraint Karpenter evaluates AT PROVISIONING TIME,
+#    so the node it creates is in the right zone to begin with.
 #
-# Why a nodeSelector and NOT a podAffinity:
-#   The first version of this policy used a required podAffinity on
-#   topology.kubernetes.io/zone keyed on the per-deployment label
-#   eks-subscription.amazonaws.com/emr.internal.id. It deadlocked. Karpenter does
-#   not reliably honour an inter-pod affinity zone constraint when it decides
-#   where to launch a node: it provisioned a us-west-2b node for TaskManagers
-#   whose JobManager was already in us-west-2a, the scheduler then rejected that
-#   node ("didn't match pod affinity rules"), the TMs stayed Pending, and the
-#   adaptive scheduler's resource-wait timeout expired ->
-#   NoResourceAvailableException -> job FAILED. A nodeSelector is a hard
-#   constraint Karpenter evaluates at provisioning time, so the node it creates is
-#   in the right zone to begin with. It also needs no already-running anchor pod,
-#   which means the JobManager can carry the same rule as the TaskManagers.
+# 2. emr.internal.id is stamped ASYNCHRONOUSLY, so it cannot be a match
+#    condition. Timed on this cluster during this deployment: at 60s the
+#    JobManager pods had no emr.internal.id label at all; by 4m both did. A pod
+#    is admitted long before that. Since a mutate rule that does not match is
+#    simply skipped — and a skipped mutate rule FAILS OPEN, producing no error,
+#    just an unpinned pod — matching on emr.internal.id would silently leave
+#    JobManagers in whatever zone Karpenter chose. So the rule below MATCHES on
+#    labels that are in the pod spec at submission time (component, and the
+#    operator-set emr-containers.amazonaws.com/component) and uses
+#    emr.internal.id only where it is safe: as the identifier this policy is
+#    documented to group by, asserted after the fact by the audit rule at the
+#    bottom rather than depended on at admission.
 #
 # Trade-off: a pod can no longer fall back to another AZ if this zone is out of
 # spot capacity — it stays Pending instead. That is intended for a benchmark with
@@ -35,14 +42,20 @@ kind: ClusterPolicy
 metadata:
   name: flink-cdc-single-az
   annotations:
-    policies.kyverno.io/title: Pin Flink CDC job pods to one AZ
+    policies.kyverno.io/title: Pin EMR on EKS Flink job pods to one AZ
     policies.kyverno.io/category: EMR on EKS / Flink
     policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Colocates all pods of an EMR on EKS Flink job (JobManager + TaskManagers,
+      grouped by eks-subscription.amazonaws.com/emr.internal.id — the Flink
+      equivalent of Spark's emr-containers.amazonaws.com/job.id) into a single
+      Availability Zone, using a nodeSelector so Karpenter provisions nodes in
+      the right zone instead of deadlocking on a pod affinity it cannot satisfy.
 spec:
-  # Mutate only — never block a pod. If the label is missing the rule is skipped.
+  # Mutate only — never block a pod.
   background: false
   rules:
-  - name: flink-cdc-pods-single-zone
+  - name: colocate-flink-job-pods-in-one-zone
     match:
       any:
       - resources:
@@ -63,24 +76,20 @@ spec:
           - emr-flink
           selector:
             matchExpressions:
-            # Match on `app`, which the Flink operator sets to the
-            # FlinkDeployment name and which is present in the pod spec from the
-            # moment it is submitted.
-            #
-            # An earlier version keyed on eks-subscription.amazonaws.com/emr.internal.id
-            # (Exists). Do not go back to it: EMR stamps that label
-            # asynchronously, so it is NOT reliably on the pod at admission time.
-            # Some JobManager pods carried it and some did not; for the ones that
-            # did not the rule was silently skipped and the pod was scheduled into
-            # whatever zone Karpenter picked — a skipped mutate rule fails open,
-            # so there is no error to notice, just an unpinned pod.
-            - key: app
+            # Only pods belonging to a Flink job carry
+            # emr-containers.amazonaws.com/component = flink.jobmanager |
+            # flink.taskmanager — the same intent as the job.id
+            # Exists check in the Spark example, using the label that Flink
+            # pods actually have at admission time.
+            - key: emr-containers.amazonaws.com/component
               operator: In
               values:
-              - flink-cdc-paimonv3
-              - flink-cdc-icebergv3
-            # Both JobManager and TaskManager — see the nodeSelector rationale
-            # above for why the JM can safely carry the rule too.
+              - flink.jobmanager
+              - flink.taskmanager
+            # Belt and braces: `component` is set by the Flink operator itself
+            # (not by the EMR layer) and is present from the moment the pod is
+            # submitted, so the rule still matches if the emr-containers label
+            # is ever stamped late.
             - key: component
               operator: In
               values:
@@ -90,8 +99,87 @@ spec:
       patchStrategicMerge:
         spec:
           nodeSelector:
-            # Both nodepools (driver-nodepool for JMs, executor-memorynodepool for
-            # TMs) have capacity in this zone on this cluster. Keep it aligned with
-            # wherever the JobManagers actually land; if they are already running
-            # elsewhere, set this to their zone rather than forcing a restart.
+            # Both nodepools (driver-nodepool for JMs, executor-memorynodepool
+            # for TMs) have capacity in this zone on this cluster. Keep it
+            # aligned with wherever the JobManagers actually land; if they are
+            # already running elsewhere, set this to their zone rather than
+            # forcing a restart.
+            topology.kubernetes.io/zone: us-west-2b
+
+---
+# Verification policy. The mutate above pins every job pod to one fixed zone, so
+# all pods of a job are colocated by construction — but only if it actually
+# fired, and a skipped mutate rule fails open with no error. This policy reports
+# (never blocks) any Flink job pod that ended up outside the pinned zone, turning
+# that silent failure into something visible in `kubectl get policyreport`.
+#
+# Deliberately a SEPARATE ClusterPolicy rather than a second rule above, because
+# `background` is a policy-level setting and the two rules need opposite values:
+#   - the mutate must have background: false (it only makes sense at admission;
+#     it is also CREATE-only for the JM self-PATCH reason documented above),
+#   - this audit must have background: true, because
+#     eks-subscription.amazonaws.com/emr.internal.id — the per-job identifier it
+#     groups by — is stamped asynchronously and is therefore absent at admission.
+#     With background: false this rule would match nothing and report nothing,
+#     which is how the first version of it produced an empty policy report.
+#
+# HEADS UP on this particular cluster: the Kyverno reports controller is deployed
+# with --backgroundScan=false, so NO background scan ever runs and this policy
+# will stay silent here no matter what `background:` says. Verified:
+#   kubectl get deploy kyverno-reports-controller -n kyverno \
+#     -o jsonpath='{.spec.template.spec.containers[0].args}'
+# Flipping that flag is a cluster-wide change to shared Kyverno infrastructure,
+# so it is left alone. Until it is enabled, verify colocation directly instead:
+#
+#   kubectl get pods -n emr-flink -o custom-columns=\
+# 'POD:.metadata.name,JOB:.metadata.labels.eks-subscription\.amazonaws\.com/emr\.internal\.id,ZONE:.spec.nodeSelector.topology\.kubernetes\.io/zone' \
+#     -l 'component in (jobmanager,taskmanager)'
+#
+# Every row of a given JOB must show the same ZONE. Confirmed on the current run:
+# both jobs (3d445784… iceberg, d1d5cd75… paimon) had all 10 pods in us-west-2b.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flink-cdc-single-az-audit
+  annotations:
+    policies.kyverno.io/title: Audit that each Flink job's pods share one AZ
+    policies.kyverno.io/category: EMR on EKS / Flink
+    policies.kyverno.io/subject: Pod
+spec:
+  # Background scans re-evaluate existing pods, which is the only time the
+  # per-job identifier label is reliably present.
+  background: true
+  rules:
+  - name: audit-flink-job-pods-share-one-zone
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - emr-flink
+          selector:
+            matchExpressions:
+            # Keying on the per-job identifier IS correct here: this rule only
+            # reports, and it runs in background scans after EMR has stamped it.
+            - key: eks-subscription.amazonaws.com/emr.internal.id
+              operator: Exists
+            - key: emr-containers.amazonaws.com/component
+              operator: In
+              values:
+              - flink.jobmanager
+              - flink.taskmanager
+    validate:
+      # Report only. Blocking here would kill a running job over a topology fact
+      # that is already unchangeable by the time it becomes observable.
+      failureAction: Audit
+      message: >-
+        This Flink job pod is not pinned to us-west-2b, so its job's pods may be
+        split across AZs: cross-AZ transfer is then billed in both directions and
+        any paimon-vs-iceberg comparison taken from this run measures network
+        topology rather than storage format. Check the pod's
+        eks-subscription.amazonaws.com/emr.internal.id label to see which job.
+      pattern:
+        spec:
+          nodeSelector:
             topology.kubernetes.io/zone: us-west-2b

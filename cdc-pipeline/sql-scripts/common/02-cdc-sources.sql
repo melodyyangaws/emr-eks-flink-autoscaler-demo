@@ -52,7 +52,16 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_customers (
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
-    'scan.incremental.snapshot.chunk.key-column' = 'customer_id'
+    'scan.incremental.snapshot.chunk.key-column' = 'customer_id',
+    -- Bound the snapshot chunk explicitly instead of trusting MySQL's row
+    -- estimate. information_schema.tables reported 3k rows for a 2.4M-row table
+    -- (stale InnoDB stats), so the connector emitted ONE unchunked split
+    -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
+    -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
+    -- caps each split regardless of how wrong the estimate is.
+    'scan.incremental.snapshot.chunk.size' = '8096',
+    -- Cap rows held in memory per fetch within a chunk.
+    'scan.snapshot.fetch.size' = '1024'
 );
 
 -- ============================================================================
@@ -79,7 +88,16 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_products (
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
-    'scan.incremental.snapshot.chunk.key-column' = 'product_id'
+    'scan.incremental.snapshot.chunk.key-column' = 'product_id',
+    -- Bound the snapshot chunk explicitly instead of trusting MySQL's row
+    -- estimate. information_schema.tables reported 3k rows for a 2.4M-row table
+    -- (stale InnoDB stats), so the connector emitted ONE unchunked split
+    -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
+    -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
+    -- caps each split regardless of how wrong the estimate is.
+    'scan.incremental.snapshot.chunk.size' = '8096',
+    -- Cap rows held in memory per fetch within a chunk.
+    'scan.snapshot.fetch.size' = '1024'
 );
 
 -- ============================================================================
@@ -106,7 +124,16 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
-    'scan.incremental.snapshot.chunk.key-column' = 'order_id'
+    'scan.incremental.snapshot.chunk.key-column' = 'order_id',
+    -- Bound the snapshot chunk explicitly instead of trusting MySQL's row
+    -- estimate. information_schema.tables reported 3k rows for a 2.4M-row table
+    -- (stale InnoDB stats), so the connector emitted ONE unchunked split
+    -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
+    -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
+    -- caps each split regardless of how wrong the estimate is.
+    'scan.incremental.snapshot.chunk.size' = '8096',
+    -- Cap rows held in memory per fetch within a chunk.
+    'scan.snapshot.fetch.size' = '1024'
 );
 
 -- ============================================================================
@@ -132,5 +159,14 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_order_items (
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
-    'scan.incremental.snapshot.chunk.key-column' = 'order_item_id'
+    'scan.incremental.snapshot.chunk.key-column' = 'order_item_id',
+    -- Bound the snapshot chunk explicitly instead of trusting MySQL's row
+    -- estimate. information_schema.tables reported 3k rows for a 2.4M-row table
+    -- (stale InnoDB stats), so the connector emitted ONE unchunked split
+    -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
+    -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
+    -- caps each split regardless of how wrong the estimate is.
+    'scan.incremental.snapshot.chunk.size' = '8096',
+    -- Cap rows held in memory per fetch within a chunk.
+    'scan.snapshot.fetch.size' = '1024'
 );

@@ -1,9 +1,0 @@
-stamp,window_s,metric,paimon,iceberg
-20260921T213318Z,322,records_written,1820387,645003
-20260921T213318Z,322,bytes_written,281583693,91815936
-20260921T213318Z,322,checkpoints_completed,6,0
-20260921T213318Z,322,checkpoints_failed,0,5
-20260921T213318Z,322,last_ckpt_duration_ms,8822,437
-20260921T213318Z,322,last_ckpt_size_bytes,959189,53210
-20260921T213318Z,322,lifetime_records,23879576,13874186
-20260921T213318Z,322,lifetime_ckpt_failed,0,59

@@ -1,12 +1,20 @@
 -- ============================================================================
--- Iceberg V3 Sink Tables — Streaming CDC Optimized
+-- Iceberg V2 Sink Tables — Streaming CDC Optimized
 -- ============================================================================
--- Creates Apache Iceberg V3 sink tables optimized for low-latency CDC:
---   - Deletion vectors (V3) for efficient row-level deletes
+-- Creates Apache Iceberg V2 sink tables optimized for low-latency CDC:
+--   - Positional delete files for row-level deletes (merge-on-read)
 --   - UPSERT enabled with hash distribution for PK-based dedup
 --   - ZSTD compression for better ratio on CDC payloads
 --   - Tuned snapshot retention and metadata cleanup for 60s checkpoints
 --   - Compatible with Athena engine v3
+--
+-- Keep 'format-version' = '2': the bundled iceberg-flink-runtime.jar sink writes
+-- positional-delete Parquet files, which is what V2 expects. Raising it rejects
+-- every checkpoint commit and silently freezes the table.
+--
+-- format-version applies at table creation only. Changing it here does not alter
+-- tables that already exist; the four tables must be dropped (and their S3
+-- warehouse prefix + Glue entries removed) before this DDL takes effect.
 --
 -- Streaming best practices applied:
 --   1. Smaller target file sizes (32-64MB) to match checkpoint-driven writes
@@ -21,8 +29,8 @@
 -- ============================================================================
 
 -- Switch to Iceberg catalog
-USE CATALOG icebergv3_catalog;
-USE ${GLUE_DATABASE:flink_icebergv3_db};
+USE CATALOG iceberg_catalog;
+USE ${GLUE_DATABASE:flink_iceberg_db};
 
 -- ============================================================================
 -- Table: customers (Dimension Table — unpartitioned)
@@ -43,8 +51,8 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'format-version' = '3',
-    'write.delete.vector.enabled' = 'true',
+    -- Matches the positional deletes the Flink sink writes — see the header.
+    'format-version' = '2',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
@@ -78,8 +86,8 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'format-version' = '3',
-    'write.delete.vector.enabled' = 'true',
+    -- Matches the positional deletes the Flink sink writes — see the header.
+    'format-version' = '2',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
@@ -114,8 +122,8 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (order_dt, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_dt) WITH (
-    'format-version' = '3',
-    'write.delete.vector.enabled' = 'true',
+    -- Matches the positional deletes the Flink sink writes — see the header.
+    'format-version' = '2',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
@@ -149,8 +157,8 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_dt STRING,
     PRIMARY KEY (created_dt, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_dt) WITH (
-    'format-version' = '3',
-    'write.delete.vector.enabled' = 'true',
+    -- Matches the positional deletes the Flink sink writes — see the header.
+    'format-version' = '2',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',

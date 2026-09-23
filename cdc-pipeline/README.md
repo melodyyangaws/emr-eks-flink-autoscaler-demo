@@ -5,7 +5,7 @@
 A complete **real-time Change Data Capture (CDC)** pipeline with dual lakehouse formats and multiple OLAP query engines:
 
 - **Source**: MySQL RDS with binlog-based CDC
-- **Processing**: Apache Flink on EMR on EKS 7.12
+- **Processing**: Apache Flink on EMR on EKS 7.13
 - **Storage**: Apache Paimon + Apache Iceberg on S3 (AWS Glue Catalog)
 - **OLAP**: AWS Athena (serverless) + StarRocks on EKS (high-performance)
 - **Monitoring**: Custom Python monitor app comparing Paimon vs Iceberg CDC pipelines
@@ -63,13 +63,13 @@ cdc-pipeline/
 ├── sql-scripts/
 │   ├── common/
 │   │   └── 02-cdc-sources.sql          ← MySQL CDC source table definitions
-│   ├── paimonv3/
+│   ├── paimon/
 │   │   ├── 01-catalog-setup.sql        ← Paimon catalog (Hive/Glue metastore)
 │   │   ├── 03-paimon-sinks.sql         ← Paimon tables (DV + Iceberg compat)
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
-│   ├── icebergv3/
+│   ├── iceberg/
 │   │   ├── 01-catalog-setup.sql        ← Iceberg catalog (Glue)
-│   │   ├── 03-iceberg-sinks.sql        ← Iceberg V3 tables (merge-on-read)
+│   │   ├── 03-iceberg-sinks.sql        ← Iceberg V2 tables (merge-on-read)
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
 │   └── starrocks/
 │       ├── 01-starrocks-paimon-catalog.sql
@@ -162,7 +162,7 @@ kubectl delete -f flink-cdc-paimon-deployed.yaml
 **Flink Job Configuration:**
 | Setting | Value |
 |---------|-------|
-| EMR Version | 7.12.0 |
+| EMR Version | 7.13.0 |
 | Flink Version | 1.20 |
 | Job Manager | 2 replicas (HA), 2 GB memory |
 | Task Manager | 4 GB memory, 4 task slots |
@@ -229,7 +229,7 @@ The monitor reads table stats via:
 
 **Athena (Icebergv2)** — query via Athena Console directly:
 ```sql
-SELECT * FROM flink_icebergv3_db.customers LIMIT 10;
+SELECT * FROM flink_iceberg_db.customers LIMIT 10;
 ```
 
 **Athena (Paimon)** — query via Athena Notebook :
@@ -244,7 +244,7 @@ SELECT * FROM flink_icebergv3_db.customers LIMIT 10;
 
 ```sql
 spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
-spark.sql("SELECT * FROM paimon_iceberg.flink_paimonv3_db.customers LIMIT 10").show()
+spark.sql("SELECT * FROM paimon_iceberg.flink_paimon_db.customers LIMIT 10").show()
 ```
 
 **StarRocks on EKS** — native support for both Paimon and Iceberg:
@@ -282,7 +282,8 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 - **4/8 buckets** — balances parallelism vs small file count
 
 ### Iceberg Tables
-- **Format V3** with deletion vectors — efficient merge-on-read for CDC
+- **Format V2** with positional delete files — merge-on-read for CDC, matching what
+  the bundled `iceberg-flink-runtime.jar` sink writes
 - **UPSERT enabled** (`write.upsert.enabled = true`)
 - **Explicit partition columns** — Flink SQL doesn't support hidden transforms
 - **Glue catalog** — native Athena integration
@@ -342,10 +343,10 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 ---
 
 **Status**: ✅ Production Ready
-**Last Updated**: 2026-03-11
-**EMR Version**: 7.12.0
+**Last Updated**: 2026-09-21
+**EMR Version**: 7.13.0
 **Flink Version**: 1.20
 **Paimon Version**: 1.3.0
-**Iceberg Version**: 1.10.0-amzn-0
+**Iceberg Version**: 1.10.0-amzn-1
 **StarRocks Version**: 3.2.x
 **MySQL Version**: 8.0.45

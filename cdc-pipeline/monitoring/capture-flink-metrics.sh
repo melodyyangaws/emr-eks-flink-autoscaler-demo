@@ -86,8 +86,8 @@ print('STATUS=%s'    % vert.get('state', 'UNKNOWN'))
 " "$vert" "$ckpt" 2>/dev/null
 }
 
-PAIMON_POD=$(jm_pod flink-cdc-paimonv3)
-ICEBERG_POD=$(jm_pod flink-cdc-icebergv3)
+PAIMON_POD=$(jm_pod flink-cdc-paimon)
+ICEBERG_POD=$(jm_pod flink-cdc-iceberg)
 [[ -z "$PAIMON_POD"  ]] && { echo "ERROR: no paimon JobManager pod found"  >&2; exit 1; }
 [[ -z "$ICEBERG_POD" ]] && { echo "ERROR: no iceberg JobManager pod found" >&2; exit 1; }
 

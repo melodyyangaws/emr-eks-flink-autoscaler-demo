@@ -87,7 +87,7 @@ cdc-pipeline/
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
 
-export VERSION=7.12.0
+export VERSION=7.13.0
 export NAMESPACE=emr-flink
 
 helm install flink-kubernetes-operator \
@@ -120,6 +120,7 @@ export LAKEHOUSE_FORMAT=both
 # deploy PyFlink(FlinkSQL) jobs to EKS
 ./build-deploy-generic.sh deploy
 ```
+
 ### 3. Monitor
 ```bash
 ./build-deploy-generic.sh monitor
@@ -159,8 +160,9 @@ aws s3 cp sql-scripts/common/02-cdc-sources.sql \
   s3://${BUCKET_NAME}/flink/sql-scripts/common/
 
 # Restart job
-kubectl delete flinkdeployment flink-cdc-paimon -n emr-flink
+kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n emr-flink
 kubectl apply -f flink-cdc-paimon-deployed.yaml -n emr-flink
+kubectl apply -f flink-cdc-iceberg-deployed.yaml -n emr-flink
 ```
 
 ---
@@ -276,8 +278,8 @@ aws s3 ls s3://${BUCKET_NAME}/flink/sql-scripts/paimon/
 
 **Status**: ✅ Production Ready
 **Last Updated**: 2026-02-21
-**EMR Version**: 7.12.0
+**EMR Version**: 7.13.0
 **Flink Version**: 1.20
 **Paimon Version**: 1.3.0
-**Iceberg Version**: 1.10.0-amzn-0
+**Iceberg Version**: 1.10.0-amzn-1
 **mySQL Version**: 8.0.45
