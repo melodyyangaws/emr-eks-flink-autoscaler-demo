@@ -52,13 +52,13 @@ cdc-pipeline/
 ├── 1-BUILD-DEPLOY-FLINK-APP-GUIDE.md   ← Step 1: Build & deploy Flink CDC pipelines
 ├── 2-DATA-GEN-GUIDE.md                 ← Step 2: Data generation for source DB with adjustable rate
 ├── 3-MONITOR.md                        ← Step 3: Monitoring setup guide
-├── 4-STARROCKS-OLAP-ENGINE.md          ← Step 4: OLAP layer (Athena + StarRocks)
+├── 4-STARROCKS-OLAP-ENGINE.md          ← Step 4: OLAP layer (Athena + StarRocks) + benchmark results
 │
 ├── docker/
-│   └── Dockerfile.cdc-paimon           ← Flink image (CDC + Paimon + Iceberg)
+│   └── Dockerfile.cdc-paimon           ← Flink image (CDC + Paimon + Iceberg), multi-arch
 │
-├── flink-cdc-executor.py               ← Generic SQL executor (PyFlink) runing FlinkSQL as jobs
-├── build-deploy-generic.sh             ← Build image, upload SQL, deploy jobs
+├── flink-cdc-executor.py               ← Generic SQL executor (PyFlink) running FlinkSQL as jobs
+├── build-deploy-generic.sh             ← Build image (Kaniko), upload SQL, deploy jobs
 │
 ├── sql-scripts/
 │   ├── common/
@@ -73,30 +73,59 @@ cdc-pipeline/
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
 │   └── starrocks/
 │       ├── 01-starrocks-paimon-catalog.sql
-│       └── 02-starrocks-iceberg-catalog.sql
+│       ├── 02-starrocks-iceberg-catalog.sql
+│       ├── 03-hot-data-queries.sql     ← Hot-window query suite (UTC_TIMESTAMP)
+│       ├── bench-server-side.sh        ← Benchmark harness — USE THIS ONE
+│       └── bench-hot-data.sh           ← Client-side timing; absolute numbers NOT quotable
 │
-├── flink-cdc-paimon-sql.yaml           ← FlinkDeployment manifest (Paimon)
-├── flink-cdc-iceberg-sql.yaml          ← FlinkDeployment manifest (Iceberg)
+├── flink-cdc-paimon-sql.yaml           ← FlinkDeployment manifest (Paimon), ${VAR} template
+├── flink-cdc-iceberg-sql.yaml          ← FlinkDeployment manifest (Iceberg), ${VAR} template
 │
 ├── mysql-data-generator/
-│   ├── deploy-data-generator.sh        ← Deploy/scale/configure data gen
-│   └── mysql-data-generator.yaml       ← ConfigMap + Deployment (Python)
+│   ├── deploy-data-generator.sh        ← Deploy/scale/configure either workload
+│   ├── mysql-data-generator.yaml       ← "mixed": INSERT/UPDATE/DELETE, ~400 rows/s
+│   └── mysql-upsert-loadgen.yaml       ← "upsert": batched upserts, ~40,000 rows/s
 │
 ├── monitoring/
 │   ├── deploy-monitor.sh               ← Deploy monitor (no image build)
 │   ├── flink_cdc_monitor.py            ← Flink REST API + table stats
 │   ├── entrypoint.py                   ← Continuous monitoring loop
 │   ├── monitor-deployment.yaml         ← K8s Deployment (python:3.11-slim) + ConfigMap
+│   ├── capture-flink-metrics.sh        ← Point-in-time Flink metrics → CSV
 │   └── requirements.txt                ← pip-installed at pod boot
 │
-├── deploy-starrocks.sh                 ← StarRocks on EKS deployment
-├── helm/
-│   └── starrocks-eks-values.yaml
+├── k8s/
+│   ├── ebs-sc-storageclass.yaml        ← gp3 StorageClass named "ebs-sc" (EMR requires
+│   │                                     that exact name for Flink local-recovery)
+│   └── kyverno-flink-az-affinity.yaml  ← Pin each Flink job's pods to one AZ
 │
-├── PAIMON-VS-ICEBERG.md                ← Lakehouse format comparison
-├── QUICKSTART.md                       ← Quick reference
-└── QUICK-REFERENCE.md
+├── starrocks/
+│   └── deploy-starrocks.sh             ← StarRocks on EKS deployment
+├── helm/
+│   └── starrocks-eks-values.yaml       ← kube-starrocks chart values (>= 1.11)
+│
+├── glue-catalog-test.py                ← Standalone Glue catalog connectivity check
+├── glue-catalog-test.yaml              ← Pod manifest for the above
+│
+├── bench-results/                      ← Benchmark CSVs (committed; metrics only)
+│   └── starrocks-audit-20260922T160312Z.csv
+│
+├── PAIMON-VS-ICEBERG.md                ← Format comparison + 40k/s benchmark results
+└── README.md                           ← This file
 ```
+
+**Not in git** (`.gitignore`) — generated locally, and they contain resolved account
+IDs, bucket names or credentials:
+
+```
+mysql-cdc-env.sh                        ← MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD
+*-deployed.yaml                         ← rendered manifests with ${VAR} substituted:
+                                          flink-cdc-{paimon,iceberg}-deployed.yaml,
+                                          monitoring/monitor-deployment-deployed.yaml
+```
+
+Edit the `*-sql.yaml` / `monitor-deployment.yaml` templates, never the `*-deployed.yaml`
+renderings — `build-deploy-generic.sh` overwrites the latter on every run.
 
 ---
 
