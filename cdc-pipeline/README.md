@@ -396,7 +396,8 @@ mysql -h <STARROCKS_FE_LB> -P 9030 -u root
 **Last Updated**: 2026-09-21
 **EMR Version**: 7.13.0
 **Flink Version**: 1.20
-**Paimon Version**: 1.3.0
+**Paimon Version**: 1.3.2 (newest release still publishing `paimon-spark-3.5`; 1.4.x dropped it)
 **Iceberg Version**: 1.10.0-amzn-1
-**StarRocks Version**: 3.2.x
+**StarRocks Version**: 4.1.x (chart `kube-starrocks-1.11.7`, images pinned to the
+floating `4.1-latest` tag — `SELECT CURRENT_VERSION()` reported `4.1.4-4a9848e`)
 **MySQL Version**: 8.0.45

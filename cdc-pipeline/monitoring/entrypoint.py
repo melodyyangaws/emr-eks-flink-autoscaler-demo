@@ -35,7 +35,7 @@ if not PAIMON_WAREHOUSE or not ICEBERG_WAREHOUSE:
               "(see monitoring/monitor-deployment.yaml)")
     sys.exit(1)
 CDC_TABLES = os.environ.get("CDC_TABLES", "customers,products,orders,order_items").split(",")
-MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "120"))
+MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "60"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 REPEAT_INTERVAL = int(os.environ.get("REPEAT_INTERVAL", "300"))
 REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports")

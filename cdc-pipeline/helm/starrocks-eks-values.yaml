@@ -4,9 +4,14 @@
 # Notes for this environment (loadtest-mcp / us-west-2):
 #   - Chart 1.11.x nests component specs under the `starrocks:` key. Earlier
 #     charts (<= 1.8) used top-level starrocksFESpec/starrocksBeSpec.
-#   - Image tag is left empty so the chart's appVersion is used. The sink tables
-#     are Iceberg format-version 2 and Paimon 1.3 with deletion vectors, which
-#     need a recent StarRocks — do not pin back to 3.2.x.
+#   - Image tag is left empty so the chart's appVersion is used, which on chart
+#     1.11.7 resolves to the floating `4.1-latest` tag (the cluster reported
+#     4.1.4 via SELECT CURRENT_VERSION()). The sink tables are Iceberg
+#     format-version 2 and Paimon 1.3 with deletion vectors, which need a recent
+#     StarRocks — stay on 4.1.x and do not pin to an older minor.
+#     Caveat: `4.1-latest` is mutable, so the engine version drifts whenever a
+#     pod restarts. Pin an exact tag (e.g. "4.1.4") before capturing benchmark
+#     numbers you intend to compare across runs.
 #   - S3/Glue access uses IRSA: the pods run with a ServiceAccount annotated
 #     with the EMR execution role, which already carries the S3 + Glue read
 #     permissions the external catalogs need. The catalogs therefore use

@@ -68,9 +68,31 @@ kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 # Pause (keeps the Deployment and ConfigMap, so restarting is instant)
 kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=0
 
+# Resume
+kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=1
+
 # Or remove entirely
 kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 ```
+
+Prefer scaling to zero: the pod `pip install`s its requirements at boot, so a full redeploy
+costs ~2 min of cold start while a scale-up is near-instant.
+
+The monitor is **independent** of the pipelines and the load generator — stopping it does not
+affect them, and `./build-deploy-generic.sh cleanup` does not stop it. The related commands:
+
+```bash
+# Flink CDC jobs (prompts for confirmation)
+./build-deploy-generic.sh cleanup [paimon|iceberg]
+
+# Load generator — `mixed` (Deployment) or `upsert` (StatefulSet)
+./mysql-data-generator/deploy-data-generator.sh stop upsert
+```
+
+> `monitor-deployment-deployed.yaml` is the rendered output of the template and is
+> gitignored, so `kubectl delete -f` only works on a machine that has run
+> `deploy-monitor.sh`. Elsewhere use
+> `kubectl delete deployment/flink-cdc-monitor -n emr-flink`.
 
 ---
 

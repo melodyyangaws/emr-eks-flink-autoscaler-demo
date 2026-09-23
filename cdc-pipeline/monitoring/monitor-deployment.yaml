@@ -24,7 +24,11 @@ data:
   PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimon-warehouse"
   ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/iceberg-warehouse/"
   CDC_TABLES: "customers,products,orders,order_items"
-  MONITOR_DURATION: "120"
+  # Sampling window per pipeline, reported as "Duration (s)" in the comparison
+  # table. Throughput is (last records_out - first records_out) / elapsed across
+  # this window, so it must stay a multiple of POLL_INTERVAL: at 60s/20s the loop
+  # takes samples at 0/20/40/60 and the delta spans a full minute.
+  MONITOR_DURATION: "60"
   POLL_INTERVAL: "20"
   REPEAT_INTERVAL: "60"
   RUN_MODE: "continuous"
