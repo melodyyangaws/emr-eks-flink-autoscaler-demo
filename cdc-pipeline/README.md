@@ -1,5 +1,26 @@
 # Realtime Lakehouse via Flink CDC (FlinkSQL Approch)
 
+## Quick Start — what to ask your AI tool
+
+- Clone the source code, go to the project directory, start your GenAI assistant. 
+- Just talk to the GenAI assistant at your terminal or IDE in plain language. See the following examples:
+
+- **Create a test on an existing EKS cluster:**
+  > "follow the Deployment Steps to create the test, use my existing EKS cluster called demo"
+
+- **Start flink jobs to produce Paimon and Iceberg data to S3**
+  > "Start both jobs for Paimon and Iceberg at the same time"
+  > 
+- **Start data generator to create new CDC dataset in RDS as source**
+  > "Start a large scale data gen to test UPSERT performance, with the rate of 40k/s"
+  >
+- **Capture benchmark result**
+  > "Start to monitor the flink jobs to capture test result"
+  >
+- **Test StarRocks queries and capture the result**
+  > "Query hostdata and snapshot data using Starrocks, collect the read performance result for Paimon and Iceberg formats and compare"
+  >
+  
 ## What We Built
 
 A complete **real-time Change Data Capture (CDC)** pipeline with dual lakehouse formats and multiple OLAP query engines:
