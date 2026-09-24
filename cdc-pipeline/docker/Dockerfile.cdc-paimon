@@ -19,8 +19,16 @@ ARG EMR_VERSION=7.13.0
 # Stage 1: Download Flink connector JARs
 # ============================================================================
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 AS downloader
+# PAIMON_VERSION stays on the 1.3.x line deliberately. 1.4.x publishes the Flink
+# modules used here but dropped every paimon-spark bundle from Maven Central
+# (paimon-spark-3.5 and -4.0 are both 404 at 1.4.1), and EMR 7.13 ships Spark
+# 3.5.6 — so moving to 1.4.x would keep Flink writes working while silently
+# removing the Spark reader that the Athena notebook path depends on. 1.3.2 is
+# the newest release that has both. Being a patch bump it also leaves the table
+# format and deletion-vector metadata unchanged, so existing warehouse data is
+# readable without a rewrite and earlier benchmark numbers stay comparable.
 ENV FLINK_VERSION=1.20 \
-    PAIMON_VERSION=1.3.0 \
+    PAIMON_VERSION=1.3.2 \
     MYSQL_CDC_VERSION=3.5.0 \
     SCALA_VERSION=2.12
 

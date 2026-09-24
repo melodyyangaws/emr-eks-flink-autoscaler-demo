@@ -11,6 +11,41 @@ It simulates a real production workload with:
 
 ---
 
+## Two workloads — pick the right one
+
+`deploy-data-generator.sh` drives **two** generators against the same database. Every
+command below takes `mixed` or `upsert` as a trailing argument (or `WORKLOAD=`), and the
+default is `mixed`. They are not interchangeable:
+
+| | `mixed` (default) | `upsert` |
+|---|---|---|
+| Manifest | `mysql-data-generator.yaml` | `mysql-upsert-loadgen.yaml` |
+| Kubernetes kind | Deployment | **StatefulSet** |
+| Statements | one row per statement | `INSERT … ON DUPLICATE KEY UPDATE`, 500 rows/statement |
+| Rate | ~400 rows/s ceiling | ~40,000 rows/s across 8 pods |
+| DELETE events | **yes** | no |
+| Use it for | CDC correctness, all three event types | the Paimon-vs-Iceberg storage benchmark |
+
+`mixed` does not scale — it issues one statement per row and picks rows with
+`ORDER BY RAND()`. Use it to prove the pipeline handles inserts, updates *and* deletes.
+
+`upsert` is the benchmark workload. Repeated upserts on a skewed hot-key window are what
+make Iceberg accumulate equality-delete files while Paimon's LSM compacts them away; a
+uniformly random key stream over 14M keys would measure raw ingest and show neither effect.
+
+> **The upsert generator is a StatefulSet, not a Deployment.** Each pod owns a *disjoint
+> slice* of the hot-key window and derives that slice from its ordinal, and only a
+> StatefulSet hands out exact `0..N-1` ordinals (`mysql-upsert-loadgen-0` … `-7`). This
+> matters for two commands: `kubectl` calls must say `statefulset`, not `deployment`, and
+> if you ever ran the older Deployment version you must `kubectl delete deployment
+> mysql-upsert-loadgen -n emr-flink` first — `kubectl apply` cannot convert a Deployment
+> into a StatefulSet of the same name.
+
+The rest of this guide covers the `mixed` workload; the
+[Upsert Workload](#upsert-workload-benchmark-load) section covers `upsert`.
+
+---
+
 ## What It Does
 
 ### **Operations Generated**
@@ -195,6 +230,126 @@ Adjust batch size and interval:
 ```bash
 ./mysql-data-generator/deploy-data-generator.sh stop
 ```
+
+---
+
+## Upsert Workload (benchmark load)
+
+The high-rate workload used for the Paimon-vs-Iceberg comparison in
+[4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md). Append `upsert` to every command.
+
+### **Deploy**
+
+```bash
+cd cdc-pipeline
+source mysql-cdc-env.sh
+
+# One-time only, and only if the older Deployment version was ever applied.
+# apply cannot convert a Deployment into a StatefulSet of the same name.
+kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
+
+# 8 pods x RATE_PER_POD 5000 = 40,000 rows/s aggregate
+./mysql-data-generator/deploy-data-generator.sh deploy upsert
+```
+
+Pods come up as `mysql-upsert-loadgen-0` … `-7` all at once
+(`podManagementPolicy: Parallel` — the default `OrderedReady` would start them one at a
+time, and during that ramp the achieved rate is meaningless).
+
+Each pod logs its ordinal on startup; this is the line to check, because a duplicate
+ordinal means two pods are fighting over the same rows:
+
+```
+mysql C extension: available
+pod=mysql-upsert-loadgen-3 ordinal=3 of 8
+```
+
+### **Stop**
+
+```bash
+./mysql-data-generator/deploy-data-generator.sh stop upsert
+```
+
+This deletes the StatefulSet, its headless Service and the script ConfigMap. To pause
+without deleting anything, scale to zero instead:
+
+```bash
+kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
+```
+
+### **Status and achieved rate**
+
+```bash
+./mysql-data-generator/deploy-data-generator.sh status upsert
+```
+
+Quote the **`avg=`** figure, never `inst=`. `avg` is cumulative since pod start; `inst` is a
+15-second sample and the pods report on staggered clocks, so summing `inst` reads high or
+low depending on when you looked. The target rate is only a token-bucket ceiling — a
+shortfall shows up as a low `avg`, not as an error.
+
+### **Scale**
+
+```bash
+# 16 pods x 5000 = 80,000 rows/s target
+./mysql-data-generator/deploy-data-generator.sh scale 16 upsert
+```
+
+The script sets `POD_COUNT=16` **before** scaling. `POD_COUNT` is the divisor that sizes
+each pod's hot-key slice, so it has to track the replica count: set too low, slices overlap
+and the cross-pod lock convoy returns; set too high, part of the window goes unwritten. If
+you scale with a bare `kubectl scale`, set `POD_COUNT` yourself.
+
+### **Tune rate and key skew**
+
+```bash
+# rate/pod, worker threads, rows per statement
+./mysql-data-generator/deploy-data-generator.sh config 5000 4 500 upsert
+
+# upsert ratio, hot-key ratio, hot-key window
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.8 20000 upsert
+```
+
+`config` changes *how fast*; `upsert-mix` changes *what is being measured*. A tighter
+`HOT_KEY_WINDOW` concentrates updates and accumulates Iceberg delete files faster —
+widening it weakens the very effect the comparison is looking for.
+
+### **Measured ceiling**
+
+A replica ramp (`mysql-data-generator/find-rds-ceiling.sh`) against `db.m5.2xlarge` /
+500 GB gp3 / 12,000 provisioned IOPS found the aggregate rate peaks near **32 replicas at
+~69,000 rows/s and then declines**:
+
+| replicas | target | achieved | % of target | RDS CPU | write IOPS |
+|---------:|-------:|---------:|------------:|--------:|-----------:|
+| 8 | 40,000 | 34,989 | 87.5% | 32% | 7,363 |
+| 16 | 80,000 | 58,265 | 72.8% | 47% | 8,013 |
+| 24 | 120,000 | 65,914 | 54.9% | 47% | 7,955 |
+| **32** | 160,000 | **68,818** | 43.0% | 48% | 7,997 |
+| 40 | 200,000 | 66,404 | 33.2% | 46% | 7,481 |
+
+The limit was **InnoDB row-lock contention, not hardware**: at 40 replicas 154 of 163
+server connections sat in `LOCK WAIT` with 2.33M cumulative row-lock waits averaging
+135 ms, while CPU idled under 50% and write IOPS sat at 8,000 of the 12,000 provisioned.
+Connections were never the constraint — 160 against `max_connections=2591`.
+
+Hot-window sharding (`SHARD_HOT_KEYS=true`) was added in response: it gives each pod a
+disjoint slice so pods stop colliding, which raised 8-replica throughput from 34,989 to
+**39,964 rows/s (99.9% of target)** and pushed RDS CPU up to 54.7% — the bottleneck moving
+toward the database, which is the point. Sharding makes each key *hotter*, not colder (with
+32 pods a pod cycles ~1,560 keys instead of 50,000), so it strengthens rather than dilutes
+the benchmark signal.
+
+Re-run the ramp to re-establish the ceiling under the sharded pattern:
+
+```bash
+# hold_seconds, then replica steps
+./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
+# results land in ./bench-results/rds-ceiling-<UTC timestamp>.csv
+```
+
+> Pods are **not** CPU-bound: measured 31–70 millicores against a 2-core limit (~3%). They
+> block on MySQL round trips. Add replicas rather than raising `THREADS` in one pod.
 
 ---
 
@@ -409,6 +564,11 @@ FROM ecommerce.customers;
 
 ## Commands Reference
 
+Every command takes `mixed` (default) or `upsert` as a trailing argument. `WORKLOAD=upsert`
+works too if you prefer an environment variable.
+
+### mixed workload — CDC correctness, all three event types
+
 ```bash
 # Deploy
 ./mysql-data-generator/deploy-data-generator.sh deploy
@@ -434,16 +594,50 @@ FROM ecommerce.customers;
 ./mysql-data-generator/deploy-data-generator.sh config 5 10       # 5 records/10s
 ```
 
+### upsert workload — 40k/s benchmark load (StatefulSet)
+
+```bash
+# One-time, only if the older Deployment version was ever applied
+kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
+
+# Deploy — 8 pods x 5000 = 40,000 rows/s
+./mysql-data-generator/deploy-data-generator.sh deploy upsert
+
+# Stop (removes StatefulSet + headless Service + ConfigMap)
+./mysql-data-generator/deploy-data-generator.sh stop upsert
+
+# Pause without deleting
+kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
+
+# Status + achieved rate per pod (quote avg=, not inst=)
+./mysql-data-generator/deploy-data-generator.sh status upsert
+
+# Scale — also sets POD_COUNT so hot-key slices stay disjoint
+./mysql-data-generator/deploy-data-generator.sh scale 16 upsert
+
+# Rate: rows/s per pod, threads, rows per statement
+./mysql-data-generator/deploy-data-generator.sh config 5000 4 500 upsert
+
+# Key skew: upsert ratio, hot-key ratio, hot-key window
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.8 20000 upsert
+
+# Find the RDS ceiling: hold_seconds, then replica steps
+./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
+```
+
 ---
 
 ## Summary
 
-✅ **Deployed as**: Kubernetes Deployment in `emr-flink` namespace
-✅ **Purpose**: Generate continuous streaming data for CDC testing
-✅ **Operations**: INSERT, UPDATE, DELETE on 4 tables
-✅ **Scalable**: 1-10 pods for different load profiles
-✅ **Configurable**: Batch size and interval adjustable
+✅ **Two workloads**: `mixed` (Deployment, ~400 rows/s, emits DELETEs) and `upsert`
+   (StatefulSet, ~40,000 rows/s, no DELETEs)
+✅ **Deployed in**: `emr-flink` namespace
+✅ **Purpose**: `mixed` for CDC correctness, `upsert` for the storage-format benchmark
+✅ **Operations**: INSERT, UPDATE, DELETE on 4 tables (`mixed`);
+   batched `ON DUPLICATE KEY UPDATE` (`upsert`)
+✅ **Scalable**: 1-10 pods (`mixed`); 8-40 pods with per-pod hot-key slices (`upsert`)
+✅ **Configurable**: batch size and interval (`mixed`); rate, threads, key skew (`upsert`)
 ✅ **Realistic**: E-commerce transactional patterns
-✅ **Monitored**: Live statistics every 5 iterations
+✅ **Measured**: ~69,000 rows/s RDS ceiling on `db.m5.2xlarge`, lock-contention-bound
 
 Use this to test and validate your Flink CDC pipelines with realistic streaming workloads! 🚀

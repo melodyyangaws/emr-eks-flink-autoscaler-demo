@@ -10,6 +10,8 @@
 --   MYSQL_USER: MySQL username
 --   MYSQL_PASSWORD: MySQL password
 --   MYSQL_DATABASE: MySQL database name (default: ecommerce)
+--   CDC_SERVER_ID_CUSTOMERS, CDC_SERVER_ID_PRODUCTS, CDC_SERVER_ID_ORDERS,
+--   CDC_SERVER_ID_ORDER_ITEMS: binlog client id ranges (see below)
 --
 -- Features:
 --   - Full snapshot on startup, then continuous binlog CDC
@@ -17,6 +19,34 @@
 --   - Non-blocking snapshot (no table locks on RDS)
 --   - Heartbeat to prevent connection timeout during idle periods
 --   - JDBC-level timeouts to prevent hung connections
+--
+-- ----------------------------------------------------------------------------
+-- server-id: every source below MUST get an explicit, globally unique range
+-- ----------------------------------------------------------------------------
+-- Each source subtask opens its own binlog client, and MySQL treats a client's
+-- server id as an exclusive identity: when a second client connects with an id
+-- already in use, the server evicts the first one. The evicted subtask dies with
+--
+--   io.debezium.DebeziumException: A replica with the same server_uuid/server_id
+--   as this replica has connected to the source
+--
+-- Leaving 'server-id' unset lets the connector pick ids on its own, and this
+-- deployment opens 128 binlog clients at once (16 subtasks x 4 tables x 2 jobs,
+-- Paimon and Iceberg reading the same MySQL), so ids collided constantly. The
+-- sources then failed in a loop, no checkpoint ever completed ("Not all required
+-- tasks are currently running"), and neither sink committed a snapshot — the
+-- lakehouse tables sat frozen while /jobs still reported RUNNING.
+--
+-- The range must be at least as wide as the source parallelism; 32 each leaves
+-- room to raise parallelism without re-planning the map. These are injected per
+-- job from the FlinkDeployment manifests so the two pipelines never overlap:
+--
+--             customers    products     orders       order_items
+--   Paimon    5401-5432    5441-5472    5481-5512    5521-5552
+--   Iceberg   6401-6432    6441-6472    6481-6512    6521-6552
+--
+-- They are intentionally declared with no default: a missing value should fail
+-- the job loudly at SQL-parse time rather than silently re-collide at runtime.
 -- ============================================================================
 
 -- Create dedicated catalog for CDC sources (instead of default_catalog)
@@ -49,6 +79,8 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_customers (
     'password' = '${MYSQL_PASSWORD}',
     'database-name' = '${MYSQL_DATABASE:ecommerce}',
     'table-name' = 'customers',
+    -- Unique binlog client id range — see the server-id note in the header.
+    'server-id' = '${CDC_SERVER_ID_CUSTOMERS}',
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
@@ -59,9 +91,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_customers (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -85,6 +127,8 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_products (
     'password' = '${MYSQL_PASSWORD}',
     'database-name' = '${MYSQL_DATABASE:ecommerce}',
     'table-name' = 'products',
+    -- Unique binlog client id range — see the server-id note in the header.
+    'server-id' = '${CDC_SERVER_ID_PRODUCTS}',
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
@@ -95,9 +139,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_products (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -121,6 +175,8 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
     'password' = '${MYSQL_PASSWORD}',
     'database-name' = '${MYSQL_DATABASE:ecommerce}',
     'table-name' = 'orders',
+    -- Unique binlog client id range — see the server-id note in the header.
+    'server-id' = '${CDC_SERVER_ID_ORDERS}',
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
@@ -131,9 +187,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -156,6 +222,8 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_order_items (
     'password' = '${MYSQL_PASSWORD}',
     'database-name' = '${MYSQL_DATABASE:ecommerce}',
     'table-name' = 'order_items',
+    -- Unique binlog client id range — see the server-id note in the header.
+    'server-id' = '${CDC_SERVER_ID_ORDER_ITEMS}',
     'server-time-zone' = 'UTC',
     'scan.startup.mode' = 'initial',
     'scan.incremental.snapshot.enabled' = 'true',
@@ -166,7 +234,17 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_order_items (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );

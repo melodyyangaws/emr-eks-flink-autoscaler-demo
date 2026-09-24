@@ -253,6 +253,17 @@ Every timing is the median of 3 server-side `Time=` values from the FE audit log
 **while the 40k/s load was still running** — so these are concurrent-ingest read latencies,
 not quiet-table latencies.
 
+> Measured on **Paimon 1.3.0**. The image has since moved to 1.3.2 (a patch bump, same
+> table format and deletion-vector metadata), so these numbers remain the comparison
+> baseline and were not re-measured. Re-run the suite before quoting them against any
+> later minor version.
+>
+> Also captured before the generator gained hot-window sharding (`SHARD_HOT_KEYS`) and
+> the C-extension MySQL driver. Those changes alter how the *write* rate is reached, not
+> the key distribution the comparison depends on — each pod now draws from a disjoint
+> slice, which makes individual keys hotter rather than colder. Read-side ratios are
+> unaffected; the write rate at a given replica count is now higher.
+
 ### Workload
 
 | Parameter | Value |
@@ -262,7 +273,7 @@ not quiet-table latencies.
 | Key skew | 60% of upserts into a 50,000-key hot window, 40% across the full key range |
 | Table mix | order_items 45%, orders 30%, customers 15%, products 10% |
 | Duration before benchmark | ~17 min sustained (≈41M row-modifications) |
-| Generator | `mysql-data-generator/mysql-upsert-loadgen.yaml`, 8 replicas × 4 threads × 500-row batches |
+| Generator | `mysql-data-generator/mysql-upsert-loadgen.yaml` (StatefulSet), 8 replicas × 4 threads × 500-row batches |
 | Both pipelines | `RUNNING`, 34/34 checkpoints completed, 0 failed, parallelism 16 |
 
 ### Table state at benchmark time
@@ -329,8 +340,18 @@ volume, while Paimon's LSM has already merged them away.
 ./sql-scripts/starrocks/bench-server-side.sh            # snapshot + hot suites
 SUITE=hot RUNS=5 ./sql-scripts/starrocks/bench-server-side.sh
 
-# 40k/s upsert load (8 pods x 5000/s):
+# 40k/s upsert load (8 pods x 5000/s). This is a StatefulSet, not a Deployment:
+# each pod derives its own disjoint slice of the hot-key window from its ordinal,
+# and only a StatefulSet hands out exact 0..N-1 ordinals. If the older Deployment
+# version was ever applied, delete it first — apply cannot convert kinds in place.
+kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
 kubectl apply -f mysql-data-generator/mysql-upsert-loadgen.yaml
+
+# or, equivalently, via the management script:
+./mysql-data-generator/deploy-data-generator.sh deploy upsert
+
+# stop the load when the benchmark is done:
+./mysql-data-generator/deploy-data-generator.sh stop upsert
 ```
 
 Note the StarRocks catalogs must exist and point at the *current* warehouses — this cluster
@@ -426,4 +447,6 @@ Start: Need OLAP Query Layer
 
 **Status**: ✅ Production Ready
 **Last Updated**: 2026-03-08
-**Technologies**: Flink 1.20, Paimon 1.3.0, Iceberg 1.10.0-amzn-1, StarRocks 4.1.4
+**Technologies**: Flink 1.20, Paimon 1.3.2, Iceberg 1.10.0-amzn-1, StarRocks 4.1.4
+(benchmark numbers above were captured on Paimon 1.3.0 — see the note in
+[Performance Comparison](#performance-comparison))

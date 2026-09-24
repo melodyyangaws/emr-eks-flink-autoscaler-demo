@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS customers (
     'write.distribution-mode' = 'hash',
     'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
+    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
+    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
+    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
+    -- throughput and a stored-bytes difference that is a config artifact rather than
+    -- a property of either table format.
+    'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '8388608',
     'history.expire.max-snapshot-age-ms' = '3600000',
     'history.expire.min-snapshots-to-keep' = '5',
@@ -95,6 +101,12 @@ CREATE TABLE IF NOT EXISTS products (
     'write.distribution-mode' = 'hash',
     'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
+    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
+    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
+    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
+    -- throughput and a stored-bytes difference that is a config artifact rather than
+    -- a property of either table format.
+    'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '8388608',
     'history.expire.max-snapshot-age-ms' = '3600000',
     'history.expire.min-snapshots-to-keep' = '5',
@@ -131,6 +143,12 @@ CREATE TABLE IF NOT EXISTS orders (
     'write.distribution-mode' = 'hash',
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
+    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
+    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
+    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
+    -- throughput and a stored-bytes difference that is a config artifact rather than
+    -- a property of either table format.
+    'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
     'history.expire.max-snapshot-age-ms' = '3600000',
     'history.expire.min-snapshots-to-keep' = '5',
@@ -166,6 +184,12 @@ CREATE TABLE IF NOT EXISTS order_items (
     'write.distribution-mode' = 'hash',
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
+    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
+    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
+    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
+    -- throughput and a stored-bytes difference that is a config artifact rather than
+    -- a property of either table format.
+    'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
     'history.expire.max-snapshot-age-ms' = '3600000',
     'history.expire.min-snapshots-to-keep' = '5',

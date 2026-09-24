@@ -71,16 +71,23 @@ for arg in "$@"; do
 done
 set -- "${ARGS[@]}"
 
+# KIND differs between the two workloads: the upsert generator is a StatefulSet
+# so that each pod gets a stable 0..N-1 ordinal to shard the hot-key window by
+# (a Deployment's random name suffix had to be hashed, and hashing collided).
+# Every kubectl call below is parameterised on it, since `scale`, `set env` and
+# `get` all need the resource kind spelled correctly.
 case $WORKLOAD in
     mixed)
         MANIFEST="mysql-data-generator/mysql-data-generator.yaml"
         DEPLOYMENT="mysql-data-generator"
         APP_LABEL="mysql-data-generator"
+        KIND="deployment"
         ;;
     upsert)
         MANIFEST="mysql-data-generator/mysql-upsert-loadgen.yaml"
         DEPLOYMENT="mysql-upsert-loadgen"
         APP_LABEL="mysql-upsert-loadgen"
+        KIND="statefulset"
         ;;
     *)
         error "Unknown WORKLOAD '$WORKLOAD' (expected 'mixed' or 'upsert')"
@@ -174,7 +181,7 @@ stop_generator() {
 status_generator() {
     log "Data generator status (workload: $WORKLOAD):"
     echo ""
-    kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" || true
+    kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" || true
     echo ""
     kubectl get pods -l app="$APP_LABEL" -n "$NAMESPACE" || true
 
@@ -215,7 +222,25 @@ scale_generator() {
     local replicas=${2:-1}
     log "Scaling data generator to $replicas replicas..."
 
-    kubectl scale deployment "$DEPLOYMENT" \
+    # The upsert workload shards the hot-key window by POD_COUNT, so that value
+    # has to move with the replica count. Setting it BEFORE scaling means the
+    # rollout the env change triggers already carries the right divisor, instead
+    # of pods starting on a stale one and restarting a second time. A POD_COUNT
+    # below the real replica count makes slices overlap and brings back the
+    # cross-pod lock convoy that capped throughput at ~69,000 rows/s.
+    if [[ "$WORKLOAD" == upsert ]]; then
+        local shard
+        shard=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
+                  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SHARD_HOT_KEYS")].value}' \
+                  2>/dev/null)
+        if [[ "${shard:-true}" == "true" ]]; then
+            log "Setting POD_COUNT=$replicas to keep hot-key slices disjoint..."
+            kubectl set env "$KIND"/"$DEPLOYMENT" POD_COUNT="$replicas" \
+                -n "$NAMESPACE" >/dev/null || warn "Could not update POD_COUNT"
+        fi
+    fi
+
+    kubectl scale "$KIND" "$DEPLOYMENT" \
         --replicas="$replicas" \
         -n "$NAMESPACE" || error "Failed to scale"
 
@@ -223,7 +248,7 @@ scale_generator() {
 
     if [[ "$WORKLOAD" == upsert ]]; then
         local per_pod
-        per_pod=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+        per_pod=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
                     -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RATE_PER_POD")].value}' \
                     2>/dev/null)
         [[ -n "$per_pod" ]] && \
@@ -245,14 +270,14 @@ configure_rate() {
         log "  Threads      : ${threads}"
         log "  Rows/batch   : ${batch_rows}"
 
-        kubectl set env deployment/"$DEPLOYMENT" \
+        kubectl set env "$KIND"/"$DEPLOYMENT" \
             RATE_PER_POD="$rate" \
             THREADS="$threads" \
             BATCH_ROWS="$batch_rows" \
             -n "$NAMESPACE" || error "Failed to update configuration"
 
         local replicas
-        replicas=$(kubectl get deployment "$DEPLOYMENT" -n "$NAMESPACE" \
+        replicas=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
                      -o jsonpath='{.spec.replicas}' 2>/dev/null)
         [[ -n "$replicas" ]] && \
             info "Aggregate target: ${replicas} x ${rate} = $(( replicas * rate )) rows/s"
@@ -270,7 +295,7 @@ configure_rate() {
         log "  Batch size: $batch_size"
         log "  Sleep interval: ${sleep_seconds}s"
 
-        kubectl set env deployment/"$DEPLOYMENT" \
+        kubectl set env "$KIND"/"$DEPLOYMENT" \
             BATCH_SIZE="$batch_size" \
             SLEEP_SECONDS="$sleep_seconds" \
             -n "$NAMESPACE" || error "Failed to update configuration"
@@ -299,7 +324,7 @@ configure_upsert_mix() {
     log "  Hot-key ratio  : ${hot_ratio}"
     log "  Hot-key window : ${hot_window} keys"
 
-    kubectl set env deployment/"$DEPLOYMENT" \
+    kubectl set env "$KIND"/"$DEPLOYMENT" \
         UPSERT_RATIO="$upsert_ratio" \
         HOT_KEY_RATIO="$hot_ratio" \
         HOT_KEY_WINDOW="$hot_window" \

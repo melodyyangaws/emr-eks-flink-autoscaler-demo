@@ -54,8 +54,10 @@ cdc-pipeline/
     ├── Dockerfile.cdc-paimon        ← Docker image with FlinkCDC(add) + Paimon(add) + Iceberg 
   |
   ├── mysql-data-generator
-    ├── deploy-data-generator.sh
-    ├── mysql-data-generator.yaml
+    ├── deploy-data-generator.sh     ← Manages both workloads (pass `mixed` or `upsert`)
+    ├── mysql-data-generator.yaml    ← `mixed`: Deployment, INSERT/UPDATE/DELETE, ~400 rows/s
+    ├── mysql-upsert-loadgen.yaml    ← `upsert`: StatefulSet, batched upserts, ~40,000 rows/s
+    ├── find-rds-ceiling.sh          ← Ramps upsert replicas to find the RDS write ceiling
   |  
   ├── flink-cdc-executor.py            ← Generic SQL executor to produce Paimon or Iceberg tables
   │
@@ -225,6 +227,33 @@ python flink-cdc-executor.py \
 ./build-deploy-generic.sh cleanup
 ```
 
+### Stopping the pipelines
+
+`cleanup` prompts for confirmation, then deletes the rendered FlinkDeployments. It takes an
+optional format so you can stop one pipeline and leave the other running — useful when only
+one side of the Paimon-vs-Iceberg comparison needs restarting:
+
+```bash
+./build-deploy-generic.sh cleanup            # both (LAKEHOUSE_FORMAT default)
+./build-deploy-generic.sh cleanup paimon     # Paimon only
+./build-deploy-generic.sh cleanup iceberg    # Iceberg only
+```
+
+This removes the jobs, **not** the data: S3 warehouses, Glue tables and checkpoints all
+survive, so a redeploy resumes against the existing tables.
+
+To stop everything the pipeline touches, stop the load generator and the monitor too — they
+are independent workloads and `cleanup` does not know about them:
+
+```bash
+./mysql-data-generator/deploy-data-generator.sh stop upsert   # or `mixed`
+kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=0
+```
+
+> Restarting a job with `kubectl delete flinkdeployment` + `kubectl apply` (as in
+> [Change CDC Configuration](#change-cdc-configuration) above) is not the same as `cleanup`:
+> it reuses the already-rendered `*-deployed.yaml` and skips the confirmation prompt.
+
 ---
 
 ## Troubleshooting
@@ -272,7 +301,12 @@ aws s3 ls s3://${BUCKET_NAME}/flink/sql-scripts/paimon/
 
 ## Next Steps
 
-- **Generate sample data**: Follow the [DATA-GEN-GUIDE](./DATA-GEN-GUIDE.md) to produce more source data in mysql DB based on different rate.
+- **Generate sample data**: Follow the [Data Generator Guide](./2-DATA-GEN-GUIDE.md) to produce
+  more source data in the MySQL DB at different rates. Use the `mixed` workload for CDC
+  correctness (it is the only one that emits DELETE events) and the `upsert` workload for
+  high-rate benchmark load (~40,000 rows/s across 8 pods).
+- **Monitor the pipelines**: [Monitor Guide](./3-MONITOR.md)
+- **Query with StarRocks**: [StarRocks OLAP Engine](./4-STARROCKS-OLAP-ENGINE.md)
 
 ---
 
@@ -280,6 +314,6 @@ aws s3 ls s3://${BUCKET_NAME}/flink/sql-scripts/paimon/
 **Last Updated**: 2026-02-21
 **EMR Version**: 7.13.0
 **Flink Version**: 1.20
-**Paimon Version**: 1.3.0
+**Paimon Version**: 1.3.2 (newest release still publishing `paimon-spark-3.5`; 1.4.x dropped it)
 **Iceberg Version**: 1.10.0-amzn-1
 **mySQL Version**: 8.0.45

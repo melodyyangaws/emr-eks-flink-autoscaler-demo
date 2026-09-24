@@ -43,6 +43,12 @@ ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db}"
 SUITE="${SUITE:-all}"
 RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-1}"
+# S3 bucket both formats must live in. The preflight below resolves each format's
+# real physical read path and fails the run if either one leaves this bucket or if
+# the two ever resolve to the same prefix (which would mean the "comparison" is
+# reading one dataset twice). Default is derived from the account, matching
+# build-deploy-generic.sh.
+EXPECT_BUCKET="${EXPECT_BUCKET:-}"
 OUT_DIR="${OUT_DIR:-./bench-results}"
 mkdir -p "$OUT_DIR"
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -121,6 +127,71 @@ echo "  Results : ${CSV}"
 echo "═══════════════════════════════════════════════════════════════════════"
 
 sr1 "SELECT 1;" >/dev/null || { echo "ERROR: cannot reach StarRocks FE in ${FE_POD}" >&2; exit 1; }
+
+# ── Preflight: both formats must read from the same S3 bucket ───────────────
+# This guards a failure mode that produces plausible-looking numbers instead of an
+# error. The cluster carries stale v3 catalogs alongside the live ones
+# (paimon_catalogv3 -> paimonv3-warehouse/, icebergv3_catalog -> icebergv3-warehouse/),
+# so a mistyped PAIMON_CATALOG/ICEBERG_CATALOG silently benchmarks a different,
+# frozen dataset in a different prefix and still prints a full ratio table. Storage
+# location is the one variable this benchmark must hold fixed — the whole claim is
+# "same bucket, same region, same S3 endpoint, only the table format differs" — so
+# it is asserted rather than assumed.
+#
+# The two paths are resolved from what StarRocks will actually read, not from the
+# catalog properties:
+#   Iceberg — the file_path of a real data file from the <table>$files metadata
+#             table. Iceberg data can live outside the catalog warehouse (the Glue
+#             table's own location wins), so only a data file proves the location.
+#   Paimon  — paimon.catalog.warehouse from SHOW CREATE CATALOG. Paimon's $files
+#             metadata table is not readable through this connector ("Failed to
+#             find latest snapshot id"), so the catalog root is the best available
+#             signal; it is a filesystem catalog, so the root does determine reads.
+resolve_bucket() { sed -n 's#^s3[an]*://\([^/]*\)/.*#\1#p' <<<"$1" | head -1; }
+
+ICE_FILE=$(sr1 "SELECT file_path FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.\`customers\$files\` LIMIT 1;" | head -1)
+PAI_ROOT=$(kubectl exec -n "$NAMESPACE" "$FE_POD" -- mysql -h127.0.0.1 -P9030 -uroot -N -B \
+             -e "SHOW CREATE CATALOG ${PAIMON_CATALOG};" 2>/dev/null \
+           | grep -o '"paimon.catalog.warehouse"[^"]*"[^"]*"' | grep -o 's3[an]*://[^"]*' | head -1)
+
+[[ -n "$ICE_FILE" ]] || { echo "ERROR: could not resolve an Iceberg data file path from ${ICEBERG_CATALOG}.${ICEBERG_DB}" >&2; exit 1; }
+[[ -n "$PAI_ROOT" ]] || { echo "ERROR: could not resolve paimon.catalog.warehouse from ${PAIMON_CATALOG}" >&2; exit 1; }
+
+PAI_BUCKET=$(resolve_bucket "$PAI_ROOT")
+ICE_BUCKET=$(resolve_bucket "$ICE_FILE")
+# Compare the table-level prefixes, not the full file path: a data file sits many
+# levels below the table root, so the raw strings would never match anyway.
+PAI_PREFIX="${PAI_ROOT#*://}"
+ICE_PREFIX=$(sed -n 's#^s3[an]*://[^/]*/\(.*\)/customers/.*#\1#p' <<<"$ICE_FILE" | head -1)
+
+printf '\n%s\n' "── Storage location (asserted, not assumed) ───────────────────────────"
+printf '  %-8s %s\n' "Paimon"  "$PAI_ROOT"
+printf '  %-8s %s\n' "Iceberg" "$ICE_FILE"
+
+if [[ -z "$EXPECT_BUCKET" ]]; then
+    EXPECT_BUCKET="$PAI_BUCKET"
+    printf '  %-8s %s (from %s)\n' "bucket" "$EXPECT_BUCKET" "$PAIMON_CATALOG"
+else
+    printf '  %-8s %s (required)\n' "bucket" "$EXPECT_BUCKET"
+fi
+
+fail=0
+[[ "$PAI_BUCKET" == "$EXPECT_BUCKET" ]] || {
+    echo "  ✗ Paimon bucket '${PAI_BUCKET}' != expected '${EXPECT_BUCKET}'" >&2; fail=1; }
+[[ "$ICE_BUCKET" == "$EXPECT_BUCKET" ]] || {
+    echo "  ✗ Iceberg bucket '${ICE_BUCKET}' != expected '${EXPECT_BUCKET}'" >&2; fail=1; }
+# Identical prefixes would mean both catalogs point at one dataset, so every ratio
+# would be ~1.00x for reasons that have nothing to do with the table formats.
+[[ "$PAI_PREFIX" != "$ICE_PREFIX" ]] || {
+    echo "  ✗ Paimon and Iceberg resolve to the SAME prefix '${PAI_PREFIX}' — not a comparison" >&2; fail=1; }
+(( fail == 0 )) || {
+    echo "" >&2
+    echo "ERROR: storage-location preflight failed. Both formats must be written by the" >&2
+    echo "       CDC pipelines into bucket '${EXPECT_BUCKET}' under distinct prefixes." >&2
+    echo "       Check PAIMON_CATALOG/ICEBERG_CATALOG — the stale *v3* catalogs on this" >&2
+    echo "       cluster point at paimonv3-warehouse/ and icebergv3-warehouse/." >&2
+    exit 1; }
+printf '  ✓ same bucket, distinct prefixes: %s/ vs %s/\n' "$PAI_PREFIX" "$ICE_PREFIX"
 
 # ── Table state: the numbers that explain the timings ───────────────────────
 printf '\n%s\n' "── Table state ────────────────────────────────────────────────────────"
@@ -233,6 +304,13 @@ for s in $RUN_SUITES; do
 done
 
 printf '\n%s' "$STATE_TSV" | awk -F, 'NF>1 {print "'"${STAMP}"',state,"$1",rows_and_files,"$2","$3",ice_files="$4" ice_snaps="$5}' >> "$CSV"
+
+# Record the asserted storage locations in the CSV too, so a result file carries its
+# own proof that both formats were read from the same bucket.
+{
+  echo "${STAMP},location,bucket,s3_bucket,${PAI_BUCKET},${ICE_BUCKET},same"
+  echo "${STAMP},location,prefix,s3_prefix,${PAI_PREFIX},${ICE_PREFIX},distinct"
+} >> "$CSV"
 
 printf '\n%s\n' "═══════════════════════════════════════════════════════════════════════"
 echo "  ✓ CSV: ${CSV}"

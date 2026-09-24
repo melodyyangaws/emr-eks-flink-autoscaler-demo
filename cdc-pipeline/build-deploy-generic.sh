@@ -574,6 +574,8 @@ generate_flink_deployment() {
     # NOTE: MYSQL_PASSWORD is deliberately NOT substituted — the manifest pulls it
     # in via `envFrom: secretRef: ${MYSQL_ENV_SECRET_NAME}` so no credential is
     # ever written to the generated file.
+    #
+    # TM_NODEPOOL defaults to driver-nodepool, NOT executor-memorynodepool to avoid Karpenter consolidation interruptping TM
     sed -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
         -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
         -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
@@ -586,7 +588,7 @@ generate_flink_deployment() {
         -e "s|\${MYSQL_SECRET_NAME}|${MYSQL_SECRET_NAME:-mysql-cdc-credentials}|g" \
         -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
         -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
-        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-executor-memorynodepool}|g" \
+        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-driver-nodepool}|g" \
         "$template_file" > "$output_file"
 
     # Fail loudly on an unsubstituted or empty placeholder. Left alone, an empty

@@ -126,7 +126,7 @@ ORDER BY order_day DESC, revenue DESC
 LIMIT 100;
 
 -- ============================================================================
--- Iceberg Time Travel Queries (StarRocks 3.2+)
+-- Iceberg Time Travel Queries (StarRocks 3.2+; this cluster runs 4.1.x)
 -- ============================================================================
 
 -- Query as of specific timestamp

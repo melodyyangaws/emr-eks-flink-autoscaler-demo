@@ -1,0 +1,35 @@
+stamp,suite,query,metric,paimon,iceberg,ratio_iceberg_over_paimon
+20260923T144114Z,snapshot,Q1_count,time_ms,205,52260,254.93x
+20260923T144114Z,snapshot,Q1_count,scan_rows,6447691,137792271,21.37x
+20260923T144114Z,snapshot,Q1_count,scan_bytes,0,480641722,n/a
+20260923T144114Z,snapshot,Q2_group_by,time_ms,203,58005,285.74x
+20260923T144114Z,snapshot,Q2_group_by,scan_rows,6447691,137792271,21.37x
+20260923T144114Z,snapshot,Q2_group_by,scan_bytes,0,204529186,n/a
+20260923T144114Z,snapshot,Q3_join,time_ms,755,143198,189.67x
+20260923T144114Z,snapshot,Q3_join,scan_rows,21669196,433222674,19.99x
+20260923T144114Z,snapshot,Q3_join,scan_bytes,66604807,1468974003,22.06x
+20260923T144114Z,snapshot,Q4_product_sales,time_ms,1407,224944,159.87x
+20260923T144114Z,snapshot,Q4_product_sales,scan_rows,35351976,541520839,15.32x
+20260923T144114Z,snapshot,Q4_product_sales,scan_bytes,171300547,4431312204,25.87x
+20260923T144114Z,snapshot,Q5_time_window,time_ms,353,135669,384.33x
+20260923T144114Z,snapshot,Q5_time_window,scan_rows,15221505,295430403,19.41x
+20260923T144114Z,snapshot,Q5_time_window,scan_bytes,68255370,2377049814,34.83x
+20260923T144114Z,snapshot,Q6_multi_join,time_ms,1783,13623,7.64x
+20260923T144114Z,snapshot,Q6_multi_join,scan_rows,57021172,0,0.00x
+20260923T144114Z,snapshot,Q6_multi_join,scan_bytes,184097144,0,0.00x
+20260923T144114Z,hot,Q7_freshness,time_ms,184,474,2.58x
+20260923T144114Z,hot,Q7_freshness,scan_rows,10683315,0,0.00x
+20260923T144114Z,hot,Q7_freshness,scan_bytes,38040,0,0.00x
+20260923T144114Z,hot,Q8_hot_pk_lookup,time_ms,330,410,1.24x
+20260923T144114Z,hot,Q8_hot_pk_lookup,scan_rows,17952339,0,0.00x
+20260923T144114Z,hot,Q8_hot_pk_lookup,scan_bytes,43411,0,0.00x
+20260923T144114Z,hot,Q9_recent_window,time_ms,209,432,2.07x
+20260923T144114Z,hot,Q9_recent_window,scan_rows,12739103,0,0.00x
+20260923T144114Z,hot,Q9_recent_window,scan_bytes,53214615,0,0.00x
+20260923T144114Z,hot,Q10_hot_join,time_ms,429,821,1.91x
+20260923T144114Z,hot,Q10_hot_join,scan_rows,43825599,0,0.00x
+20260923T144114Z,hot,Q10_hot_join,scan_bytes,162535074,0,0.00x
+20260923T144114Z,state,customers,rows_and_files,5023288,20326276,ice_files=12793 ice_snaps=269
+20260923T144114Z,state,products,rows_and_files,4870276,18437576,ice_files=7191 ice_snaps=269
+20260923T144114Z,state,orders,rows_and_files,11933282,52786784,ice_files=1601 ice_snaps=270
+20260923T144114Z,state,order_items,rows_and_files,24148908,84755076,ice_files=1609 ice_snaps=271

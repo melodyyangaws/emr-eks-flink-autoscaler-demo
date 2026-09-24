@@ -1,5 +1,8 @@
 ---
-# 40,000 rows/sec UPSERT load generator for the Paimon-vs-Iceberg CDC benchmark.
+# ~69,000 rows/sec UPSERT load generator for the Paimon-vs-Iceberg CDC benchmark.
+# That figure is the measured ceiling of the RDS instance under test
+# (db.m5.2xlarge, 500GB gp3, 12,000 IOPS), not a chosen target — see the
+# replicas: comment on the StatefulSet for the sweep that established it.
 #
 # Why this exists alongside mysql-data-generator.yaml
 # ---------------------------------------------------
@@ -74,6 +77,17 @@ data:
         # limit is fine but be explicit so a BATCH_ROWS bump cannot silently
         # start failing with "packet too large".
         'connection_timeout': 30,
+        # Use the C extension (_mysql_connector) rather than the pure-Python
+        # protocol implementation. Building and serializing a 2,000-row statement
+        # is where a generator pod actually spends its CPU, and in pure Python
+        # that work holds the GIL — which is what capped a pod at ~5,000 rows/s
+        # no matter how many threads it ran. The C path releases the GIL during
+        # socket I/O and escapes parameters natively.
+        #
+        # USE_PURE=true falls back to pure Python: the C extension is a compiled
+        # wheel, so if the image's platform ever lacks one, pip installs only the
+        # pure-Python part and use_pure=False would raise at connect() time.
+        'use_pure': os.environ.get('USE_PURE', 'false').lower() == 'true',
     }
 
     RATE          = int(os.environ.get('RATE_PER_POD', '5000'))    # rows/sec, this pod
@@ -84,6 +98,31 @@ data:
     HOT_WINDOW    = int(os.environ.get('HOT_KEY_WINDOW', '50000'))
     REPORT_EVERY  = int(os.environ.get('REPORT_SECONDS', '15'))
     DURATION      = int(os.environ.get('DURATION_SECONDS', '0'))   # 0 = run forever
+
+    # ── Hot-window sharding ─────────────────────────────────────────────────
+    # Every pod used to draw hot keys from the SAME HOT_KEY_WINDOW, so each added
+    # pod piled onto the same rows. Measured at 40 replicas: 154 of 163 server
+    # connections sat in LOCK WAIT, 2.33M cumulative row-lock waits averaging
+    # 135ms, while RDS CPU idled at 46% and write IOPS sat at 8,000 of 12,000
+    # provisioned. Aggregate throughput peaked at ~69,000 rows/s on 32 replicas
+    # and then FELL to 66,000 at 40 — a lock convoy, not a hardware limit.
+    #
+    # Giving each pod a disjoint slice removes the cross-pod collisions without
+    # weakening the benchmark. The Iceberg-vs-Paimon comparison needs the same
+    # keys rewritten over and over (that is what makes Iceberg pile up equality
+    # -delete files while Paimon's LSM compacts them). Sharding makes each key
+    # HOTTER, not colder: with 32 pods a pod cycles ~1,560 keys instead of
+    # 50,000, so per-key rewrite frequency goes up ~32x. What disappears is only
+    # the contention between pods, which was never part of what we measure.
+    #
+    # POD_ORDINAL is derived from the pod name by the container entrypoint, so a
+    # plain Deployment works — no StatefulSet needed. Both default to a single
+    # unsharded pod, which keeps the original behaviour if they are unset.
+    POD_ORDINAL   = int(os.environ.get('POD_ORDINAL', '0'))
+    POD_COUNT     = max(1, int(os.environ.get('POD_COUNT', '1')))
+    SHARD_HOT     = os.environ.get('SHARD_HOT_KEYS', 'true').lower() == 'true'
+    # Never let a slice collapse to nothing when POD_COUNT > HOT_WINDOW.
+    HOT_SLICE     = max(1, HOT_WINDOW // POD_COUNT)
 
     CITIES = ['Seattle', 'Portland', 'San Francisco', 'Los Angeles', 'Phoenix',
               'Denver', 'Austin', 'Houston', 'Dallas', 'Chicago', 'New York', 'Miami']
@@ -158,10 +197,29 @@ data:
         return ranges, cust, prod, ordr
 
     def pick_key(max_id, rnd):
-        """Choose an existing primary key, skewed towards recent (hot) keys."""
+        """Choose an existing primary key, skewed towards recent (hot) keys.
+
+        When SHARD_HOT_KEYS is on, this pod's hot draws are confined to its own
+        slice of the window so pods do not fight for the same rows — see the
+        "Hot-window sharding" note above for the measurements behind that.
+
+        The cold tail (1 - HOT_KEY_RATIO) stays deliberately unsharded and spans
+        the full key range: it is what keeps writes landing across every data
+        file rather than only in the newest one, and it is uniform over millions
+        of keys, so it contributes almost no lock contention anyway.
+        """
         if rnd.random() < HOT_KEY_RATIO:
-            lo = max(1, max_id - HOT_WINDOW)
-            return rnd.randint(lo, max_id)
+            window_lo = max(1, max_id - HOT_WINDOW)
+            if not SHARD_HOT:
+                return rnd.randint(window_lo, max_id)
+            lo = window_lo + POD_ORDINAL * HOT_SLICE
+            hi = lo + HOT_SLICE - 1
+            # A pod whose slice starts past max_id (small table, many pods) would
+            # otherwise get an empty range; fall back to the whole window so it
+            # still generates load instead of raising ValueError.
+            if lo > max_id:
+                return rnd.randint(window_lo, max_id)
+            return rnd.randint(lo, min(hi, max_id))
         return rnd.randint(1, max_id)
 
     def plan_keys(max_id, n, rnd):
@@ -421,18 +479,68 @@ data:
     if __name__ == '__main__':
         main()
 ---
-apiVersion: apps/v1
-kind: Deployment
+# Headless Service exists only to satisfy the StatefulSet's serviceName
+# requirement — nothing connects TO these pods, they are outbound writers. No
+# ClusterIP is allocated and no DNS load balancing happens.
+apiVersion: v1
+kind: Service
 metadata:
   name: mysql-upsert-loadgen
   namespace: emr-flink
   labels:
     app: mysql-upsert-loadgen
 spec:
-  # 8 pods x RATE_PER_POD 5000 = 40,000 rows/sec aggregate.
-  # Split across pods rather than raising THREADS in one pod because a single
-  # Python process is GIL-bound: the driver spends real CPU building the
-  # multi-row statement text, so past ~4 threads a lone pod stops scaling.
+  clusterIP: None
+  selector:
+    app: mysql-upsert-loadgen
+  ports:
+  - name: placeholder
+    port: 9999
+---
+# A StatefulSet rather than a Deployment, purely for stable ordinals. Each pod
+# owns a disjoint slice of the hot-key window (see SHARD_HOT_KEYS), and a
+# StatefulSet names its pods mysql-upsert-loadgen-0..N-1, so the ordinal is
+# exact. The previous Deployment had to hash its random pod-name suffix into
+# [0, POD_COUNT), which collided: 8 pods produced only 6 distinct ordinals in
+# testing, leaving two pairs sharing a slice and still contending.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-upsert-loadgen
+  namespace: emr-flink
+  labels:
+    app: mysql-upsert-loadgen
+spec:
+  serviceName: mysql-upsert-loadgen
+  # Start and stop all pods at once. The default OrderedReady brings pods up one
+  # at a time, which for a 32-pod load test means a long ramp during which the
+  # achieved rate is meaningless — and on scale-down it would drain the highest
+  # ordinals serially while the benchmark waits.
+  podManagementPolicy: Parallel
+  # 8 pods x THREADS 4 = 32 MySQL connections, holding the same ~69,000 rows/sec
+  # that 32 pods (128 connections) reached. Throughput here is set by BATCH_ROWS
+  # (rows per commit), not by how many clients are connected.
+  #
+  # Pod count is deliberately NOT the throughput knob. find-rds-ceiling.sh swept
+  # 8/16/24/32/40 replicas against db.m5.2xlarge (500GB gp3, 12,000 IOPS):
+  #
+  #   replicas  conns  target    achieved  errors   write_iops  rds_cpu
+  #    8         32     40,000    34,989      984     7,363      32%
+  #   16         64     80,000    58,265    5,960     8,013      47%
+  #   32        128    160,000    68,818   17,248     7,997      48%
+  #   40        160    200,000    66,404   23,843     7,481      46%
+  #
+  # Write IOPS flatlines near 8,000 of 12,000 provisioned while CPU stays under
+  # 50%, so the wall is InnoDB's single-writer commit path, not client count,
+  # client CPU, or storage. Past 32 replicas the extra pods only bought row-lock
+  # contention — that is what the errors column counts, and why 40 replicas is
+  # SLOWER than 32. Adding clients to a commit-bound server cannot help.
+  #
+  # So the same rows are moved with 4x fewer connections by committing in larger
+  # batches: 32 connections x 2,000-row batches instead of 128 x 500. Fewer,
+  # bigger commits amortize the redo-log flush that is the actual bottleneck, and
+  # cut the lock-timeout errors that 128 competing writers produced. See
+  # bench-results/rds-ceiling-20260923T081657Z.csv.
   replicas: 8
   selector:
     matchLabels:
@@ -453,7 +561,45 @@ spec:
         command: ["/bin/bash", "-c"]
         args:
           - |
+            set -e
+            # mysql-connector-python ships the C extension (_mysql_connector) as
+            # a separate wheel. Without it, use_pure=False raises at connect()
+            # time, so install it explicitly rather than relying on the default.
             pip install --quiet mysql-connector-python
+            python - <<'PY'
+            try:
+                import _mysql_connector  # noqa: F401
+                print("mysql C extension: available", flush=True)
+            except ImportError:
+                print("mysql C extension: MISSING - set USE_PURE=true or the "
+                      "pod will fail at connect()", flush=True)
+            PY
+
+            # This pod's ordinal decides which slice of the hot-key window it
+            # owns (see SHARD_HOT_KEYS). As a StatefulSet, the pod name is
+            # mysql-upsert-loadgen-<n> with n in 0..replicas-1, so the trailing
+            # field IS the ordinal — exact, stable across restarts, and
+            # collision-free. That is the reason this workload is a StatefulSet
+            # and not a Deployment: a Deployment's random name suffix had to be
+            # hashed into [0, POD_COUNT), and hashing collided (8 pods produced
+            # 6 distinct ordinals, so two pairs shared a slice and still fought
+            # over the same rows).
+            #
+            # The md5 fallback remains for the case where this manifest is run as
+            # a plain Deployment: it keeps such a pod working (spread, if
+            # imperfectly) rather than crashing on a non-numeric suffix.
+            if [[ -z "${POD_ORDINAL:-}" ]]; then
+              suffix="${HOSTNAME##*-}"
+              if [[ "$suffix" =~ ^[0-9]+$ ]]; then
+                export POD_ORDINAL="$suffix"
+              else
+                echo "WARNING: pod name '$HOSTNAME' has no numeric ordinal —" \
+                     "not a StatefulSet? Falling back to a hashed ordinal," \
+                     "which can collide and leave pods sharing a key slice."
+                export POD_ORDINAL=$(( 0x$(printf '%s' "$HOSTNAME" | md5sum | cut -c1-6) % ${POD_COUNT:-1} ))
+              fi
+            fi
+            echo "pod=$HOSTNAME ordinal=$POD_ORDINAL of ${POD_COUNT:-1}"
             exec python /scripts/upsert_loadgen.py
         env:
         # Credentials come from the existing secret; the password is never a
@@ -469,12 +615,23 @@ spec:
             secretKeyRef: { name: mysql-credentials, key: password }
         - name: MYSQL_DATABASE
           value: "ecommerce"
+        # 8 pods x 8,600 = 68,800 rows/sec, matching the measured ~69,000 ceiling.
+        # Per-pod rate is 1.7x the old 5,000 because there are 4x fewer pods; the
+        # aggregate is unchanged, which is the point — this change trades
+        # connections for batch size, not throughput.
         - name: RATE_PER_POD
-          value: "5000"
+          value: "8600"
         - name: THREADS
           value: "4"
+        # 500 -> 2,000 rows per commit. This is what lets 32 connections carry the
+        # load that previously needed 128: the bottleneck is commits/sec against
+        # the redo log (write IOPS pinned at ~8,000 while CPU idled at 48%), so
+        # 4x fewer, 4x larger commits move the same rows with a quarter of the
+        # flushes. Bounded deliberately at 2,000 — a batch is one transaction,
+        # holding row locks for its whole duration, so an oversized batch trades
+        # the connection contention away for lock-hold contention instead.
         - name: BATCH_ROWS
-          value: "500"
+          value: "2000"
         - name: UPSERT_RATIO
           value: "0.8"
         - name: HOT_KEY_RATIO
@@ -483,8 +640,26 @@ spec:
           value: "50000"
         - name: REPORT_SECONDS
           value: "15"
+        # 4 hours, then every pod exits on its own. Set deliberately rather than
+        # left at 0 (run forever): the run has to stop without depending on
+        # someone remembering to scale the StatefulSet down, and a self-stop ends
+        # all 32 pods at the same moment, which keeps the end of the measurement
+        # window sharp.
         - name: DURATION_SECONDS
-          value: "0"
+          value: "14400"
+        # Hot-window sharding. POD_COUNT must track `replicas` above: it is the
+        # divisor that sizes each pod's slice, and the deploy script keeps the two
+        # in step on `scale`. If it drifts low, slices overlap and the lock
+        # convoy comes back; if it drifts high, part of the window goes unwritten
+        # (harmless, just less hot-key pressure than intended).
+        - name: POD_COUNT
+          value: "8"
+        - name: SHARD_HOT_KEYS
+          value: "true"
+        # Pure-Python protocol fallback. Leave false to use the C extension,
+        # which is what lifts a pod past the ~5,000 rows/s GIL ceiling.
+        - name: USE_PURE
+          value: "false"
         volumeMounts:
         - name: script
           mountPath: /scripts

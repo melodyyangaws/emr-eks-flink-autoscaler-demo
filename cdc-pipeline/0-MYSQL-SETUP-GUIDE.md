@@ -311,7 +311,7 @@ aws rds modify-db-instance \
 
 ```sql
 -- Create CDC user (use from MySQL prompt)
-CREATE USER 'cdcuser'@'%' IDENTIFIED BY 'CDCPassword123!';
+CREATE USER 'cdcuser'@'%' IDENTIFIED BY '<YOUR_CDC_PASSWORD>';
 
 -- Grant replication permissions (required for CDC)
 GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT
@@ -346,7 +346,7 @@ SHOW GRANTS FOR 'cdcuser'@'%';
 exit;
 
 # Test connection with CDC user
-mysql -h $MYSQL_HOST -u cdcuser -p'CDCPassword123!';
+mysql -h $MYSQL_HOST -u cdcuser -p"$MYSQL_PASSWORD";
 # If successful, you're ready for CDC!
 exit;
 ```
@@ -714,7 +714,7 @@ kubectl run mysql-test --rm -it --restart=Never \
 # after login to the pod, set the RDS host name
 MYSQL_HOST=xxxxxxxxx
 # Inside the pod, test connection:
-mysql -h $MYSQL_HOST -u cdcuser -p'CDCPassword123!' -e "SELECT COUNT(*) FROM ecommerce.customers;"
+mysql -h $MYSQL_HOST -u cdcuser -p"$MYSQL_PASSWORD" -e "SELECT COUNT(*) FROM ecommerce.customers;"
 
 # If successful, you'll see:
 # +----------+
@@ -744,7 +744,7 @@ export MYSQL_HOST=$(aws rds describe-db-instances \
 export MYSQL_PORT=3306
 export MYSQL_DATABASE=ecommerce
 export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='CDCPassword123!'
+export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
 
 # Save to a file for easy reuse
 cat > mysql-cdc-env.sh <<EOF
@@ -752,7 +752,7 @@ export MYSQL_HOST=$MYSQL_HOST
 export MYSQL_PORT=3306
 export MYSQL_DATABASE=ecommerce
 export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='CDCPassword123!'
+export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
 EOF
 
 chmod +x mysql-cdc-env.sh
@@ -815,7 +815,7 @@ mysql -h $MYSQL_HOST -u admin -p
 
 -- Drop and recreate user
 DROP USER IF EXISTS 'cdcuser'@'%';
-CREATE USER 'cdcuser'@'%' IDENTIFIED BY 'CDCPassword123!';
+CREATE USER 'cdcuser'@'%' IDENTIFIED BY '<YOUR_CDC_PASSWORD>';
 GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdcuser'@'%';
 GRANT ALL PRIVILEGES ON ecommerce.* TO 'cdcuser'@'%';
 FLUSH PRIVILEGES;
@@ -834,3 +834,28 @@ FLUSH PRIVILEGES;
 ✅ **CDC readiness verified**
 
 Your MySQL database is now ready to be the source for Flink CDC! 🎉
+
+---
+
+## Next Steps
+
+1. **[Build and deploy the Flink CDC jobs](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)** — build the
+   image, upload the SQL scripts, and start the Paimon and Iceberg pipelines.
+2. **[Generate streaming data](./2-DATA-GEN-GUIDE.md)** — two workloads share one script:
+
+   ```bash
+   # mixed: INSERT/UPDATE/DELETE, ~400 rows/s. The only workload that emits DELETEs,
+   # so this is the one that proves CDC handles all three event types.
+   ./mysql-data-generator/deploy-data-generator.sh deploy
+   ./mysql-data-generator/deploy-data-generator.sh stop
+
+   # upsert: batched ON DUPLICATE KEY UPDATE, ~40,000 rows/s across 8 pods.
+   # The storage-format benchmark load. Deployed as a StatefulSet.
+   ./mysql-data-generator/deploy-data-generator.sh deploy upsert
+   ./mysql-data-generator/deploy-data-generator.sh stop upsert
+   ```
+
+   Both read `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` from the `mysql-credentials`
+   secret, which the script creates from this guide's exported variables on first run.
+3. **[Monitor the pipelines](./3-MONITOR.md)** — job status, throughput, checkpoints, table stats.
+4. **[Query with StarRocks](./4-STARROCKS-OLAP-ENGINE.md)** — the Paimon vs Iceberg comparison.
