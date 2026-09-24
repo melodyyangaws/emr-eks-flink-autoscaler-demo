@@ -1,0 +1,28 @@
+# Load generator throughput: the bottleneck was read IOPS, not the commit path.
+#
+# Same 8 replicas, same THREADS=4, same BATCH_ROWS=2000, same RDS instance
+# (db.m5.2xlarge, 500GB gp3, 12,000 provisioned IOPS, 500 MB/s). The ONLY changes
+# were HOT_KEY_RATIO 0.6 -> 0.95 and HOT_KEY_WINDOW 50,000 -> 2,000,000.
+#
+# Why it worked: at ratio 0.6, 40% of upserts drew uniformly across 410M rows /
+# ~100GB against a ~24GB buffer pool, so nearly every cold upsert paid a random
+# disk read to fetch the page before updating it. Those reads consumed 43% of the
+# instance's entire IOPS budget and bought the benchmark nothing. Raising the
+# ratio removed them; widening the window kept the concentrated writes from
+# rebuilding the row-lock convoy documented in mysql-upsert-loadgen.yaml.
+#
+# This CORRECTS the earlier reading of rds-ceiling-20260923T081657Z.csv, which
+# concluded "the wall is InnoDB's single-writer commit path" from WriteIOPS alone.
+# Performance Insights puts the commit path at effectively zero load
+# (wait/io/file/sql/binlog 0.043, MYSQL_BIN_LOG::COND_done 0.003) while
+# wait/io/table/sql/handler sits at 26.3 -- plain storage I/O.
+#
+# After the fix the bottleneck is CPU (78%), which is why throughput lands in the
+# 40-70k band. Reaching 1,000,000 rows/s would need ~60-70x this storage
+# bandwidth: it is a hardware change, not a generator-tuning change.
+#
+# Restart boundary is 08:42 UTC. CloudWatch Period=60 Average; waits from
+# Performance Insights db.load.avg grouped by db.wait_event.
+phase,hot_key_ratio,hot_key_window,replicas,threads,batch_rows,aggregate_rows_s,inst_rows_s_peak,read_iops,write_iops,total_iops,provisioned_iops,disk_queue_depth,rds_cpu_pct,write_throughput_mb_s,db_connections,top_wait_event,top_wait_load,cpu_wait_load
+before,0.6,50000,8,4,2000,15000,2533,5655,6518,12173,12000,34.7,26.3,106.4,95,wait/io/table/sql/handler,26.323,0.310
+after,0.95,2000000,8,4,2000,58300,12800,1484,5639,7123,12000,6.8,78.3,106.4,95,wait/io/table/sql/handler,26.036,1.186

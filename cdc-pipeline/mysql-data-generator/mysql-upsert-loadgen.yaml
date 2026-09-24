@@ -48,6 +48,13 @@
 # that neither effect shows up, and the benchmark would measure raw ingest only.
 # So HOT_KEY_RATIO of the upserts land in a sliding window of the most recent
 # HOT_KEY_WINDOW keys, and the rest spread over the full range.
+#
+# The skew is also the single biggest throughput lever, for a reason unrelated to
+# the format comparison: the non-hot remainder is uniform over ~100GB and misses
+# the buffer pool, so each cold upsert costs a random read. At ratio 0.6 that read
+# traffic consumed 43% of the instance's provisioned IOPS and capped the whole
+# generator at ~15,000 rows/s. At 0.95 with a 2,000,000-key window it runs at
+# ~58,300 rows/s. See the env-var comments on HOT_KEY_RATIO for the measurements.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -94,8 +101,10 @@ data:
     THREADS       = int(os.environ.get('THREADS', '4'))
     BATCH_ROWS    = int(os.environ.get('BATCH_ROWS', '500'))
     UPSERT_RATIO  = float(os.environ.get('UPSERT_RATIO', '0.8'))   # rest are pure inserts
-    HOT_KEY_RATIO = float(os.environ.get('HOT_KEY_RATIO', '0.6'))
-    HOT_WINDOW    = int(os.environ.get('HOT_KEY_WINDOW', '50000'))
+    # Defaults track the StatefulSet's env values so a run launched without them
+    # does not silently fall back to the IOPS-bound 0.6 / 50,000 combination.
+    HOT_KEY_RATIO = float(os.environ.get('HOT_KEY_RATIO', '0.95'))
+    HOT_WINDOW    = int(os.environ.get('HOT_KEY_WINDOW', '2000000'))
     REPORT_EVERY  = int(os.environ.get('REPORT_SECONDS', '15'))
     DURATION      = int(os.environ.get('DURATION_SECONDS', '0'))   # 0 = run forever
 
@@ -207,6 +216,13 @@ data:
         the full key range: it is what keeps writes landing across every data
         file rather than only in the newest one, and it is uniform over millions
         of keys, so it contributes almost no lock contention anyway.
+
+        It does, however, contribute enormous READ I/O, which is why the ratio is
+        now 0.95 rather than 0.6. Uniform draws over 410M rows / ~100GB miss a
+        ~24GB buffer pool almost every time, and an upsert that misses must read
+        the page before it can update it. At ratio 0.6 that was 5,655 ReadIOPS —
+        43% of the instance's entire 12,000-IOPS budget spent fetching pages the
+        benchmark does not care about. Keep the tail small.
         """
         if rnd.random() < HOT_KEY_RATIO:
             window_lo = max(1, max_id - HOT_WINDOW)
@@ -530,11 +546,20 @@ spec:
   #   32        128    160,000    68,818   17,248     7,997      48%
   #   40        160    200,000    66,404   23,843     7,481      46%
   #
-  # Write IOPS flatlines near 8,000 of 12,000 provisioned while CPU stays under
-  # 50%, so the wall is InnoDB's single-writer commit path, not client count,
-  # client CPU, or storage. Past 32 replicas the extra pods only bought row-lock
-  # contention — that is what the errors column counts, and why 40 replicas is
-  # SLOWER than 32. Adding clients to a commit-bound server cannot help.
+  # Past 32 replicas the extra pods only bought row-lock contention — that is what
+  # the errors column counts, and why 40 replicas is SLOWER than 32. Adding
+  # clients to an already-saturated server cannot help.
+  #
+  # CORRECTION: this sweep was originally read as "the wall is InnoDB's
+  # single-writer commit path", because it only looked at WriteIOPS. That was
+  # wrong. Performance Insights puts the commit path at effectively zero load
+  # (wait/io/file/sql/binlog 0.043, MYSQL_BIN_LOG::COND_done 0.003) while
+  # wait/io/table/sql/handler sits at 26.3 — plain storage I/O. The missing term
+  # was READS: ReadIOPS 5,655 + WriteIOPS 6,518 = 11,878 of 12,000 provisioned.
+  # The instance was IOPS-saturated, not commit-bound, and the reads came from the
+  # cold-tail key distribution (see the HOT_KEY_RATIO note below). Fixing that
+  # alone took throughput from ~15,000 to ~58,300 rows/s at these same 8 replicas
+  # and moved the bottleneck to CPU (26% -> 78%).
   #
   # So the same rows are moved with 4x fewer connections by committing in larger
   # batches: 32 connections x 2,000-row batches instead of 128 x 500. Fewer,
@@ -634,19 +659,41 @@ spec:
           value: "2000"
         - name: UPSERT_RATIO
           value: "0.8"
+        # 0.6 -> 0.95, and the window 50,000 -> 2,000,000. Together these took
+        # aggregate throughput from ~15,000 rows/s to ~58,300 (3.9x). Both move
+        # the same direction, for two different reasons:
+        #
+        # The ratio is the IOPS fix. The old cold tail (1 - 0.6 = 40% of upserts)
+        # drew uniformly across 410M rows / ~100GB against a ~24GB buffer pool, so
+        # nearly every cold upsert paid a random disk READ to fetch the page before
+        # updating it. Measured: ReadIOPS 5,655 alongside WriteIOPS 6,518, i.e.
+        # 11,878 of the 12,000 provisioned IOPS consumed with 43% of them reads,
+        # DiskQueueDepth 34.7, CPU idle at 26%. Raising the ratio dropped ReadIOPS
+        # to 1,484 (-74%) and the queue to 6.8, freeing the IOPS for writes. That
+        # read traffic bought the benchmark nothing — it was cache-miss noise.
+        #
+        # The window is the lock fix, and it is what makes the higher ratio safe:
+        # concentrating 95% of writes into the OLD 50,000-key window would have
+        # rebuilt the lock convoy described in the sharding note above. At 2,000,000
+        # (HOT_SLICE = 250,000 keys per pod) the same rows are still rewritten many
+        # times per hour at these rates, so Iceberg's equality-delete files still
+        # accumulate and Paimon's LSM still compacts them — the effect the
+        # comparison exists to measure is preserved, and in fact strengthened,
+        # since a larger share of writes is now repeat-key.
         - name: HOT_KEY_RATIO
-          value: "0.6"
+          value: "0.95"
         - name: HOT_KEY_WINDOW
-          value: "50000"
+          value: "2000000"
         - name: REPORT_SECONDS
           value: "15"
-        # 4 hours, then every pod exits on its own. Set deliberately rather than
-        # left at 0 (run forever): the run has to stop without depending on
-        # someone remembering to scale the StatefulSet down, and a self-stop ends
-        # all 32 pods at the same moment, which keeps the end of the measurement
-        # window sharp.
+        # Run forever. Was 3600 for a bounded one-hour measurement, but the
+        # StatefulSet restarts each pod the moment it self-exits, so the pods
+        # cycled 4-5 times and every "average rows/sec" reading was diluted by
+        # a fresh ramp-up. Bound a measurement window by scaling the StatefulSet
+        # down instead, which stops all 8 pods at the same moment without the
+        # restart loop.
         - name: DURATION_SECONDS
-          value: "14400"
+          value: "0"
         # Hot-window sharding. POD_COUNT must track `replicas` above: it is the
         # divisor that sizes each pod's slice, and the deploy script keeps the two
         # in step on `scale`. If it drifts low, slices overlap and the lock

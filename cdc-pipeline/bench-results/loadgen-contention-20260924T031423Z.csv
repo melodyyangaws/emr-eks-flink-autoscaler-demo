@@ -1,0 +1,19 @@
+# Upsert generator throughput measured DURING the initial CDC snapshot, 2026-09-24.
+# Context: both Flink jobs were snapshot-reading ~410M rows from the same RDS
+# instance while the generator ran, so this is NOT a clean ceiling measurement --
+# compare against rds-ceiling-20260923T081657Z.csv for the uncontended numbers.
+#
+# Finding: the ~69,000 rows/s established in the uncontended sweep was NOT reached
+# (~20,000 rows/s aggregate at 8 pods), and neither side was saturated:
+#   generator pods : 66-92m CPU against a 2000m limit  (~4%)
+#   RDS            : 17-43% CPU, write IOPS 1,000-2,900 of an ~8,000 ceiling
+# So the limiter was neither client CPU nor RDS commit bandwidth.
+#
+# Raising THREADS 4 -> 12 made it WORSE, not better: instantaneous rate collapsed
+# to 0-800/s and error counts rose. That is row-lock contention on the hot-key
+# window (HOT_KEY_RATIO 0.6, HOT_KEY_WINDOW 50000), the same wall the replica sweep
+# hit when 40 pods measured slower than 32. More concurrency against a deliberately
+# narrow hot window buys contention, not throughput. Reverted to THREADS=4.
+threads,pods,per_pod_avg_rows_s,aggregate_rows_s,inst_rate_range,errors_per_pod,pod_cpu_millicores,cpu_limit_millicores,rds_cpu_pct,rds_write_iops
+4,8,2500,20000,1067-4533,~300,66-92,2000,17-43,1000-2900
+12,8,2200,17600,0-1867,~650,unmeasured,2000,unmeasured,unmeasured
