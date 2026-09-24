@@ -1,0 +1,24 @@
+# RDS source-table baseline captured immediately after the full lakehouse reset and
+# BEFORE the Paimon/Iceberg pipelines were restarted. This is the snapshot volume both
+# jobs must burst-process from scratch, so it is the denominator for any
+# "time to catch up" or "snapshot throughput" claim made about the run that follows.
+#
+# instance: flink-cdc-mysql-8-0 (db.m5.2xlarge, 500GB gp3, 12000 IOPS), schema ecommerce
+#
+# est_rows_infoschema is information_schema.tables.table_rows, an InnoDB ESTIMATE, and
+# is recorded only to show how far off it is: orders estimates 131.9M against 154.0M
+# actual (0.86x), products 41.8M against 53.2M (0.79x). That unreliability is why the
+# mysql-cdc sources pin scan.incremental.snapshot.chunk.size explicitly instead of
+# letting the connector size splits from these statistics — a bad estimate previously
+# produced one unchunked split per table and OOMed the TaskManager.
+# exact_rows is COUNT(*) and is the authoritative number.
+#
+# Sizes are from information_schema (data_length / index_length) and describe MySQL's
+# on-disk footprint, which is not comparable to Paimon/Iceberg object sizes in S3:
+# different encoding, compression (zstd) and no secondary indexes in the lakehouse.
+stamp,source,table,metric,exact_rows,est_rows_infoschema,data_gib,index_gib,total_gib
+20260923T180601Z,rds_ecommerce,order_items,table_state,235853644,188735037,20.65,13.38,34.03
+20260923T180601Z,rds_ecommerce,orders,table_state,154020612,131900834,20.12,13.83,33.95
+20260923T180601Z,rds_ecommerce,products,table_state,53171399,41809940,9.69,5.14,14.83
+20260923T180601Z,rds_ecommerce,customers,table_state,48094803,48423223,9.66,10.18,19.84
+20260923T180601Z,rds_ecommerce,ALL,table_state_total,491140458,410869034,60.12,42.53,102.65

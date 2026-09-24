@@ -38,6 +38,13 @@ spec:
     execution.checkpointing.interval: "60s"
     execution.checkpointing.timeout: "600s"
     execution.checkpointing.min-pause: "30s"
+    # Survive transient checkpoint failures during the initial snapshot instead of
+    # failing the job. The snapshot phase reads 491M rows / 102 GiB from RDS, and a
+    # checkpoint taken mid-snapshot has to persist large per-split backfill state; a
+    # single timeout there is normal and is not a reason to restart 408 tasks. The
+    # default is 0, meaning the very first failed checkpoint kills the job. Interval
+    # itself stays at 60s — it is a fair-comparison variable and must match Iceberg.
+    execution.checkpointing.tolerable-failed-checkpoints: "10"
     state.backend.local-recovery: "true"
     # ebs local-recovery
     task.local-recovery.ebs.enable: "true"
@@ -127,6 +134,7 @@ spec:
     podTemplate:
       spec:
         nodeSelector:
+          karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${JM_NODEPOOL}
         containers:
         - name: flink-main-container
@@ -169,19 +177,6 @@ spec:
       memory: 32Gi
       cpu: 4
     podTemplate:
-      metadata:
-        annotations:
-          # Exempt TaskManagers from Karpenter consolidation. Without this the job
-          # dies mid-run even on on-demand capacity: Karpenter judged the TM node
-          # "Underutilized" and terminated it while both pipelines were RUNNING
-          # (`DisruptionTerminating ... Disrupting NodeClaim: Underutilized`),
-          # which killed the TMs with exitCode=239 and exhausted the restart
-          # strategy. A Flink TM looks idle to a bin-packer — it holds slots and
-          # in-memory state but requests modest CPU — so consolidation keeps
-          # choosing it. This is separate from the spot reclamation that killed an
-          # earlier run; the capacity-type pin below fixes that one, and only this
-          # annotation fixes consolidation.
-          karpenter.sh/do-not-disrupt: "true"
       spec:
         containers:
         - name: flink-main-container

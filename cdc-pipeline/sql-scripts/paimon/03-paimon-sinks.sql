@@ -4,7 +4,10 @@
 -- Creates Apache Paimon sink tables optimized for low-latency CDC:
 --   - Deletion vectors: bitmap-based row deletes without rewriting data files
 --   - Deduplicate merge engine (default): last-write-wins upsert via PK
---   - ZSTD compression for better ratio on CDC payloads
+--   - ZSTD compression for the Parquet DATA files (better ratio on CDC payloads);
+--     the Iceberg-compat Avro MANIFESTS use snappy instead, because StarRocks BE
+--     has no zstd-jni on its Iceberg reader classpath — see the
+--     metadata.iceberg.manifest-compression note on `customers` below
 --   - Tuned compaction, write buffers, and snapshot retention for 60s checkpoints
 --   - Iceberg compatibility: IcebergHadoopMetadataCommitter writes read-only
 --     Iceberg V2 metadata to S3 for Athena/Spark queries
@@ -56,6 +59,14 @@ CREATE TABLE IF NOT EXISTS customers (
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
+    -- Matches Iceberg's 'write.parquet.row-group-size-bytes' = '8388608'. Without
+    -- this Paimon inherits parquet-mr's 128MB default block size and emits ONE row
+    -- group for a whole 32MB file (measured: 1 x 84MB row group, vs Iceberg's
+    -- 5 x 16MB). Row group is the unit of predicate pushdown and scan splitting, so
+    -- a single one means the reader can neither skip within the file nor parallelize
+    -- across it — that penalizes Paimon on the read benchmark for a reason that has
+    -- nothing to do with the LSM-vs-merge-on-read question being measured.
+    'parquet.block.size' = '8388608',
     'target-file-size' = '32mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
@@ -76,7 +87,26 @@ CREATE TABLE IF NOT EXISTS customers (
     -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
     -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd',
+    -- 'snappy', not 'zstd'. This compresses the Avro MANIFEST files of the
+    -- Iceberg-compatible metadata Paimon exports under <table>/iceberg/, and it
+    -- has to be a codec the READER has on its classpath, not just the best
+    -- ratio. StarRocks BE ships avro-1.12.0.jar and snappy-java in
+    -- be/lib/iceberg-reader-lib/ but NO zstd-jni (hudi-reader-lib,
+    -- kudu-reader-lib and odps-reader-lib each bundle it; the Iceberg one does
+    -- not). Avro's ZstandardCodec class itself IS present, so the codec is
+    -- selected and then dies on its missing native binding:
+    --
+    --   java.lang.NoClassDefFoundError: com/github/luben/zstd/ZstdInputStreamNoFinalizer
+    --     at org.apache.avro.file.ZstandardCodec.decompress(ZstandardCodec.java:84)
+    --     at org.apache.iceberg.avro.AvroIterable$AvroReuseIterator.hasNext(...)
+    --
+    -- Fixing it BE-side is not durable: /opt/starrocks/be/lib is a container
+    -- layer (a copied zstd-jni jar is lost on restart, and the classloader is
+    -- built at BE start so a live copy has no effect anyway), and
+    -- /etc/starrocks/be/conf is a read-only ConfigMap mount. Writing a codec
+    -- the reader already supports is the fix that survives a pod restart.
+    -- Costs a little manifest size; manifests are tiny next to the data files.
+    'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -102,6 +132,14 @@ CREATE TABLE IF NOT EXISTS products (
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
+    -- Matches Iceberg's 'write.parquet.row-group-size-bytes' = '8388608'. Without
+    -- this Paimon inherits parquet-mr's 128MB default block size and emits ONE row
+    -- group for a whole 32MB file (measured: 1 x 84MB row group, vs Iceberg's
+    -- 5 x 16MB). Row group is the unit of predicate pushdown and scan splitting, so
+    -- a single one means the reader can neither skip within the file nor parallelize
+    -- across it — that penalizes Paimon on the read benchmark for a reason that has
+    -- nothing to do with the LSM-vs-merge-on-read question being measured.
+    'parquet.block.size' = '8388608',
     'target-file-size' = '32mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
@@ -121,7 +159,8 @@ CREATE TABLE IF NOT EXISTS products (
     -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
     -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd',
+    -- snappy, not zstd — see the manifest-compression note on `customers`.
+    'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -149,6 +188,9 @@ CREATE TABLE IF NOT EXISTS orders (
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
+    -- 16MB to match Iceberg's row-group-size on the fact tables — see the
+    -- parquet.block.size note on `customers`.
+    'parquet.block.size' = '16777216',
     'target-file-size' = '64mb',
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
@@ -168,7 +210,8 @@ CREATE TABLE IF NOT EXISTS orders (
     -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
     -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd',
+    -- snappy, not zstd — see the manifest-compression note on `customers`.
+    'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -194,6 +237,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
+    -- 16MB to match Iceberg's row-group-size on the fact tables — see the
+    -- parquet.block.size note on `customers`.
+    'parquet.block.size' = '16777216',
     'target-file-size' = '64mb',
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
@@ -213,6 +259,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
     -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
     'metadata.iceberg.format-version' = '2',
-    'metadata.iceberg.manifest-compression' = 'zstd',
+    -- snappy, not zstd — see the manifest-compression note on `customers`.
+    'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
 );

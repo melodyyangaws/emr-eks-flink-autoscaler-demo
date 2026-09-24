@@ -1,5 +1,8 @@
 ---
-# 40,000 rows/sec UPSERT load generator for the Paimon-vs-Iceberg CDC benchmark.
+# ~69,000 rows/sec UPSERT load generator for the Paimon-vs-Iceberg CDC benchmark.
+# That figure is the measured ceiling of the RDS instance under test
+# (db.m5.2xlarge, 500GB gp3, 12,000 IOPS), not a chosen target — see the
+# replicas: comment on the StatefulSet for the sweep that established it.
 #
 # Why this exists alongside mysql-data-generator.yaml
 # ---------------------------------------------------
@@ -75,7 +78,7 @@ data:
         # start failing with "packet too large".
         'connection_timeout': 30,
         # Use the C extension (_mysql_connector) rather than the pure-Python
-        # protocol implementation. Building and serializing a 500-row statement
+        # protocol implementation. Building and serializing a 2,000-row statement
         # is where a generator pod actually spends its CPU, and in pure Python
         # that work holds the GIL — which is what capped a pod at ~5,000 rows/s
         # no matter how many threads it ran. The C path releases the GIL during
@@ -514,11 +517,30 @@ spec:
   # achieved rate is meaningless — and on scale-down it would drain the highest
   # ordinals serially while the benchmark waits.
   podManagementPolicy: Parallel
-  # 8 pods x RATE_PER_POD 5000 = 40,000 rows/sec aggregate.
-  # Split across pods rather than raising THREADS in one pod: measured CPU is
-  # only ~3% of the 2-core limit, so a pod is bound by waiting on MySQL round
-  # trips, not by local CPU. More concurrent writers is what adds throughput —
-  # up to the point where they start contending for row locks.
+  # 8 pods x THREADS 4 = 32 MySQL connections, holding the same ~69,000 rows/sec
+  # that 32 pods (128 connections) reached. Throughput here is set by BATCH_ROWS
+  # (rows per commit), not by how many clients are connected.
+  #
+  # Pod count is deliberately NOT the throughput knob. find-rds-ceiling.sh swept
+  # 8/16/24/32/40 replicas against db.m5.2xlarge (500GB gp3, 12,000 IOPS):
+  #
+  #   replicas  conns  target    achieved  errors   write_iops  rds_cpu
+  #    8         32     40,000    34,989      984     7,363      32%
+  #   16         64     80,000    58,265    5,960     8,013      47%
+  #   32        128    160,000    68,818   17,248     7,997      48%
+  #   40        160    200,000    66,404   23,843     7,481      46%
+  #
+  # Write IOPS flatlines near 8,000 of 12,000 provisioned while CPU stays under
+  # 50%, so the wall is InnoDB's single-writer commit path, not client count,
+  # client CPU, or storage. Past 32 replicas the extra pods only bought row-lock
+  # contention — that is what the errors column counts, and why 40 replicas is
+  # SLOWER than 32. Adding clients to a commit-bound server cannot help.
+  #
+  # So the same rows are moved with 4x fewer connections by committing in larger
+  # batches: 32 connections x 2,000-row batches instead of 128 x 500. Fewer,
+  # bigger commits amortize the redo-log flush that is the actual bottleneck, and
+  # cut the lock-timeout errors that 128 competing writers produced. See
+  # bench-results/rds-ceiling-20260923T081657Z.csv.
   replicas: 8
   selector:
     matchLabels:
@@ -593,12 +615,23 @@ spec:
             secretKeyRef: { name: mysql-credentials, key: password }
         - name: MYSQL_DATABASE
           value: "ecommerce"
+        # 8 pods x 8,600 = 68,800 rows/sec, matching the measured ~69,000 ceiling.
+        # Per-pod rate is 1.7x the old 5,000 because there are 4x fewer pods; the
+        # aggregate is unchanged, which is the point — this change trades
+        # connections for batch size, not throughput.
         - name: RATE_PER_POD
-          value: "5000"
+          value: "8600"
         - name: THREADS
           value: "4"
+        # 500 -> 2,000 rows per commit. This is what lets 32 connections carry the
+        # load that previously needed 128: the bottleneck is commits/sec against
+        # the redo log (write IOPS pinned at ~8,000 while CPU idled at 48%), so
+        # 4x fewer, 4x larger commits move the same rows with a quarter of the
+        # flushes. Bounded deliberately at 2,000 — a batch is one transaction,
+        # holding row locks for its whole duration, so an oversized batch trades
+        # the connection contention away for lock-hold contention instead.
         - name: BATCH_ROWS
-          value: "500"
+          value: "2000"
         - name: UPSERT_RATIO
           value: "0.8"
         - name: HOT_KEY_RATIO
@@ -607,8 +640,13 @@ spec:
           value: "50000"
         - name: REPORT_SECONDS
           value: "15"
+        # 4 hours, then every pod exits on its own. Set deliberately rather than
+        # left at 0 (run forever): the run has to stop without depending on
+        # someone remembering to scale the StatefulSet down, and a self-stop ends
+        # all 32 pods at the same moment, which keeps the end of the measurement
+        # window sharp.
         - name: DURATION_SECONDS
-          value: "0"
+          value: "14400"
         # Hot-window sharding. POD_COUNT must track `replicas` above: it is the
         # divisor that sizes each pod's slice, and the deploy script keeps the two
         # in step on `scale`. If it drifts low, slices overlap and the lock

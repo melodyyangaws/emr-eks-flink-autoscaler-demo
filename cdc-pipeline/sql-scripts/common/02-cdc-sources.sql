@@ -91,9 +91,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_customers (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -129,9 +139,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_products (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -167,9 +187,19 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
 
 -- ============================================================================
@@ -204,7 +234,17 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_order_items (
     -- (splitStart=null, splitEnd=null) and pulled whole tables into heap ->
     -- "OutOfMemoryError: Java heap space" in the TaskManager. A fixed chunk size
     -- caps each split regardless of how wrong the estimate is.
-    'scan.incremental.snapshot.chunk.size' = '8096',
-    -- Cap rows held in memory per fetch within a chunk.
-    'scan.snapshot.fetch.size' = '1024'
+    -- 8096 -> 65536. The initial snapshot is 491M rows / 102 GiB across four tables,
+    -- and chunk size sets the split count: at 8096 order_items alone planned ~29,000
+    -- splits, and per-split coordination with the enumerator then dominated the
+    -- snapshot instead of the actual row reads. 65536 cuts that to ~3,600 splits.
+    -- The original small value was a reaction to the OOM described above, but the
+    -- real defect there was ONE UNCHUNKED split per table (splitStart/End = null);
+    -- any explicit bound fixes that, and task heap is now 21.27 GiB per TaskManager
+    -- rather than 7.13 GiB, so a 65536-row chunk has ample headroom.
+    'scan.incremental.snapshot.chunk.size' = '65536',
+    -- Rows held in memory per JDBC fetch within a chunk. 1024 -> 8192: at 1024 the
+    -- reader round-trips to RDS every ~0.5 MB, which throttles the snapshot on
+    -- network latency rather than on the instance's 12,000 IOPS / 500 MB/s.
+    'scan.snapshot.fetch.size' = '8192'
 );
