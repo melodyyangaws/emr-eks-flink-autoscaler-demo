@@ -857,5 +857,29 @@ Your MySQL database is now ready to be the source for Flink CDC! 🎉
 
    Both read `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` from the `mysql-credentials`
    secret, which the script creates from this guide's exported variables on first run.
+
+### Secret required by the Flink CDC jobs
+
+The data generators and the Flink jobs read the CDC password from **two different
+secrets**, and only the generator's is created for you. Create the Flink one before
+deploying either pipeline:
+
+```bash
+kubectl create secret generic flink-cdc-mysql-env \
+    --namespace emr-flink \
+    --from-literal=MYSQL_PASSWORD="${MYSQL_PASSWORD}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+```
+
+The key must be named `MYSQL_PASSWORD`: both `flink-cdc-*-sql.yaml` manifests pull it
+in with `envFrom: secretRef`, which maps every key in the secret to an env var of the
+same name, so the name inside the secret *is* the env var the job reads.
+
+If this secret is missing, the JobManager pod does not report a credential error — it
+sits in `CreateContainerConfigError` with `secret "flink-cdc-mysql-env" not found` only
+in `kubectl describe pod`, while the FlinkDeployment shows a healthy-looking
+`RECONCILING` / `DEPLOYED`.
+
+Override the name with `MYSQL_ENV_SECRET_NAME` if you use a different one.
 3. **[Monitor the pipelines](./3-MONITOR.md)** — job status, throughput, checkpoints, table stats.
 4. **[Query with StarRocks](./4-STARROCKS-OLAP-ENGINE.md)** — the Paimon vs Iceberg comparison.

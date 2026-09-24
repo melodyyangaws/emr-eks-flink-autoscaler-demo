@@ -585,7 +585,6 @@ generate_flink_deployment() {
         -e "s|\${GLUE_DATABASE}|${GLUE_DATABASE:-flink_iceberg_db}|g" \
         -e "s|\${MYSQL_HOST}|${MYSQL_HOST}|g" \
         -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
-        -e "s|\${MYSQL_SECRET_NAME}|${MYSQL_SECRET_NAME:-mysql-cdc-credentials}|g" \
         -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
         -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
         -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-driver-nodepool}|g" \

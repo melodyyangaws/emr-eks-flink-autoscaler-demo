@@ -155,7 +155,17 @@ spec:
           - name: PAIMON_WAREHOUSE
             value: "s3://${BUCKET_NAME}/paimon-warehouse/"
           - name: AWS_REGION
-            value: "${AWS_REGION}"  
+            value: "${AWS_REGION}"
+          # Needed on the JobManager too, not just the TaskManager. The JM parses
+          # the catalog DDL and creates the Glue database/tables through the legacy
+          # Hadoop/Hive client (AWSGlueClientFactory), which reads
+          # AWS_DEFAULT_REGION — the v2 SDK's AWS_REGION is invisible to it. With
+          # only AWS_REGION set the JM logs "No region info found, using SDK default
+          # region: us-east-1", then falls back to EC2 IMDS for a region and fails
+          # with "AmazonServiceException: Unauthorized (Status Code: 401)" because
+          # IMDS is not reachable from the pod.
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
           - name: GLUE_DATABASE
             value: "flink_paimon_db"
           # Binlog client id ranges for the four mysql-cdc sources. These are
