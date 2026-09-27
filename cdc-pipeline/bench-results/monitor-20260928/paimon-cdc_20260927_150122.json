@@ -1,0 +1,70 @@
+{
+  "label": "paimon-cdc",
+  "pipeline_type": "paimon-cdc",
+  "job_name": "flink-cdc-paimon",
+  "job_status": "RUNNING",
+  "parallelism": 32,
+  "duration_seconds": 120,
+  "start_time": "2026-09-27T14:59:35.517607Z",
+  "end_time": "2026-09-27T15:01:18.870765Z",
+  "throughput_records_per_sec": 0.0,
+  "throughput_bytes_per_sec": 0.0,
+  "total_records_processed": 0,
+  "total_bytes_processed": 0,
+  "avg_checkpoint_duration_ms": 0.0,
+  "checkpoint_count": 0,
+  "total_new_snapshots": 0,
+  "total_new_data_files": 0,
+  "total_new_delete_files": 0,
+  "total_new_position_deletes": 0,
+  "total_new_equality_deletes": 0,
+  "total_new_records_in_tables": 0,
+  "total_new_bytes_in_tables": 0,
+  "errors": [],
+  "table_details": {
+    "customers": {
+      "format_version": 0,
+      "snapshots_delta": 0,
+      "records_delta": 0,
+      "data_files_delta": 0,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 0
+    },
+    "products": {
+      "format_version": 0,
+      "snapshots_delta": 0,
+      "records_delta": 0,
+      "data_files_delta": 0,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 0
+    },
+    "orders": {
+      "format_version": 0,
+      "snapshots_delta": 0,
+      "records_delta": 0,
+      "data_files_delta": 0,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 0
+    },
+    "order_items": {
+      "format_version": 0,
+      "snapshots_delta": 0,
+      "records_delta": 0,
+      "data_files_delta": 0,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 0
+    }
+  }
+}

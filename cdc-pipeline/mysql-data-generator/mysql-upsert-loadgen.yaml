@@ -645,9 +645,9 @@ spec:
         # aggregate is unchanged, which is the point — this change trades
         # connections for batch size, not throughput.
         - name: RATE_PER_POD
-          value: "8600"
+          value: "80000"
         - name: THREADS
-          value: "4"
+          value: "8"
         # 500 -> 2,000 rows per commit. This is what lets 32 connections carry the
         # load that previously needed 128: the bottleneck is commits/sec against
         # the redo log (write IOPS pinned at ~8,000 while CPU idled at 48%), so
@@ -656,9 +656,9 @@ spec:
         # holding row locks for its whole duration, so an oversized batch trades
         # the connection contention away for lock-hold contention instead.
         - name: BATCH_ROWS
-          value: "2000"
+          value: "5000"
         - name: UPSERT_RATIO
-          value: "0.8"
+          value: "0.5"
         # 0.6 -> 0.95, and the window 50,000 -> 2,000,000. Together these took
         # aggregate throughput from ~15,000 rows/s to ~58,300 (3.9x). Both move
         # the same direction, for two different reasons:
@@ -681,7 +681,7 @@ spec:
         # comparison exists to measure is preserved, and in fact strengthened,
         # since a larger share of writes is now repeat-key.
         - name: HOT_KEY_RATIO
-          value: "0.95"
+          value: "0.5"
         - name: HOT_KEY_WINDOW
           value: "2000000"
         - name: REPORT_SECONDS
@@ -710,13 +710,19 @@ spec:
         volumeMounts:
         - name: script
           mountPath: /scripts
+        # Raised 2 -> 4 CPU when RATE_PER_POD went to 8000. At 2 cores a pod
+        # cannot reach 8,000 rows/s: the driver burns real CPU building the
+        # 2,000-row multi-row statement text, so the ceiling is the GIL plus the
+        # C extension's encode loop, not MySQL. Requests go 1 -> 2 so the
+        # scheduler reserves enough to actually run the threads rather than
+        # letting them fight over one core under contention.
         resources:
           requests:
             memory: "512Mi"
-            cpu: "1"
+            cpu: "2"
           limits:
             memory: "1Gi"
-            cpu: "2"
+            cpu: "4"
       volumes:
       - name: script
         configMap:

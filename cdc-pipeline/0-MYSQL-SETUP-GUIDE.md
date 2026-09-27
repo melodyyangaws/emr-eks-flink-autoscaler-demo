@@ -283,7 +283,67 @@ SHOW VARIABLES LIKE 'binlog_format';
 -- Check binlog retention
 SHOW VARIABLES LIKE 'binlog_expire_logs_seconds';
 -- Should be > 86400 (24 hours) for safety
+--
+-- WARNING: on RDS this variable does NOT control when binlogs are deleted.
+-- Reading it is actively misleading. It reported 2592000 (30 days) on an
+-- instance that was retaining only ~6 MINUTES of binlog.
 ```
+
+### ⚠️ RDS binlog retention: the variable lies
+
+On RDS, purging is governed by an RDS-managed setting, not by
+`binlog_expire_logs_seconds`. When `binlog retention hours` is unset (the
+default, NULL), **RDS deletes each binlog file as soon as its backup captures
+it** — regardless of what `binlog_expire_logs_seconds` claims.
+
+Measured on `flink-cdc-mysql-8-0` under ~58k rows/s, over one 90-second window:
+
+| | T+0 | T+90s |
+|---|---|---|
+| oldest file | `002995` | `003003` (**8 purged in 90s**) |
+| newest file | `003011` | `003013` |
+| files retained | 17 | **11** |
+
+At ~1.75 new files/min × 134 MB, only ~11 files retained, the whole binlog
+history on the server was about **6 minutes deep**. This was NOT disk pressure
+(`FreeStorageSpace` was 267 GB of 500).
+
+**Why this breaks Flink CDC.** The MySQL source records its low watermark when
+the snapshot *starts*, then requests that offset when the snapshot *finishes*.
+A 410M-row snapshot across 6,270 splits takes ~62 minutes here. Against a
+6-minute window the offset is long gone, and the job dies on:
+
+```
+java.lang.IllegalStateException: The connector is trying to read binlog starting at
+  Struct{...file=mysql-bin-changelog.002970,pos=48226680,row=0},
+  but this is no longer available on the server.
+  Reconfigure the connector to use a snapshot when needed.
+    at StatefulTaskContext.loadStartingOffsetState(StatefulTaskContext.java:207)
+    at BinlogSplitReader.submitSplit(BinlogSplitReader.java:121)
+```
+
+This fails *after* a full successful snapshot, which makes it expensive: hours
+of snapshot work are discarded, the job restarts, re-snapshots, and loses the
+race again — indefinitely. It also masquerades as a different bug, because the
+enumerator's earlier symptom is a silent stall with no error at all.
+
+**Fix — set retention explicitly. This is required, not optional:**
+
+```sql
+-- Must run as the MASTER user (e.g. admin). A least-privilege CDC user cannot
+-- do this: it needs EXECUTE on mysql.*, and cdcuser is deliberately limited to
+-- SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT.
+CALL mysql.rds_set_configuration('binlog retention hours', 24);
+
+-- Verify (also master-only):
+CALL mysql.rds_show_configuration;
+-- name                   value
+-- binlog retention hours 24
+```
+
+Set this **before** the first Flink deployment. 24 hours comfortably covers the
+~62-minute snapshot; raise it if you grow the dataset or lower the write rate.
+Binlogs cost storage, so don't set it to NULL-equivalent extremes in reverse.
 
 **✅ Good News**: RDS MySQL **automatically enables binlog** with correct settings!
 

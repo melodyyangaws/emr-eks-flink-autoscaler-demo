@@ -1,0 +1,70 @@
+{
+  "label": "iceberg-cdc",
+  "pipeline_type": "iceberg-cdc",
+  "job_name": "flink-cdc-iceberg",
+  "job_status": "RUNNING",
+  "parallelism": 32,
+  "duration_seconds": 120,
+  "start_time": "2026-09-27T15:01:22.028880Z",
+  "end_time": "2026-09-27T15:03:03.045166Z",
+  "throughput_records_per_sec": 1035500.85,
+  "throughput_bytes_per_sec": 148561021.76,
+  "total_records_processed": 103590432,
+  "total_bytes_processed": 14861890713,
+  "avg_checkpoint_duration_ms": 3818.5,
+  "checkpoint_count": 1,
+  "total_new_snapshots": 4,
+  "total_new_data_files": 46,
+  "total_new_delete_files": 90,
+  "total_new_position_deletes": 1623791,
+  "total_new_equality_deletes": 17699077,
+  "total_new_records_in_tables": 19322868,
+  "total_new_bytes_in_tables": 432927486,
+  "errors": [],
+  "table_details": {
+    "customers": {
+      "format_version": 2,
+      "snapshots_delta": 1,
+      "records_delta": 2234365,
+      "data_files_delta": 32,
+      "delete_files_delta": 64,
+      "position_deletes_delta": 261281,
+      "equality_deletes_delta": 1973084,
+      "added_delete_files": 64,
+      "bytes_delta": 81814731
+    },
+    "products": {
+      "format_version": 2,
+      "snapshots_delta": 1,
+      "records_delta": 3358717,
+      "data_files_delta": 10,
+      "delete_files_delta": 20,
+      "position_deletes_delta": 281719,
+      "equality_deletes_delta": 3076998,
+      "added_delete_files": 20,
+      "bytes_delta": 85537288
+    },
+    "orders": {
+      "format_version": 2,
+      "snapshots_delta": 1,
+      "records_delta": 6137853,
+      "data_files_delta": 2,
+      "delete_files_delta": 3,
+      "position_deletes_delta": 435537,
+      "equality_deletes_delta": 5702316,
+      "added_delete_files": 3,
+      "bytes_delta": 119929989
+    },
+    "order_items": {
+      "format_version": 2,
+      "snapshots_delta": 1,
+      "records_delta": 7591933,
+      "data_files_delta": 2,
+      "delete_files_delta": 3,
+      "position_deletes_delta": 645254,
+      "equality_deletes_delta": 6946679,
+      "added_delete_files": 3,
+      "bytes_delta": 145645478
+    }
+  }
+}

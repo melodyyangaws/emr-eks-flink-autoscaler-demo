@@ -1,0 +1,37 @@
+stamp,suite,query,metric,paimon,iceberg,ratio_iceberg_over_paimon
+20260927T115210Z,snapshot,Q1_count,time_ms,640,5108,7.98x
+20260927T115210Z,snapshot,Q1_count,scan_rows,82187953,120342529,1.46x
+20260927T115210Z,snapshot,Q1_count,scan_bytes,360979724,8452681,0.02x
+20260927T115210Z,snapshot,Q2_group_by,time_ms,734,5403,7.36x
+20260927T115210Z,snapshot,Q2_group_by,scan_rows,82046995,121674968,1.48x
+20260927T115210Z,snapshot,Q2_group_by,scan_bytes,214274881,112553720,0.53x
+20260927T115210Z,snapshot,Q3_join,time_ms,3079,18209,5.91x
+20260927T115210Z,snapshot,Q3_join,scan_rows,0,280722589,n/a
+20260927T115210Z,snapshot,Q3_join,scan_bytes,0,1487036227,n/a
+20260927T115210Z,snapshot,Q4_product_sales,time_ms,11158,7981,0.72x
+20260927T115210Z,snapshot,Q4_product_sales,scan_rows,400073245,0,0.00x
+20260927T115210Z,snapshot,Q4_product_sales,scan_bytes,3102166901,0,0.00x
+20260927T115210Z,snapshot,Q5_time_window,time_ms,3685,18373,4.99x
+20260927T115210Z,snapshot,Q5_time_window,scan_rows,468299085,341155804,0.73x
+20260927T115210Z,snapshot,Q5_time_window,scan_bytes,2872488574,1688976692,0.59x
+20260927T115210Z,snapshot,Q6_multi_join,time_ms,27909,8137,0.29x
+20260927T115210Z,snapshot,Q6_multi_join,scan_rows,517541358,0,0.00x
+20260927T115210Z,snapshot,Q6_multi_join,scan_bytes,2803721666,0,0.00x
+20260927T115210Z,hot,Q7_freshness,time_ms,203,7151,35.23x
+20260927T115210Z,hot,Q7_freshness,scan_rows,2055968,0,0.00x
+20260927T115210Z,hot,Q7_freshness,scan_bytes,1513807,0,0.00x
+20260927T115210Z,hot,Q8_hot_pk_lookup,time_ms,2400,6707,2.79x
+20260927T115210Z,hot,Q8_hot_pk_lookup,scan_rows,485498286,0,0.00x
+20260927T115210Z,hot,Q8_hot_pk_lookup,scan_bytes,1693150387,0,0.00x
+20260927T115210Z,hot,Q9_recent_window,time_ms,848,1265,1.49x
+20260927T115210Z,hot,Q9_recent_window,scan_rows,64708408,0,0.00x
+20260927T115210Z,hot,Q9_recent_window,scan_bytes,412780535,0,0.00x
+20260927T115210Z,hot,Q10_hot_join,time_ms,7766,5780,0.74x
+20260927T115210Z,hot,Q10_hot_join,scan_rows,280731120,122678936,0.44x
+20260927T115210Z,hot,Q10_hot_join,scan_bytes,2084009463,465494475,0.22x
+20260927T115210Z,state,customers,rows_and_files,80507319,80508416,ice_files=1766 ice_snaps=11
+20260927T115210Z,state,products,rows_and_files,160118409,160300671,ice_files=396 ice_snaps=12
+20260927T115210Z,state,orders,rows_and_files,440044431,374334719,ice_files=283 ice_snaps=22
+20260927T115210Z,state,order_items,rows_and_files,596577180,424313527,ice_files=313 ice_snaps=22
+20260927T115210Z,location,bucket,s3_bucket,emr-on-eks-test-633458367150-us-west-2,emr-on-eks-test-633458367150-us-west-2,same
+20260927T115210Z,location,prefix,s3_prefix,emr-on-eks-test-633458367150-us-west-2/paimon-warehouse/,iceberg-warehouse/flink_iceberg_db.db,distinct

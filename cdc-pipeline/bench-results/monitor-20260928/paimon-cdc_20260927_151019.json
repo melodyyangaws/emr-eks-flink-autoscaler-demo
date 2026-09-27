@@ -1,0 +1,70 @@
+{
+  "label": "paimon-cdc",
+  "pipeline_type": "paimon-cdc",
+  "job_name": "flink-cdc-paimon",
+  "job_status": "RUNNING",
+  "parallelism": 32,
+  "duration_seconds": 120,
+  "start_time": "2026-09-27T15:08:32.806603Z",
+  "end_time": "2026-09-27T15:10:16.523111Z",
+  "throughput_records_per_sec": 1453570.63,
+  "throughput_bytes_per_sec": 197658527.07,
+  "total_records_processed": 145499984,
+  "total_bytes_processed": 19785287296,
+  "avg_checkpoint_duration_ms": 10019,
+  "checkpoint_count": 1,
+  "total_new_snapshots": 8,
+  "total_new_data_files": 0,
+  "total_new_delete_files": 0,
+  "total_new_position_deletes": 0,
+  "total_new_equality_deletes": 0,
+  "total_new_records_in_tables": 13773482,
+  "total_new_bytes_in_tables": 1003070467,
+  "errors": [],
+  "table_details": {
+    "customers": {
+      "format_version": 0,
+      "snapshots_delta": -2,
+      "records_delta": 555893,
+      "data_files_delta": -112,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": -96758339
+    },
+    "products": {
+      "format_version": 0,
+      "snapshots_delta": -2,
+      "records_delta": 570053,
+      "data_files_delta": -933,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": -68611577
+    },
+    "orders": {
+      "format_version": 0,
+      "snapshots_delta": -2,
+      "records_delta": 5493710,
+      "data_files_delta": -64,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 136743074
+    },
+    "order_items": {
+      "format_version": 0,
+      "snapshots_delta": 0,
+      "records_delta": 7153826,
+      "data_files_delta": -102,
+      "delete_files_delta": 0,
+      "position_deletes_delta": 0,
+      "equality_deletes_delta": 0,
+      "added_delete_files": 0,
+      "bytes_delta": 199611650
+    }
+  }
+}

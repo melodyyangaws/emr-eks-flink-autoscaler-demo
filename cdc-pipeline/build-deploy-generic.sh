@@ -575,7 +575,21 @@ generate_flink_deployment() {
     # in via `envFrom: secretRef: ${MYSQL_ENV_SECRET_NAME}` so no credential is
     # ever written to the generated file.
     #
-    # TM_NODEPOOL defaults to driver-nodepool, NOT executor-memorynodepool to avoid Karpenter consolidation interruptping TM
+    # CAPACITY: driver-nodepool needs limits.cpu >= 256 to host BOTH jobs. Each job
+    # is parallelism 16 / 4 slots per TM = 4 TMs x (4 cpu, 32Gi), plus a 4-cpu/16Gi
+    # JM, so the pair needs ~40 cpu and ~288Gi of schedulable room. At the original
+    # limits.cpu: 128 the pool wedged: Karpenter counts the limit against PROVISIONED
+    # NODE CAPACITY, not pod requests, so 5 nodes (127.3 allocatable cpu) exhausted it
+    # while only 55.5 cpu was actually requested. New TMs then failed to schedule
+    #   "all available instance types exceed limits for nodepool (NodePool=driver-nodepool)"
+    # and the job sat at RUNNING with half its tasks never deployed (209/408 running,
+    # 189 failed), aborting every checkpoint with "Not all required tasks are
+    # currently running" -- no error, no restart, just a silent stall. Karpenter drift
+    # eviction made it worse, cycling TMs 778 times because replacements had nowhere
+    # to land. Raise with:
+    #   kubectl patch nodepool driver-nodepool --type=merge -p '{"spec":{"limits":{"cpu":256}}}'
+    # Pass the value UNQUOTED: '{"cpu":"256"}' is parsed as a quantity and can land as
+    # 25600. Verify with: kubectl get nodepool driver-nodepool -o jsonpath='{.spec.limits}'
     sed -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
         -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
         -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
@@ -587,7 +601,7 @@ generate_flink_deployment() {
         -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
         -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
         -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
-        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-driver-nodepool}|g" \
+        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-executor-memorynodepool}|g" \
         "$template_file" > "$output_file"
 
     # Fail loudly on an unsubstituted or empty placeholder. Left alone, an empty

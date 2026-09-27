@@ -66,7 +66,24 @@ spec:
     state.savepoints.dir: s3://${BUCKET_NAME}/flink/cdc-paimon/savepoints/
 
     # Restart Strategy
-    jobmanager.execution.failover-strategy: region
+    # 'full', not 'region'. region restarts only the failed pipelined region, and
+    # on this graph each of the 16 source subtasks is its own region — so when
+    # Source: mysql_src_customers[1] subtask 0 died, region failover had nothing
+    # to cascade to and the other 15 subtasks were left RUNNING. 407 of 408 tasks
+    # healthy is not a job failure to Flink, so the restart strategy below never
+    # fired and the orphan was never replaced. Every subsequent checkpoint then
+    # aborted at trigger time:
+    #   "Checkpoint triggering task Source: mysql_src_customers[1] (1/16) ... is not
+    #    being executed at the moment. Aborting checkpoint. Failure reason: Not all
+    #    required tasks are currently running."
+    # Aborted-at-trigger checkpoints are not counted as FAILED, so
+    # tolerable-failed-checkpoints: "10" never fired either. Net effect: 0
+    # checkpoints committed in 65 minutes, job pinned at RUNNING, no error surfaced.
+    # Reproduced twice on independent from-scratch deployments (subtask 0 both
+    # times, attempt 1 then attempt 0, failure-cause None in both). 'full' makes a
+    # single lost source subtask restart the whole graph, which for a CDC job that
+    # cannot checkpoint without all 16 sources is the only correct behaviour.
+    jobmanager.execution.failover-strategy: full
     # exponential-delay, not fixed-delay. fixed-delay's attempts counter is
     # GLOBAL, while failover-strategy: region files one restart request per
     # failed task — so a single TaskManager going away takes the whole graph's
@@ -95,7 +112,17 @@ spec:
     jobmanager.adaptive-scheduler.combined-restart.enabled: "false"
     jobmanager.adaptive-scheduler.resource-wait-timeout: "10m"
     # Scheduler
-    jobmanager.scheduler: adaptive
+    # 'default', not 'adaptive'. The adaptive scheduler is what allowed a subtask to
+    # sit in FAILED while its siblings stayed RUNNING and the job stayed RUNNING: it
+    # tracks desired vs available parallelism rather than requiring every declared
+    # task to be deployed, and it logged no "switched to FAILED" transition for the
+    # orphan at all (failure-cause came back None from /jobs). Autoscaling is off
+    # here anyway (job.autoscaler.*.enabled: "false"), so adaptive buys nothing and
+    # costs the all-tasks-running invariant that checkpointing depends on. The
+    # default scheduler declares the full 408-task graph up front and fails the job
+    # if it cannot keep it deployed — which is what we want to see, loudly, instead
+    # of a silent stall. Keep in sync with Iceberg: this is a fair-comparison knob.
+    jobmanager.scheduler: default
     taskmanager.numberOfTaskSlots: "4"
     # TaskManager heap. The CDC deserializer OOMed at the previous sizing
     # ("OutOfMemoryError: Java heap space" inside RowDataDebeziumDeserializeSchema
@@ -136,8 +163,33 @@ spec:
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${JM_NODEPOOL}
+        # flink-cdc-executor.py is mounted here from a ConfigMap built out of the
+        # local file, NOT fetched from S3. The operator's own artifact plumbing is
+        # broken for this path: it injects an `aws-cli` initContainer that
+        # downloads jarURI into volume `flink-artifact` at /flink-artifact, but the
+        # main container never mounts that volume — it mounts `user-artifacts-volume`
+        # at /opt/flink/artifacts instead, while the job args point at a third path,
+        # /opt/flink/usrlib/. The download succeeds (initContainer exits 0) and the
+        # file is then thrown away with the volume, so PythonDriver fails with
+        #   java.nio.file.NoSuchFileException:
+        #     /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py
+        # (that /tmp/pyflink path is where PythonEnvUtils symlinks the -py argument,
+        # so the message names the temp copy rather than the missing source).
+        # Mounting the ConfigMap directly at /opt/flink/usrlib puts the file exactly
+        # where the args already expect it. /opt/flink/usrlib is empty in the image,
+        # so shadowing it costs nothing. Refresh after editing the script with:
+        #   kubectl create configmap flink-cdc-executor-py -n emr-flink \
+        #     --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
+        #     --dry-run=client -o yaml | kubectl apply -f -
+        volumes:
+        - name: executor-py
+          configMap:
+            name: flink-cdc-executor-py
         containers:
         - name: flink-main-container
+          volumeMounts:
+          - name: executor-py
+            mountPath: /opt/flink/usrlib
           # Password is never templated into this manifest — MYSQL_PASSWORD is
           # injected at pod start from Secret ${MYSQL_ENV_SECRET_NAME} (key
           # MYSQL_PASSWORD). envFrom is used rather than an env[].valueFrom
@@ -174,6 +226,10 @@ spec:
           # read the same RDS instance, and MySQL evicts whichever binlog client
           # connected first when a second one reuses its id. See the server-id
           # note in sql-scripts/common/02-cdc-sources.sql.
+          #
+          # Each range is 32 wide to cover parallelism: 32 below — the connector
+          # hands one id per source subtask, so a range narrower than the
+          # parallelism makes subtasks share ids and evict each other.
           - name: CDC_SERVER_ID_CUSTOMERS
             value: "5401-5432"
           - name: CDC_SERVER_ID_PRODUCTS
@@ -184,7 +240,7 @@ spec:
             value: "5521-5552"
   taskManager:
     resource:
-      memory: 32Gi
+      memory: 16Gi
       cpu: 4
     podTemplate:
       spec:
@@ -217,10 +273,10 @@ spec:
       - "--sql-dir"
       - "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/"
       - "--checkpoint-interval"
-      - "60s"
+      - "70s"
       - "--parallelism"
-      - "16"
-    parallelism: 16
+      - "32"
+    parallelism: 32
     upgradeMode: last-state
 
   monitoringConfiguration:
