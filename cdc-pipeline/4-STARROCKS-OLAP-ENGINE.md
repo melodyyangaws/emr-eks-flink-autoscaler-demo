@@ -166,7 +166,7 @@ spark.sql("""
 export AWS_REGION=us-west-2
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
-export EKS_CLUSTER_NAME=eks-test
+export EKS_CLUSTER_NAME=loadtest-mcp
 
 # Install IRSA + operator + cluster
 ./starrocks/deploy-starrocks.sh install-iam
@@ -174,8 +174,29 @@ export EKS_CLUSTER_NAME=eks-test
 
 This creates:
 - IAM policy `StarRocksS3GluePolicy` (S3 + Glue read access)
-- IRSA service account `starrocks/starrocks-sa`
+- IRSA service account `starrocks-sa` in `$NAMESPACE` (script default: `starrocks`)
 - StarRocks operator + FE/BE cluster via Helm
+
+Cluster shape comes from `helm/starrocks-eks-values.yaml`: **1 FE** (2–4 cpu,
+8–16 Gi, 50 Gi gp3) and **3 BE** (4–6 cpu, 16–24 Gi, 200 Gi gp3 each).
+
+> **Two things in the repo disagree about the namespace.** The script defaults to
+> `NAMESPACE=starrocks`, while `helm/starrocks-eks-values.yaml` says StarRocks is
+> installed into `emr-flink` because the execution role's trust policy allows
+> `system:serviceaccount:emr-flink:*`. If you deploy into `starrocks`, the
+> `starrocks-sa` ServiceAccount there is **not** covered by that trust policy and
+> the external catalogs will fail on S3/Glue. Either set `NAMESPACE=emr-flink` or
+> widen the trust policy — the chart does not create the SA, it only references
+> one by name.
+>
+> **The chart version is not pinned.** `deploy-starrocks.sh` runs
+> `helm upgrade --install … starrocks/kube-starrocks` with no `--version`, so it
+> takes whatever the repo's latest is. The values file is written for `>= 1.11`
+> (component specs nested under `starrocks:`) and the image tags are left empty,
+> which resolves to the chart appVersion — currently the **floating `4.1-latest`
+> tag**. That means the engine version drifts on every pod restart. Pin both the
+> chart (`--version`) and an exact image tag (e.g. `4.1.4`) before capturing
+> numbers you intend to compare across runs.
 
 ### 3.2 Connect to StarRocks
 
@@ -230,7 +251,43 @@ FROM iceberg_catalog.flink_iceberg_db.customers;
 kubectl get pods -n starrocks
 ```
 
-**Cost:** ~$300–500/month (3 FE + 3 BE pods)
+**Cost:** ~$300–500/month for the 1 FE + 3 BE shape above (rough order of
+magnitude; it is EC2 + EBS, so it tracks whatever nodes the BEs land on).
+
+### 3.6 Scaling down and tearing down
+
+**Scale the BEs down before the FE, not after.** The FE holds the cluster
+metadata and the backend registry; if it goes away first, the operator has
+nothing to reconcile the remaining BEs against and they are left orphaned.
+
+Prefer editing the `StarRocksCluster` CR so the operator stays in agreement with
+the desired state:
+
+```bash
+kubectl get starrockscluster -n starrocks
+kubectl edit starrockscluster <name> -n starrocks   # set starrocksBeSpec.replicas
+```
+
+Scaling the BE StatefulSet directly (`kubectl scale statefulset … -n starrocks`)
+works for a quick pause, but the operator will reconcile it back to the CR's
+`replicas` — change the CR if you want the reduction to stick.
+
+> **`helm uninstall` does not delete the PVCs.** Each BE holds a 200 Gi gp3
+> volume and the FE a 50 Gi one, and StatefulSet PVCs outlive the StatefulSet by
+> design. `./starrocks/deploy-starrocks.sh cleanup` does
+> `kubectl delete namespace $NAMESPACE`, which *does* take the PVCs with it — but
+> a bare `helm uninstall` leaves them billing. After any uninstall:
+> ```bash
+> kubectl get pvc -n starrocks
+> ```
+> and delete what you no longer need. Leftover PVCs also mean a fresh install can
+> pick up stale BE data directories.
+>
+> Neither the scale-down ordering nor the PVC retention behaviour is asserted
+> anywhere in the repo's scripts, and StarRocks is **not currently deployed on
+> this cluster** (`helm list -n starrocks` is empty, and
+> `kubectl get starrockscluster,pvc -n starrocks` returns no resources), so
+> the two notes above were not verified in-cluster.
 
 ---
 
@@ -275,6 +332,14 @@ not quiet-table latencies.
 | Duration before benchmark | ~17 min sustained (≈41M row-modifications) |
 | Generator | `mysql-data-generator/mysql-upsert-loadgen.yaml` (StatefulSet), 8 replicas × 4 threads × 500-row batches |
 | Both pipelines | `RUNNING`, 34/34 checkpoints completed, 0 failed, parallelism 16 |
+
+> Every row in this table is the configuration **as it was on 2026-09-22** and none
+> of it matches the current manifests. The generator now ships `RATE_PER_POD 80000`
+> / `THREADS 8` / `BATCH_ROWS 8000` / `UPSERT_RATIO 0.5` / `HOT_KEY_RATIO 0.5` /
+> `HOT_KEY_WINDOW 5000000`, and both Flink jobs run at **parallelism 32**
+> (808 tasks Paimon, 520 Iceberg). Re-run the suite before comparing anything
+> against these figures — see [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md) for the
+> current values and why each changed.
 
 ### Table state at benchmark time
 
@@ -340,7 +405,7 @@ volume, while Paimon's LSM has already merged them away.
 ./sql-scripts/starrocks/bench-server-side.sh            # snapshot + hot suites
 SUITE=hot RUNS=5 ./sql-scripts/starrocks/bench-server-side.sh
 
-# 40k/s upsert load (8 pods x 5000/s). This is a StatefulSet, not a Deployment:
+# Upsert load (8 pods). This is a StatefulSet, not a Deployment:
 # each pod derives its own disjoint slice of the hot-key window from its ordinal,
 # and only a StatefulSet hands out exact 0..N-1 ordinals. If the older Deployment
 # version was ever applied, delete it first — apply cannot convert kinds in place.
@@ -377,7 +442,16 @@ did not exist yet. All-zero `ScanRows` means the queries errored, not that they 
 - **Check pipeline health before believing a result.** A Flink job reports `RUNNING` with
   dead sink committers — `/jobs` looks fine while the table is frozen. Confirm freshness
   (`MAX(updated_at)` vs `UTC_TIMESTAMP()`) and checkpoint counts on both sides first;
-  comparing a live table against a stalled one measures nothing.
+  comparing a live table against a stalled one measures nothing. When you check
+  checkpoints, read the `history` array from `/jobs/<id>/checkpoints`, **not** the
+  `counts.failed` / `cp_fail` number — that counter is cumulative for the life of
+  the job and never decreases, so an unchanged value proves nothing either way.
+  See [3-MONITOR.md](3-MONITOR.md#checkpoint-failure-counts-are-cumulative-not-current).
+- **A benchmark run can be silently invalidated by a TaskManager restart.** Karpenter
+  consolidation evicts nodes that are still hosting RUNNING TaskManagers, and with
+  `failover-strategy: full` one lost TM restarts the entire task graph. Confirm the
+  jobs were not restarting during the window — see the troubleshooting entry in the
+  [README](README.md#troubleshooting-quick-reference).
 - **Compare like with like.** Paimon compacts continuously in the background; Iceberg
   needs an explicit `rewrite_data_files`. Capture Iceberg both before and after
   compaction, and say which state each number came from.
@@ -446,7 +520,7 @@ Start: Need OLAP Query Layer
 ---
 
 **Status**: ✅ Production Ready
-**Last Updated**: 2026-03-08
+**Last Updated**: 2026-09-27
 **Technologies**: Flink 1.20, Paimon 1.3.2, Iceberg 1.10.0-amzn-1, StarRocks 4.1.4
 (benchmark numbers above were captured on Paimon 1.3.0 — see the note in
 [Performance Comparison](#performance-comparison))

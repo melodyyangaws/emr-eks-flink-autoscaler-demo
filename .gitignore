@@ -9,3 +9,4 @@ cdc-pipeline/mysql-cdc-env.sh
 
 # Runtime logs
 *.log
+cdc-pipeline/bench-results

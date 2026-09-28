@@ -640,21 +640,64 @@ spec:
             secretKeyRef: { name: mysql-credentials, key: password }
         - name: MYSQL_DATABASE
           value: "ecommerce"
-        # 8 pods x 8,600 = 68,800 rows/sec, matching the measured ~69,000 ceiling.
-        # Per-pod rate is 1.7x the old 5,000 because there are 4x fewer pods; the
-        # aggregate is unchanged, which is the point — this change trades
-        # connections for batch size, not throughput.
+        # 8 pods x 100,000 = 800,000 rows/sec of TARGET. RATE is a token-bucket
+        # ceiling, not a promise, and this target is far above anything this
+        # instance has delivered (best measured: 94,327 at 8 pods). Setting it
+        # well past the achievable rate is deliberate — the bucket then never
+        # binds, so the pods run flat out and whatever they reach is the real
+        # limit of MySQL plus the driver rather than an artifact of the generator
+        # throttling itself. Do not read this number as a throughput claim:
+        # measure `inst=` from the pod logs. `avg=` is a lifetime average and is
+        # useless after a settings change.
+        #
+        # 800k/s is NOT reachable on a single db.m5.2xlarge, and the arithmetic
+        # says so before the test does. Measured per-row cost is 0.198 write
+        # IOPS/row and 3.36 KB/row, so 800k rows/s needs ~158,400 IOPS and
+        # ~2,625 MB/s. The gp3 volume is provisioned at 64,000 IOPS (gp3's
+        # maximum), which caps sustained throughput near ~323,000 rows/s — and
+        # that ceiling was confirmed once already, at ~330,000 rows/s with
+        # WriteIOPS reading 65,310 of 64,000 (102%). Reaching 800k needs either
+        # io2 with more IOPS on a bigger instance, or sharding across ~3
+        # instances. Expect this target to be clipped by storage, and read the
+        # gap between target and `inst=` as the headroom measurement it is.
         - name: RATE_PER_POD
           value: "80000"
         - name: THREADS
           value: "8"
-        # 500 -> 2,000 rows per commit. This is what lets 32 connections carry the
-        # load that previously needed 128: the bottleneck is commits/sec against
-        # the redo log (write IOPS pinned at ~8,000 while CPU idled at 48%), so
-        # 4x fewer, 4x larger commits move the same rows with a quarter of the
-        # flushes. Bounded deliberately at 2,000 — a batch is one transaction,
-        # holding row locks for its whole duration, so an oversized batch trades
-        # the connection contention away for lock-hold contention instead.
+        # 10,000 -> 5,000. REVERTED: 10,000 was tried and measured WORSE, which
+        # settles the lock-hold question the earlier note left open.
+        #
+        # The reasoning for going up was that the bottleneck is commits/sec
+        # against the redo log, so fewer, larger commits move the same rows with
+        # fewer flushes. That holds up to about 5,000 and then inverts, because a
+        # batch is ONE transaction holding every row lock it touches for the
+        # whole statement. At 10,000 rows the hold window is long enough that
+        # 8 threads x 8 pods = 64 concurrent writers collide constantly.
+        #
+        # Measured at 10,000 (per pod, 240s after rollout): inst= 4,000/s against
+        # a 100,000/s target, with 53 of 130 batches erroring — a ~40% batch
+        # failure rate. Aggregate across 8 pods was ~30,000/s, an order of
+        # magnitude below where 5,000 had been running.
+        #
+        # The errors are 1213 (deadlock) and 1205 (lock-wait timeout), NOT the
+        # 1153 max_allowed_packet breach the previous note worried about. Those
+        # two errnos are retried silently in worker() and never printed, so they
+        # only show up in the `errors=` counter — which is why this looked like a
+        # stall rather than an error storm. Each rollback discards the entire
+        # multi-row statement, so a failed batch costs BATCH_ROWS rows off the
+        # achieved rate, and the 4 retry attempts serialize behind the same
+        # contention that caused the first failure.
+        #
+        # RDS was NOT the wall here, which is what makes this conclusive: during
+        # the 10,000 run WriteIOPS sat at 7,900-11,800 of 64,000 provisioned
+        # (~18%), WriteThroughput ~134-205 MB/s of 2,500, and WriteLatency 0.
+        # Storage had ~5x headroom and the generator still could not use it.
+        # DiskQueueDepth 18-76 alongside idle IOPS is the signature of requests
+        # queued behind lock waits rather than behind the device.
+        #
+        # 5,000 is the measured optimum for this workload shape. Do not raise it
+        # again without also reducing concurrency (THREADS x replicas); the two
+        # multiply into the collision rate.
         - name: BATCH_ROWS
           value: "5000"
         - name: UPSERT_RATIO
@@ -681,9 +724,47 @@ spec:
         # comparison exists to measure is preserved, and in fact strengthened,
         # since a larger share of writes is now repeat-key.
         - name: HOT_KEY_RATIO
-          value: "0.5"
+          value: "0.6"
+        # 5,000,000 — sized to the BUFFER POOL, which is the constraint that
+        # actually governs this number. Everything above is still true, but it
+        # missed the ceiling: a window only behaves as "hot" while the rows it
+        # spans fit in memory. Past that the hot half misses cache just like the
+        # cold tail and the skew buys nothing.
+        #
+        # The arithmetic. Rows are ~3.36 KB, so a window of N keys spans
+        # N x 3.36 KB. The buffer pool is innodb_buffer_pool_size =
+        # {DBInstanceClassMemory*3/4} on a db.m5.2xlarge (32 GiB) => ~24 GB.
+        #   200,000,000 keys ->  641 GB   = 27x the pool   (what was running)
+        #     5,000,000 keys ->   16 GB   = fits, with room for the cold tail
+        # Per pod, HOT_SLICE = window / POD_COUNT: 25,000,000 keys / 80 GB before
+        # vs 625,000 keys / 2 GB now.
+        #
+        # What 200,000,000 measured (8 pods, BATCH_ROWS 5,000, ratio 0.5):
+        #   ReadIOPS 6,619 ~= WriteIOPS 8,690 — nearly every upsert paid a random
+        #     disk read to fetch the page before updating it
+        #   CPUUtilization 60-73% on 8 vCPU
+        #   WriteIOPS 8,690 of 64,000 provisioned (14%), 143 MB/s of 2,500,
+        #     WriteLatency 0 — storage had ~7x headroom and could not be used
+        #   ~50% of batches failing (pod-0: 85 errors / 154 batches), ~3,000 rows/s
+        #     per pod against a 100,000 target
+        # Storage was never the wall; buffer-pool misses and CPU were.
+        #
+        # This does NOT weaken the Paimon-vs-Iceberg comparison — it strengthens
+        # it, for the same reason the sharding note gives. A narrower window makes
+        # each key ~40x HOTTER, so Iceberg accumulates equality-delete files
+        # faster and Paimon's LSM has more to compact. That divergence is the
+        # entire point of the benchmark.
+        #
+        # Expect lock errors (1213/1205) to PERSIST: concentrating writes raises
+        # per-key contention even as it fixes the cache misses. Those two pull in
+        # opposite directions, so judge this by achieved rows/s, not by the error
+        # count alone. If throughput does not improve, the next lever is the
+        # instance itself (more vCPU and a bigger pool), not this number.
+        #
+        # Re-derive this if the instance class or row width changes:
+        #   window = 0.65 x buffer_pool_bytes / avg_row_bytes
         - name: HOT_KEY_WINDOW
-          value: "2000000"
+          value: "5000000"
         - name: REPORT_SECONDS
           value: "15"
         # Run forever. Was 3600 for a bounded one-hour measurement, but the
@@ -718,10 +799,10 @@ spec:
         # letting them fight over one core under contention.
         resources:
           requests:
-            memory: "512Mi"
+            memory: "2Gi"
             cpu: "2"
           limits:
-            memory: "1Gi"
+            memory: "4Gi"
             cpu: "4"
       volumes:
       - name: script

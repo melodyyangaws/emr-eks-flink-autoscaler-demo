@@ -185,14 +185,17 @@ spec:
             value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
-          # Needed on the JobManager too, not just the TaskManager. The JM parses
-          # the catalog DDL and creates the Glue database/tables through the legacy
-          # Hadoop/Hive client (AWSGlueClientFactory), which reads
-          # AWS_DEFAULT_REGION — the v2 SDK's AWS_REGION is invisible to it. With
-          # only AWS_REGION set the JM logs "No region info found, using SDK default
-          # region: us-east-1", then falls back to EC2 IMDS for a region and fails
-          # with "AmazonServiceException: Unauthorized (Status Code: 401)" because
-          # IMDS is not reachable from the pod.
+          # Set for the v1 SDK's DefaultAwsRegionProviderChain, which reads
+          # AWS_DEFAULT_REGION where the v2 SDK reads AWS_REGION. Kept in lockstep
+          # with the Paimon job. Do NOT read it as a fix for the
+          # "AWSGlueClientFactory - No region info found, using SDK default region:
+          # us-east-1" -> EC2MetadataUtils -> "Unauthorized (Status Code: 401)"
+          # sequence: that claim was tested and is false. Both AWS_REGION and
+          # AWS_DEFAULT_REGION were confirmed present in the resolved container env
+          # and the sequence still appeared, because the legacy EMR Glue client
+          # takes its region from the Hadoop/Hive Configuration it is handed, not
+          # from the process environment. See the longer note in
+          # flink-cdc-paimon-sql.yaml — that job is where it was diagnosed.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
           - name: GLUE_DATABASE
@@ -217,8 +220,8 @@ spec:
             value: "6521-6552"
   taskManager:
     resource:
-      memory: 16Gi
-      cpu: 4
+      memory: 32Gi
+      cpu: 8
     podTemplate:
       spec:
         containers:
@@ -230,6 +233,14 @@ spec:
           # reads AWS_REGION. Set both so neither path falls back to us-east-1.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
+        # Same Karpenter consolidation exposure as the Paimon job: this nodepool
+        # runs consolidationPolicy WhenEmptyOrUnderutilized / consolidateAfter 2m,
+        # so nodes hosting RUNNING TaskManagers get evicted as "Underutilized",
+        # and with failover-strategy: full one lost TM restarts all 520 tasks. The
+        # fit table (8100m cpu / 32868Mi per TM -> 1/3/5/7 TMs on
+        # 4x/8x/12x/16xlarge) and the fragmented-instance-mix feedback loop are
+        # documented in full in flink-cdc-paimon-sql.yaml. Nodepool cpu limits are
+        # not a factor. Keep in lockstep — TM placement is a fair-comparison knob.
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${TM_NODEPOOL}
@@ -243,7 +254,7 @@ spec:
       - "--sql-dir"
       - "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/"
       - "--checkpoint-interval"
-      - "70s"
+      - "60s"
       - "--parallelism"
       - "32"
     parallelism: 32

@@ -37,6 +37,7 @@ export AWS_REGION=us-west-2
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
 export NAMESPACE=emr-flink
+export EKS_CLUSTER_NAME=loadtest-mcp   # only needed for the IRSA step below
 ```
 
 ### Deploy Monitor
@@ -106,10 +107,50 @@ affect them, and `./build-deploy-generic.sh cleanup` does not stop it. The relat
 | **Parallelism** | Flink REST `/jobs/:id` | Current task parallelism |
 | **Throughput** | Flink REST `/jobs/:id/vertices` | Records in/out per operator |
 | **Checkpoint Status** | Flink REST `/jobs/:id/checkpoints` | Latest checkpoint size, duration, alignment |
+| **Checkpoint failures** | Flink REST `/jobs/:id/checkpoints` → `counts.failed` | **Cumulative since job start — see the caveat below** |
 | **Table Row Count** | pyiceberg / Glue API | Total records per sink table |
 | **Table File Count** | pyiceberg / Glue API | Data files per table |
 | **Table Size** | pyiceberg / Glue API | Total bytes on S3 |
 | **Snapshot Count** | pyiceberg / Glue API | Number of snapshots retained |
+
+### Checkpoint failure counts are cumulative, not current
+
+`monitoring/capture-flink-metrics.sh` reads `CP_FAIL` from
+`counts.failed` in `/jobs/<jobid>/checkpoints`, and reports it two ways:
+
+```
+Checkpoints failed     <delta over the sampling window>
+Lifetime ckpt failed    <the raw cumulative counter>
+```
+
+`counts.failed` **never decreases for the life of a job**. A job that failed
+checkpoints during its snapshot phase and has been checkpointing cleanly ever
+since still reports the same non-zero `counts.failed` forever. A byte-identical
+`cp_fail` across two captures therefore tells you nothing about current health —
+it is the *expected* reading for a healthy job.
+
+Only the `history` array in the same response is authoritative for "is it
+checkpointing right now". Neither `capture-flink-metrics.sh` nor
+`flink_cdc_monitor.py::get_checkpoint_stats()` reads `history`, so check it by
+hand:
+
+```bash
+JM=$(kubectl get pods -n emr-flink -o name | grep flink-cdc-paimon | grep -v taskmanager | head -1)
+JID=$(kubectl exec -n emr-flink "$JM" -c flink-main-container -- \
+        curl -s localhost:8081/jobs | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobs"][0]["id"])')
+kubectl exec -n emr-flink "$JM" -c flink-main-container -- \
+  curl -s "localhost:8081/jobs/$JID/checkpoints" \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(c["id"], c["status"], c["trigger_timestamp"]) for c in d["history"]]'
+```
+
+Recent `COMPLETED` entries with advancing ids and timestamps mean the job is
+healthy regardless of what `counts.failed` says. Use the **delta** row
+("Checkpoints failed") from `capture-flink-metrics.sh`, never the lifetime row.
+
+> A related trap: checkpoints that are *aborted at trigger time* (because not
+> every task is running) are **not** counted as FAILED, so neither
+> `counts.failed` nor `tolerable-failed-checkpoints` reacts to them. That was the
+> failure mode the manifests' `failover-strategy: full` setting exists to prevent.
 
 ### Table Stats: Iceberg vs Paimon
 
@@ -160,7 +201,8 @@ The monitor pod needs S3 + Glue read access. It uses the `default` service accou
 ### 1. Get OIDC Issuer
 
 ```bash
-OIDC_ID=$(aws eks describe-cluster --name eks-test --region $AWS_REGION \
+export EKS_CLUSTER_NAME=loadtest-mcp   # the cluster this pipeline runs on
+OIDC_ID=$(aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION \
   --query "cluster.identity.oidc.issuer" --output text | cut -d'/' -f5)
 ```
 
@@ -210,8 +252,8 @@ kubectl rollout restart deployment/flink-cdc-monitor -n emr-flink
  Flink CDC Monitor — Paimon vs Iceberg Comparison
 ════════════════════════════════════════════════════════════
 
-Job: flink-cdc-paimon [3812d4307feb3a01f59c4b5fe5346a56] parallelism=4
-Job: flink-cdc-iceberg [a1b2c3d4e5f67890abcdef1234567890] parallelism=4
+Job: flink-cdc-paimon [3812d4307feb3a01f59c4b5fe5346a56] parallelism=32
+Job: flink-cdc-iceberg [a1b2c3d4e5f67890abcdef1234567890] parallelism=32
 
 ┌──────────────┬─────────┬──────────┬───────────┬──────────┐
 │ Table        │ Format  │ Records  │ Files     │ Size     │
@@ -253,4 +295,4 @@ aws s3 ls s3://${BUCKET_NAME}/iceberg-warehouse/ --recursive | tail -10
 ---
 
 **Status**: ✅ Production Ready
-**Last Updated**: 2026-03-08
+**Last Updated**: 2026-09-27

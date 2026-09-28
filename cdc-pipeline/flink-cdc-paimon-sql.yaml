@@ -208,14 +208,29 @@ spec:
             value: "s3://${BUCKET_NAME}/paimon-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
-          # Needed on the JobManager too, not just the TaskManager. The JM parses
-          # the catalog DDL and creates the Glue database/tables through the legacy
-          # Hadoop/Hive client (AWSGlueClientFactory), which reads
-          # AWS_DEFAULT_REGION — the v2 SDK's AWS_REGION is invisible to it. With
-          # only AWS_REGION set the JM logs "No region info found, using SDK default
-          # region: us-east-1", then falls back to EC2 IMDS for a region and fails
-          # with "AmazonServiceException: Unauthorized (Status Code: 401)" because
-          # IMDS is not reachable from the pod.
+          # Set for the v1 SDK's DefaultAwsRegionProviderChain, which reads
+          # AWS_DEFAULT_REGION where the v2 SDK reads AWS_REGION. Harmless and
+          # worth keeping, but do NOT read it as a fix for this log sequence:
+          #   AWSGlueClientFactory - No region info found, using SDK default
+          #     region: us-east-1
+          #   EC2MetadataUtils - Unable to retrieve the requested metadata
+          #     (/latest/dynamic/instance-identity/document)
+          #   com.amazonaws.AmazonServiceException: Unauthorized (Status Code: 401)
+          # That claim was tested and is false. With BOTH AWS_REGION and
+          # AWS_DEFAULT_REGION confirmed present in the resolved JM and TM
+          # container env (verified with `env | grep ^AWS_`), the sequence still
+          # appeared. The legacy EMR Glue client resolves its region from the
+          # Hadoop/Hive Configuration it is handed, not from the process
+          # environment, so no env var can suppress it. The 401 is IMDSv2 being
+          # unreachable from the pod (hop limit / IRSA-only networking).
+          #
+          # It is also NOT a failure. The job reaches RUNNING 808/808 with these
+          # lines present, and they do not appear in steady-state TM logs at all
+          # (0 hits across all 8 TMs). Treat this as noise and look elsewhere for
+          # a restart cause — see the note on Karpenter consolidation in the
+          # taskManager nodeSelector below, which is what actually restarts this
+          # job. To silence it properly you would set the region in Hadoop conf
+          # (e.g. a hive-site/core-site property the Glue factory reads), not here.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
           - name: GLUE_DATABASE
@@ -240,8 +255,8 @@ spec:
             value: "5521-5552"
   taskManager:
     resource:
-      memory: 16Gi
-      cpu: 4
+      memory: 32Gi
+      cpu: 8
     podTemplate:
       spec:
         containers:
@@ -261,6 +276,21 @@ spec:
           # reads AWS_REGION. Set both so neither path falls back to us-east-1.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
+        # THIS is what restarts the job, not the Glue region log lines above.
+        # executor-memorynodepool has consolidationPolicy:
+        # WhenEmptyOrUnderutilized with consolidateAfter: 2m and a 25%
+        # Underutilized disruption budget, so Karpenter actively deletes nodes
+        # that are still hosting RUNNING TaskManagers. Captured directly:
+        #   nodeclaim/... DisruptionTerminating  Disrupting NodeClaim: Underutilized
+        #   pod/flink-cdc-paimon-taskmanager-1-23  Evicted pod: Underutilized
+        # Losing one TM with jobmanager.execution.failover-strategy: full (set
+        # above, deliberately) restarts the entire 808-task graph, so the job
+        # cycles RUNNING -> RESTARTING -> CREATED -> RUNNING. Over ~12 minutes the
+        # pool oscillated 2 -> 6 -> 4 nodes and TM attempt indices reached -25,
+        # roughly 10 wasted TM generations. The matching JM exception is
+        # "NoResourceAvailableException" / an RPC TimeoutException on a Writer
+        # subtask — nothing that names Karpenter.
+        #
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${TM_NODEPOOL}
@@ -273,7 +303,7 @@ spec:
       - "--sql-dir"
       - "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/"
       - "--checkpoint-interval"
-      - "70s"
+      - "60s"
       - "--parallelism"
       - "32"
     parallelism: 32

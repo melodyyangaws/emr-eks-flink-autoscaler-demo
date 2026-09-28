@@ -42,7 +42,18 @@ This guide walks you through creating and configuring a MySQL database as the so
 
 ## Step 1: Create RDS MySQL Instance
 
-### Option A: Using AWS Console (Easiest)
+> **To reproduce the benchmark instance, use Option B.** The live instance is
+> `flink-cdc-mysql-8-0`: **db.m5.2xlarge** (8 vCPU, 32 GB), **MySQL 8.0.45**,
+> **500 GB gp3 with 64,000 provisioned IOPS and 2,500 MB/s throughput**, single-AZ,
+> initial database `ecommerce`. The default gp3 allocation (12,000 IOPS) is *not*
+> enough: a load-generator run against it saturated at ReadIOPS + WriteIOPS ≈
+> 11,878 of 12,000, and the throughput ceiling was storage, not row-lock
+> contention — see
+> [2-DATA-GEN-GUIDE.md](./2-DATA-GEN-GUIDE.md).
+> Option A below is the smaller Dev/POC shape and will not reproduce the numbers
+> in the benchmark guides.
+
+### Option A: Using AWS Console (Dev/POC shape — smaller than the benchmark instance)
 
 1. **Navigate to RDS Console**
    - Go to: https://console.aws.amazon.com/rds/
@@ -53,7 +64,7 @@ This guide walks you through creating and configuring a MySQL database as the so
 
 3. **Engine Options**
    - Engine type: **MySQL**
-   - Version: **MySQL 8.0.35** (or latest 8.0.x)
+   - Version: **MySQL 8.0.45** (latest 8.0.x; this is what the benchmark instance runs)
    - Edition: **MySQL Community**
 
 4. **Templates**
@@ -189,6 +200,8 @@ aws rds create-db-instance \
     --master-user-password "$DB_PASSWORD" \
     --allocated-storage 500 \
     --storage-type gp3 \
+    --iops 64000 \
+    --storage-throughput 2500 \
     --db-subnet-group-name rds-mysql-cdc-subnet-group \
     --vpc-security-group-ids $SG_ID \
     --backup-retention-period 7 \
@@ -909,8 +922,10 @@ Your MySQL database is now ready to be the source for Flink CDC! 🎉
    ./mysql-data-generator/deploy-data-generator.sh deploy
    ./mysql-data-generator/deploy-data-generator.sh stop
 
-   # upsert: batched ON DUPLICATE KEY UPDATE, ~40,000 rows/s across 8 pods.
-   # The storage-format benchmark load. Deployed as a StatefulSet.
+   # upsert: batched ON DUPLICATE KEY UPDATE across 8 pods (StatefulSet). The
+   # storage-format benchmark load. The manifest's RATE_PER_POD is a token-bucket
+   # ceiling, not an achieved rate — read the actual rate from the pods' `inst=`
+   # line (see 2-DATA-GEN-GUIDE.md).
    ./mysql-data-generator/deploy-data-generator.sh deploy upsert
    ./mysql-data-generator/deploy-data-generator.sh stop upsert
    ```

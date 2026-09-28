@@ -20,11 +20,17 @@ default is `mixed`. They are not interchangeable:
 | | `mixed` (default) | `upsert` |
 |---|---|---|
 | Manifest | `mysql-data-generator.yaml` | `mysql-upsert-loadgen.yaml` |
-| Kubernetes kind | Deployment | **StatefulSet** |
-| Statements | one row per statement | `INSERT … ON DUPLICATE KEY UPDATE`, 500 rows/statement |
-| Rate | ~400 rows/s ceiling | ~40,000 rows/s across 8 pods |
+| Kubernetes kind | Deployment | **StatefulSet**, 8 replicas |
+| Statements | one row per statement | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows/statement (manifest: 8000) |
+| Rate | ~400 rows/s ceiling | measure it — `RATE_PER_POD` is 80,000, a deliberately unreachable token-bucket ceiling |
 | DELETE events | **yes** | no |
 | Use it for | CDC correctness, all three event types | the Paimon-vs-Iceberg storage benchmark |
+
+> **The upsert generator's `RATE_PER_POD` is not a throughput claim.** It is set
+> far above anything the instance has delivered (8 x 80,000 = 640,000 rows/s of
+> *target*; best measured at 8 pods is 94,327 rows/s) precisely so the bucket
+> never binds and the pods run flat out. Read the achieved rate off the pod logs
+> (`inst=`), and read the gap to the target as a headroom measurement.
 
 `mixed` does not scale — it issues one statement per row and picks rows with
 `ORDER BY RAND()`. Use it to prove the pipeline handles inserts, updates *and* deletes.
@@ -248,9 +254,15 @@ source mysql-cdc-env.sh
 # apply cannot convert a Deployment into a StatefulSet of the same name.
 kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
 
-# 8 pods x RATE_PER_POD 5000 = 40,000 rows/s aggregate
+# 8 pods, RATE_PER_POD 80,000 (an intentionally unreachable ceiling — the pods
+# run flat out and whatever they achieve is the real limit). Read `inst=` from
+# the logs for the actual rate.
 ./mysql-data-generator/deploy-data-generator.sh deploy upsert
 ```
+
+> The script's own banner still prints "default 5000 x 8 = 40,000 rows/s" and
+> "80% of rows are upserts". Both are stale relative to the manifest, which sets
+> `RATE_PER_POD: 80000` and `UPSERT_RATIO: 0.5`. Trust the manifest.
 
 Pods come up as `mysql-upsert-loadgen-0` … `-7` all at once
 (`podManagementPolicy: Parallel` — the default `OrderedReady` would start them one at a
@@ -283,38 +295,118 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 ./mysql-data-generator/deploy-data-generator.sh status upsert
 ```
 
-Quote the **`avg=`** figure, never `inst=`. `avg` is cumulative since pod start; `inst` is a
-15-second sample and the pods report on staggered clocks, so summing `inst` reads high or
-low depending on when you looked. The target rate is only a token-bucket ceiling — a
-shortfall shows up as a low `avg`, not as an error.
+Each pod prints a counter line every `REPORT_SECONDS` (15):
+
+```
+[  120s] rows=1,234,567 inst=41,204/s avg=38,910/s upserts=… inserts=… batches=… errors=… | <per-table mix>
+```
+
+Quote the **`inst=`** figure, not `avg=`. `avg` is a *lifetime* average since pod
+start and is useless after any settings change or after a restart — it stays
+diluted by the old regime and by the ramp-up for as long as the pod lives.
+`inst=` is the rate over the last reporting interval, which is what you want.
+Let the pods settle (a few reporting intervals) and read `inst=` across all 8.
+
+> **`errors=` is the column that explains a low `inst=`.** The two errnos this
+> workload actually hits — 1213 (deadlock) and 1205 (lock-wait timeout) — are
+> retried silently in `worker()` and **never printed**, so contention looks like a
+> stall rather than an error storm. Each rollback discards the whole multi-row
+> statement, costing `BATCH_ROWS` rows off the achieved rate, and the 4 retry
+> attempts serialize behind the same contention. If `inst=` is far below target,
+> check `errors=` against `batches=` before blaming RDS. `1153`
+> (`max_allowed_packet`) has not been observed at these settings.
+
+The target rate is only a token-bucket ceiling — a shortfall shows up as a low
+`inst=` plus a high `errors=`, not as a hard failure.
 
 ### **Scale**
 
 ```bash
-# 16 pods x 5000 = 80,000 rows/s target
 ./mysql-data-generator/deploy-data-generator.sh scale 16 upsert
 ```
 
 The script sets `POD_COUNT=16` **before** scaling. `POD_COUNT` is the divisor that sizes
-each pod's hot-key slice, so it has to track the replica count: set too low, slices overlap
-and the cross-pod lock convoy returns; set too high, part of the window goes unwritten. If
-you scale with a bare `kubectl scale`, set `POD_COUNT` yourself.
+each pod's hot-key slice (`HOT_SLICE = HOT_KEY_WINDOW // POD_COUNT`), so it has to track
+the replica count: set too low, slices overlap and the cross-pod lock convoy returns; set
+too high, part of the window goes unwritten. If you scale with a bare `kubectl scale`, set
+`POD_COUNT` yourself.
 
 ### **Tune rate and key skew**
 
 ```bash
-# rate/pod, worker threads, rows per statement
-./mysql-data-generator/deploy-data-generator.sh config 5000 4 500 upsert
+# rate/pod, worker threads, rows per statement — pass all three explicitly;
+# the script's defaults (5000 4 500) are stale relative to the manifest
+./mysql-data-generator/deploy-data-generator.sh config 80000 8 8000 upsert
 
-# upsert ratio, hot-key ratio, hot-key window
-./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.8 20000 upsert
+# upsert ratio, hot-key ratio, hot-key window — same caveat, the script
+# defaults to 0.8 0.6 50000 while the manifest ships 0.5 0.5 5000000
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.5 5000000 upsert
 ```
 
-`config` changes *how fast*; `upsert-mix` changes *what is being measured*. A tighter
-`HOT_KEY_WINDOW` concentrates updates and accumulates Iceberg delete files faster —
-widening it weakens the very effect the comparison is looking for.
+`config` changes *how fast*; `upsert-mix` changes *what is being measured*.
+
+> **Both commands are `kubectl set env`, which triggers a rolling restart** — the
+> script says so itself ("Pods will restart automatically"). The StatefulSet
+> rolls pods one at a time in descending ordinal order, so for 8 pods the cluster
+> spends a few minutes running a *mix* of the old and new configuration. Do not
+> start a measurement window until every pod has re-printed its startup banner,
+> and do not interrupt a rollout mid-flight — the surviving pods keep the old
+> values and the aggregate `inst=` is then meaningless.
+
+#### Sizing `HOT_KEY_WINDOW` — it is a buffer-pool number
+
+A window only behaves as "hot" while the rows it spans fit in the InnoDB buffer
+pool. Past that, the hot half misses cache exactly like the cold tail and the
+skew buys nothing. Derive it, do not guess:
+
+```
+window = 0.65 x buffer_pool_bytes / avg_row_bytes
+```
+
+On `db.m5.2xlarge` (32 GiB, `innodb_buffer_pool_size = {DBInstanceClassMemory*3/4}`
+≈ 24 GB) with ~3.36 KB rows:
+
+| `HOT_KEY_WINDOW` | Span | vs 24 GB pool |
+|---:|---:|---|
+| 200,000,000 | 641 GB | 27x the pool — **what was running, and it was wrong** |
+| **5,000,000** (current) | 16 GB | fits, with room for the cold tail |
+
+At 200,000,000 the measurement was: `ReadIOPS 6,619 ≈ WriteIOPS 8,690` (nearly
+every upsert paid a random disk read to fetch the page before updating it), CPU
+60–73% on 8 vCPU, and WriteIOPS only 14% of the 64,000 provisioned with
+`WriteLatency 0` — storage had ~7x headroom and could not be used. ~50% of
+batches were failing, ~3,000 rows/s per pod. Buffer-pool misses and CPU were the
+wall, never storage.
+
+A narrower window makes each key hotter, which **strengthens** the benchmark:
+Iceberg accumulates equality-delete files faster and Paimon's LSM has more to
+compact, and that divergence is the whole point. Expect 1213/1205 to persist —
+concentrating writes raises per-key contention even as it fixes cache misses.
+
+#### `BATCH_ROWS` is not monotonic
+
+Bigger batches amortize the redo-log flush, but a batch is **one transaction
+holding every row lock it touches for the whole statement**. Measured at
+`BATCH_ROWS=10000` (per pod, 240s after rollout): `inst=` 4,000/s against a
+100,000/s target with 53 of 130 batches erroring (~40% batch failure rate),
+aggregate ~30,000/s. RDS was *not* the wall — WriteIOPS 7,900–11,800 of 64,000
+(~18%), throughput 134–205 MB/s of 2,500, `WriteLatency 0`, while
+`DiskQueueDepth` sat at 18–76: the signature of requests queued behind lock waits
+rather than behind the device.
+
+> The manifest's own comment concludes "5,000 is the measured optimum for this
+> workload shape", but the value it actually ships is **`BATCH_ROWS: "8000"`**.
+> The comment and the value disagree; the value is what runs. Do not raise it
+> without also reducing concurrency (`THREADS` x `replicas`) — the two multiply
+> into the collision rate.
 
 ### **Measured ceiling**
+
+> **This whole section is a historical run made at 12,000 provisioned IOPS.** The
+> instance is now `db.m5.2xlarge` / 500 GB gp3 / **64,000 IOPS / 2,500 MB/s**, so
+> the absolute numbers below no longer bound anything. The *shape* of the result
+> (adding replicas past saturation buys lock contention, not throughput) still
+> holds. Re-run the ramp before quoting a ceiling.
 
 A replica ramp (`mysql-data-generator/find-rds-ceiling.sh`) against `db.m5.2xlarge` /
 500 GB gp3 / 12,000 provisioned IOPS found the aggregate rate peaks near **32 replicas at
@@ -328,10 +420,21 @@ A replica ramp (`mysql-data-generator/find-rds-ceiling.sh`) against `db.m5.2xlar
 | **32** | 160,000 | **68,818** | 43.0% | 48% | 7,997 |
 | 40 | 200,000 | 66,404 | 33.2% | 46% | 7,481 |
 
-The limit was **InnoDB row-lock contention, not hardware**: at 40 replicas 154 of 163
-server connections sat in `LOCK WAIT` with 2.33M cumulative row-lock waits averaging
-135 ms, while CPU idled under 50% and write IOPS sat at 8,000 of the 12,000 provisioned.
-Connections were never the constraint — 160 against `max_connections=2591`.
+At 40 replicas 154 of 163 server connections sat in `LOCK WAIT` with 2.33M cumulative
+row-lock waits averaging 135 ms, while CPU idled under 50%. Connections were never the
+constraint — 160 against `max_connections=2591`.
+
+> **Corrected reading.** This was originally written up as "row-lock contention,
+> not hardware", on the evidence that *write* IOPS sat at only ~8,000 of 12,000.
+> That was wrong, because it ignored reads. `ReadIOPS 5,655 + WriteIOPS 6,518 =
+> 11,878 of 12,000 provisioned` — the instance **was** IOPS-saturated, and the
+> reads came from the cold-tail key distribution missing the buffer pool.
+> Performance Insights put the commit path at effectively zero
+> (`wait/io/file/sql/binlog` 0.043, `MYSQL_BIN_LOG::COND_done` 0.003) while
+> `wait/io/table/sql/handler` sat at 26.3 — plain storage I/O. Fixing the key
+> distribution alone took throughput from ~15,000 to ~58,300 rows/s at these same
+> 8 replicas and moved the bottleneck to CPU (26% → 78%). Lock contention is real
+> and shows up in `errors=`, but it was not the wall here.
 
 Hot-window sharding (`SHARD_HOT_KEYS=true`) was added in response: it gives each pod a
 disjoint slice so pods stop colliding, which raised 8-replica throughput from 34,989 to
@@ -348,8 +451,13 @@ Re-run the ramp to re-establish the ceiling under the sharded pattern:
 # results land in ./bench-results/rds-ceiling-<UTC timestamp>.csv
 ```
 
-> Pods are **not** CPU-bound: measured 31–70 millicores against a 2-core limit (~3%). They
-> block on MySQL round trips. Add replicas rather than raising `THREADS` in one pod.
+> **The "pods are not CPU-bound" note is stale.** It was measured at 500-row
+> batches against a 2-core limit. The manifest now requests **4 cpu / 4 Gi** and
+> limits **8 cpu / 8 Gi** precisely because the driver burns real CPU building the
+> multi-row statement text — at 2 cores a pod could not reach its target at all,
+> and the ceiling was the GIL plus the C extension's encode loop rather than
+> MySQL. Keep `USE_PURE=false` (the C extension) for the same reason: pure Python
+> caps a pod near ~5,000 rows/s.
 
 ---
 
@@ -594,43 +702,64 @@ works too if you prefer an environment variable.
 ./mysql-data-generator/deploy-data-generator.sh config 5 10       # 5 records/10s
 ```
 
-### upsert workload — 40k/s benchmark load (StatefulSet)
+### upsert workload — benchmark load (StatefulSet, 8 replicas)
 
 ```bash
 # One-time, only if the older Deployment version was ever applied
 kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
 
-# Deploy — 8 pods x 5000 = 40,000 rows/s
+# Deploy — 8 pods, RATE_PER_POD 80000 (unreachable ceiling by design)
 ./mysql-data-generator/deploy-data-generator.sh deploy upsert
 
 # Stop (removes StatefulSet + headless Service + ConfigMap)
 ./mysql-data-generator/deploy-data-generator.sh stop upsert
 
-# Pause without deleting
+# Pause without deleting — also the right way to bound a measurement window,
+# since DURATION_SECONDS=0 (run forever) and a self-exiting pod would just be
+# restarted by the StatefulSet, diluting every average with a fresh ramp
 kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 
-# Status + achieved rate per pod (quote avg=, not inst=)
+# Status + achieved rate per pod (read inst=, not avg=)
 ./mysql-data-generator/deploy-data-generator.sh status upsert
 
 # Scale — also sets POD_COUNT so hot-key slices stay disjoint
 ./mysql-data-generator/deploy-data-generator.sh scale 16 upsert
 
-# Rate: rows/s per pod, threads, rows per statement
-./mysql-data-generator/deploy-data-generator.sh config 5000 4 500 upsert
+# Rate: rows/s per pod, threads, rows per statement (restarts the pods)
+./mysql-data-generator/deploy-data-generator.sh config 80000 8 8000 upsert
 
-# Key skew: upsert ratio, hot-key ratio, hot-key window
-./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.8 20000 upsert
+# Key skew: upsert ratio, hot-key ratio, hot-key window (restarts the pods)
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.5 5000000 upsert
 
 # Find the RDS ceiling: hold_seconds, then replica steps
 ./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
 ```
+
+**Current manifest values** (`mysql-data-generator/mysql-upsert-loadgen.yaml`) —
+these are the ground truth, not the script's CLI defaults:
+
+| Variable | Value | Note |
+|---|---|---|
+| `replicas` | 8 | `podManagementPolicy: Parallel` |
+| `RATE_PER_POD` | 80000 | token-bucket ceiling, deliberately unreachable |
+| `THREADS` | 8 | |
+| `BATCH_ROWS` | 8000 | multiplies with `THREADS` x `replicas` into lock contention |
+| `UPSERT_RATIO` | 0.5 | rest are pure inserts |
+| `HOT_KEY_RATIO` | 0.5 | |
+| `HOT_KEY_WINDOW` | 5000000 | buffer-pool sized, ≈16 GB of rows |
+| `POD_COUNT` | 8 | must equal `replicas` |
+| `SHARD_HOT_KEYS` | true | disjoint hot slice per ordinal |
+| `REPORT_SECONDS` | 15 | interval behind `inst=` |
+| `DURATION_SECONDS` | 0 | run forever |
+| `USE_PURE` | false | use the C extension |
+| resources | req 4 cpu / 4 Gi, lim 8 cpu / 8 Gi | `nodeSelector: driver-nodepool` |
 
 ---
 
 ## Summary
 
 ✅ **Two workloads**: `mixed` (Deployment, ~400 rows/s, emits DELETEs) and `upsert`
-   (StatefulSet, ~40,000 rows/s, no DELETEs)
+   (StatefulSet, 8 pods, rate is measured not configured, no DELETEs)
 ✅ **Deployed in**: `emr-flink` namespace
 ✅ **Purpose**: `mixed` for CDC correctness, `upsert` for the storage-format benchmark
 ✅ **Operations**: INSERT, UPDATE, DELETE on 4 tables (`mixed`);
@@ -638,6 +767,9 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 ✅ **Scalable**: 1-10 pods (`mixed`); 8-40 pods with per-pod hot-key slices (`upsert`)
 ✅ **Configurable**: batch size and interval (`mixed`); rate, threads, key skew (`upsert`)
 ✅ **Realistic**: E-commerce transactional patterns
-✅ **Measured**: ~69,000 rows/s RDS ceiling on `db.m5.2xlarge`, lock-contention-bound
+✅ **Measured**: best observed 94,327 rows/s at 8 pods on `db.m5.2xlarge`
+   (500 GB gp3, 64,000 IOPS). Bottleneck is buffer-pool misses and CPU, plus
+   row-lock contention visible in `errors=` — re-measure, never quote a stale
+   ceiling.
 
 Use this to test and validate your Flink CDC pipelines with realistic streaming workloads! 🚀
