@@ -1,0 +1,33 @@
+-- Full-partition COUNT(*) over one CLOSED dt partition.
+--
+-- STEP 1 OF 4, SNAPSHOT SUITE. Run first because every other arm-to-arm
+-- comparison is normalised by this number.
+--
+-- COST: this IS a full scan of the partition. There is no COUNT(*) metadata
+-- shortcut on an external catalog and both harnesses disable their data caches,
+-- so budget for it; it is not the cheap query its shape suggests.
+--
+-- ── IT SUBSUMES starrocks-bench.sh's q1_count AND q2_partition_prune ────────
+-- q2 was this query with the partition written as
+-- `dt = DATE_FORMAT(NOW(), '%Y-%m-%d')`. The literal replaces the clock
+-- function for the reason the library header gives: NOW() is evaluated in the
+-- FE session timezone (Asia/Shanghai on this cluster) against UTC data, and
+-- serial arms each get their own value, so the arms stopped reading the same
+-- partition. Same question, pinned bound.
+--
+-- q1_count was `SELECT COUNT(*) FROM cid_events` with NO bound, asking: does
+-- the engine answer COUNT(*) from manifest/snapshot statistics, or does it open
+-- data files? IT IS NOT PORTED, AND THE REASON IS THAT IT WAS ANSWERED: on an
+-- external catalog there is no such shortcut, so an unbounded COUNT(*) is a
+-- full ~8 TiB table scan that does not return and has to be killed. As a
+-- measurement it spends a whole QUERY_TIMEOUT to learn one bit that this
+-- query's own elapsed time already reports — a dt-bounded count that still
+-- costs minutes IS the no-shortcut finding, at one partition's price.
+--
+-- Where the metadata path IS exercised: the harnesses read record_count from
+-- `cid_events$partitions` (StarRocks) for their table-state preamble, which is
+-- the O(metadata) counterpart to this query. Compare the two if the shortcut
+-- question comes back.
+SELECT COUNT(*) AS partition_rows
+FROM ${TABLE}
+WHERE dt = '${SNAPSHOT_DT}';

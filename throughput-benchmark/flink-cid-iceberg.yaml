@@ -1,0 +1,188 @@
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  namespace: emr-flink
+  name: flink-cid-iceberg
+spec:
+  flinkVersion: v1_20
+  executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
+  image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${IMAGE_TAG}
+  imagePullPolicy: IfNotPresent
+  emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
+
+  flinkConfiguration:
+    fs.s3a.endpoint.region: ${AWS_REGION}
+    job.autoscaler.scaling.enabled: "false"
+    job.autoscaler.enabled: "false"
+    # ON (it was "false"). With it off, every 4 KB row was serialized and
+    # deserialized across each Source -> Calc -> Map -> Writer edge, and that
+    # copying was part of the Calc that capped the s3json runs at ~184K rows/s
+    # (2026-10-08). The cost: the UI and REST show one vertex per chain instead
+    # of per-operator busy/backpressure. Set "false" for a diagnostic run.
+    # Kept identical across both formats — it is a fair-comparison variable.
+    pipeline.operator-chaining.enabled: "true"
+    # The s3json source loads Hive's module for json_tuple. HiveModule's static
+    # init needs commons-codec (org.apache.commons.codec.language.Soundex),
+    # which the image ships only under hudi/, off the classpath. Flink appends
+    # HADOOP_CLASSPATH to the JVM classpath, so this is the image's own value
+    # (emr-7.13.0, `echo $HADOOP_CLASSPATH` in the image) plus that one jar.
+    # An env var set here REPLACES the image's, so re-copy the base value if
+    # the image changes. Harmless in datagen mode.
+    containerized.master.env.HADOOP_CLASSPATH: "/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*:/usr/lib/flink/hudi/commons-codec-1.15.jar"
+    containerized.taskmanager.env.HADOOP_CLASSPATH: "/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*:/usr/lib/flink/hudi/commons-codec-1.15.jar"
+    pipeline.auto-watermark-interval: "1s"
+    # Checkpoint interval doubles as the Iceberg commit interval — every
+    # checkpoint produces one snapshot commit. 60s matches the CDC benchmarks
+    # so their numbers stay comparable, and MUST match the Paimon job:
+    # commit cadence is a fair-comparison variable.
+    execution.checkpointing.interval: "60s"
+    execution.checkpointing.timeout: "600s"
+    execution.checkpointing.min-pause: "30s"
+    # Unaligned checkpoints are DISABLED to match the Paimon job, which cannot
+    # support them: paimon-flink-1.20-1.3.2.jar throws
+    #   "Paimon sink currently does not support unaligned checkpoints.
+    #    Please set execution.checkpointing.unaligned.enabled to false."
+    # (PrepareCommitOperator needs aligned barriers so the write-buffer flush
+    # and snapshot commit are atomic at the checkpoint boundary).
+    execution.checkpointing.unaligned.enabled: "false"
+    execution.checkpointing.tolerable-failed-checkpoints: "10"
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    # APPEND-ONLY: the pipeline is INSERT INTO ... SELECT over a datagen view
+    # with no keyed/stateful operator, so the only state is the Iceberg writer's
+    # in-flight manifest. hashmap-on-heap is sufficient and avoids RocksDB
+    # amplification at this write rate; there is no keyed state to spill.
+    state.backend.type: hashmap
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cid-iceberg/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cid-iceberg/savepoints/
+    heartbeat.timeout: "180s"
+    heartbeat.interval: "20s"
+    heartbeat.rpc-failure-threshold: "10"
+    # Failover/restart settings carried over verbatim from the CDC benchmark
+    # jobs — see cdc-pipeline/flink-cdc-iceberg-sql.yaml for the full war
+    # stories behind full-failover + exponential-delay + default scheduler.
+    jobmanager.execution.failover-strategy: full
+    restart-strategy.type: exponential-delay
+    restart-strategy.exponential-delay.initial-backoff: "10s"
+    restart-strategy.exponential-delay.max-backoff: "2min"
+    restart-strategy.exponential-delay.backoff-multiplier: "2.0"
+    restart-strategy.exponential-delay.reset-backoff-threshold: "10min"
+    restart-strategy.exponential-delay.jitter-factor: "0.1"
+    cluster.taskmanager.graceful-decommission.enabled: "true"
+    jobmanager.adaptive-scheduler.combined-restart.enabled: "false"
+    jobmanager.scheduler: default
+    taskmanager.numberOfTaskSlots: "4"
+    # Writer-heavy, stateless-ish job: hand most memory to task heap, where
+    # the Parquet write buffers live, not to managed memory (no RocksDB).
+    taskmanager.memory.managed.fraction: "0.1"
+    parallelism.default: "${JOB_PARALLELISM}"
+    pipeline.max-parallelism: "256"
+    table.exec.source.idle-timeout: "30s"
+    sql-client.execution.result-mode: tableau
+    table.dml-sync: "false"
+    kubernetes.transactional-operation.max-retries: "10"
+
+  jobManager:
+    highAvailabilityEnabled: true
+    storageDir: s3://${BUCKET_NAME}/flink/cid-iceberg/ha
+    replicas: 1
+    resource:
+      memory: 8Gi
+      cpu: 4
+    podTemplate:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: ${JM_NODEPOOL}
+        # No volumes here on purpose — EMR on EKS stages the s3:// jarURI into
+        # /opt/flink/usrlib itself, via its webhook at CR CREATE only; an apply
+        # over an existing CR drops that mount, so deploy re-creates the CR. A
+        # NoSuchFileException from PythonDriver.main means usrlib is empty —
+        # lost mount or executor absent from S3; see the longer note
+        # in flink-cid-paimon.yaml. Kept identical across both formats — a
+        # difference in how the executor is delivered would be a fair-comparison
+        # variable.
+        containers:
+        - name: flink-main-container
+          env:
+          - name: ICEBERG_WAREHOUSE
+            value: "s3://${BUCKET_NAME}/cid-warehouse-iceberg/"
+          - name: GLUE_DATABASE
+            value: "flink_cid_iceberg_db"
+          - name: AWS_REGION
+            value: "${AWS_REGION}"
+          # The legacy Hadoop/Hive Glue client reads AWS_DEFAULT_REGION; the
+          # v2 SDK reads AWS_REGION. Set both or Glue calls fall back to
+          # us-east-1 via IMDS and die with a 401.
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
+          - name: SOURCE_ROWS_PER_SECOND
+            value: "${SOURCE_ROWS_PER_SECOND}"
+          # Read only by 00-source.sql when SOURCE_MODE=s3json (01-s3json-source.sql);
+          # harmless under the default datagen source.
+          - name: S3JSON_SOURCE_PATH
+            value: "${S3JSON_SOURCE_PATH}"
+          - name: S3JSON_MONITOR_INTERVAL
+            value: "${S3JSON_MONITOR_INTERVAL}"
+          # Must match the Paimon run's value — it shapes the generated data.
+          - name: HOT_KEY_FRACTION
+            value: "${HOT_KEY_FRACTION}"
+          # CID source-mockup fan-out. CID_DAY_SPREAD is the one to watch: dt is
+          # the partition column, so it sets the PARTITION COUNT on this table.
+          # It must match the Paimon run's value or the two sinks are not being
+          # given the same partition layout.
+          - name: CID_CUSTOMER_COUNT
+            value: "${CID_CUSTOMER_COUNT}"
+          - name: CID_HOST_COUNT
+            value: "${CID_HOST_COUNT}"
+          - name: CID_DAY_SPREAD
+            value: "${CID_DAY_SPREAD}"
+          - name: ICEBERG_S3_MULTIPART_SIZE_BYTES
+            value: "${ICEBERG_S3_MULTIPART_SIZE_BYTES}"
+          - name: ICEBERG_S3_MULTIPART_THREADS
+            value: "${ICEBERG_S3_MULTIPART_THREADS}"
+  taskManager:
+    resource:
+      memory: 16Gi
+      cpu: 4
+    podTemplate:
+      spec:
+        containers:
+        - name: flink-main-container
+          env:
+          - name: AWS_REGION
+            value: "${AWS_REGION}"
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: ${TM_NODEPOOL}
+
+  job:
+    jarURI: s3://${BUCKET_NAME}/flink/scripts/flink-cid-executor.py
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/usrlib/flink-cid-executor.py"
+      - "--sql-dir"
+      - "s3://${BUCKET_NAME}/flink/cid-sql/iceberg/"
+      - "--checkpoint-interval"
+      - "60s"
+      - "--parallelism"
+      - "${JOB_PARALLELISM}"
+    parallelism: ${JOB_PARALLELISM}
+    upgradeMode: stateless
+    # Declared EXPLICITLY — see the matching note in flink-cid-paimon.yaml.
+    # A bare apply over a suspended CR leaves spec.job.state untouched, so the
+    # redeploy silently stays SUSPENDED.
+    state: running
+
+  monitoringConfiguration:
+    s3MonitoringConfiguration:
+      logUri: s3://${BUCKET_NAME}/flink/logs/cid-iceberg
+    sideCarResources:
+      limits:
+        cpuLimit: 500m
+        memoryLimit: 250Mi
+    containerLogRotationConfiguration:
+        rotationSize: 2GB
+        maxFilesToKeep: "10"

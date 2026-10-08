@@ -1,0 +1,21 @@
+# writers: flink-cid-paimon=running flink-cid-iceberg=running
+# snapshot_dt: 2026-10-01  runs: 3  warmup: 1  spill: enabled  datacache: disabled
+stamp,suite,query,metric,paimon,pmn_as_iceberg,iceberg,ratio_pmnice_over_paimon,ratio_iceberg_over_paimon
+20261005T030837Z,hot,H1_freshness,time_ms,3769,4385,5853,1.16x,1.55x
+20261005T030837Z,hot,H1_freshness,scan_rows,70447423,78044365,81029921,,
+20261005T030837Z,hot,H1_freshness,scan_bytes,165481739,217257256,275694064,,
+20261005T030837Z,hot,H2_hot_count_1m,time_ms,1136,881,2013,0.78x,1.77x
+20261005T030837Z,hot,H2_hot_count_1m,scan_rows,11496962,8773103,10958310,,
+20261005T030837Z,hot,H2_hot_count_1m,scan_bytes,27524083,20850250,22108317,,
+20261005T030837Z,hot,H3_hot_needle_uuid,time_ms,78,486,1543,6.23x,19.78x
+20261005T030837Z,hot,H3_hot_needle_uuid,scan_rows,0,0,0,,
+20261005T030837Z,hot,H3_hot_needle_uuid,scan_bytes,0,0,0,,
+20261005T030837Z,hot,H4_hot_narrow_agg,time_ms,4724,4222,8035,0.89x,1.70x
+20261005T030837Z,hot,H4_hot_narrow_agg,scan_rows,78210494,75436147,94927473,,
+20261005T030837Z,hot,H4_hot_narrow_agg,scan_bytes,195869670,189053903,193252274,,
+20261005T030837Z,hot,H5_hot_wide_json,time_ms,71510,72921,92798,1.02x,1.30x
+20261005T030837Z,hot,H5_hot_wide_json,scan_rows,78210494,75436147,92090013,,
+20261005T030837Z,hot,H5_hot_wide_json,scan_bytes,95574087821,92079594132,112213308037,,
+20261005T030837Z,hot,H6_hot_customer_agg,time_ms,13500,11152,16729,0.83x,1.24x
+20261005T030837Z,hot,H6_hot_customer_agg,scan_rows,156756207,136965036,170031384,,
+20261005T030837Z,hot,H6_hot_customer_agg,scan_bytes,571116368,439985031,504007087,,

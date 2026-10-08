@@ -1,0 +1,109 @@
+# Throughput-benchmark monitor — SAME code as cdc-pipeline/monitoring, second
+# instance pointed at the flink-cid-* jobs.
+#
+# Same no-image-build design as the CDC monitor: stock python:3.11-slim and
+# pip install at boot. The code arrives from S3 rather than from a ConfigMap —
+# see cdc-pipeline/monitoring/monitor-deployment.yaml for the no-image-build
+# rationale, and MONITOR_CODE_PREFIX below for why S3.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flink-cid-monitor-config
+  namespace: ${NAMESPACE}
+data:
+  PAIMON_FLINK_URL: "http://flink-cid-paimon-rest:8081"
+  ICEBERG_FLINK_URL: "http://flink-cid-iceberg-rest:8081"
+  AWS_REGION: "${AWS_REGION}"
+  PAIMON_GLUE_DB: "flink_cid_paimon_db"
+  ICEBERG_GLUE_DB: "flink_cid_iceberg_db"
+  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-paimon"
+  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-iceberg/"
+  # One table per pipeline in this benchmark (vs the CDC pipeline's four).
+  CDC_TABLES: "cid_events"
+  # Same window/poll discipline as the CDC monitor: throughput is the
+  # records_out delta across MONITOR_DURATION, so keep it a multiple of
+  # POLL_INTERVAL.
+  MONITOR_DURATION: "120"
+  POLL_INTERVAL: "20"
+  REPEAT_INTERVAL: "60"
+  RUN_MODE: "continuous"
+  # Where deploy-cid-monitor.sh uploaded the monitor code. S3 rather than a
+  # ConfigMap because flink_cdc_monitor.py is ~36 KB and growing, and a
+  # ConfigMap is a 1 MiB-capped etcd object that every API-server client can
+  # read — the same reason the Flink jobs already take their SQL and
+  # flink-cid-executor.py from s3://${BUCKET_NAME}/flink/scripts/. One upload
+  # path for all code in this project, and `aws s3 cp` at boot picks up a
+  # re-upload on the next restart without a kubectl round-trip.
+  MONITOR_CODE_PREFIX: "${MONITOR_CODE_PREFIX}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flink-cid-monitor
+  namespace: ${NAMESPACE}
+  labels:
+    app: flink-cid-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flink-cid-monitor
+  template:
+    metadata:
+      labels:
+        app: flink-cid-monitor
+    spec:
+      # Same IRSA SA as the CDC monitor: reads Glue table metadata and lists
+      # the warehouse prefixes in S3.
+      serviceAccountName: ${MONITOR_SERVICE_ACCOUNT}
+      containers:
+      - name: monitor
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+          # boto3 is installed BEFORE the fetch and pinned to the same version
+          # requirements.txt pins, so the second pip install finds it already
+          # satisfied — this is a reordering, not an extra dependency. It has to
+          # come first because requirements.txt itself lives in S3, and the
+          # python:3.11-slim image has no `aws` CLI (adding awscli here would
+          # pull in a second botocore copy at boot for one GET per file).
+          pip install --no-cache-dir --quiet boto3==1.40.0
+          cd /app
+          python - <<'FETCH'
+          import os, boto3
+          bucket, _, prefix = os.environ["MONITOR_CODE_PREFIX"][5:].partition("/")
+          s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"])
+          for name in ("flink_cdc_monitor.py", "entrypoint.py", "requirements.txt"):
+              key = prefix + "/" + name
+              s3.download_file(bucket, key, "/app/" + name)
+              print("fetched s3://%s/%s" % (bucket, key), flush=True)
+          FETCH
+          pip install --no-cache-dir --quiet -r requirements.txt
+          exec python -u entrypoint.py
+        envFrom:
+        - configMapRef:
+            name: flink-cid-monitor-config
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+        volumeMounts:
+        # /app is where the S3 fetch lands and where pip installs run. Still an
+        # emptyDir and not the image filesystem, so a restart always re-fetches
+        # rather than running whatever the last boot left behind.
+        - name: app
+          mountPath: /app
+        - name: reports
+          mountPath: /tmp/reports
+      volumes:
+      - name: app
+        emptyDir: {}
+      - name: reports
+        emptyDir:
+          sizeLimit: 500Mi
+      restartPolicy: Always
