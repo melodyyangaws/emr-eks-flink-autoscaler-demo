@@ -5,9 +5,9 @@
 # stale here has no effect. 
 
 export AWS_REGION=us-west-2
-export AWS_ACCOUNT_ID=633458367150
-export BUCKET_NAME=emr-on-eks-test-633458367150-us-west-2
-export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::633458367150:role/emr-on-eks-test-execution-role
+export AWS_ACCOUNT_ID=account
+export BUCKET_NAME=emr-on-eks-test-account-us-west-2
+export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::account:role/emr-on-eks-test-execution-role
 export IMAGE_TAG=7.13.0
 
 # 160 subtasks per side to meet the 8 GiB/s throughput requirement set just
