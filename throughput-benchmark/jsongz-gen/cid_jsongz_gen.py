@@ -31,18 +31,27 @@ mockup uses to hit 4 KB — would cap the ratio near 5x and are NOT used here.
 
 THROUGHPUT. One worker process renders + gzips ~60-90 MB/s raw (gzip level 6
 dominates). 6 GB/s therefore needs ~80 worker processes cluster-wide; see
-run-jsongz-gen.sh for the sizing. Rate is capped by TARGET_ROWS_PER_SECOND,
-split evenly over (pods x workers) — it is a LIMIT, the cap is only reached if
-there is enough CPU.
+run-jsongz-gen.sh for the sizing. Rate is capped PER POD by
+POD_ROWS_PER_SECOND, split evenly over this pod's workers, so the cluster rate
+is replicas x POD_ROWS_PER_SECOND. It is a LIMIT, only reached if there is
+enough CPU.
 
 Environment knobs:
     OUTPUT_URI               s3://bucket/prefix  or  file:///tmp/dir  (required)
-    TARGET_ROWS_PER_SECOND   cluster-wide cap, default 1500000 (≈6 GB/s @4 KB)
+    POD_ROWS_PER_SECOND      this pod's cap, default 500000 (≈2 GB/s @4 KB)
     DURATION_SECONDS         run length, default 1800 (30 min) and the maximum;
                              1..1800 only shortens it. 0 / run-until-killed is
                              not supported.
+    RUN_DEADLINE_EPOCH       optional hard stop (unix seconds) shared by all
+                             pods: writing ends at min(start + DURATION_SECONDS,
+                             this). A pod restarted or scaled up after it
+                             writes nothing.
+    IDLE_AFTER_DONE          1 = after the window, sleep until SIGTERM instead
+                             of exiting (a Deployment restarts exited pods,
+                             which would start a new window). Default 0.
     WORKERS                  processes in this pod, default = CPU count
-    TOTAL_PODS / POD_INDEX   set by the Indexed Job; default 1 / 0
+    POD_NAME                 RNG seed salt, from the downward API (default
+                             HOSTNAME); pods need no index to stay distinct
     ROWS_PER_FILE            file-size scale, default 40000: rows are drawn from
                              0.15x .. 1.25x of it (mean ~0.83x), so ~33K rows, ~7 MB
                              gz per file (~1.3 .. 10 MB). The real extract's files
@@ -515,11 +524,13 @@ class Sink:
 # ---------------------------------------------------------------------------
 def worker(idx, cfg, counters, stop):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    rng = random.Random((cfg['pod_index'] << 16) ^ idx ^ int(time.time() * 1e6))
+    # str seeds are hashed (SHA-512), so pod name + worker + ns start time give
+    # every worker its own stream, and its own file names, without a pod index.
+    rng = random.Random('%s/%d/%d' % (cfg['pod_name'], idx, time.time_ns()))
     crng = random.Random(42)        # customerIds identical across pods and workers
     customers = [guid(crng) for _ in range(cfg['customers'])]
     sink = Sink(cfg['output'], cfg['upload_threads'])
-    rows_per_sec = cfg['rate'] / cfg['total_workers']
+    rows_per_sec = cfg['rate'] / cfg['workers']
     t0 = time.time()
     rows_done = 0
     seq = 0
@@ -563,22 +574,30 @@ def main():
                          'only a shorter whole-second override 1..%d is allowed'
                          % (raw_duration, MAX_DURATION_SECONDS, MAX_DURATION_SECONDS))
     workers = int(os.environ.get('WORKERS', os.cpu_count()))
-    total_pods = int(os.environ.get('TOTAL_PODS', '1'))
+    duration = float(raw_duration)
+    deadline = os.environ.get('RUN_DEADLINE_EPOCH', '').strip()
+    if deadline:
+        duration = min(duration, float(deadline) - time.time())
+    idle_after = os.environ.get('IDLE_AFTER_DONE', '0') == '1'
     cfg = {
         'output': output,
-        'rate': float(os.environ.get('TARGET_ROWS_PER_SECOND', '1500000')),
-        'duration': int(raw_duration),
-        'pod_index': int(os.environ.get('POD_INDEX', os.environ.get('JOB_COMPLETION_INDEX', '0'))),
-        'total_workers': workers * total_pods,
+        'rate': float(os.environ.get('POD_ROWS_PER_SECOND', '500000')),
+        'duration': duration,
+        'pod_name': os.environ.get('POD_NAME') or os.environ.get('HOSTNAME') or str(os.getpid()),
+        'workers': workers,
         'rows_per_file': int(os.environ.get('ROWS_PER_FILE', '40000')),
         'customers': int(os.environ.get('CID_CUSTOMER_COUNT', '16')),
         'hosts': int(os.environ.get('CID_HOST_COUNT', '1024')),
         'gzip_level': int(os.environ.get('GZIP_LEVEL', '6')),
         'upload_threads': int(os.environ.get('UPLOAD_THREADS', '4')),
     }
-    print('cid-jsongz-gen pod %d/%d: %d workers, cluster cap %.0f rows/s (%.0f/worker) -> %s'
-          % (cfg['pod_index'], total_pods, workers, cfg['rate'],
-             cfg['rate'] / cfg['total_workers'], output), flush=True)
+    if duration <= 0:
+        print('IDLE %s: RUN_DEADLINE_EPOCH has passed, writing nothing' % cfg['pod_name'], flush=True)
+        idle_forever(idle_after)
+        return
+    print('cid-jsongz-gen pod %s: %d workers, pod cap %.0f rows/s (%.0f/worker), %.0f s -> %s'
+          % (cfg['pod_name'], workers, cfg['rate'], cfg['rate'] / workers, duration, output),
+          flush=True)
 
     counters = mp.Array('d', 4)          # rows, raw bytes, gz bytes, files
     stop = mp.Event()
@@ -609,6 +628,20 @@ def main():
         print('DONE %.0f rows, %.2f GB raw, %.2f GB gz, %.0f files, mean row %.0f B / gz %.0f B'
               % (cur[0], cur[1] / 1e9, cur[2] / 1e9, cur[3], cur[1] / cur[0], cur[2] / cur[0]),
               flush=True)
+    idle_forever(idle_after)
+
+def idle_forever(enabled):
+    """Deployment mode: hold the pod after the window so it is not restarted."""
+    if not enabled:
+        return
+    print('IDLE window closed; sleeping until stopped (scale to 0 / delete)', flush=True)
+    # Nothing left to flush: exit at once. An explicit handler, not SIG_DFL,
+    # because the container execs python as PID 1, which ignores default
+    # SIGTERM and would sit out the whole termination grace period.
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
+    while True:
+        time.sleep(3600)
 
 if __name__ == '__main__':
     main()

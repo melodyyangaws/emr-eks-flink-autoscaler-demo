@@ -1,0 +1,83 @@
+# DuckDB benchmark Job: one per arm and suite. A template, rendered by duckdb.sh
+# with envsubst over an explicit variable list; every variable's default is set
+# there, and the render fails if any placeholder survives.
+#
+# Sizing is CPU/RAM parity with StarRocks' 3 BEs (3 x 6 cpu / 24Gi) on ONE node.
+# Locality is not at parity: StarRocks has three nodes' memory bandwidth and
+# NICs, DuckDB has one, which binds on the wide-JSON queries.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: ${NAMESPACE}
+  labels: {app: duckdb-bench}
+spec:
+  backoffLimit: 0                           # a failed run must not silently re-run and requery
+  template:
+    metadata:
+      labels: {app: duckdb-bench}           # the anti-affinity below selects on this, so it is on the POD
+      annotations:
+        karpenter.sh/do-not-disrupt: "true" # consolidation mid-run would kill the measurement
+    spec:
+      restartPolicy: Never
+      serviceAccountName: starrocks-sa      # reuses StarRocks' IRSA role, which already reads both warehouses
+      affinity:
+        # Parallel arms on separate nodes. 2 x 18 cpu fits one m5.8xlarge by
+        # requests, and then the arms would share one NIC and memory bus.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: {matchLabels: {app: duckdb-bench}}
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/arch: amd64                  # = StarRocks' BEs
+        karpenter.sh/nodepool: executor-memorynodepool
+        karpenter.k8s.aws/instance-family: m5      # = StarRocks' BEs: changing CPU family moved timings 20-36%
+        karpenter.k8s.aws/instance-size: 8xlarge   # 32 vcpu / 128Gi, the smallest m5 that holds 18 cpu / 72Gi
+        karpenter.sh/capacity-type: on-demand      # a spot reclaim is a lost run (backoffLimit 0)
+      containers:
+      - name: duckdb
+        image: python:3.12-slim
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          # duckdb-cli is the standalone binary (the duckdb wheel is only the
+          # Python module). awscli does STS, Glue and S3; it is 1.x because v2
+          # is not on PyPI, and no v2-only feature is used.
+          pip install --quiet --no-cache-dir --root-user-action=ignore duckdb-cli==${DUCKDB_VERSION} awscli
+          exec ${POD_CMD}
+        env:
+        - {name: AWS_REGION,           value: "${AWS_REGION}"}
+        - {name: AWS_DEFAULT_REGION,   value: "${AWS_REGION}"}   # awscli 1.x reads this one
+        - {name: BUCKET_NAME,          value: "${BUCKET_NAME}"}
+        - {name: ARM,                  value: "${ARM}"}
+        - {name: SUITE,                value: "${SUITE}"}
+        - {name: STAMP,                value: "${STAMP}"}
+        - {name: RUN_TAG,              value: "${RUN_TAG}"}
+        - {name: RUNS,                 value: "${RUNS}"}
+        - {name: WARMUP,               value: "${WARMUP}"}
+        - {name: QUERY_TIMEOUT_S,      value: "${QUERY_TIMEOUT_S}"}
+        - {name: ICEBERG_DB,           value: "${ICEBERG_DB}"}
+        - {name: TABLE_NAME,           value: "${TABLE_NAME}"}
+        - {name: PAIMON_TABLE_ROOT,    value: "${PAIMON_TABLE_ROOT}"}
+        - {name: PIN_SNAPSHOT,         value: "${PIN_SNAPSHOT}"}
+        - {name: DUCKDB_MEMORY_LIMIT,  value: "${DUCKDB_MEMORY_LIMIT}"}
+        - {name: DUCKDB_THREADS,       value: "${DUCKDB_THREADS}"}
+        - {name: SPILL_DIR,            value: "${SPILL_DIR}"}
+        - {name: DUCKDB_MAX_TEMP_SIZE, value: "${DUCKDB_MAX_TEMP_SIZE}"}
+        resources:                          # requests = limits: Guaranteed QoS, no CPU burst over parity
+          requests: {cpu: "18", memory: 72Gi}
+          limits:   {cpu: "18", memory: 72Gi}
+        volumeMounts:
+        - {name: bench,   mountPath: /opt/bench}
+        - {name: scratch, mountPath: "${SPILL_DIR}"}
+      volumes:
+      - name: bench
+        configMap: {name: "${CM}"}          # duckdb.sh + the rendered queries
+      - name: scratch                       # spill space: its own volume, sized above DUCKDB_MAX_TEMP_SIZE
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: gp3
+              resources: {requests: {storage: 200Gi}}

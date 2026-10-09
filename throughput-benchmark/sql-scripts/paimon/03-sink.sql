@@ -3,7 +3,7 @@
 -- ============================================================================
 -- Schema, partitioning and the write properties below are taken from
 -- schema_sample.sql (the CID ingestion PoC definition): 33 extracted columns +
--- event_json, PARTITIONED BY (dt), no primary key, bucketed on uuid.
+-- event_json, PARTITIONED BY (dt), no primary key, unaware-bucket (bucket = -1).
 -- ../iceberg/03-sink.sql declares the SAME 34 columns in the SAME order with
 -- the SAME identity partitioning, so the two formats are given one table shape
 -- and the only remaining difference is the write path itself.
@@ -55,14 +55,17 @@ CREATE TABLE IF NOT EXISTS cid_events (
     spt              INT,
     winEventId       INT
 ) PARTITIONED BY (dt) WITH (
-    -- = the job parallelism, as PAIMON_BUCKETS from build-deploy-cid.sh: each
-    -- bucket has exactly one writer, so fewer buckets than subtasks idles
-    -- writers (JOB_PARALLELISM / 2 from 2026-10-06 to 2026-10-09 left 80 of 160
-    -- with no rows). The default here is the script's default parallelism —
-    -- a FALLBACK ONLY: build-deploy-cid.sh always ships PAIMON_BUCKETS as pod
-    -- env, so this value is reached only if the JobManager env is missing.
-    'bucket' = '${PAIMON_BUCKETS:128}',
-    'bucket-key' = 'uuid',
+    -- -1 = unaware-bucket append table, the same layout as the Iceberg side
+    -- (PARTITIONED BY dt, 'write.distribution-mode' = 'none', no bucketing):
+    -- no hash shuffle, so the writer chains into the source vertex and rows
+    -- are never serialized across the network. With fixed buckets every ~5.7 KB
+    -- row crossed a keyBy(uuid) edge and Paimon ran at ~820K rows/s against
+    -- Iceberg's ~1.4M (2026-10-09).
+    -- PAIMON_BUCKETS=N (>= 1) in build-deploy-cid.sh restores fixed buckets
+    -- on uuid; PAIMON_BUCKET_KEY_OPT then renders the 'bucket-key' line, which
+    -- Paimon REJECTS on a bucket = -1 table, so it must be absent there.
+    'bucket' = '${PAIMON_BUCKETS:-1}',
+    ${PAIMON_BUCKET_KEY_OPT:}
     'file.format' = 'parquet',
     -- snappy, matching Iceberg's 'write.parquet.compression-codec' = 'snappy'.
     'file.compression' = 'snappy',

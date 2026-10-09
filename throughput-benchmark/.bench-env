@@ -4,20 +4,27 @@
 # the script uses ${VAR:-default}. So a knob changed in the script but left
 # stale here has no effect. 
 
+# Account-specific values live in .bench-env.local (git-ignored), sourced here
+# so it overrides the placeholders below. Create it with your own:
+#   export AWS_ACCOUNT_ID=<id>
+#   export BUCKET_NAME=emr-on-eks-test-<id>-us-west-2
+#   export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::<id>:role/emr-on-eks-test-execution-role
 export AWS_REGION=us-west-2
 export AWS_ACCOUNT_ID=account
 export BUCKET_NAME=emr-on-eks-test-account-us-west-2
 export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::account:role/emr-on-eks-test-execution-role
+_bench_env_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+[ -f "$_bench_env_dir/.bench-env.local" ] && source "$_bench_env_dir/.bench-env.local"
+unset _bench_env_dir
 export IMAGE_TAG=7.13.0
 
 # 160 subtasks per side to meet the 8 GiB/s throughput requirement set just
 # below (SOURCE_ROWS_PER_SECOND). The script's own default is 128.
 #
-# It is also the Paimon 'bucket' count: PAIMON_BUCKETS = JOB_PARALLELISM (= 160
-# here), derived in build-deploy-cid.sh, one bucket per writer subtask (the
-# /2 used 2026-10-06..09 left half the writers idle). It is baked into the table
-# schema at CREATE TABLE and cannot be rescaled afterwards, so changing
-# JOB_PARALLELISM moves the bucket count too — drop cid_events when you do.
+# Paimon defaults to unaware-bucket (PAIMON_BUCKETS=-1, no shuffle, the same
+# layout as Iceberg), so parallelism no longer sets a bucket count. For a
+# fixed-bucket run, export PAIMON_BUCKETS=$JOB_PARALLELISM (one bucket per writer)
+# and drop cid_events first: the bucket count is baked in at CREATE TABLE.
 export JOB_PARALLELISM=160
 
 # 8 GiB/s at the calibrated 4KB mean row = 8*1024^3 / 4096 = 2,097,152 rows/s

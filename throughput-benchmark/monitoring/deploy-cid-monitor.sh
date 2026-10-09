@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Deploy the throughput-benchmark monitor — the SAME monitoring mechanics as
+# Deploy the throughput-benchmark monitor — the same monitoring mechanics as
 # cdc-pipeline/monitoring, as a second Deployment pointed at the flink-cid-*
-# jobs. The monitor code is taken from ../../cdc-pipeline/monitoring so both
-# monitors always run identical logic; only the config ConfigMap differs.
+# jobs. The monitor code lives in this directory: it started as a copy of
+# cdc-pipeline/monitoring and has since diverged (operator-scoped record
+# counts, so a fully chained Iceberg job no longer reads ~3 rec/s).
 #
 # The code travels via S3 (s3://${BUCKET_NAME}/flink/monitoring/), next to
 # every other artifact the cluster runs; the pod fetches it at boot, so
@@ -33,13 +34,12 @@ export MONITOR_CODE_PREFIX="${MONITOR_CODE_PREFIX:-s3://${BUCKET_NAME}/flink/mon
 MONITOR_CODE_PREFIX="${MONITOR_CODE_PREFIX%/}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CDC_MONITOR_DIR="${SCRIPT_DIR}/../../cdc-pipeline/monitoring"
 DEPLOYED_MANIFEST="${SCRIPT_DIR}/monitor-deployment-deployed.yaml"
 # Must match the FETCH list in monitor-deployment.yaml.
-MONITOR_FILES=(flink_cdc_monitor.py entrypoint.py requirements.txt)
+MONITOR_FILES=(flink_cid_monitor.py entrypoint.py requirements.txt)
 
-[[ -f "${CDC_MONITOR_DIR}/flink_cdc_monitor.py" ]] || {
-    echo "ERROR: CDC monitor code not found at ${CDC_MONITOR_DIR}" >&2; exit 1; }
+[[ -f "${SCRIPT_DIR}/flink_cid_monitor.py" ]] || {
+    echo "ERROR: monitor code not found at ${SCRIPT_DIR}" >&2; exit 1; }
 
 echo "Flink throughput monitor -> ${NAMESPACE} (SA ${MONITOR_SERVICE_ACCOUNT}, code ${MONITOR_CODE_PREFIX})"
 
@@ -52,7 +52,7 @@ if [[ -z "${CURRENT_ROLE}" ]]; then
 fi
 
 for f in "${MONITOR_FILES[@]}"; do
-    aws s3 cp "${CDC_MONITOR_DIR}/${f}" "${MONITOR_CODE_PREFIX}/${f}" \
+    aws s3 cp "${SCRIPT_DIR}/${f}" "${MONITOR_CODE_PREFIX}/${f}" \
       --region "${AWS_REGION}" --only-show-errors
     echo "  ✓ uploaded ${f}"
 done

@@ -25,6 +25,26 @@
 # There is deliberately NO image build here. The benchmark reuses the CDC
 # image byte-for-byte — build it (once) with:
 #   cd ../cdc-pipeline && ./build-deploy-generic.sh build
+#
+# USAGE (source .bench-env first; it sets the account, bucket, role and knobs):
+#   source .bench-env
+#   ./build-deploy-cid.sh upload                # Glue DBs + executor/SQL to S3, verified; no kubectl
+#   ./build-deploy-cid.sh deploy paimon         # one writer — the only way to get a quotable rows/s
+#   ./build-deploy-cid.sh deploy iceberg
+#   ./build-deploy-cid.sh deploy both           # side by side: measures contention, not a write path
+#   ./build-deploy-cid.sh render                # write flink-cid-<fmt>-deployed.yaml, don't apply
+#   ./build-deploy-cid.sh monitor               # FlinkDeployments + pods
+#   ./build-deploy-cid.sh cleanup [paimon|iceberg|both]   # delete the CR(s); asks "yes"; keeps data
+# deploy always deletes and re-CREATEs the CR, since EMR stages jarURI on CREATE only.
+# Suspend without deleting:
+#   kubectl patch flinkdeployment flink-cid-<fmt> -n emr-flink --type=merge \
+#     -p '{"spec":{"job":{"state":"suspended"}}}'
+# Knobs (env, defaults below): SOURCE_MODE=datagen|s3json (+S3JSON_SOURCE_PATH),
+#   SOURCE_ROWS_PER_SECOND, JOB_PARALLELISM, PAIMON_BUCKETS (-1 = unaware),
+#   ICEBERG_COMPAT, WRITE_BUFFER, CID_CUSTOMER_COUNT, CID_HOST_COUNT,
+#   CID_DAY_SPREAD, HOT_KEY_FRACTION, JM_NODEPOOL, TM_NODEPOOL.
+# Changing JOB_PARALLELISM/PAIMON_BUCKETS or ICEBERG_COMPAT requires dropping the
+# tables first (README "Teardown"): the bucket count is fixed at CREATE TABLE.
 ###############################################################################
 
 set -e
@@ -51,20 +71,24 @@ export SOURCE_ROWS_PER_SECOND=${SOURCE_ROWS_PER_SECOND:-2000000}
 # is the wall.
 export JOB_PARALLELISM=${JOB_PARALLELISM:-128}
 
-# Paimon 'bucket' count = the job parallelism (128 by default, 160 in .bench-env).
+# Paimon 'bucket': -1 (unaware-bucket) by default, matching the Iceberg side,
+# which is PARTITIONED BY dt with 'write.distribution-mode' = 'none' and no
+# bucketing. Fixed buckets force a keyBy(uuid) shuffle in front of the writer:
+# every row is serialized across the network (~5.7 KB/row measured) and the
+# writer runs as its own vertex on the same cores as the source chain. That
+# was Paimon at ~820K rows/s vs Iceberg's ~1.4M on 2026-10-09.
 #
-# Paimon routes every row by hash(bucket-key=uuid) % bucket, and each bucket
-# is written by exactly ONE writer subtask. So bucket < parallelism leaves
-# writers with nothing to do: from 2026-10-06 to 2026-10-09 this was
-# JOB_PARALLELISM / 2, and at 160 writers only 80 ever received a row while
-# the source chain sat 13% backpressured (measured 2026-10-09). The earlier
-# reasoning behind halving ("two buckets per subtask") had it backwards:
-# half as many buckets as subtasks is half a bucket each.
-#
-# Open files per side are bucket x (CID_DAY_SPREAD+1), each its own
-# write-buffer-size budget and target-file-size=256mb stream.
-export PAIMON_BUCKETS=${PAIMON_BUCKETS:-$JOB_PARALLELISM}
-(( PAIMON_BUCKETS < 1 )) && export PAIMON_BUCKETS=1
+# PAIMON_BUCKETS=N (>= 1) restores fixed buckets on uuid. Use N = JOB_PARALLELISM:
+# each bucket has exactly ONE writer subtask, so fewer buckets idle writers
+# (JOB_PARALLELISM / 2 from 2026-10-06 to 2026-10-09 left 80 of 160 with no
+# rows). Paimon rejects 'bucket-key' on a bucket = -1 table, so the key line is
+# rendered only in fixed mode.
+export PAIMON_BUCKETS=${PAIMON_BUCKETS:--1}
+if (( PAIMON_BUCKETS >= 1 )); then
+    export PAIMON_BUCKET_KEY_OPT="'bucket-key' = 'uuid',"
+else
+    export PAIMON_BUCKETS=-1 PAIMON_BUCKET_KEY_OPT=""
+fi
 
 # Endpoint-skew knob.
 # HOT_KEY_FRACTION: percentage of rows routed to the hot slice [0,99].
@@ -163,7 +187,13 @@ export CID_DAY_SPREAD=${CID_DAY_SPREAD:-1}
 # project, so the knobs had exactly one reachable value each and became a way
 # to silently reinstate a retired arm — .bench-env was in fact overriding both
 # to the exploratory values.
-export PAIMON_WRITE_ONLY=false
+# Exception: PAIMON_WRITE_ONLY=true may be set per run (2026-10-09) to measure
+# Paimon with no inline compaction or expiry, like Iceberg's writer. Small files
+# and expired snapshots then accumulate until something compacts the table.
+export PAIMON_WRITE_ONLY=${PAIMON_WRITE_ONLY:-false}
+if [[ "$PAIMON_WRITE_ONLY" != true && "$PAIMON_WRITE_ONLY" != false ]]; then
+    echo "PAIMON_WRITE_ONLY must be true or false, got '$PAIMON_WRITE_ONLY'" >&2; exit 1
+fi
 export PAIMON_WRITE_BUFFER_SPILLABLE=true
 
 # Paimon write buffer size. The default 128 MiB is the same as Iceberg's
@@ -365,12 +395,12 @@ display_config() {
     echo "                     ^ calibrated to the 4 KB/row requirement (modelled"
     echo "                       mean 4099 B); sample's own mean is 3817 B."
     echo "  Job parallelism:   $JOB_PARALLELISM"
-    echo "  Paimon buckets:    $PAIMON_BUCKETS (= JOB_PARALLELISM; fixed at CREATE TABLE)"
+    echo "  Paimon buckets:    $PAIMON_BUCKETS (-1 = unaware-bucket, no shuffle; fixed at CREATE TABLE)"
     echo "  Endpoint skew:     HOT_KEY_FRACTION=$HOT_KEY_FRACTION (0=uniform; % of rows on a hot 5% of hosts)"
     echo "  CID fan-out:       customers=$CID_CUSTOMER_COUNT hosts=$CID_HOST_COUNT days=$CID_DAY_SPREAD"
     if [[ "$CID_DAY_SPREAD" -gt 1 ]]; then
         echo "                     ^ days>1 means $CID_DAY_SPREAD dt PARTITIONS on both sinks,"
-        echo "                       so ${PAIMON_BUCKETS}x${CID_DAY_SPREAD} (paimon, by bucket) /"
+        echo "                       so $(( PAIMON_BUCKETS >= 1 ? PAIMON_BUCKETS : JOB_PARALLELISM ))x${CID_DAY_SPREAD} (paimon, by $( (( PAIMON_BUCKETS >= 1 )) && echo bucket || echo subtask)) /"
         echo "                       ${JOB_PARALLELISM}x${CID_DAY_SPREAD} (iceberg, by subtask) concurrently-open files."
         echo "                       Report this with any result — it is not comparable to days=1."
     fi
@@ -379,7 +409,7 @@ display_config() {
     echo "  Table shape:       APPEND-ONLY, PARTITIONED BY (dt), 34 cols (schema_sample.sql)"
     echo "                     ^ no primary key. NOT comparable with pre-CID upsert runs."
     echo "  Iceberg compat:    $ICEBERG_COMPAT (paimon metadata.iceberg.storage = $PAIMON_ICEBERG_STORAGE)"
-    echo "  Paimon write path: write-only=$PAIMON_WRITE_ONLY spillable=$PAIMON_WRITE_BUFFER_SPILLABLE (fixed, not configurable)"
+    echo "  Paimon write path: write-only=$PAIMON_WRITE_ONLY spillable=$PAIMON_WRITE_BUFFER_SPILLABLE (spillable fixed)"
     echo "                     ^ inline compaction on; the write buffer spills and"
     echo "                       external-merges at the checkpoint barrier."
     echo "  Paimon write buf:  $WRITE_BUFFER (write-buffer-size INSERT hint; heap"
@@ -529,6 +559,7 @@ render_manifest() {
         -e "s|\${SOURCE_ROWS_PER_SECOND}|${SOURCE_ROWS_PER_SECOND}|g" \
         -e "s|\${JOB_PARALLELISM}|${JOB_PARALLELISM}|g" \
         -e "s|\${PAIMON_BUCKETS}|${PAIMON_BUCKETS}|g" \
+        -e "s|\${PAIMON_BUCKET_KEY_OPT}|${PAIMON_BUCKET_KEY_OPT}|g" \
         -e "s|\${HOT_KEY_FRACTION}|${HOT_KEY_FRACTION}|g" \
         -e "s|\${S3JSON_SOURCE_PATH}|${S3JSON_SOURCE_PATH}|g" \
         -e "s|\${S3JSON_MONITOR_INTERVAL}|${S3JSON_MONITOR_INTERVAL}|g" \
@@ -652,7 +683,7 @@ main() {
             for f in ${deployed[@]+"${deployed[@]}"}; do
                 echo "  Watch:  kubectl get flinkdeployment flink-cid-${f} -n ${NAMESPACE} -w"
                 echo "  UI:     kubectl port-forward svc/flink-cid-${f}-rest 8081:8081 -n ${NAMESPACE}"
-                echo "  Metrics: LOCAL_PORT=${port} ./collect-metrics.sh ${f} 30 3600"
+                echo "  Metrics: LOCAL_PORT=${port} ./monitoring/collect-metrics.sh ${f} 30 3600"
                 port=$(( port + 1 ))
             done
             ;;
@@ -701,7 +732,8 @@ main() {
             echo "Knobs: SOURCE_ROWS_PER_SECOND JOB_PARALLELISM IMAGE_TAG"
             echo "       SOURCE_MODE=datagen|s3json (default datagen). s3json reads the"
             echo "       gzip NDJSON from S3JSON_SOURCE_PATH (jsongz-gen/), continuously."
-            echo "       PAIMON_BUCKETS=N (default JOB_PARALLELISM) — Paimon 'bucket'."
+            echo "       PAIMON_BUCKETS=N (default -1 = unaware-bucket) — Paimon 'bucket';"
+            echo "       N >= 1 = fixed buckets on uuid, use N = JOB_PARALLELISM."
             echo "       BAKED IN at CREATE TABLE: drop cid_events before changing it."
             echo "       HOT_KEY_FRACTION=0..99 (default 0=uniform; 80=80/20 skew)"
             echo "       Routes the ENDPOINT identity, not a primary key — the tables"
@@ -737,8 +769,8 @@ main() {
             echo "Side-by-side run (both writers, started together):"
             echo "  source .bench-env"
             echo "  $0 deploy both"
-            echo "  LOCAL_PORT=8091 ./collect-metrics.sh paimon 30 3600 &"
-            echo "  LOCAL_PORT=8092 ./collect-metrics.sh iceberg 30 3600 &"
+            echo "  LOCAL_PORT=8091 ./monitoring/collect-metrics.sh paimon 30 3600 &"
+            echo "  LOCAL_PORT=8092 ./monitoring/collect-metrics.sh iceberg 30 3600 &"
             exit 1
             ;;
     esac

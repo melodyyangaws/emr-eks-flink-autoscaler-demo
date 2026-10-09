@@ -3,8 +3,8 @@
 # Throughput metric collector — samples the Flink REST API through a
 # port-forward and appends CSV rows to bench-results/.
 #
-# Usage:   ./collect-metrics.sh paimon|iceberg [interval-seconds] [duration-seconds]
-# Output:  bench-results/cid-<format>-<UTC timestamp>.csv
+# Usage:   ./monitoring/collect-metrics.sh paimon|iceberg [interval-seconds] [duration-seconds]
+# Output:  throughput-benchmark/bench-results/cid-<format>-<UTC timestamp>.csv
 #
 # Columns:
 #   ts                         sample time (UTC, ISO8601)
@@ -35,7 +35,7 @@ NAMESPACE=${NAMESPACE:-emr-flink}
 DEPLOYMENT="flink-cid-${FORMAT}"
 PORT=${LOCAL_PORT:-8091}
 
-OUTDIR="$(dirname "$0")/bench-results"
+OUTDIR="$(cd "$(dirname "$0")/.." && pwd)/bench-results"
 mkdir -p "$OUTDIR"
 OUTFILE="${OUTDIR}/cid-${FORMAT}-$(date -u +%Y%m%dT%H%M%SZ).csv"
 
@@ -66,11 +66,26 @@ SOURCE_VID=$(echo "$VERTICES" | jq -r '.vertices[] | select(.name | test("datage
 SINK_VID=$(echo "$VERTICES"   | jq -r '.vertices[] | select(.name | test("IcebergStreamWriter|Writer")) | select(.name | test("Committer") | not) | .id' | head -1)
 [[ -n "$SOURCE_VID" && -n "$SINK_VID" ]] || { echo "Could not resolve source/sink vertex ids; vertices are:" >&2; echo "$VERTICES" | jq -r '.vertices[].name' >&2; exit 1; }
 
+# Rates come from OPERATOR-scoped metrics, not vertex-level ones. A vertex's
+# numRecordsIn/Out only counts records crossing a vertex boundary: Iceberg
+# chains source -> Correlate -> Calc -> IcebergStreamWriter into ONE vertex, so
+# its vertex numRecordsOutPerSecond is the writer's committables (~3/s) and its
+# numRecordsInPerSecond is 0. Paimon's bucket shuffle happens to split the
+# writer into its own vertex, which is why only Iceberg read wrong.
+operator_metric() {  # $1 vertex id, $2 operator-name regex, $3 metric; falls back to the vertex metric
+    curl -sf "${BASE}/jobs/${JOB_ID}/vertices/$1/subtasks/metrics" \
+        | jq -r --arg re "^($2).*\\.$3\$" '[.[].id | select(test($re))][0] // empty' \
+        | grep . || echo "$3"
+}
+SOURCE_RATE_METRIC=$(operator_metric "$SOURCE_VID" "Source__" "numRecordsOutPerSecond")
+SINK_RATE_METRIC=$(operator_metric "$SINK_VID" "IcebergStreamWriter|Writer" "numRecordsInPerSecond")
+echo "Rate metrics: source=${SOURCE_RATE_METRIC} sink=${SINK_RATE_METRIC}" >&2
+
 echo "Sampling job ${JOB_ID} on ${DEPLOYMENT} every ${INTERVAL}s for ${DURATION}s -> ${OUTFILE}" >&2
 echo "ts,job_state,source_rec_per_s,sink_rec_per_s,source_backpressure_ms,busy_ms,ckpt_completed,ckpt_failed,last_ckpt_duration_ms,last_ckpt_size_bytes" > "$OUTFILE"
 
 vertex_metric_sum() {  # $1 vertex id, $2 metric name -> sum across subtasks
-    curl -sf "${BASE}/jobs/${JOB_ID}/vertices/$1/subtasks/metrics?get=$2" \
+    curl -sf "${BASE}/jobs/${JOB_ID}/vertices/$1/subtasks/metrics?get=$(jq -rn --arg m "$2" '$m|@uri')" \
         | jq -r '.[0].sum // 0'
 }
 vertex_metric_avg() {
@@ -83,8 +98,8 @@ while (( SECONDS < END )); do
     TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     STATE=$(curl -sf "${BASE}/jobs/${JOB_ID}" | jq -r '.state' || echo "UNKNOWN")
 
-    SRC_RATE=$(vertex_metric_sum "$SOURCE_VID" "numRecordsOutPerSecond")
-    SINK_RATE=$(vertex_metric_sum "$SINK_VID" "numRecordsInPerSecond")
+    SRC_RATE=$(vertex_metric_sum "$SOURCE_VID" "$SOURCE_RATE_METRIC")
+    SINK_RATE=$(vertex_metric_sum "$SINK_VID" "$SINK_RATE_METRIC")
     SRC_BP=$(vertex_metric_avg "$SOURCE_VID" "backPressuredTimeMsPerSecond")
     SINK_BUSY=$(vertex_metric_avg "$SINK_VID" "busyTimeMsPerSecond")
 

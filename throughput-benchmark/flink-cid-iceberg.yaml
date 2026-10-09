@@ -21,6 +21,13 @@ spec:
     # of per-operator busy/backpressure. Set "false" for a diagnostic run.
     # Kept identical across both formats — it is a fair-comparison variable.
     pipeline.operator-chaining.enabled: "true"
+    # ON. Off (Flink's default), every chained hop deep-copies the row through
+    # CopyingChainingOutput — 27% of task CPU in the 2026-10-09 profile, the
+    # second cost after json_tuple. The SQL runtime and both sinks are safe
+    # with it: Iceberg encodes each row into Parquet on arrival and Paimon
+    # serializes into its own write buffer. Kept identical across both formats —
+    # it is a fair-comparison variable.
+    pipeline.object-reuse: "true"
     # The s3json source loads Hive's module for json_tuple. HiveModule's static
     # init needs commons-codec (org.apache.commons.codec.language.Soundex),
     # which the image ships only under hudi/, off the classpath. Flink appends

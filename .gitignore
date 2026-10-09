@@ -10,3 +10,7 @@ cdc-pipeline/mysql-cdc-env.sh
 # Runtime logs
 *.log
 cdc-pipeline/bench-results
+#python
+*pycache*
+# Account-specific values for throughput-benchmark/.bench-env
+.bench-env.local

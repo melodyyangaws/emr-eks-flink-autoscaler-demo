@@ -1,32 +1,37 @@
 # Raw landing-zone generator — gzipped NDJSON to S3, no Flink.
 #
-# Rendered by run-jsongz-gen.sh (envsubst). Every ${VAR} below is a render-time
-# placeholder; the script asserts none survive rendering.
+# Rendered by run-jsongz-gen.sh (envsubst over an explicit variable list) to
+# jsongz-gen-job-deployed.yaml, which is what gets applied. Every braced $VAR
+# below is a render-time placeholder; the script asserts none survive. (Keep
+# braced placeholders out of these comments: they would trip that check.)
 #
-# Indexed Job: TOTAL_PODS pods, each running WORKERS generator processes. The
-# cluster-wide TARGET_ROWS_PER_SECOND is split evenly over TOTAL_PODS x WORKERS
-# by the generator itself; each pod learns its index from JOB_COMPLETION_INDEX
-# (injected by the Job controller for Indexed Jobs), which seeds its RNG.
+# Deployment (the file keeps its old -job name): JSONGZ_REPLICAS pods, each
+# running WORKERS generator processes capped at POD_ROWS_PER_SECOND, so the
+# cluster rate is replicas x per-pod rate and `run-jsongz-gen.sh scale N`
+# changes it. Pods have no index; each seeds its RNG from its own pod name
+# (downward API), so file names cannot collide across pods.
 #
-# Placement: the cluster's Karpenter pools admit no compute-optimized 16xlarge
-# (driver-nodepool is c/m up to 8xlarge, executor-memorynodepool is m up to
-# 16xlarge), so the default is executor-memorynodepool m6i.16xlarge = 64 vCPU,
-# one pod per node at WORKERS=60. The generator is CPU-bound on gzip and needs
-# little memory (~150 MB per worker), so m-family only wastes RAM, not speed.
-apiVersion: batch/v1
-kind: Job
+# Fixed window, not run-until-stopped: every pod writes for DURATION_SECONDS
+# from its own start, but never past RUN_DEADLINE_EPOCH (render time +
+# duration + 600 s for node launch + pip; replaces activeDeadlineSeconds). Then it
+# IDLES rather than exiting, because a Deployment restarts exited pods and
+# each restart would open a new window. A pod restarted or scaled up after
+# the deadline writes nothing. `stop` scales to 0.
+#
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: cid-jsongz-gen
   namespace: ${NAMESPACE}
 spec:
-  completionMode: Indexed
-  completions: ${TOTAL_PODS}
-  parallelism: ${TOTAL_PODS}
-  backoffLimit: 0          # a crashed generator must not silently restart and skew the rate
-  # Backstop for the fixed 30-min run: DURATION_SECONDS + 300 s (pip install,
-  # pod start, final upload flush). Pods exit on their own at DURATION_SECONDS;
-  # this only kills a hung one, so nothing writes past the window.
-  activeDeadlineSeconds: ${JOB_DEADLINE_SECONDS}
+  replicas: ${JSONGZ_REPLICAS}
+  # Recreate, not RollingUpdate: a re-start (new deadline) must not surge
+  # extra 60-cpu pods next to the old ones and briefly double the rate.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cid-jsongz-gen
   template:
     metadata:
       annotations:
@@ -34,7 +39,9 @@ spec:
       labels:
         app: cid-jsongz-gen
     spec:
-      restartPolicy: Never
+      restartPolicy: Always
+      # SIGTERM stops the workers and flushes in-flight PUTs before exit.
+      terminationGracePeriodSeconds: 60
       # IRSA role that already reads/writes the benchmark bucket (same SA as
       # the DuckDB harness).
       serviceAccountName: starrocks-sa
@@ -51,8 +58,6 @@ spec:
         kubernetes.io/arch: amd64
         karpenter.sh/capacity-type: on-demand
         karpenter.sh/nodepool: ${GEN_NODEPOOL}
-        karpenter.k8s.aws/instance-family: ${GEN_INSTANCE_FAMILY}
-        karpenter.k8s.aws/instance-size: ${GEN_INSTANCE_SIZE}
       containers:
       - name: gen
         image: python:3.12-slim
@@ -71,12 +76,18 @@ spec:
           value: "${AWS_REGION}"
         - name: OUTPUT_URI
           value: "${OUTPUT_URI}"
-        - name: TARGET_ROWS_PER_SECOND
-          value: "${JSONGZ_ROWS_PER_SECOND}"
+        - name: POD_ROWS_PER_SECOND
+          value: "${JSONGZ_ROWS_PER_POD}"
         - name: DURATION_SECONDS
           value: "${DURATION_SECONDS}"
-        - name: TOTAL_PODS
-          value: "${TOTAL_PODS}"
+        - name: RUN_DEADLINE_EPOCH
+          value: "${RUN_DEADLINE_EPOCH}"
+        - name: IDLE_AFTER_DONE
+          value: "1"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: WORKERS
           value: "${WORKERS}"
         - name: GZIP_LEVEL
