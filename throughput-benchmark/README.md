@@ -30,7 +30,7 @@ the tag exists in ECR before rendering.
 
 ```bash
 cd throughput-benchmark
-source .bench-env                    # compulsory, always first — see below
+source .bench-env                    # compulsory, always first — needs .bench-env.local, see below
 ./jsongz-gen/run-jsongz-gen.sh start # put gzip NDJSON source data to s3 for 30 min max for 6GB/s. Run once.
 
 # ingest/writer performance test
@@ -47,6 +47,22 @@ SUITE=snapshot FORMAT=both ./querybench/duckdb.sh
 ./build-deploy-cid.sh cleanup        # then wipe — see step 7
 ./monitoring/deploy-cid-monitor.sh stop
 ```
+
+**First time: create `.bench-env.local`.** The committed `.bench-env` holds
+placeholders (`account`) for the account-specific values, and sources the
+git-ignored `.bench-env.local` to override them. Without it, every S3 path,
+Glue call and the job role point at a bucket and role that don't exist:
+
+```bash
+cat > .bench-env.local <<'EOF'
+export AWS_ACCOUNT_ID=<your-account-id>
+export BUCKET_NAME=emr-on-eks-test-<your-account-id>-us-west-2
+export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::<your-account-id>:role/emr-on-eks-test-execution-role
+EOF
+```
+
+Keep account IDs, bucket names and ARNs out of `.bench-env` and out of
+committed results — they belong only in `.bench-env.local`.
 
 **`source .bench-env` is the most common way to lose ten minutes.** Without it
 the script aborts on missing `AWS_REGION` / `AWS_ACCOUNT_ID` / `BUCKET_NAME` /
@@ -1013,7 +1029,8 @@ either format.
 
 ```
 throughput-benchmark/
-├── .bench-env                       # sourceable env (region, bucket, role, knobs)
+├── .bench-env                       # sourceable env (region, knobs; account placeholders)
+├── .bench-env.local                 # git-ignored: your account ID, bucket, role ARN
 ├── flink-cid-executor.py            # generic SQL executor (copy of cdc-pipeline's)
 ├── flink-cid-paimon.yaml            # FlinkDeployment — Paimon sink
 ├── flink-cid-iceberg.yaml           # FlinkDeployment — Iceberg sink

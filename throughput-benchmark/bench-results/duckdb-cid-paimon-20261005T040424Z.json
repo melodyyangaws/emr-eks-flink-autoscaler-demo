@@ -3,12 +3,12 @@
   "duckdb_version": "1.5.6",
   "format": "paimon",
   "provenance": {
-    "glob": "s3://emr-on-eks-test-633458367150-us-west-2/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events/dt=*/bucket-*/*.parquet",
+    "glob": "s3://emr-on-eks-test-account-us-west-2/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events/dt=*/bucket-*/*.parquet",
     "paimon_files_at_start": 21760,
     "paimon_bytes_at_start": 3864348316292
   },
   "region": "us-west-2",
-  "table": "s3://emr-on-eks-test-633458367150-us-west-2/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events",
+  "table": "s3://emr-on-eks-test-account-us-west-2/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events",
   "partitions": {
     "today": "2026-10-05",
     "yesterday": "2026-10-04"
@@ -103,7 +103,7 @@
         "1658258513523"
       ],
       "metadata_location": null,
-      "error": "HTTPException: HTTP Error: HTTP GET error reading 'https://emr-on-eks-test-633458367150-us-west-2.s3.us-west-2.amazonaws.com/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events/dt%3D2026-10-05/bucket-60/data-38d0fcb8-8da0-4790-a852-0bbbc60aa2a9-93.parquet' in region 'us-west-2' (HTTP 400 Bad Request)\n\nExpiredToken: The provided token has expired.\n\nBad Request - this can be caused by the S3 region being set incorrectly.\n* Provided region is: \"us-west-2\""
+      "error": "HTTPException: HTTP Error: HTTP GET error reading 'https://emr-on-eks-test-account-us-west-2.s3.us-west-2.amazonaws.com/cid-warehouse-paimon/flink_cid_paimon_db.db/cid_events/dt%3D2026-10-05/bucket-60/data-38d0fcb8-8da0-4790-a852-0bbbc60aa2a9-93.parquet' in region 'us-west-2' (HTTP 400 Bad Request)\n\nExpiredToken: The provided token has expired.\n\nBad Request - this can be caused by the S3 region being set incorrectly.\n* Provided region is: \"us-west-2\""
     },
     "H6_hot_customer_agg": {
       "suite": "hot",
