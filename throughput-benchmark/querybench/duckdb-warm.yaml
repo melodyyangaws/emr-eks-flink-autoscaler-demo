@@ -1,0 +1,90 @@
+# Warm DuckDB server for one suite, rendered by duckdb-warm.sh (envsubst): a
+# long-lived pod holding one DuckDB process (duckdb_warm_server.py), the
+# counterpart of the always-up StarRocks cluster. Same node pins and CPU/RAM as
+# the old cold duckdb-job.yaml (removed 2026-10-18), so only "warm vs cold" changed, not the hardware.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${NAME}
+  namespace: ${NAMESPACE}
+  labels: {app: duckdb-warm, suite: "${SUITE}"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}                # never two servers for one suite
+  selector:
+    matchLabels: {app: duckdb-warm, suite: "${SUITE}"}
+  template:
+    metadata:
+      labels: {app: duckdb-warm, suite: "${SUITE}"}
+      annotations:
+        karpenter.sh/do-not-disrupt: "true" # consolidation would drop the warm cache
+    spec:
+      serviceAccountName: starrocks-sa      # reuses StarRocks' IRSA role, which already reads both warehouses
+      terminationGracePeriodSeconds: 5
+      affinity:
+        podAntiAffinity:                    # one server per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions: [{key: app, operator: In, values: [duckdb-warm]}]
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/arch: amd64                  # = StarRocks' BEs
+        karpenter.sh/nodepool: driver-nodepool     # = StarRocks (starrocks-placement.sh); never consolidated while busy
+        karpenter.k8s.aws/instance-family: m5      # = StarRocks' BEs: changing CPU family moved timings 20-36%
+        karpenter.k8s.aws/instance-size: 8xlarge   # 32 vcpu / 128Gi, the smallest m5 that holds 18 cpu / 72Gi
+        karpenter.sh/capacity-type: on-demand      # a spot reclaim would drop the warm cache
+      containers:
+      - name: duckdb
+        image: python:3.12-slim
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          pip install --quiet --no-cache-dir --root-user-action=ignore duckdb==${DUCKDB_VERSION} awscli
+          exec python3 -u /opt/bench/duckdb_warm_server.py
+        ports: [{containerPort: 8080, name: http}]
+        readinessProbe:
+          httpGet: {path: /health, port: 8080}
+          periodSeconds: 10
+          failureThreshold: 3
+        env:
+        - {name: AWS_REGION,           value: "${AWS_REGION}"}
+        - {name: AWS_DEFAULT_REGION,   value: "${AWS_REGION}"}   # awscli 1.x reads this one
+        - {name: BUCKET_NAME,          value: "${BUCKET_NAME}"}
+        - {name: SUITE,                value: "${SUITE}"}
+        - {name: ICEBERG_DB,           value: "${ICEBERG_DB}"}
+        - {name: TABLE_NAME,           value: "${TABLE_NAME}"}
+        - {name: PMNICE_TABLE_ROOT,    value: "${PMNICE_TABLE_ROOT}"}
+        - {name: PIN_SNAPSHOT,         value: "${PIN_SNAPSHOT}"}
+        - {name: DUCKDB_MEMORY_LIMIT,  value: "${DUCKDB_MEMORY_LIMIT}"}
+        - {name: DUCKDB_THREADS,       value: "${DUCKDB_THREADS}"}
+        - {name: SPILL_DIR,            value: /scratch}
+        - {name: DUCKDB_MAX_TEMP_SIZE, value: "${DUCKDB_MAX_TEMP_SIZE}"}
+        - {name: CACHE_MODE,           value: "${CACHE_MODE}"}
+        - {name: CACHE_DIR,            value: /cache}
+        - {name: CACHE_DISK_BYTES,     value: "${CACHE_DISK_BYTES}"}
+        - {name: CACHE_MEM_BYTES,      value: "${CACHE_MEM_BYTES}"}
+        resources:                          # requests = limits: Guaranteed QoS, no CPU burst over parity
+          requests: {cpu: "18", memory: 72Gi}
+          limits:   {cpu: "18", memory: 72Gi}
+        volumeMounts:
+        - {name: bench,   mountPath: /opt/bench}
+        - {name: scratch, mountPath: /scratch}
+        - {name: cache,   mountPath: /cache}
+      volumes:
+      - name: bench
+        configMap: {name: "${CM}"}          # duckdb_warm_server.py
+      - name: scratch                       # spill space, sized above DUCKDB_MAX_TEMP_SIZE
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: gp3
+              resources: {requests: {storage: 200Gi}}
+      - name: cache                         # CACHE_MODE=on_disk only: CACHE_DISK_BYTES plus headroom
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: ${CACHE_STORAGE_CLASS}   # gp3-fast: 1000 MB/s, see gp3-fast-sc.yaml
+              resources: {requests: {storage: ${CACHE_VOLUME}}}

@@ -12,7 +12,7 @@ Iceberg 1.10.0-amzn-1).
 
 **Both sides are append-only** — no primary key, no upsert, no merge-on-read
 deletes, no changelog producer. Each pipeline is `INSERT INTO cid_events
-SELECT …` over a datagen view with no stateful operator, so the planner cannot
+SELECT …` over the source view with no stateful operator, so the planner cannot
 produce a retraction: every record reaching either sink is a new row.
 
 ⚠ **Not comparable with pre-append-only (upsert-test-case) runs.** The update
@@ -35,15 +35,15 @@ source .bench-env                    # compulsory, always first — needs .bench
 
 # ingest/writer performance test
 ./build-deploy-cid.sh upload         # executor + SQL to S3, verified
-./build-deploy-cid.sh deploy both    # or paimon or iceberg, Append-only throughput test. read from s3 or self-generated source stream data per job.
-./monitoring/collect-metrics.sh paimon 30 3600  # or iceberg, collecting 30s metrics for 1h -> bench-results/
-./monitoring/deploy-cid-monitor.sh   # show side-by-side throughput metrics comparison on console
+./build-deploy-cid.sh deploy both    # or paimon or iceberg, Append-only throughput test. Each job reads the generator's files via its own SQS queue.
+./monitoring/deploy-cid-monitor.sh   # side-by-side monitor pod + 30 s CSV collectors per RUNNING job -> bench-results/
 
 # query/reader performance test
+./querybench/duckdb-warm.sh up       # once: the two warm DuckDB servers
 SUITE=hot ./querybench/starrocks.sh  # hot suites need the cid Flink jobs - writers RUNNING
-SUITE=hot FORMAT=both ./querybench/duckdb.sh
+SUITE=hot ./querybench/duckdb-warm.sh run      # after StarRocks, never at the same time
 SUITE=snapshot ./querybench/starrocks.sh # stops the writers, leaves them suspended
-SUITE=snapshot FORMAT=both ./querybench/duckdb.sh
+SUITE=snapshot ./querybench/duckdb-warm.sh run
 ./build-deploy-cid.sh cleanup        # then wipe — see step 7
 ./monitoring/deploy-cid-monitor.sh stop
 ```
@@ -71,12 +71,9 @@ not running the script's defaults when you source it:
 
 | | script default | `.bench-env` |
 |---|---|---|
-| `JOB_PARALLELISM` | 128 | **160** |
+| `JOB_PARALLELISM` | 128 | **320** |
 | `PAIMON_BUCKETS` | -1 (unaware-bucket) | -1 |
-| `SOURCE_ROWS_PER_SECOND` | 2,000,000 | **2,097,152** |
-| `HOT_KEY_FRACTION` | 0 (uniform) | **80** |
 | `ICEBERG_COMPAT` | false | **true** |
-| `SOURCE_MODE` | datagen | **s3json** — see [Feeding the Flink jobs from these files](#feeding-the-flink-jobs-from-these-files) |
 
 `PAIMON_BUCKETS` is listed because it changes the write path: the default `-1`
 is an unaware-bucket append table with no shuffle, like the Iceberg side. Set
@@ -87,11 +84,12 @@ is an unaware-bucket append table with no shuffle, like the Iceberg side. Set
 ## Deployment steps
 
 Run every step from `throughput-benchmark/` in one shell that has done
-`source .bench-env` first. It points the generator (`OUTPUT_URI`) and the jobs
-(`S3JSON_SOURCE_PATH`) at the **same** landing prefix, and that prefix should be
-**fresh per run**: the Flink file source lists the whole prefix at JobManager
-startup, and a large backlog makes the JM crash-loop (exit 239, ask timeout).
-Bump the `-rN` suffix in `.bench-env` for each run.
+`source .bench-env` first. It sets the generator's landing prefix
+(`OUTPUT_URI`). The jobs never list it; they read the files announced on SQS.
+The prefix is **fixed**: the bucket's S3 event notifications fire for
+`cid-landing-jsongz-r4/` only, so a file written anywhere else is never read.
+What is reset between runs is the **queues** — see
+[Reading through SQS](#reading-through-sqs).
 
 ### 1. Check capacity before deploying
 
@@ -108,18 +106,18 @@ Keep total requests under ~80% of nodepool allocatable. Above that the pods
 evict each other in a loop: a displaced writer TM's replacement hits
 `FailedScheduling: Insufficient cpu` and the job restarts.
 
-### 2. Start the data generator (`SOURCE_MODE=s3json` only)
+### 2. Start the data generator
 
-In `s3json` mode the jobs read the `.json.gz` files this lands, so start it
-before or alongside the writers, or they have nothing to read. Skip this step
-with `SOURCE_MODE=datagen`.
+The jobs read the `.json.gz` files this lands, so start it before or alongside
+the writers, or they have nothing to read. `OUTPUT_URI` must be under
+`s3://$BUCKET_NAME/cid-landing-jsongz-r4/`, the only prefix with notifications.
 
 ```bash
-./jsongz-gen/run-jsongz-gen.sh start                # Deployment, 3 replicas; pods write DURATION_SECONDS (1..1800, max 30 min), then idle
-./jsongz-gen/run-jsongz-gen.sh scale 4              # change replicas (rate = N x 500K rows/s)
+./jsongz-gen/run-jsongz-gen.sh start                # Job, 3 pods; each writes DURATION_SECONDS (1..1800, max 30 min), then exits and its node is released
+./jsongz-gen/run-jsongz-gen.sh scale 4              # change Job parallelism (rate = N x 500K rows/s)
 ./jsongz-gen/run-jsongz-gen.sh status               # per-pod rows/s, MB/s
 ./jsongz-gen/run-jsongz-gen.sh logs                 # follow the first pod (POD=N for another)
-./jsongz-gen/run-jsongz-gen.sh stop                 # scale to 0; written files stay
+./jsongz-gen/run-jsongz-gen.sh stop                 # end a run early (deletes the Job); written files stay
 ```
 
 Knobs, sizing and file layout:
@@ -140,9 +138,10 @@ artifact:
 | S3 key | from | read by |
 |---|---|---|
 | `flink/scripts/flink-cid-executor.py` | `flink-cid-executor.py` | `spec.job.jarURI`, which EMR copies into `/opt/flink/usrlib` |
-| `flink/cid-sql/<fmt>/00-source.sql` | `sql-scripts/common/01-datagen-source.sql` or `01-s3json-source.sql`, picked by `SOURCE_MODE` | the executor's `--sql-dir` |
+| `flink/cid-sql/<fmt>/00-source.sql` | `01-raw-s3sqs.sql` **concatenated with** `01-parse-s3json.sql` (both in `sql-scripts/common/`). The same file for both formats | the executor's `--sql-dir` |
 | `flink/cid-sql/<fmt>/02..04-*.sql` | `sql-scripts/<fmt>/` (synced with `--delete`) | the executor's `--sql-dir` |
-| `flink/cid-sql/common/01-{datagen,s3json}-source.sql` | `sql-scripts/common/` (both, whatever `SOURCE_MODE` is; synced with `--delete`) | nothing at runtime — a full copy of the script set; no `--sql-dir` points here, since a second source file in `<fmt>/` would define `datagen_source` twice |
+| `flink/cid-sql/common/01-*.sql` | `sql-scripts/common/` (synced with `--delete`) | nothing at runtime — a copy of the two fragments; no `--sql-dir` points here, since neither runs on its own |
+| `flink/jars/sqs-delta-filename.jar` | `sqs-delta-filename/target/sqs-delta-filename-*.jar`, rebuilt with `mvn -q package` when missing or older than `src/`/`pom.xml` | `ADD JAR '${SQS_SOURCE_JAR}'` in `00-source.sql`, on the JobManager |
 
 It runs no `kubectl`. A missing or zero-length object stops it at the shell
 with `[ERROR] NOT IN S3` / `ZERO-LENGTH`, instead of 10 minutes later as a
@@ -167,33 +166,37 @@ In case of stopping jobs:
 ```bash
 ./build-deploy-cid.sh cleanup paimon  # or: iceberg, or: both
 ```
-Then start a collector:
-
-```bash
-# ./monitoring/collect-metrics.sh paimon|iceberg [interval-s] [duration-s]
-./monitoring/collect-metrics.sh iceberg 30 3600 &                   # default LOCAL_PORT=8091
-LOCAL_PORT=8092 ./monitoring/collect-metrics.sh paimon 30 3600 &
-```
-**`LOCAL_PORT` is mandatory on a second concurrent collector.** Both default to
-8091 for their `kubectl port-forward`, so the second one reads the *first* job's
-samples. Output: `bench-results/cid-<format>-<UTC stamp>.csv`.
+Once the jobs are RUNNING, start monitoring (step 5): it also starts the
+per-job CSV collectors.
 
 ### 5. Monitoring
 
 ```bash
-./build-deploy-cid.sh monitor         # FlinkDeployments + pods, one shot
+kubectl get flinkdeployment,pods -n emr-flink                           # FlinkDeployments + pods, one shot
 kubectl port-forward svc/flink-cid-paimon-rest 8081:8081 -n emr-flink   # one job's REST/UI
 ```
 
-Optional side-by-side monitor — a plain `Deployment` running the Python in
-`monitoring/` (forked from `cdc-pipeline/monitoring`; record counts here are
-operator-scoped, so the chained Iceberg job reports real rows/s):
+`deploy-cid-monitor.sh` does both kinds of monitoring in one step:
+- **Side-by-side monitor:** a plain `Deployment` running the Python in
+  `monitoring/` (forked from `cdc-pipeline/monitoring`; record counts here are
+  operator-scoped, so the chained Iceberg job reports real rows/s).
+- **CSV collectors:** `collect-metrics.sh` started locally, in the background,
+  for each job that is RUNNING: Paimon on `LOCAL_PORT` 8091, Iceberg on 8092.
+  Output: `bench-results/cid-<format>-<UTC stamp>.csv`, logs
+  `bench-results/collect-<format>-<stamp>.log`. Re-running the script replaces
+  the collectors; `stop` ends them. A collector exits when its job stops or
+  after `COLLECT_DURATION`.
 
 ```bash
-./monitoring/deploy-cid-monitor.sh        # upload code, apply, restart, wait
+./monitoring/deploy-cid-monitor.sh        # upload code, apply, restart, wait, start collectors
 kubectl logs -f deployment/flink-cid-monitor -n emr-flink
-./monitoring/deploy-cid-monitor.sh stop   # scale to 0; re-run without args to start
+./monitoring/deploy-cid-monitor.sh stop   # scale to 0 and stop collectors; re-run without args to start
+COLLECT=0 ./monitoring/deploy-cid-monitor.sh                # monitor pod only
+COLLECT_INTERVAL=15 COLLECT_DURATION=3600 ./monitoring/deploy-cid-monitor.sh
 ```
+`collect-metrics.sh paimon|iceberg [interval-s] [duration-s]` still runs on its
+own. A second concurrent copy needs its own `LOCAL_PORT`: both default to 8091,
+so the second one would read the *first* job's samples.
 The script uploads the three monitor files to
 `s3://${BUCKET_NAME}/flink/monitoring/` and the pod fetches them at boot with
 `boto3` under its IRSA service account. After a code change, just re-run
@@ -228,23 +231,24 @@ Paimon 756k rec/s (+58.4%), while point samples gave ~1.75M vs ~830k.
 
 ### 6. Run the query benchmark (the read half)
 
-Both tables must hold rows. The **hot** suite reads the last minutes of data, so
+Both tables must hold rows. The **hot** suite reads the last 30 s of data, so
 it needs the writers **RUNNING**; the **snapshot** suite stops the writers
 itself and leaves them suspended. So run both engines' hot suites first, then
 both snapshot suites:
 
 ```bash
-SUITE=hot                  ./querybench/starrocks.sh   # arms: paimon, pmn_as_iceberg, iceberg
-SUITE=hot      FORMAT=both ./querybench/duckdb.sh
-SUITE=snapshot             ./querybench/starrocks.sh   # suspends the writers
-SUITE=snapshot FORMAT=both ./querybench/duckdb.sh
+./querybench/duckdb-warm.sh up                        # once: the two warm DuckDB servers
+SUITE=hot      ./querybench/starrocks.sh              # arms: paimon, pmn_as_iceberg, iceberg
+SUITE=hot      ./querybench/duckdb-warm.sh run        # one engine after the other, never at once
+SUITE=snapshot ./querybench/starrocks.sh              # suspends the writers
+SUITE=snapshot ./querybench/duckdb-warm.sh run
 ```
 
 `SUITE=all` (the default) runs hot, stops the writers, then snapshot — fine for
 one engine, but the second engine's hot suite would then run against stopped
 writers. Other knobs: `RUNS=3`, `WARMUP=1`, `ARMS=...`, `SUSPEND_WRITERS=0`
-(StarRocks); `./querybench/duckdb.sh clean` / `debug [arm]` (DuckDB). Output:
-`bench-results/starrocks-<stamp>.csv` and `bench-results/duckdb-<stamp>.csv`,
+(StarRocks); `./querybench/duckdb-warm.sh status` / `down` (DuckDB). Output:
+`bench-results/starrocks-<stamp>.csv` and `bench-results/duckdb_warm-<stamp>.csv`,
 same columns. Details:
 [Query benchmarks — the read half](#query-benchmarks--the-read-half).
 
@@ -256,7 +260,7 @@ and is not.
 
 ```bash
 # 7a. Stop the writers FIRST — the generator too, if it is still running.
-./jsongz-gen/run-jsongz-gen.sh clean            # delete the Deployment + ConfigMap; files stay
+./jsongz-gen/run-jsongz-gen.sh clean            # delete the Job + ConfigMap; files stay
 # Then the Flink writers — suspend, or delete with `cleanup` (prompts "yes").
 kubectl patch flinkdeployment flink-cid-paimon -n emr-flink --type=merge \
   -p '{"spec":{"job":{"state":"suspended"}}}'
@@ -307,7 +311,8 @@ aws s3 rm --recursive "s3://$BUCKET_NAME/cid-warehouse-paimon/"
 aws s3 rm --recursive "s3://$BUCKET_NAME/cid-warehouse-iceberg/"
 aws s3 rm --recursive "s3://$BUCKET_NAME/flink/cid-paimon/"
 aws s3 rm --recursive "s3://$BUCKET_NAME/flink/cid-iceberg/"
-aws s3 rm --recursive "${OUTPUT_URI}/"        # this run's landing prefix (s3json)
+aws s3 rm --recursive "${OUTPUT_URI}/"        # this run's landing prefix
+# then purge both queues — see "Reading through SQS"
 # Optional, and only if you want a genuinely cold next run:
 aws s3 rm --recursive "s3://$BUCKET_NAME/flink/logs/cid-paimon/"
 aws s3 rm --recursive "s3://$BUCKET_NAME/flink/logs/cid-iceberg/"
@@ -360,8 +365,16 @@ harnesses.
   Paimon's Iceberg export, `ICEBERG_COMPAT=true`), `iceberg` (Iceberg reader →
   native Iceberg table). paimon vs pmn_as_iceberg changes only the reader;
   pmn_as_iceberg vs iceberg only the writer.
-- **`querybench/duckdb.sh`**, two arms: `iceberg` (`iceberg_scan`) and `paimon`
-  (`read_parquet`), one Kubernetes Job per arm.
+- **`querybench/duckdb-warm.sh`**, two arms, both `iceberg_scan`, because DuckDB
+  has no Paimon reader: `iceberg` (native Iceberg table) and `paimon` (Paimon's
+  Iceberg export, so `ICEBERG_COMPAT=true` is required). The reader is the same
+  on both sides, so only the writer differs. That makes it the DuckDB
+  counterpart of StarRocks' `pmn_as_iceberg` vs `iceberg`. **Warm**: one
+  long-lived server per suite, like the always-up StarRocks cluster; see "Warm
+  DuckDB" below.
+  - History: the cold harness (`duckdb.sh`, a fresh `duckdb` process timed per
+    attempt, a 20-30 s floor on the hot queries) was removed on 2026-10-18 and
+    is in git history.
 
 Prerequisites: both tables hold rows, the FE pod is up, and `envsubst` exists
 for DuckDB (`brew install gettext`). StarRocks creates its catalogs idempotently
@@ -369,22 +382,133 @@ and aborts if it cannot read a row through each.
 
 ### Running it
 
-The **hot** suite reads the last minutes of data, so it needs the writers
+The **hot** suite reads the last 30 s of data, so it needs the writers
 **running**. The **snapshot** suite needs them **stopped**: it suspends them
 itself and leaves them suspended. So run both engines' hot suites, then both
 snapshot suites:
 
 ```bash
-SUITE=hot                  ./querybench/starrocks.sh
-SUITE=hot      FORMAT=both ./querybench/duckdb.sh
-SUITE=snapshot             ./querybench/starrocks.sh   # suspends the writers
-SUITE=snapshot FORMAT=both ./querybench/duckdb.sh
+./querybench/duckdb-warm.sh up                         # once: the two warm DuckDB servers
+SUITE=hot      ./querybench/starrocks.sh
+SUITE=hot      ./querybench/duckdb-warm.sh run         # after StarRocks, never at the same time
+SUITE=snapshot ./querybench/starrocks.sh               # suspends the writers
+SUITE=snapshot ./querybench/duckdb-warm.sh run
 ./build-deploy-cid.sh deploy both                      # resume later: a fresh, stateless restart
 
 ARMS="paimon iceberg" ./querybench/starrocks.sh        # e.g. with ICEBERG_COMPAT off
-./querybench/duckdb.sh debug iceberg   # idle pod, same spec; prints its `--shell` command
-./querybench/duckdb.sh clean           # Jobs + ConfigMaps, legacy names included
+./querybench/duckdb-warm.sh status                     # health, busy, cache bytes
+./querybench/duckdb-warm.sh down                       # servers + their cache volumes
 ```
+
+### Warm DuckDB (`duckdb-warm.sh`)
+
+One long-lived server per suite (`duckdb-warm-hot`, `duckdb-warm-snapshot`,
+`duckdb-warm.yaml`), each holding a single DuckDB process
+(`duckdb_warm_server.py`) for the pod's life. Extensions, the S3 secret, Parquet
+footers and the block cache carry over from query to query, as they do on a
+StarRocks cluster that is already up.
+
+| | StarRocks (live, 2026-10-13) | warm DuckDB |
+|---|---|---|
+| CPU / RAM | 3 BEs × 6 cpu / 24Gi limit = 18 cpu / 72Gi, m5 | one pod, 18 cpu / 72Gi, m5.8xlarge |
+| process | always up | always up |
+| data cache (on, both defaults) | `datacache`: 3 × 150 GiB disk (gp3, 125 MB/s) + 3 × ~4.2 GB memory; the io adaptor sends reads to S3 when the disk saturates | `cache_httpfs` on disk (`CACHE_MODE=on_disk`): 450 GiB cap (`CACHE_DISK_BYTES`), LRU, on `gp3-fast` (1000 MB/s), + 12.5 GB memory read cache (`CACHE_MEM_BYTES`) |
+| metadata | FE catalog caches | `parquet_metadata_cache`, `enable_http_metadata_cache`, cache_httpfs metadata/glob/handle caches |
+| timing | server-side (audit log), planning included | in-process around execute + fetch, planning included |
+| arms | serial on one cluster | serial on one process |
+
+**Why DuckDB's cache disk is faster.** DuckDB's cache is on a `gp3-fast`
+volume (16000 IOPS, 1000 MB/s; `querybench/gp3-fast-sc.yaml`), not default gp3.
+- **On default gp3 the cache made DuckDB slower than S3.** cache_httpfs serves
+  every hit from the disk, never S3, so on 2026-10-17 the snapshot S3 pass ran
+  for hours at 130 MB/s from the cache disk, 0 MB/s from S3 and 0.3 cores.
+- **StarRocks' BEs stay on default gp3.** Their `enable_datacache_io_adaptor`
+  sends reads back to S3 when the disk saturates, and cache_httpfs has nothing
+  like it.
+- **`CACHE_MODE=in_mem` keeps only the memory cache.**
+
+`DUCKDB_MEMORY_LIMIT` is 44GB, not the removed cold harness's 56GB: DuckDB does not
+count the cache_httpfs memory, and 44 + 11.7 GB leaves the same headroom under
+72Gi. Resolving and pinning `${TABLE}` and refreshing the secret happen outside
+the timer, as StarRocks' catalog refresh does. RUNS/WARMUP, the median
+(`qb_median`) and the timeouts (`qb_query_timeout`) are `lib.sh`'s, shared with
+`starrocks.sh`; the server applies the ZERO_SCAN guard to each pass.
+
+```bash
+./querybench/duckdb-warm.sh up                    # both servers; ~5-10 min (Karpenter + pip + extensions)
+./querybench/duckdb-warm.sh status                # health, busy, cache bytes
+SUITE=hot      ./querybench/duckdb-warm.sh run    # writers running
+SUITE=snapshot ./querybench/duckdb-warm.sh run    # suspends the writers, like the others
+./querybench/duckdb-warm.sh clear-cache [suite]   # a cold cache on demand
+./querybench/duckdb-warm.sh down                  # deletes the servers and their cache volumes
+```
+
+**Running a benchmark that survives the laptop.** `./querybench/qb-runner.sh
+start '<cmd>'` runs one step in an in-cluster Job (`qb-runner`, on
+`driver-nodepool`, `do-not-disrupt`), so closing the laptop does not stop it.
+- **Permissions:** a namespace Role only (pod exec / port-forward, deployment
+  restarts, FlinkDeployment read / patch), and **no AWS credentials**. Pin
+  `SNAPSHOT_DT` and `SNAPSHOT_S4_FROM`/`_TO` (or `HOT_TO`) so `lib.sh` never
+  calls aws.
+- **`wait_for_sr_run <RUN_ID>`** at the start of `<cmd>` waits until that
+  `starrocks.sh` run has nothing left in the FE pod, so the engines never
+  overlap.
+- **`logs`** follows the output, **`fetch`** copies the pod's `bench-results/`
+  into the local one, **`delete`** removes the Job, its ConfigMap and Secret.
+  The pod keeps its results for 7 days.
+
+```bash
+./querybench/qb-runner.sh start 'wait_for_sr_run <RUN_ID>; STAMP=<stamp> SUITE=snapshot SNAPSHOT_DT=2026-10-10 \
+  SNAPSHOT_S4_FROM="2026-10-10 15:06:00" SNAPSHOT_S4_TO="2026-10-10 15:09:00" ./querybench/duckdb-warm.sh run'
+./querybench/qb-runner.sh logs
+./querybench/qb-runner.sh fetch
+```
+
+**Placement.** Both engines run on Karpenter's `driver-nodepool` (on-demand,
+consolidates only empty nodes). Warm DuckDB is pinned there by `duckdb-warm.yaml`.
+StarRocks is pinned by `./querybench/starrocks-placement.sh`:
+- **What it patches:** the live StarRocksCluster, to m5.2xlarge with one BE per
+  node and the FE off the BE nodes.
+- **No auto-instrumentation:** it also opts the FE and BEs out of the CloudWatch
+  add-on's OpenTelemetry injection, which had put a Java agent in StarRocks only.
+- **Run it again after any `helm upgrade` from `cdc-pipeline/`,** which does not
+  carry these settings.
+- **`show`** prints each pod's node and `otel=none|INJECTED`.
+
+**Comparing the two engines.** `querybench/compare.py` builds one markdown table
+per suite from both CSVs. It shows median seconds per arm and like-for-like
+ratios: DuckDB ÷ StarRocks on the same storage, and Iceberg ÷ Paimon-export
+inside each engine. Cells that are not OK are listed.
+
+```bash
+./querybench/compare.py --sr bench-results/starrocks-<STAMP>.csv \
+                        --duck bench-results/duckdb_warm-<STAMP>.csv [--suite snapshot]
+```
+
+**Fair-comparison rules.**
+- **One engine at a time.** `run` refuses while `starrocks.sh` or the other
+  warm server is busy (`ALLOW_CONCURRENT=1` overrides). There are two
+  servers but StarRocks has one cluster, so they must never run together, and
+  the hot/snapshot writer states already keep them apart.
+- **Start both caches in the same state.** StarRocks' datacache persists across
+  BE restarts and holds earlier runs' blocks. Either empty it (each BE's
+  `storage/datacache/`, then restart the BE) and `clear-cache` DuckDB, or warm
+  both with the same discarded pass (`WARMUP`).
+- **Both caches are on, as both engines' defaults.** StarRocks keeps its
+  datacache (150 GiB disk + ~3.8 GB memory per BE), and warm DuckDB keeps a
+  matching disk + memory cache (`CACHE_MODE=on_disk`, see below).
+- **S4 runs with a narrower scan on StarRocks.** `S4_wide_json.sql` carries
+  `-- bench: io-tasks=1`, so `starrocks.sh` sets
+  `connector_io_tasks_per_scan_operator = 1` for that one query (2 elsewhere).
+  - With the cache on, S4's wide `event_json` scan filled the whole 17.5 GiB
+    query pool on a BE (`MEM_LIMIT_EXCEEDED` on both passes, 2026-10-17).
+  - With the cache off it held 0.2-0.5 GB, but turning the cache off would make
+    the two engines' setups differ.
+- Output: `bench-results/duckdb_warm-<STAMP>.csv` (`engine=duckdb_warm`) and
+  `.log`, every pass and the pinned scan per query.
+- DuckDB **2.0 is not released** (PyPI has 2.0.0 dev builds only, 2026-10);
+  `DUCKDB_VERSION` defaults to stable 1.5.6, and community extensions such as
+  cache_httpfs are not published for dev builds.
 
 `SUITE=all` (the default) runs hot, stops the writers, then runs snapshot: right
 for one engine alone, wrong for two, since the second engine's hot suite would
@@ -402,9 +526,11 @@ fresh, so nothing timed there is quotable.
 |---|---|---|
 | `SUITE` / `RUNS` / `WARMUP` | `all` / `3` / `1` | `hot`\|`snapshot`\|`all`; timed / discarded passes; result = median of timed passes |
 | `SUSPEND_WRITERS` / `FLINK_JOBS` | `1` / `flink-cid-paimon flink-cid-iceberg` | `0` = never touch the writers; which writers are stopped and recorded |
-| `HOT_TO`, `HOT_FROM_1M`/`5M`/`10M`, `HOT_DT` | now, now − 1/5/10 min, `HOT_TO`'s date (UTC) | hot windows; pin to rerun an earlier one |
+| `HOT_WINDOW_SECONDS` | `30` | hot window length, shared by H1-H6 (~90M rows at ~3M rows/s) |
+| `HOT_TO`, `HOT_FROM`, `HOT_DT` | now, `HOT_TO` − `HOT_WINDOW_SECONDS`, `HOT_TO`'s date (UTC) | the hot window; pin to rerun an earlier one |
 | `SNAPSHOT_DT` | oldest `dt` in **both** tables | the snapshot partition |
-| `SNAPSHOT_S4_FROM` / `_TO` | `04:30:00` / `05:00:00` | S4's slice, on `SNAPSHOT_DT` + 1 day |
+| `SNAPSHOT_S4_MINUTES` | `3` | width of S4's `eventTimeDT` slice, centred in the committed span |
+| `SNAPSHOT_S4_FROM` / `_TO` | derived from the commit history | pin S4's slice; both, as `YYYY-MM-DD HH:MM:SS` |
 | `OUT_DIR` / `STAMP` | `bench-results/` / UTC now | |
 | `NAMESPACE`, `FE_POD`, `PAIMON_DB`, `ICEBERG_DB`, `TABLE_NAME` | `emr-flink`, `kube-starrocks-fe-0`, `flink_cid_paimon_db`, `flink_cid_iceberg_db`, `cid_events` | |
 | `ARMS`, `AUDIT` (StarRocks) | all three; `/opt/starrocks/fe/log/fe.audit.log` | arms run serially |
@@ -419,22 +545,23 @@ snapshot**), so `TIMEOUT` means the same thing on both.
 
 ### Outputs
 
-`bench-results/starrocks-<STAMP>.csv` and `bench-results/duckdb-<STAMP>.csv`,
+`bench-results/starrocks-<STAMP>.csv` and `bench-results/duckdb_warm-<STAMP>.csv`,
 one row per arm × query, same columns:
 
 ```
 stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
 ```
 
-`status`: StarRocks `ok`/`ERR`/`MISSING`; DuckDB `OK`/`ERROR`/`TIMEOUT`/`ZERO_SCAN`.
+`status`: StarRocks `OK`/`ERROR`/`MISSING`; DuckDB `OK`/`ERROR`/`TIMEOUT`/`ZERO_SCAN`.
 A failed query has an empty `median_ms`, never 0. `scan_rows`/`scan_bytes` are
 the FE's `ScanRows`/`ScanBytes` medians, empty on DuckDB (no such counters). The
 StarRocks CSV adds `#` lines per suite: writer state (`# suite=… writers: …`),
 run parameters (`dt`, `runs`, `warmup`, `arms`, `run_id`), and one `# state` line
 per arm with the partition's row count from metadata (plus `$files` for the
 Iceberg-reader arms). Its console table adds `ice/pai` and `pmn/pai` ratios (>1 =
-slower than paimon). DuckDB appends each arm's pod log to
-`bench-results/duckdb-<arm>-<STAMP>.log`, headed `# ---- arm=… suite=… job=… writers: …`.
+slower than paimon). Warm DuckDB writes every pass (time, status, first row, the
+pinned scan) to `bench-results/duckdb_warm-<STAMP>.log`, headed
+`# ---- suite=… arms=… writers: …` and the server's `/health`.
 
 ### The queries
 
@@ -443,12 +570,12 @@ order; add a file and it runs. Each header says what to read it against:
 
 | Query | Measures | Read it against |
 |---|---|---|
-| `H1_freshness` | newest row + count, last 5 min | sanity: `rows_in_window = 0` = writers down, every hot number an empty scan. Lag = `HOT_TO` − `newest_row` |
-| `H2_hot_count_1m` | `COUNT(*)`, last minute | the planning floor: almost all listing and pruning |
-| `H3_hot_needle_uuid` | uuid that cannot exist, 5 min | control: uuid prunes nothing, so a full window scan. Much faster here than on H4 = winning on aggregation, not the scan |
+| `H1_freshness` | newest row + count, last 30 s | sanity: `rows_in_window = 0` = writers down, every hot number an empty scan. Lag = `HOT_TO` − `newest_row` |
+| `H2_hot_count` | `COUNT(*)`, same window | the planning floor: no value columns, almost all listing and pruning |
+| `H3_hot_needle_uuid` | `SUBSTR(uuid, 20, 4) = '0000'` (never true for a UUIDv7), 30 s | control: the function defeats min/max pruning, so a full window scan of `uuid`. A literal `uuid = '...'` would prune almost every file, because UUIDv7 is time-ordered. Much faster here than on H4 = winning on aggregation, not the scan |
 | `H4_hot_narrow_agg` | `GROUP BY eventId`, 1 of 35 cols | projection pushdown; H5/H4 is the fat-column tax, compare it across arms |
 | `H5_hot_wide_json` | bytes of the ~3.3 KB `event_json` | most sensitive to file count/size; `payload_bytes` must match across engines |
-| `H6_hot_customer_agg` | `COUNT(DISTINCT)` per customer, 10 min | hash table and spill, not the read path |
+| `H6_hot_customer_agg` | `COUNT(DISTINCT)` per customer, 30 s | hash table and spill, not the read path |
 | `S1_partition_count` | full-partition `COUNT(*)` | the normaliser; no metadata shortcut, caches off |
 | `S2_narrow_agg` | H4's shape over the partition | S2 − S1 = the aggregate's cost at constant scan |
 | `S3_risk_distinct` | `COUNT(DISTINCT customerId)` by risk level | the memory-pressure query |
@@ -458,7 +585,7 @@ Placeholders: `${TABLE}` (StarRocks: `cid_events` after `SET CATALOG`/`USE`;
 DuckDB: resolved in the pod per arm and query), `${BYTES_FN}` (`LENGTH` /
 `STRLEN`, both count bytes; DuckDB's `LENGTH` counts characters and
 `octet_length()` is BLOB-only), and the window literals `${HOT_DT}`,
-`${HOT_FROM_1M|5M|10M}`, `${HOT_TO}`, `${SNAPSHOT_DT}`, `${S4_FROM}`, `${S4_TO}`.
+`${HOT_FROM}`, `${HOT_TO}`, `${SNAPSHOT_DT}`, `${S4_FROM}`, `${S4_TO}`.
 A `${...}` surviving render is fatal: on neither engine is it a syntax error, it
 binds and returns a wrong answer. `-- bench:` flags feed DuckDB's zero-scan
 guard: `allow-zero-rows` (H3), `leading-col-is-label` (H4, H6, S2, S3).
@@ -474,11 +601,33 @@ empty scan reports as the fastest result.
 delimited S3 `LIST` per table root): the most-closed partition every arm can
 read. Not "yesterday", which is often still being written (event time lags
 ingest) or absent, pruning to an instant empty win. S1-S3 are bounded by `dt`
-alone: full-partition scans. S4 adds a 30-minute `ingestionTime` slice, since
-unbounded it ran 18-41 min per pass per arm; `ingestionTime` prunes files because
-it is monotonic with write order. The slice sits on the **ingestion** day,
-`SNAPSHOT_DT` + 1: `dt` derives from event time, rows of `dt=D` are written on
-D+1, and a slice inside D matches zero rows.
+alone: full-partition scans. S4 adds a time slice, since unbounded it ran 18-41
+min per pass per arm.
+
+**S4 slices on `eventTimeDT`, not `ingestionTime`.** The comparison needs the
+same rows in the same time slot of the same partition in every format.
+- **`eventTimeDT` is set by the generator,** so both tables hold exactly the
+  same rows in any `eventTimeDT` window.
+- **`dt` is derived from it,** so the window is always inside the partition.
+- **`ingestionTime` is each writer's own processing time.** The same
+  `ingestionTime` window held 471M rows in Paimon and 480M in Iceberg
+  (2026-10-17).
+- **A slice sized by share of rows was rejected for the same reason.**
+
+The window is `SNAPSHOT_S4_MINUTES` (default 3) wide and is **derived**, since
+each run happens at a different date and time.
+- **It is centred in the span where both tables were committing.** That span
+  comes from the snapshots in the Iceberg table's `metadata.json` and Paimon's
+  retained snapshot files.
+- **The span is clipped** to `SNAPSHOT_DT`'s own day, with 120 s (two
+  checkpoints) kept clear of each end.
+- **Event time runs ahead of commit time by the ingest lag,** so the centre of
+  the committed span is well inside the generator's run.
+- **Size:** at ~2.6M rows/s, 3 min is ~465M rows. S4's own `n` is the exact
+  count and must be equal on every arm.
+- **Writers must be stopped and drained,** or the newest rows are not in every
+  table yet.
+- **Example:** for 2026-10-10 the window is `[15:06:00, 15:09:00)`.
 
 **The writers must be stopped.** Live, the "closed" partition is a moving target
 (compaction and commit contention): the same 944,023,427 rows and DuckDB query
@@ -511,41 +660,49 @@ refuses to record one during which it changed.
 - The Paimon export is read via a `hadoop` Iceberg catalog: Paimon registers it
   in Glue with `PaimonStorageHandler`, which StarRocks' Glue catalog cannot load.
 
-### DuckDB: one Job per arm
+### DuckDB: one warm server per suite
 
-- **Sizing.** One on-demand `m5.8xlarge` per arm, 18 cpu / 72Gi, requests =
-  limits: CPU/RAM parity with StarRocks' 3 BEs (3 × 6 cpu / 24Gi), same family
-  and arch. Not locality parity (one node's memory bandwidth and NIC). Arms land
-  on separate nodes (anti-affinity); pods carry `karpenter.sh/do-not-disrupt`.
-- **One script, two roles.** On the laptop `duckdb.sh` renders the queries via
-  `lib.sh` and ships them plus itself in one ConfigMap; in the pod `--in-pod`
-  fills `${TABLE}`, times each query and prints CSV rows after `===CSV===`.
-- **IRSA via STS.** `credential_chain` cannot use IRSA in this pod, so before
-  **every** attempt the runner calls `sts assume-role-with-web-identity` and
-  writes a `CREATE SECRET` (a secret minted once expired mid-run).
-- **`PIN_SNAPSHOT=1`.** The writer commits a `metadata.json` every ~60 s and keeps
-  ~4; even a fresh one is GC'd within ~60 s and 404s mid-scan. Each query copies it
-  to `s3://…/duckdb-cid-pinned/<RUN_TAG>/` (manifests and data are retained ~1 h),
-  and the pod deletes that prefix on exit.
-- **Timing and capture.** Timed around the `duckdb` process, prelude included
-  (constant across arms). Rows are captured with `.output` *after* the prelude,
-  because `CREATE SECRET` prints a `true` row that would read as the result and
-  disarm the zero-scan guard. No rows, or a leading `0`/`NULL` without the label
-  flag, is `ZERO_SCAN`: the predicate matched nothing, **not** a win.
+- **Sizing.** One long-lived Deployment per suite (`duckdb-warm-hot`,
+  `duckdb-warm-snapshot`), each one on-demand `m5.8xlarge` on `driver-nodepool`,
+  18 cpu / 72Gi, requests = limits.
+  - **CPU/RAM parity** with StarRocks' 3 BEs (3 × 6 cpu / 24Gi), same family and
+    arch. Not locality parity (one node's memory bandwidth and NIC).
+  - The servers land on separate nodes (anti-affinity), and the pods carry
+    `karpenter.sh/do-not-disrupt`.
+- **One process.** `duckdb_warm_server.py` holds one DuckDB connection for the
+  pod's life and runs one query at a time.
+  - `duckdb-warm.sh` renders the queries via `lib.sh` on the laptop (or in
+    `qb-runner`) and submits each pass over a port-forward.
+  - The server fills `${TABLE}` and times execute + fetch inside the process.
+- **Pass-major, like StarRocks.** S1-S4 warm-up, then S1-S4 timed, one job per
+  pass; the median is taken by the client. Query-major order (S1 S1, S2 S2, ...)
+  let each DuckDB timed pass follow its own warm-up while StarRocks' S4 warm-up
+  had pushed S1-S3 out of its cache.
+- **A client deadline per pass:** the query timeout + 5 min. The server's own
+  timeout (`con.interrupt`) did not stop an I/O-bound scan on 2026-10-17. On the
+  deadline, or a lost job, the pass is `TIMEOUT`/`ERROR` and the server restarts
+  (its cache is lost; the log says so).
+- **IRSA via STS.** `credential_chain` cannot use IRSA in this pod, so the server
+  calls `sts assume-role-with-web-identity` and writes a `CREATE SECRET`. It is
+  refreshed every 20 min, outside the timer (an IRSA session lasts ~1 h).
+- **`PIN_SNAPSHOT=1`** (both arms). The writer commits a `metadata.json` every
+  ~60 s and keeps ~4; even a fresh one is GC'd within ~60 s and 404s mid-scan.
+  Each query copies it to `s3://…/duckdb-cid-pinned/warm-<pod>/` (manifests and
+  data are retained ~1 h) and scans the copy.
+- **ZERO_SCAN.** No rows, or a leading `0`/`NULL` without the label flag, is
+  `ZERO_SCAN`: the predicate matched nothing, **not** a win.
 - **Memory.** `memory_limit` sits under the container limit because DuckDB does
-  not count httpfs/Arrow buffers. Container exit `137` (log: "no ===CSV===") is a
-  kubelet OOM-kill: give the container headroom, **don't** raise
-  `DUCKDB_MEMORY_LIMIT`.
-- ⚠ **The `paimon` arm is a read-path result, not a format result.** DuckDB has no
-  Paimon reader; the arm runs `read_parquet` over `dt=*/bucket-*/*.parquet` (no
-  manifest planning, no stats pruning, only `dt=`), which works **only** because
-  the table is append-only. `ICEBERG_DB=flink_cid_paimon_db` points the `iceberg`
-  arm at Paimon's Iceberg export instead. Say which arm ran wherever a DuckDB
-  ratio is quoted.
-- **Arms run in parallel.** Hot arms must, or they would read a live table an hour
-  apart; snapshot data is frozen, so parallel costs only S3 bandwidth. Hot
-  windows are pinned at render time, before submit, so a slow Karpenter launch
-  ages them, but all arms share them.
+  not count httpfs/Arrow buffers or the cache_httpfs memory cache. An OOM-kill
+  (exit `137`) needs container headroom; **don't** raise `DUCKDB_MEMORY_LIMIT`.
+- **The `paimon` arm resolves from `version-hint.text`, not Glue.** Paimon's
+  `hive-catalog` export updates the Glue entry, but on 2026-10-09 Glue pointed at
+  `v25.metadata.json` while `v28` was already written. That lag is exactly the
+  newest minutes the hot suite reads. The arm reads
+  `<PMNICE_TABLE_ROOT>/metadata/version-hint.text` and pins
+  `v<N>.metadata.json` like the `iceberg` arm, since the export keeps only 3
+  previous versions.
+- **Arms run serially,** as on StarRocks. Hot windows are pinned once, before
+  the first arm, so every arm reads the same window.
 
 ### Interpreting the numbers: rows differ across arms
 
@@ -575,13 +732,13 @@ read 0; get them from [Secondary comparisons](#secondary-comparisons).
 
 ## Raw landing-zone generator (gzipped NDJSON)
 
-A **simpler, separate** data generator for when the system under test reads the
-raw landing zone rather than a Paimon/Iceberg table. It writes `.json.gz` files
-to S3 directly — no Flink, no table format. The Flink datagen path above
-(`sql-scripts/common/01-datagen-source.sql` → Paimon/Iceberg) is unchanged.
+The data source of the Flink jobs, and of anything else that reads the raw
+landing zone. It writes `.json.gz` files to S3 directly — no Flink, no table
+format; the jobs read them through SQS
+([below](#feeding-the-flink-jobs-from-these-files)).
 
-- **Same data.** Same fields, value ladders and presence rates as
-  `01-datagen-source.sql`, i.e. the real `cid_9011075d_sample_masked` extract.
+- **Real data shape.** The fields, value ladders and presence rates of the real
+  `cid_9011075d_sample_masked` extract.
 - **The source's layout, minus its `x=00/` shard level:**
   `year=YYYY/month=MM/day=DD/hour=HH/customerId=<uuid>/productCode=sds|ddr/<coupledTraceId>_NNN_new.json.gz`
   — one file per agent upload (one customer, one coupledTraceId), ~2,500 rows.
@@ -596,8 +753,8 @@ to S3 directly — no Flink, no table format. The Flink datagen path above
   the default `JSONGZ_ROWS_PER_SECOND` of 1,500,000 rows/s (≈ 6.1 GB/s raw,
   ≈ 0.31 GB/s gz) gives 3. `scale N` changes it live. There is no
   `TOTAL_PODS` to set (a stray one is honoured as `JSONGZ_REPLICAS`, with a
-  warning). The names are deliberately not `SOURCE_ROWS_PER_SECOND`, which
-  `.bench-env` sets for the Flink path.
+  warning). This is the **only** rate knob in the benchmark: the Flink jobs
+  read as fast as they can.
 - **Run length: a fixed 30 minutes (1800 s).** Every pod writes for 1800 s
   from its own start, then **idles** (it does not exit, since a Deployment
   would restart it and open a new window); `stop` scales to 0.
@@ -643,56 +800,86 @@ family/size selector. Karpenter sizes the node from the pod's requests
 
 ### Feeding the Flink jobs from these files
 
-`SOURCE_MODE` in `build-deploy-cid.sh` picks which file is uploaded as each
-format's `00-source.sql`:
-
-| `SOURCE_MODE` | file | reads |
-|---|---|---|
-| `datagen` (script default) | `sql-scripts/common/01-datagen-source.sql` | in-memory datagen at `SOURCE_ROWS_PER_SECOND` (the original path) |
-| `s3json` (`.bench-env`) | `sql-scripts/common/01-s3json-source.sql` | `.json.gz` under `S3JSON_SOURCE_PATH`, continuously |
-
-Both define the same `datagen_source` view with the same 34 columns, so
-`04-pipeline.sql`, the sink tables and the queries are unchanged. **To switch
-back,** set `export SOURCE_MODE=datagen` in `.bench-env` (or delete the line)
-and redeploy; the deploy re-uploads `00-source.sql`.
+Each format's `00-source.sql` is `01-raw-s3sqs.sql` followed by
+`01-parse-s3json.sql` (both in `sql-scripts/common/`), concatenated by
+`upload_scripts`. The raw fragment defines `s3json_raw(line STRING)` over the
+custom `sqs-delta-filename` connector (built from `sqs-delta-filename/`), which
+long-polls a queue of S3 event notifications and reads each object key it is
+given. Nothing lists the bucket, so job start costs the same at any backlog.
+The parse fragment turns each line into the `datagen_source` view (the name is
+historical) with the 34 columns of both sinks, so its `json_tuple` parse is
+byte-identical across the two formats.
 
 ```bash
-cd throughput-benchmark && source .bench-env          # SOURCE_MODE=s3json
-OUTPUT_URI=s3://$BUCKET_NAME/cid-landing-jsongz ./jsongz-gen/run-jsongz-gen.sh start
-./build-deploy-cid.sh deploy paimon                   # or iceberg
+cd throughput-benchmark && source .bench-env          # OUTPUT_URI = .../cid-landing-jsongz-r4
+./jsongz-gen/run-jsongz-gen.sh start
+./build-deploy-cid.sh deploy paimon     # builds + uploads the jar, prints the backlog, deploys
 ```
 
-- `S3JSON_SOURCE_PATH` (default `s3a://<bucket>/cid-landing-jsongz/`) must
-  be the generator's `OUTPUT_URI`, written as `s3a://`.
-  `S3JSON_MONITOR_INTERVAL` (default `10s`) is how often the source re-lists
-  it.
-- **Files already under the path are read too**, not only new ones. For a
-  run that sees only new data, point both sides at a fresh prefix.
 - **New files stop arriving after 30 minutes**, when the generator Job
   completes. The Flink job keeps running and polling, but idles once it has
   read the backlog. Size the measurement window to fit inside those 30
   minutes.
-- In this mode `SOURCE_ROWS_PER_SECOND`, `HOT_KEY_FRACTION` and `CID_*` do
-  nothing on the Flink side. The rate is what the generator lands, and the job
-  reads as fast as it can.
-- **The source can now be the bottleneck.** Each row costs an S3 read, an
-  inflate and about 30 `JSON_VALUE` parses of a 4 KB line. Backpressure with
-  idle sinks means the read side is the wall, so results are not comparable
-  with `datagen`-mode runs.
-- The continuous enumerator keeps every processed path in JobManager state and
-  checkpoints, about 2 M paths/hour at 1.5 M rows/s. That is fine for a
-  benchmark-length run, not for days.
+- The rate is what the generator lands, and the job reads as fast as it can.
+- **The source can be the bottleneck.** Each row costs an S3 read, an
+  inflate and one `json_tuple` parse of a 4 KB line. Backpressure with
+  idle sinks means the read side is the wall, not the table format.
+
+#### Reading through SQS
+
+Infrastructure (provisioned outside this script; `deploy` only reads it):
+
+```
+s3://$BUCKET_NAME/cid-landing-jsongz-r4/*.json.gz   ObjectCreated notifications
+  └─> SNS cid-landing-jsongz-events
+        ├─> SQS cid-landing-jsongz-paimon    read by flink-cid-paimon
+        └─> SQS cid-landing-jsongz-iceberg   read by flink-cid-iceberg
+```
+
+The fan-out gives each format its own copy of every event, so the two jobs
+never compete for messages. The job role (`EMR_EXECUTION_ROLE_ARN`) carries the
+IAM policy `FlinkLandingQueueConsume`, its consume permissions on both queues;
+an `AccessDenied` from the source means the policy is missing from that role.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `SQS_QUEUE_PREFIX` | `cid-landing-jsongz` | queue `<prefix>-<fmt>`; the URL is built per format in `render_manifest`, so it is the **only** value that differs between the two jobs' `00-source.sql` inputs |
+| `SQS_POLL_THREADS` | `8` | concurrent `ReceiveMessage` loops |
+| `SQS_MAX_PENDING` | empty | cap on received, unassigned splits; empty = the connector's default (the option line is then not rendered) |
+| `SQS_VISIBILITY_TIMEOUT` | `15min` | must outlast the 60 s checkpoint plus a file's read time, or the message reappears and its file is read twice |
+| `SQS_SOURCE_JAR` | `s3a://$BUCKET_NAME/flink/jars/sqs-delta-filename.jar` | where `upload` puts the jar and `ADD JAR` reads it |
+
+- **Purge between runs. The queue is the run's state.** Whatever is still
+  queued, including messages a deleted job received but never deleted, is the
+  first thing the next job reads, and the `rm` in
+  [7d](#7-teardown-between-runs) leaves messages pointing at deleted objects.
+  `deploy` prints `visible` / `in-flight` per queue and warns if either is
+  non-zero, but it **never purges**. Do that yourself, with every writer and
+  the generator stopped:
+  ```bash
+  for f in paimon iceberg; do
+    aws sqs purge-queue --region "$AWS_REGION" \
+      --queue-url "https://sqs.$AWS_REGION.amazonaws.com/$AWS_ACCOUNT_ID/cid-landing-jsongz-$f"
+  done   # SQS allows one purge per queue per 60 s, and it takes up to 60 s to finish
+  ```
+- **Only new objects are announced.** Files already under a prefix, and any
+  prefix other than `cid-landing-jsongz-r4/`, produce no events. To read them,
+  enqueue them with the backfill tool at `sqs-delta-filename/backfill/`,
+  which turns an existing prefix's keys into queue messages.
+- The TaskManagers need no SQS env vars: the executor substitutes the
+  connector options on the JobManager, and they reach the TMs inside the job
+  graph. The jar reaches them the same way, through `ADD JAR`.
 
 ---
 
 ## How it works
 
-With the default `SOURCE_MODE=datagen`, the source is Flink's built-in
-`datagen` connector (for `s3json`, see [above](#feeding-the-flink-jobs-from-these-files)) — rows are generated
-in-memory on the TaskManagers (no Kafka/RDS in the read path), so the source can
-never be the bottleneck and the sink write path is the only thing measured. If a
-writer can't keep up, datagen backpressures and the achieved source rate **is**
-that format's result.
+The source is the gzip NDJSON the generator lands, read through SQS (see
+[above](#feeding-the-flink-jobs-from-these-files)); there is no Kafka/RDS in
+the read path. If a writer can't keep up, the source backpressures and the
+achieved source rate **is** that format's result — provided the source itself
+is not the wall (backpressure with idle sinks), since each row costs a read, an
+inflate and a JSON parse.
 
 The row is a **mockup of real security telemetry**, not synthetic padding. It
 reproduces the shape of a production CID extract (`cid_9011075d_sample_masked`:
@@ -700,14 +887,12 @@ reproduces the shape of a production CID extract (`cid_9011075d_sample_masked`:
 columns + `event_json` from the ingestion PoC's `schema_sample.sql`. The *data*
 has real field cardinalities, real skew and real null density, so Parquet
 compression, dictionary encoding and min/max pruning behave as they do on the
-real table. See `sql-scripts/common/01-datagen-source.sql` for the measured
-distributions and which ~95 of the 170 fields `event_json` carries.
+real table. See `jsongz-gen/cid_jsongz_gen.py` for the measured
+distributions; `event_json` is the whole raw line, verbatim.
 
-**Row size is calibrated to a 4096 B mean.** The real sample's mean line is
-3,817 B, so the generator runs ~7% wider: the five command-text fields carry
-pads of 295/221/135/117/98 B — the sample's measured per-field means scaled by a
-single factor of 1.233, solved by Monte-Carlo over the generator's own
-probability model. Result: **mean 4,099 B (+0.07%)**, p50 4,163, p95 5,123.
+**Row size is calibrated to a ~4096 B mean.** The real sample's mean line is
+3,817 B, so the generator widens the five command-text fields (see
+`PROCESS_CMD_LEN` and its neighbours in `cid_jsongz_gen.py`).
 
 Two consequences worth knowing before citing a number:
 
@@ -717,8 +902,8 @@ Two consequences worth knowing before citing a number:
   null pattern and compression behaviour. A dense fixed-width filler would hit
   the byte target while destroying the properties this mockup exists to
   reproduce.
-- **The model has no heavy tail.** p95 is 5,123 B vs the sample's 8,625, and max
-  ~6,001 B vs 111,445 — the real outliers are pathological command lines.
+- **The model has no heavy tail.** The sample's p95 is 8,625 B and its max
+  111,445 B — the real outliers are pathological command lines.
   Irrelevant to a throughput number (driven by the mean); relevant if you are
   chasing per-row buffer high-water marks.
 
@@ -737,18 +922,10 @@ expectation, not an instantaneous bytes/s guarantee.
   no `changelog-producer` / `deletion-vectors` / `num-sorted-run.*`, and Iceberg
   has no `write.upsert.enabled` and no `write.*.mode=merge-on-read`. Absent is
   stronger than disabled — there is no property to accidentally flip.
-- `HOT_KEY_FRACTION` routes the **endpoint identity** (a few noisy hosts
-  producing most telemetry), not a primary key. It changes dictionary encoding
-  on the endpoint columns — and therefore the generated bytes — but drives no
-  merge or delete work. In fixed-bucket mode (`PAIMON_BUCKETS=N`) it does
-  **not** skew Paimon's bucket distribution either: `bucket-key = 'uuid'`, and
-  `uuid` comes from an independent full-range draw that this knob never touches.
 
 Both sinks declare the identical 34 columns in the identical order with the same
-identity partitioning on `dt`. `CID_DAY_SPREAD` sets how far back the generator
-spreads `dt`: `datagen`'s `r_day` bounds are **inclusive**, so N spreads over
-`N+1` days and the default 1 writes **two** live partitions, today and yesterday.
-That is what gives the snapshot suite a previous day to read.
+identity partitioning on `dt`. The generator stamps rows with wall-clock UTC
+time, so a run writes **one** live partition (two if it crosses midnight).
 
 ### Parity matrix
 
@@ -852,8 +1029,8 @@ The headline number is `source_rec_per_s` in each CSV:
 - At the configured rate, the format **keeps up** — compare
   `last_ckpt_duration_ms` (snapshot-commit cost) and sink `busy_ms` for
   remaining headroom.
-- Below it, datagen is backpressured by that format's writer and the achieved
-  rate **is** its write-path ceiling. `GiB/s = source_rec_per_s × 4096 / 2³⁰`.
+- Below it, the source is backpressured by that format's writer and the
+  achieved rate **is** its write-path ceiling. `GiB/s = source_rec_per_s × 4096 / 2³⁰`.
 
 Watch Paimon's rate over time, not just its average: compaction cost is
 periodic, so throughput saw-tooths. On an append table that saw-tooth is
@@ -953,13 +1130,8 @@ so one override pins both engines to the same rows), are in
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `SOURCE_ROWS_PER_SECOND` | `2000000` | global rate; 4096 B **mean** row ⇒ ≈7.63 GiB/s. `.bench-env` raises it to `2097152` (exactly 8 GiB/s). A rate **limit**, not a guarantee — the 2026-10-05 runs delivered ~555 K rows/s against it. The SQL carries a different fallback (`1572864`, the old 6 GiB/s target) which is **unreachable in practice**: `build-deploy-cid.sh` always ships this as pod env, so the literal applies only if the JobManager env is missing |
 | `JOB_PARALLELISM` | `128` | writer subtasks. 4 slots per TM, so 32 TMs. `.bench-env` sets `160` |
 | `PAIMON_BUCKETS` | `-1` | Paimon `bucket`, **baked at `CREATE TABLE`**. `-1` = unaware-bucket: no shuffle and no `bucket-key`, the same layout as Iceberg. `N >= 1` = fixed buckets on `uuid`, and `build-deploy-cid.sh` then renders `PAIMON_BUCKET_KEY_OPT` (Paimon rejects a `bucket-key` on a `-1` table). Use `N = JOB_PARALLELISM`: each bucket has exactly one writer subtask, so fewer idle writers. Anything below 1 is treated as `-1`. **Changing it does nothing to an existing table** — the sink DDL is `CREATE TABLE IF NOT EXISTS`, so you must drop `cid_events` or use a fresh warehouse prefix, and never compare results across the change without saying which count produced them |
-| `HOT_KEY_FRACTION` | `0` | % of rows routed to a hot 5% slice of `CID_HOST_COUNT`; `0` = uniform. Validated as an integer 0..99, because it is compared against a datagen `selector` drawn in `[0,99]`. Routes the endpoint identity, **not** a key, and does **not** affect Paimon's bucket distribution in fixed-bucket mode (`bucket-key = 'uuid'`, drawn independently). Its real effect is on **generated bytes** — the endpoint columns dictionary-encode better when skewed — so runs at different values are not comparable |
-| `CID_CUSTOMER_COUNT` | `16` | distinct `customerId` ⇒ `partition_cust` cardinality |
-| `CID_HOST_COUNT` | `1024` | distinct endpoints; sample measured 1,047 |
-| `CID_DAY_SPREAD` | `1` | how far back `dt` spreads. `r_day`'s bounds are **inclusive**, so N ⇒ `N+1` live partitions (default 1 ⇒ today *and* yesterday). `dt` is the only partition column, so that is `JOB_PARALLELISM × (N+1)` concurrently-open files on Paimon (`PAIMON_BUCKETS × (N+1)` in fixed-bucket mode) and `JOB_PARALLELISM × (N+1)` on Iceberg (which fans out by subtask), and yesterday only closes once the writers stop. Report it with any result |
 | `WRITE_BUFFER` | `128mb` | Paimon `write-buffer-size`. Only moves bytes between RAM and spill files; the bytes the barrier external-merges are set by rate × checkpoint interval. INSERT hint, so no table drop needed |
 | `S3A_MULTIPART_SIZE` | `16M` | **Paimon side only** (floor 5M). The S3A block cut point — must stay **below** the data file size, or S3A uploads each file as a single PUT at `close()` instead of streaming blocks as they fill. `.bench-env` raises it to `32M`. Must be written as an integer number of `M`; the script rejects other units loudly rather than misconverting them |
 | `S3A_MULTIPART_THRESHOLD` | `16M` | Multipart COPY path only; the write path never reads it. Kept equal to the part size for consistency, so `.bench-env`'s `32M` moves both |
@@ -1040,9 +1212,10 @@ throughput-benchmark/
 ├── sql-scripts/                     # uploaded to s3://.../flink/cid-sql/<fmt>/ by
 │   │                                #   every render/deploy (sync --delete, BOTH
 │   │                                #   formats); the jobs read S3, not this dir.
-│   ├── common/01-datagen-source.sql # THE generator: CID telemetry mockup, 34 cols.
-│   │                                #   Copied into both format prefixes AS
-│   │                                #   00-source.sql — runs before the USE CATALOG.
+│   ├── common/01-raw-s3sqs.sql      # ADD JAR + SQS-notified s3json_raw(line STRING)
+│   ├── common/01-parse-s3json.sql   # json_tuple parse -> datagen_source, 34 cols.
+│   │                                #   raw + parse = both formats' 00-source.sql,
+│   │                                #   which runs before the USE CATALOG.
 │   ├── paimon/                      # catalog + append sink + pipeline
 │   └── iceberg/                     # catalog + v2 append sink + pipeline
 ├── monitoring/                      # everything that measures the writers
@@ -1050,13 +1223,18 @@ throughput-benchmark/
 │   ├── deploy-cid-monitor.sh        #   side-by-side console monitor (Deployment)
 │   ├── flink_cid_monitor.py         #   monitor code (forked from cdc-pipeline)
 │   └── monitor-deployment.yaml      #   envsubst template; -deployed.yaml is generated
-├── build-deploy-cid.sh              # render / deploy / cleanup / monitor (no build)
+├── build-deploy-cid.sh              # upload / render / deploy / cleanup (no build)
 ├── querybench/                      # READ half: StarRocks + DuckDB query benchmark
 │   ├── lib.sh                       #   shared: env, windows, render, timeout,
 │   │                                #   median, CSV header, writer stop, FE-idle check
 │   ├── starrocks.sh                 #   3 arms, timed from the FE AUDIT LOG
-│   ├── duckdb.sh                    #   Job submitter + --in-pod runner + debug / clean
-│   ├── duckdb-job.yaml              #   envsubst Job template (m5.8xlarge, 18 cpu / 72Gi)
+│   ├── starrocks-placement.sh       #   pin StarRocks to driver-nodepool, opt out of OTel
+│   ├── duckdb-warm.sh               #   warm DuckDB: up / status / run / clear-cache / down
+│   ├── duckdb_warm_server.py        #   the server: one DuckDB process, cache_httpfs
+│   ├── duckdb-warm.yaml             #   envsubst Deployment (m5.8xlarge, 18 cpu / 72Gi)
+│   ├── gp3-fast-sc.yaml             #   StorageClass for DuckDB's cache disk (1000 MB/s)
+│   ├── qb-runner.sh                 #   run a step in an in-cluster Job (laptop-independent)
+│   ├── compare.py                   #   StarRocks vs DuckDB markdown report from two CSVs
 │   ├── hot/H1..H6*.sql              #   the queries. Filename = name = order.
 │   └── snapshot/S1..S4*.sql
 ├── jsongz-gen/                      # RAW landing zone: gzipped NDJSON on S3, no Flink
@@ -1145,8 +1323,8 @@ equalized without breaking the setup, so cite them alongside results.
 - **Scale trial first.** 8 GiB/s ≈ 40 TMs × (4 cpu / 16 Gi) at parallelism 160,
   writing Parquet to S3 at a rate that stores **multiple TiB per hour per
   format**. Do a 10-minute run before any long one, and clean the
-  `cid-warehouse-*` prefixes after. `SOURCE_ROWS_PER_SECOND` is a rate **limit**
-  and not a guarantee: if a writer cannot absorb it, datagen backpressures and
+  `cid-warehouse-*` prefixes after. The generator's rate is an offered rate,
+  not a guarantee: if a writer cannot absorb it, the source backpressures and
   the achieved rate is what the run reports.
 - **Karpenter consolidation is a real hazard here, and the mitigation is not yet
   in these manifests.** `executor-memorynodepool` consolidates with
@@ -1158,7 +1336,7 @@ equalized without breaking the setup, so cite them alongside results.
   re-done work at a 60 s interval — so the job stays live, healthy-looking and
   well below its achievable rate. *A restart-tolerant job can still be a starved
   one.* `karpenter.sh/do-not-disrupt: "true"` is currently set **only** on
-  `querybench/duckdb-job.yaml`, **not** on either FlinkDeployment's pod
+  `querybench/duckdb-warm.yaml` and `qb-runner`'s Job, **not** on either FlinkDeployment's pod
   templates; add it there before a scoring run. The fix belongs in these
   manifests, never in the nodepool — that spec is shared with other workloads.
 - **Don't run alongside the CDC benchmark jobs** — same nodepools, and the

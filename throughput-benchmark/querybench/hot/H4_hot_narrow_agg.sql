@@ -5,7 +5,7 @@
 SELECT eventId, COUNT(*) AS n
 FROM ${TABLE}
 WHERE dt = '${HOT_DT}'
-  AND ingestionTime >= '${HOT_FROM_5M}'
+  AND ingestionTime >= '${HOT_FROM}'
   AND ingestionTime <  '${HOT_TO}'
 GROUP BY eventId
 ORDER BY n DESC

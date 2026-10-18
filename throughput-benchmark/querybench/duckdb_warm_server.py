@@ -1,0 +1,272 @@
+"""Warm DuckDB query server: the DuckDB side of a warm-vs-warm comparison with
+StarRocks. Runs in a long-lived pod (duckdb-warm.yaml), driven by duckdb-warm.sh.
+
+One process and ONE connection for the pod's life, like a StarRocks FE/BE that is
+already up: extensions, the S3 secret, Parquet footers and the cache_httpfs block
+cache all survive from one query to the next. A query is timed inside this
+process around execute + fetch, which is what StarRocks' audit log reports
+(server-side, planning included). Start-up, the secret refresh and resolving
+${TABLE} are outside the timer, as they are on StarRocks.
+
+Cache parity with the StarRocks BEs (3 x datacache, checked 2026-10-13); both
+engines run with their cache ON, as both defaults:
+  disk    3 x 150 GiB = 450 GiB  ->  CACHE_MODE=on_disk (default): cache_httpfs
+                                     on-disk cache, CACHE_DISK_BYTES, LRU, on a
+                                     gp3-fast volume (1000 MB/s)
+  memory  3 x ~4.2 GB  = 12.5 GB ->  its read-through memory cache, CACHE_MEM_BYTES
+CACHE_MODE=in_mem keeps only a CACHE_MEM_BYTES memory cache (every miss reads S3).
+The cache volume must not be default gp3: at its 125 MB/s baseline cache_httpfs
+served every hit from the disk, never S3, and the snapshot S3 pass ran for hours
+at 130 MB/s and 0.3 cores (2026-10-17). StarRocks' BEs sit on default gp3, but
+enable_datacache_io_adaptor sends reads back to S3 when the disk saturates;
+cache_httpfs has no such thing, hence the faster volume on DuckDB's side.
+DuckDB does not count the cache_httpfs memory against memory_limit, so
+DUCKDB_MEMORY_LIMIT + CACHE_MEM_BYTES must stay under the container limit.
+
+One query at a time (a lock), so a suite cannot overlap another on this pod.
+HTTP, stdlib only; every call returns JSON:
+  GET  /health            version, settings, busy, cache size
+  POST /query             {suite, arm, name, sql, runs, warmup, timeout_s,
+                           allow_zero_rows, leading_col_is_label} -> {id}
+  GET  /job/<id>          progress, then the result
+  POST /clear_cache       empties the block cache (a cold start on demand)
+Queries come back by polling /job, because a snapshot query can run for half an
+hour and a port-forward drops idle connections long before that.
+"""
+import json
+import os
+import statistics
+import subprocess
+import threading
+import time
+import traceback
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import duckdb
+
+ENV = os.environ
+REGION = ENV["AWS_REGION"]
+BUCKET = ENV["BUCKET_NAME"]
+ICEBERG_DB = ENV["ICEBERG_DB"]
+TABLE_NAME = ENV["TABLE_NAME"]
+PMNICE_TABLE_ROOT = ENV["PMNICE_TABLE_ROOT"].rstrip("/")
+PIN_SNAPSHOT = ENV.get("PIN_SNAPSHOT", "1") == "1"
+POD = ENV.get("HOSTNAME", "duckdb-warm")
+PIN_PREFIX = "duckdb-cid-pinned/warm-%s" % POD
+CACHE_MODE = ENV.get("CACHE_MODE", "on_disk")
+CACHE_DIR = ENV["CACHE_DIR"]
+CACHE_DISK_BYTES = int(ENV["CACHE_DISK_BYTES"])
+CACHE_MEM_BYTES = int(ENV["CACHE_MEM_BYTES"])
+BLOCK = 524288                              # cache_httpfs_cache_block_size default
+SECRET_TTL_S = 20 * 60                      # IRSA sessions last ~1h
+
+con = duckdb.connect()
+lock = threading.Lock()                     # one query at a time
+jobs = {}
+secret_at = 0.0
+
+
+def run(cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def init():
+    if CACHE_MODE == "in_mem":
+        cache = [
+            "SET cache_httpfs_type='in_mem'",
+            "SET cache_httpfs_max_in_mem_cache_block_count=%d" % (CACHE_MEM_BYTES // BLOCK),
+            # The default 1 h expiry would drop a warm-up pass's blocks before a
+            # long snapshot suite reused them; StarRocks' cache has no TTL.
+            "SET cache_httpfs_in_mem_cache_block_timeout_millisec=%d" % (7 * 86400 * 1000),
+        ]
+        info = {"cache_mode": CACHE_MODE}
+    elif CACHE_MODE == "on_disk":
+        st = os.statvfs(CACHE_DIR)
+        vol = st.f_frsize * st.f_blocks
+        # cache_httpfs has no size cap, only a floor of free space below which it
+        # evicts (LRU), so the cap is "volume minus the floor".
+        floor = max(vol - CACHE_DISK_BYTES, 1 << 30)
+        cache = [
+            "SET cache_httpfs_type='on_disk'",
+            "SET cache_httpfs_cache_directory='%s'" % CACHE_DIR,
+            "SET cache_httpfs_min_disk_bytes_for_cache=%d" % floor,
+            "SET cache_httpfs_evict_policy='lru_sp'",
+            "SET cache_httpfs_disk_cache_reader_enable_memory_cache=true",
+            "SET cache_httpfs_disk_cache_reader_mem_cache_block_count=%d" % (CACHE_MEM_BYTES // BLOCK),
+        ]
+        info = {"cache_mode": CACHE_MODE, "volume_bytes": vol, "free_floor_bytes": floor,
+                "cache_disk_cap_bytes": CACHE_DISK_BYTES}
+    else:
+        raise SystemExit("CACHE_MODE must be in_mem|on_disk, got %r" % CACHE_MODE)
+    for sql in [
+        "SET memory_limit='%s'" % ENV["DUCKDB_MEMORY_LIMIT"],
+        "SET threads=%s" % ENV["DUCKDB_THREADS"],
+        "SET temp_directory='%s'" % ENV["SPILL_DIR"],
+        "SET max_temp_directory_size='%s'" % ENV["DUCKDB_MAX_TEMP_SIZE"],
+        "INSTALL httpfs", "LOAD httpfs",
+        "INSTALL iceberg", "LOAD iceberg",
+        "INSTALL cache_httpfs FROM community", "LOAD cache_httpfs",
+    ] + cache + [                           # before the first file access, or they do not take effect
+        # StarRocks caches Parquet footers and object metadata too.
+        "SET parquet_metadata_cache=true",
+        "SET enable_http_metadata_cache=true",
+    ]:
+        con.execute(sql)
+    return info
+
+
+def refresh_secret(force=False):
+    """IRSA -> static S3 secret; DuckDB's credential_chain cannot use IRSA here."""
+    global secret_at
+    if not force and time.time() - secret_at < SECRET_TTL_S:
+        return
+    with open(ENV["AWS_WEB_IDENTITY_TOKEN_FILE"]) as f:
+        tok = f.read().strip()
+    out = run(["aws", "sts", "assume-role-with-web-identity", "--role-arn", ENV["AWS_ROLE_ARN"],
+               "--role-session-name", "duckdb-warm", "--web-identity-token", tok,
+               "--query", "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]", "--output", "text"])
+    ak, sk, st = out.split()
+    con.execute("CREATE OR REPLACE SECRET irsa (TYPE s3, KEY_ID '%s', SECRET '%s', SESSION_TOKEN '%s', REGION '%s')"
+                % (ak, sk, st, REGION))
+    secret_at = time.time()
+
+
+def table_expr(arm):
+    """= the old duckdb.sh table_expr: the current metadata.json, pinned to a key we own,
+    because the writers delete old versions within ~60 s (404 mid-scan)."""
+    if arm == "paimon":
+        v = run(["aws", "s3", "cp", PMNICE_TABLE_ROOT + "/metadata/version-hint.text", "-"]).strip()
+        if not v.isdigit():
+            raise RuntimeError("no version-hint.text under %s/metadata (ICEBERG_COMPAT=false?)" % PMNICE_TABLE_ROOT)
+        loc = "%s/metadata/v%s.metadata.json" % (PMNICE_TABLE_ROOT, v)
+    elif arm == "iceberg":
+        loc = run(["aws", "glue", "get-table", "--database-name", ICEBERG_DB, "--name", TABLE_NAME,
+                   "--query", "Table.Parameters.metadata_location", "--output", "text"]).strip()
+        if not loc or loc == "None":
+            raise RuntimeError("no metadata_location on %s.%s" % (ICEBERG_DB, TABLE_NAME))
+    else:
+        raise RuntimeError("arm must be iceberg|paimon, got %r" % arm)
+    if PIN_SNAPSHOT:
+        key = "%s/%s" % (PIN_PREFIX, loc.rsplit("/", 1)[1])
+        run(["aws", "s3api", "copy-object", "--bucket", BUCKET, "--key", key,
+             "--copy-source", loc[len("s3://"):]])
+        loc = "s3://%s/%s" % (BUCKET, key)
+    return "iceberg_scan('%s')" % loc
+
+
+def attempt(sql, timeout_s):
+    """One timed execution. Returns (status, ms, rows). A timer interrupts it."""
+    timer = threading.Timer(timeout_s, con.interrupt)
+    t0 = time.perf_counter()
+    timer.start()
+    try:
+        rows = con.execute(sql).fetchall()
+        return "OK", int((time.perf_counter() - t0) * 1000), rows
+    except duckdb.InterruptException:
+        return "TIMEOUT", None, None
+    finally:
+        timer.cancel()
+
+
+def run_query(job, q):
+    """= the old duckdb.sh pod_run for one query: warm-up passes, timed passes, median,
+    and the same ZERO_SCAN guard (an empty scan is never reported as a win)."""
+    job.update(state="running", started=time.time(), times=[])
+    status, rows, table = "OK", None, None
+    try:
+        table = table_expr(q["arm"])
+        sql = q["sql"].replace("${TABLE}", table)
+        if "${" in sql:
+            raise RuntimeError("unresolved placeholder")
+        job["table"] = table
+        for i in range(q["warmup"] + q["runs"]):
+            refresh_secret()
+            status, ms, out = attempt(sql, q["timeout_s"])
+            if status != "OK":
+                break
+            if i >= q["warmup"]:
+                job["times"].append(ms)
+                rows = out
+    except Exception as e:                  # a failed query is a RESULT, not a crash
+        status, job["error"] = "ERROR", "%s: %s" % (type(e).__name__, str(e)[:400])
+    first = "|".join("" if v is None else str(v) for v in rows[0]) if rows else ""
+    if status == "OK" and not q.get("allow_zero_rows"):
+        v = first.split("|", 1)[0]
+        if not rows or (not q.get("leading_col_is_label") and v in ("0", "NULL", "")):
+            status = "ZERO_SCAN"
+    med = int(statistics.median(job["times"])) if job["times"] else None
+    if med is None and status == "OK":
+        status = "ERROR"
+    job.update(state="done", status=status, median_ms=med, result_rows=len(rows) if rows else 0,
+               first_row=first[:200], finished=time.time())
+
+
+def worker(job, q):
+    with lock:
+        try:
+            run_query(job, q)
+        except Exception:
+            job.update(state="done", status="ERROR", error=traceback.format_exc()[-400:])
+
+
+def cache_bytes():
+    try:
+        return con.execute("SELECT cache_httpfs_get_ondisk_data_cache_size()").fetchone()[0]
+    except Exception:
+        return None
+
+
+class H(BaseHTTPRequestHandler):
+    def reply(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/health":
+            busy = lock.locked()
+            self.reply(200, dict(INFO, busy=busy, cache_disk_bytes=None if busy else cache_bytes()))
+        elif self.path.startswith("/job/"):
+            j = jobs.get(self.path[5:])
+            self.reply(200 if j else 404, j or {"error": "no such job"})
+        else:
+            self.reply(404, {"error": "unknown path"})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        if self.path == "/query":
+            if lock.locked():
+                return self.reply(409, {"error": "busy: one query at a time"})
+            jid = uuid.uuid4().hex[:12]
+            jobs[jid] = {"id": jid, "state": "queued", "name": body.get("name"), "arm": body.get("arm")}
+            threading.Thread(target=worker, args=(jobs[jid], body), daemon=True).start()
+            self.reply(202, {"id": jid})
+        elif self.path == "/clear_cache":
+            if not lock.acquire(blocking=False):
+                return self.reply(409, {"error": "busy"})
+            try:
+                con.execute("SELECT cache_httpfs_clear_cache()").fetchall()
+                self.reply(200, {"cache_disk_bytes": cache_bytes()})
+            finally:
+                lock.release()
+        else:
+            self.reply(404, {"error": "unknown path"})
+
+
+if __name__ == "__main__":
+    vol = init()
+    refresh_secret(force=True)
+    INFO = {"pod": POD, "suite": ENV.get("SUITE"), "duckdb": duckdb.__version__,
+            "memory_limit": ENV["DUCKDB_MEMORY_LIMIT"], "threads": int(ENV["DUCKDB_THREADS"]),
+            "cache_mem_bytes": CACHE_MEM_BYTES,
+            "pin_snapshot": PIN_SNAPSHOT, **vol}
+    print("ready", json.dumps(INFO), flush=True)
+    ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()

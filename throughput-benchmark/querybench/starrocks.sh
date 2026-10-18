@@ -13,7 +13,7 @@ set -uo pipefail
 # down ONE connection, a marker SELECT before every statement, and the audit
 # records after each marker give Time/ScanRows/ScanBytes/State.
 #
-# Hot runs first, against RUNNING writers (it reads the last minutes of data);
+# Hot runs first, against RUNNING writers (it reads the last 30 s of data);
 # then the writers are stopped for snapshot (live writers cost ~89x there).
 # Writers are left stopped; resume with ../build-deploy-cid.sh.
 #
@@ -69,11 +69,21 @@ build_script() {   # <arm> <suite> <rendered sql>
     echo "USE ${t#* };"
     # Per-suite cap shared with DuckDB, so a timeout means the same on both.
     echo "SET query_timeout = $(qb_query_timeout "$2");"
-    # Datacache off: a fixed partition is otherwise served from BE cache after
-    # pass 0 (ScanBytes=0, 70s -> 2s), a cache hit scored as a format result.
-    echo "SET enable_scan_datacache = false;"
-    echo "SET enable_datacache_sharing = false;"
-    echo "SET populate_datacache_mode = 'never';"
+    # Datacache ON by default (SR_DATACACHE=1): warm-vs-warm with duckdb-warm.sh,
+    # whose server keeps a block cache of the same memory size. Both start empty
+    # (clear both before a run) and both are filled by the same WARMUP pass, so a
+    # cache hit is the engine's, on both sides. SR_DATACACHE=0 is the old
+    # cold-read mode (every pass from S3: a fixed partition is otherwise served
+    # from cache after pass 0, ScanBytes=0, 70s -> 2s); pair it with the cold
+    # DuckDB harness (the cold duckdb.sh was removed 2026-10-18), never with duckdb-warm.sh.
+    if [[ "${SR_DATACACHE:-1}" == 0 ]]; then
+        echo "SET enable_scan_datacache = false;"
+        echo "SET enable_datacache_sharing = false;"
+        echo "SET populate_datacache_mode = 'never';"
+    else
+        echo "SET enable_scan_datacache = true;"
+        echo "SET populate_datacache_mode = 'auto';"
+    fi
     # Spill: wide aggregates and COUNT(DISTINCT) can reach the memory ceiling.
     echo "SET enable_spill = true;"
     if [[ "$2" == snapshot ]]; then
@@ -82,12 +92,29 @@ build_script() {   # <arm> <suite> <rendered sql>
         echo "SET connector_io_tasks_per_scan_operator = 2;"
         echo "SET enable_connector_adaptive_io_tasks = false;"
     fi
+    # Per-query scan width: a query file flagged `-- bench: io-tasks=1` (S4)
+    # runs with ONE connector io task per scan operator instead of 2, cache
+    # still on. With the cache on, S4's wide event_json scan filled the whole
+    # 17.5 GiB query pool on a BE (MEM_LIMIT_EXCEEDED on both passes,
+    # 2026-10-17; 0.2-0.5 GB with the cache off). The cache stays on because it
+    # is StarRocks' default and warm DuckDB keeps its disk cache too. The SETs go
+    # BEFORE the marker and the restore after the statement: the marker must
+    # stay immediately before the statement it times.
+    local files narrow=" "
+    files=$(qb_query_files "$2")
+    qi=0
+    for line in $files; do
+        qb_query_flag "$line" io-tasks=1 && narrow+="${qi} "
+        qi=$(( qi + 1 ))
+    done
     for (( pass = 0; pass < WARMUP + RUNS; pass++ )); do
         qi=0
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
+            [[ "$narrow" == *" ${qi} "* ]] && echo "SET connector_io_tasks_per_scan_operator = 1;"
             echo "SELECT 'MARK_${RUN_ID}_${1}_${pass}_${qi}';"
             echo "$line"
+            [[ "$narrow" == *" ${qi} "* ]] && echo "SET connector_io_tasks_per_scan_operator = 2;"
             qi=$(( qi + 1 ))
         done <<< "$3"
     done
@@ -143,13 +170,13 @@ for line in sys.stdin:
 
 # Records on stdin -> "status ms scan_rows scan_bytes result_rows" for one
 # arm/query over the timed passes. A failed pass logs a small Time and
-# ScanRows=0 (the fastest possible result), so any non-EOF/OK pass makes it ERR.
+# ScanRows=0 (the fastest possible result), so any non-EOF/OK pass makes it ERROR.
 arm_result() {   # <arm> <qi>
     local recs
     recs=$(awk -v a="$1" -v q="$2" -v w="$WARMUP" '$1==a && $2>=w && $3==q')
     [[ -z "$recs" ]] && { echo "MISSING - - - -"; return; }
-    awk '$8!="EOF" && $8!="OK"' <<<"$recs" | grep -q . && { echo "ERR - - - -"; return; }
-    local c v out="ok"
+    awk '$8!="EOF" && $8!="OK"' <<<"$recs" | grep -q . && { echo "ERROR - - - -"; return; }
+    local c v out="OK"                  # = duckdb-warm.sh statuses
     for c in 4 5 6 7; do
         v=$(awk -v c="$c" '$c ~ /^[0-9]+$/ {print $c}' <<<"$recs" | qb_median)
         out+=" ${v:--}"
@@ -210,6 +237,45 @@ ratio() { [[ "$1" =~ ^[0-9]+$ && "$2" =~ ^[0-9]+$ && "$2" -gt 0 ]] \
               && awk -v a="$1" -v b="$2" 'BEGIN{printf "%.2f", a/b}' || echo "-"; }
 col()   { awk -v a="$1" -v c="$2" '$1==a {print $c}' <<<"$3"; }   # <arm> <field> <results>
 
+# ── One arm, run INSIDE the FE pod ──────────────────────────────────────────
+# Not piped down `kubectl exec -i ... mysql`: that stream drops during a long
+# silent query (20+ min with -N -B, which prints only at the end), the remote
+# mysql carries on, and the harness moved to the next arm while the last one
+# was still scanning. On 2026-10-16 two arms overlapped that way and the audit
+# log was read before they finished (MISSING). Now the script is copied into
+# the pod, started detached there (setsid nohup), and polled until its exit
+# code file appears; a failed poll (credentials, network) is retried, never
+# taken as "done". If the harness dies, the arm still runs to its end in the
+# pod: check with SHOW PROCESSLIST before starting another run.
+run_arm_in_pod() {   # <arm> <suite> <rendered sql>
+    local f="/tmp/qb-${RUN_ID}-$1" rc="" t0 fails=0
+    local limit=$(( (WARMUP + RUNS) * $(grep -c . <<<"$3") * $(qb_query_timeout "$2") + 600 ))
+    build_script "$@" | kubectl exec -i -n "$NAMESPACE" "$FE_POD" -- sh -c "cat > ${f}.sql" \
+        || qb_die "cannot copy the ${1} script into ${FE_POD}"
+    kubectl exec -n "$NAMESPACE" "$FE_POD" -- sh -c \
+        "rm -f ${f}.rc; setsid nohup sh -c 'mysql -h127.0.0.1 -P9030 -uroot -N -B --force < ${f}.sql > ${f}.out 2>&1; echo \$? > ${f}.rc' > /dev/null 2>&1 < /dev/null &" \
+        || qb_die "cannot start the ${1} arm in ${FE_POD}"
+    t0=$(date +%s)
+    while :; do
+        sleep 30
+        # No .rc yet is "running" only while the script and its mysql are still
+        # there: an FE restart wipes /tmp and the session, and would otherwise
+        # be waited out to the full limit (~8 h for snapshot). "[<]" keeps the
+        # pattern from matching this poll's own command line.
+        if rc=$(kubectl exec -n "$NAMESPACE" "$FE_POD" -- sh -c \
+                "cat ${f}.rc 2>/dev/null || { [ -f ${f}.sql ] && pgrep -f 'mysql.*[<] ${f}.sql' >/dev/null && echo running; } || echo lost" 2>/dev/null); then
+            fails=0
+            [[ "$rc" == lost ]] && qb_die "${2}: arm ${1}: its script or mysql session is gone from ${FE_POD} (FE restarted?); nothing to wait for"
+            [[ "$rc" != running ]] && break
+        else
+            fails=$((fails + 1)); (( fails % 10 == 1 )) && qb_log "${2}: arm ${1}: cannot reach ${FE_POD} (retrying)"
+        fi
+        (( $(date +%s) - t0 < limit )) || qb_die "${2}: arm ${1} still running after ${limit}s"
+    done
+    qb_log "${2}: arm ${1} done in $(( $(date +%s) - t0 ))s (mysql exit ${rc})"
+    kubectl exec -n "$NAMESPACE" "$FE_POD" -- sh -c "rm -f ${f}.sql ${f}.out ${f}.rc" >/dev/null 2>&1 || true
+}
+
 # ── One suite ───────────────────────────────────────────────────────────────
 run_suite() {   # <suite> <rendered sql> <dt>
     local s=$1 sql=$2 dt=$3 arm writers mark raw recs n names qi name res r state
@@ -220,9 +286,7 @@ run_suite() {   # <suite> <rendered sql> <dt>
     mark=$(audit_mark) && [[ "$mark" == *" "* ]] || qb_die "cannot stat ${AUDIT} in ${FE_POD}"
     for arm in $ARMS; do
         qb_log "${s}: arm ${arm}..."
-        build_script "$arm" "$s" "$sql" \
-          | kubectl exec -i -n "$NAMESPACE" "$FE_POD" -- \
-              mysql -h127.0.0.1 -P9030 -uroot -N -B --force >/dev/null 2>&1
+        run_arm_in_pod "$arm" "$s" "$sql"
     done
     # The arms of a suite are ratioed against each other, so a writer change
     # between them (~89x on snapshot) makes the suite meaningless.
@@ -249,12 +313,12 @@ run_suite() {   # <suite> <rendered sql> <dt>
             r=$(arm_result "$arm" "$qi" <<<"$recs")
             res+="${arm} ${r}"$'\n'
             set -- $r
-            # Unknown fields stay empty, and an ERR pass blanks its scan fields too.
+            # Unknown fields stay empty, and an ERROR pass blanks its scan fields too.
             echo "${STAMP},starrocks,${arm},${s},${name},${1},${2#-},${5#-},${3#-},${4#-}" >> "$CSV"
         done
         printf '  %-22s' "$name"
         for arm in $ARMS; do
-            r=$(col "$arm" 3 "$res"); [[ "$(col "$arm" 2 "$res")" == ok ]] || r=$(col "$arm" 2 "$res")
+            r=$(col "$arm" 3 "$res"); [[ "$(col "$arm" 2 "$res")" == OK ]] || r=$(col "$arm" 2 "$res")
             printf ' %15s' "$r"
         done
         printf ' %8s %8s' "$(ratio "$(col iceberg 3 "$res")" "$(col paimon 3 "$res")")" \
@@ -281,18 +345,18 @@ main() {
     done
 
     for arm in $ARMS; do ensure_catalog "$arm"; done
-    qb_log "run ${RUN_ID}: suites=$(qb_suites) arms=${ARMS} runs=${RUNS}+${WARMUP} warmup"
+    qb_log "run ${RUN_ID}: suites=$(qb_suites) arms=${ARMS} runs=${RUNS}+${WARMUP} warmup datacache=$([[ "${SR_DATACACHE:-1}" == 0 ]] && echo off || echo on)"
 
     for s in $(qb_suites); do
         if [[ "$s" == hot ]]; then
-            qb_resolve_hot   # the windows end now, not at script start
+            qb_resolve_hot   # the window ends now, not at script start
             HOT_SQL=$(render_suite hot) || qb_die "hot suite failed to render"
-            qb_log "hot window: dt=${QB_HOT_DT} [${QB_HOT_FROM_10M}, ${QB_HOT_TO})"
+            qb_log "hot window: dt=${QB_HOT_DT} [${QB_HOT_FROM}, ${QB_HOT_TO})"
             run_suite hot "$HOT_SQL" "$QB_HOT_DT"
         else
             qb_assert_fe_idle
             qb_stop_writers
-            qb_log "snapshot: dt=${QB_SNAPSHOT_DT} S4=[${QB_S4_FROM}, ${QB_S4_TO})"
+            qb_log "snapshot: dt=${QB_SNAPSHOT_DT} S4=[${QB_S4_FROM}, ${QB_S4_TO}) (${QB_S4_HOW:-})"
             run_suite snapshot "$SNAP_SQL" "$QB_SNAPSHOT_DT"
         fi
     done

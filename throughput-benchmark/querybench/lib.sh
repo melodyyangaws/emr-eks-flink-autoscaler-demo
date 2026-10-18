@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared by starrocks.sh and duckdb.sh, sourced, never run. One copy of
+# Shared by starrocks.sh and duckdb-warm.sh, sourced, never run. One copy of
 # everything both engines must agree on: the query files, how they render, the
 # windows and partition they read, the timeout, the median, the writer stop and
 # the results format. If two engines disagreed on any of these, the comparison
@@ -10,8 +10,8 @@
 #   ${BYTES_FN}      LENGTH (StarRocks) / STRLEN (DuckDB): both count BYTES.
 #                    DuckDB's LENGTH counts characters, and octet_length() is
 #                    BLOB-only there.
-#   ${HOT_DT} ${HOT_FROM_1M|5M|10M} ${HOT_TO}       hot windows
-#   ${SNAPSHOT_DT} ${S4_FROM} ${S4_TO}              snapshot partition + S4 slice
+#   ${HOT_DT} ${HOT_FROM} ${HOT_TO}                 hot window
+#   ${SNAPSHOT_DT} ${S4_FROM} ${S4_TO}              snapshot partition + S4 slice (derived)
 # Every bound is a literal resolved ONCE per run, never a clock function in the
 # SQL, so all arms and passes read the same rows. (The FE session timezone is
 # +08:00 and the data is UTC, so NOW() would also be simply wrong.)
@@ -57,9 +57,10 @@ qb_sr() {
 }
 
 # ── Dates (the harnesses run on macOS: BSD date first, GNU second) ──────────
-qb_utc_minus_min() {
-    date -u -v-"$1"M '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-      || date -u -d "$1 minutes ago" '+%Y-%m-%d %H:%M:%S'
+# "<YYYY-MM-DD HH:MM:SS>" minus N seconds, both UTC.
+qb_utc_minus_sec() {
+    date -u -j -v-"$2"S -f '%Y-%m-%d %H:%M:%S' "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+      || date -u -d "@$(( $(date -u -d "$1" +%s) - $2 ))" '+%Y-%m-%d %H:%M:%S'
 }
 qb_date_plus_days() {
     date -u -j -v+"$2"d -f %Y-%m-%d "$1" +%Y-%m-%d 2>/dev/null \
@@ -67,13 +68,15 @@ qb_date_plus_days() {
 }
 
 # ── Windows ─────────────────────────────────────────────────────────────────
-# Hot: the last 1/5/10 minutes of today's (live) partition. Each bound can be
-# pinned with the same-named env var, e.g. to rerun an earlier window.
+# Hot: the last HOT_WINDOW_SECONDS (30) of today's (live) partition, one window
+# for every hot query. At ~3M rows/s that is ~90M rows, seconds per query; the
+# old 1/5/10-minute windows were 180M-1.8B rows and took minutes. Each bound
+# can be pinned with the same-named env var, e.g. to rerun an earlier window.
 qb_resolve_hot() {
+    local w="${HOT_WINDOW_SECONDS:-30}"
+    [[ "$w" =~ ^[1-9][0-9]*$ ]] || qb_die "HOT_WINDOW_SECONDS='${w}' is not a positive integer"
     QB_HOT_TO="${HOT_TO:-$(date -u '+%Y-%m-%d %H:%M:%S')}"
-    QB_HOT_FROM_1M="${HOT_FROM_1M:-$(qb_utc_minus_min 1)}"
-    QB_HOT_FROM_5M="${HOT_FROM_5M:-$(qb_utc_minus_min 5)}"
-    QB_HOT_FROM_10M="${HOT_FROM_10M:-$(qb_utc_minus_min 10)}"
+    QB_HOT_FROM="${HOT_FROM:-$(qb_utc_minus_sec "$QB_HOT_TO" "$w")}"
     QB_HOT_DT="${HOT_DT:-${QB_HOT_TO%% *}}"
 }
 
@@ -88,8 +91,57 @@ _qb_dts_under() {
 # Snapshot: the OLDEST dt present in BOTH tables, i.e. the most-closed
 # partition every arm can read. Not "yesterday": at benchmark time yesterday is
 # often still being written (event time lags ingest), or does not exist yet.
-# S4 slices that partition by ingestionTime: rows of dt=D are ingested on D+1,
-# so the slice is [D+1 04:30, D+1 05:00) unless SNAPSHOT_S4_FROM/TO move it.
+#
+# S4 slices that partition by eventTimeDT, a fixed SNAPSHOT_S4_MINUTES (3) wide.
+# eventTimeDT is set by the GENERATOR, so both tables hold exactly the same rows
+# in any eventTimeDT window, and dt is derived from it, so the window is always
+# inside the partition. ingestionTime is each WRITER's processing time: the
+# same ingestionTime window held 471M rows in Paimon and 480M in Iceberg
+# (2026-10-17), which is not a like-for-like comparison. A row-sized slice was
+# rejected for the same reason: the comparison wants the same rows in the same
+# time slot, not the same share of each table.
+# The window is centred in the span where BOTH tables were committing (their
+# commit history), clipped to SNAPSHOT_DT's own day with QB_S4_MARGIN_S (120 s,
+# two checkpoints) kept clear of each end. Event time runs ahead of commit time
+# by the ingest lag, so the centre of the committed span is well inside the
+# generator's run. At ~2.6M rows/s, 3 min is ~465M rows; S4's own n is the exact
+# count and must match across arms. Writers must be stopped and drained (the
+# snapshot rule), or the newest rows are not in every table yet.
+# Pin it with SNAPSHOT_S4_FROM and SNAPSHOT_S4_TO, both 'YYYY-MM-DD HH:MM:SS'.
+QB_S4_MARGIN_S=120
+
+# "<commit_ms> <rows_added>" per commit of the Iceberg table, from the
+# snapshots in its current metadata.json (Glue metadata_location).
+_qb_commits_iceberg() {
+    local loc
+    loc=$(aws glue get-table --region "$AWS_REGION" --database-name "$ICEBERG_DB" --name "$TABLE_NAME" \
+            --query 'Table.Parameters.metadata_location' --output text 2>/dev/null)
+    [[ -n "$loc" && "$loc" != None ]] || return 1
+    aws s3 cp --region "$AWS_REGION" "$loc" - 2>/dev/null | python3 -c '
+import json, sys
+for s in json.load(sys.stdin).get("snapshots", []):
+    print(s["timestamp-ms"], s.get("summary", {}).get("added-records", 0))'
+}
+
+# The same for Paimon, from every RETAINED snapshot file (APPEND commits carry
+# the rows; COMPACT ones add none). Expiry drops old snapshots, which can only
+# move the start of the common span later, never the slice outside the data.
+_qb_commits_paimon() {
+    local snap="${PAIMON_TABLE_ROOT}/snapshot" d rc=0
+    d=$(mktemp -d)
+    aws s3 ls --region "$AWS_REGION" "${snap}/" 2>/dev/null | sed -n 's/.* \(snapshot-[0-9]*\)$/\1/p' \
+        | xargs -P 8 -I{} aws s3 cp --quiet --region "$AWS_REGION" "${snap}/{}" "${d}/{}" 2>/dev/null || true
+    ls "$d" | grep -q . || rc=1
+    (( rc )) || python3 - "$d" <<'EOF'
+import json, os, sys
+for f in os.listdir(sys.argv[1]):
+    j = json.load(open(os.path.join(sys.argv[1], f)))
+    print(j["timeMillis"], j.get("deltaRecordCount", 0) if j.get("commitKind") == "APPEND" else 0)
+EOF
+    rm -rf "$d"
+    return $rc
+}
+
 qb_resolve_snapshot() {
     if [[ -z "${SNAPSHOT_DT:-}" ]]; then
         local p i
@@ -99,11 +151,45 @@ qb_resolve_snapshot() {
         SNAPSHOT_DT=$([[ "$p" > "$i" ]] && echo "$p" || echo "$i")
     fi
     [[ "$SNAPSHOT_DT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || qb_die "SNAPSHOT_DT='${SNAPSHOT_DT}' is not YYYY-MM-DD"
-    local ing
-    ing=$(qb_date_plus_days "$SNAPSHOT_DT" 1)
     QB_SNAPSHOT_DT="$SNAPSHOT_DT"
-    QB_S4_FROM="${ing} ${SNAPSHOT_S4_FROM:-04:30:00}"
-    QB_S4_TO="${ing} ${SNAPSHOT_S4_TO:-05:00:00}"
+
+    local ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
+    if [[ -n "${SNAPSHOT_S4_FROM:-}${SNAPSHOT_S4_TO:-}" ]]; then
+        [[ "${SNAPSHOT_S4_FROM:-}" =~ $ts_re && "${SNAPSHOT_S4_TO:-}" =~ $ts_re ]] \
+            || qb_die "SNAPSHOT_S4_FROM and SNAPSHOT_S4_TO must both be set, as 'YYYY-MM-DD HH:MM:SS'"
+        QB_S4_FROM="$SNAPSHOT_S4_FROM"; QB_S4_TO="$SNAPSHOT_S4_TO"; QB_S4_HOW="pinned"
+        return 0
+    fi
+
+    local m="${SNAPSHOT_S4_MINUTES:-3}" d r
+    [[ "$m" =~ ^[1-9][0-9]*$ ]] || qb_die "SNAPSHOT_S4_MINUTES='${m}' is not a positive integer"
+    d=$(mktemp -d)
+    _qb_commits_paimon  > "${d}/p" || { rm -rf "$d"; qb_die "no Paimon snapshots under ${PAIMON_TABLE_ROOT}/snapshot; set SNAPSHOT_S4_FROM/TO"; }
+    _qb_commits_iceberg > "${d}/i" && [[ -s "${d}/i" ]] \
+        || { rm -rf "$d"; qb_die "no Iceberg snapshots for ${ICEBERG_DB}.${TABLE_NAME}; set SNAPSHOT_S4_FROM/TO"; }
+    r=$(python3 - "$SNAPSHOT_DT" "$m" "$QB_S4_MARGIN_S" "${d}/p" "${d}/i" <<'EOF'
+import sys
+from datetime import datetime, timezone
+dt, mins, margin = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+day0 = datetime.strptime(dt, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
+f = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+spans = []
+for path in sys.argv[4:6]:
+    t = sorted(int(l.split()[0]) / 1000 for l in open(path) if l.strip())
+    spans.append((t[0], t[-1]))
+lo = max(max(a for a, _ in spans), day0) + margin
+hi = min(min(b for _, b in spans), day0 + 86400) - margin
+span = "both committing, clipped to %s and less %ds each end: [%s, %s)" % (dt, margin, f(lo), f(hi))
+if hi - lo < mins * 60:
+    print("ERR %s is %.1f min, under SNAPSHOT_S4_MINUTES=%d" % (span, max(hi - lo, 0) / 60, mins)); sys.exit()
+start = int((lo + hi) / 2 - mins * 30) // 60 * 60       # centred, on a whole minute
+start = max(start, int(lo + 59) // 60 * 60)
+print("OK|%s|%s|%d min of eventTimeDT, centred in the span %s" % (f(start), f(start + mins * 60), mins, span))
+EOF
+)
+    rm -rf "$d"
+    [[ "$r" == OK\|* ]] || qb_die "S4: ${r#ERR }; lower SNAPSHOT_S4_MINUTES or set SNAPSHOT_S4_FROM/TO"
+    IFS='|' read -r _ QB_S4_FROM QB_S4_TO QB_S4_HOW <<<"$r"
 }
 
 # ── Queries ─────────────────────────────────────────────────────────────────
@@ -120,8 +206,7 @@ qb_render() {
     content=$(<"$1")
     for kv in "TABLE=${QB_TABLE:-}" "BYTES_FN=${QB_BYTES_FN:-}" \
               "HOT_DT=${QB_HOT_DT:-}" "HOT_TO=${QB_HOT_TO:-}" \
-              "HOT_FROM_1M=${QB_HOT_FROM_1M:-}" "HOT_FROM_5M=${QB_HOT_FROM_5M:-}" \
-              "HOT_FROM_10M=${QB_HOT_FROM_10M:-}" "SNAPSHOT_DT=${QB_SNAPSHOT_DT:-}" \
+              "HOT_FROM=${QB_HOT_FROM:-}" "SNAPSHOT_DT=${QB_SNAPSHOT_DT:-}" \
               "S4_FROM=${QB_S4_FROM:-}" "S4_TO=${QB_S4_TO:-}"; do
         k="${kv%%=*}"
         [[ "$k" == "${QB_DEFER:-}" ]] && continue
@@ -142,7 +227,7 @@ qb_render_oneline() {
 }
 
 # Per-query cap, the same on both engines so a TIMEOUT means the same thing.
-# Hot windows are minutes of data; the snapshot partition is a full day.
+# The hot window is seconds of data; the snapshot partition is a full day.
 qb_query_timeout() { [[ "$1" == hot ]] && echo 1800 || echo 3600; }
 
 # Median of the numbers on stdin; empty input prints nothing.

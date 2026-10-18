@@ -6,5 +6,5 @@ SELECT COUNT(*)                        AS n,
        SUM(${BYTES_FN}(event_json))    AS payload_bytes
 FROM ${TABLE}
 WHERE dt = '${HOT_DT}'
-  AND ingestionTime >= '${HOT_FROM_5M}'
+  AND ingestionTime >= '${HOT_FROM}'
   AND ingestionTime <  '${HOT_TO}';
