@@ -1,0 +1,24 @@
+stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
+# suite=hot writers: flink-cid-paimon=running flink-cid-iceberg=running
+# suite=hot dt=2026-10-10 runs=3 warmup=1 arms=paimon pmn_as_iceberg iceberg run_id=20261010T150541Z_41253
+# state suite=hot arm=paimon dt=2026-10-10 rows=1947978653
+# state suite=hot arm=pmn_as_iceberg dt=2026-10-10 rows=1947978653 files=7040
+# state suite=hot arm=iceberg dt=2026-10-10 rows=2112379699 files=7360
+20261010T150541Z,starrocks,paimon,hot,H1_freshness,ok,2224,1,97061719,44921971
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H1_freshness,ok,2669,1,97061719,48409338
+20261010T150541Z,starrocks,iceberg,hot,H1_freshness,ok,4055,1,96852949,273704162
+20261010T150541Z,starrocks,paimon,hot,H2_hot_count,ok,2174,1,97061719,44921971
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H2_hot_count,ok,3748,1,97061719,159798325
+20261010T150541Z,starrocks,iceberg,hot,H2_hot_count,ok,3859,1,96852949,261758263
+20261010T150541Z,starrocks,paimon,hot,H3_hot_needle_uuid,ok,2780,0,97061719,2539857115
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H3_hot_needle_uuid,ok,3228,0,97061719,2544468055
+20261010T150541Z,starrocks,iceberg,hot,H3_hot_needle_uuid,ok,4303,0,96852949,2785083968
+20261010T150541Z,starrocks,paimon,hot,H4_hot_narrow_agg,ok,2070,9,97061719,44933606
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H4_hot_narrow_agg,ok,2737,9,97061719,47932673
+20261010T150541Z,starrocks,iceberg,hot,H4_hot_narrow_agg,ok,5545,9,96852949,331554971
+20261010T150541Z,starrocks,paimon,hot,H5_hot_wide_json,ok,92441,1,97061719,54228102999
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H5_hot_wide_json,ok,92509,1,97061719,54232695417
+20261010T150541Z,starrocks,iceberg,hot,H5_hot_wide_json,ok,87990,1,96852949,56430386095
+20261010T150541Z,starrocks,paimon,hot,H6_hot_customer_agg,ok,3991,16,97061719,46041533
+20261010T150541Z,starrocks,pmn_as_iceberg,hot,H6_hot_customer_agg,ok,4059,16,97061719,48434264
+20261010T150541Z,starrocks,iceberg,hot,H6_hot_customer_agg,ok,5993,16,96852949,301363706

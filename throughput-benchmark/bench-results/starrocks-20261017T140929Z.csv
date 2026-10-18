@@ -1,0 +1,18 @@
+stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
+# suite=snapshot writers: flink-cid-paimon= flink-cid-iceberg=
+# suite=snapshot dt=2026-10-10 runs=1 warmup=1 arms=paimon pmn_as_iceberg iceberg run_id=20261017T140929Z_71523
+# state suite=snapshot arm=paimon dt=2026-10-10 rows=4642903015
+# state suite=snapshot arm=pmn_as_iceberg dt=2026-10-10 rows=4642903015 files=16640
+# state suite=snapshot arm=iceberg dt=2026-10-10 rows=4642903015 files=16008
+20261017T140929Z,starrocks,paimon,snapshot,S1_partition_count,OK,27260,1,4642903015,13722530
+20261017T140929Z,starrocks,pmn_as_iceberg,snapshot,S1_partition_count,OK,384,1,0,0
+20261017T140929Z,starrocks,iceberg,snapshot,S1_partition_count,OK,1668,1,0,0
+20261017T140929Z,starrocks,paimon,snapshot,S2_narrow_agg,OK,59114,9,4642903015,5745502769
+20261017T140929Z,starrocks,pmn_as_iceberg,snapshot,S2_narrow_agg,OK,72205,9,4642903015,190465336
+20261017T140929Z,starrocks,iceberg,snapshot,S2_narrow_agg,OK,55005,9,4642903015,12074409752
+20261017T140929Z,starrocks,paimon,snapshot,S3_risk_distinct,OK,190185,4,4642903015,1250493298
+20261017T140929Z,starrocks,pmn_as_iceberg,snapshot,S3_risk_distinct,OK,316353,4,4642903015,50020290
+20261017T140929Z,starrocks,iceberg,snapshot,S3_risk_distinct,OK,768467,4,4642903015,5302623723
+20261017T140929Z,starrocks,paimon,snapshot,S4_wide_json,OK,799830,1,541020581,305229616818
+20261017T140929Z,starrocks,pmn_as_iceberg,snapshot,S4_wide_json,OK,1055315,1,541020581,288147059160
+20261017T140929Z,starrocks,iceberg,snapshot,S4_wide_json,OK,1184527,1,574186891,286087813249

@@ -1,0 +1,13 @@
+stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
+20261010T150541Z,duckdb,paimon,hot,H1_freshness,OK,25665,1,,
+20261010T150541Z,duckdb,paimon,hot,H2_hot_count,OK,21651,1,,
+20261010T150541Z,duckdb,paimon,hot,H3_hot_needle_uuid,OK,28265,0,,
+20261010T150541Z,duckdb,paimon,hot,H4_hot_narrow_agg,OK,27383,9,,
+20261010T150541Z,duckdb,paimon,hot,H5_hot_wide_json,OK,81187,1,,
+20261010T150541Z,duckdb,paimon,hot,H6_hot_customer_agg,OK,28718,16,,
+20261010T150541Z,duckdb,iceberg,hot,H1_freshness,OK,32910,1,,
+20261010T150541Z,duckdb,iceberg,hot,H2_hot_count,OK,32187,1,,
+20261010T150541Z,duckdb,iceberg,hot,H3_hot_needle_uuid,OK,39327,0,,
+20261010T150541Z,duckdb,iceberg,hot,H4_hot_narrow_agg,OK,36220,9,,
+20261010T150541Z,duckdb,iceberg,hot,H5_hot_wide_json,OK,96447,1,,
+20261010T150541Z,duckdb,iceberg,hot,H6_hot_customer_agg,OK,35168,16,,
