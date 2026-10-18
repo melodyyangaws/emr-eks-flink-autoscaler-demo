@@ -20,7 +20,7 @@ spec:
     job.autoscaler.enabled: "false"
     # ON (it was "false"). With it off, every 4 KB row was serialized and
     # deserialized across each Source -> Calc -> Map -> Writer edge, and that
-    # copying was part of the Calc that capped the s3json runs at ~184K rows/s
+    # copying was part of the Calc that capped the S3 JSON runs at ~184K rows/s
     # (2026-10-08). The cost: the UI and REST show one vertex per chain instead
     # of per-operator busy/backpressure. Set "false" for a diagnostic run.
     # Kept identical across both formats — it is a fair-comparison variable.
@@ -32,13 +32,13 @@ spec:
     # serializes into its own write buffer. Kept identical across both formats —
     # it is a fair-comparison variable.
     pipeline.object-reuse: "true"
-    # The s3json source loads Hive's module for json_tuple. HiveModule's static
+    # The SQS source's parse stage loads Hive's module for json_tuple. HiveModule's static
     # init needs commons-codec (org.apache.commons.codec.language.Soundex),
     # which the image ships only under hudi/, off the classpath. Flink appends
     # HADOOP_CLASSPATH to the JVM classpath, so this is the image's own value
     # (emr-7.13.0, `echo $HADOOP_CLASSPATH` in the image) plus that one jar.
     # An env var set here REPLACES the image's, so re-copy the base value if
-    # the image changes. Harmless in datagen mode.
+    # the image changes.
     containerized.master.env.HADOOP_CLASSPATH: "/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*:/usr/lib/flink/hudi/commons-codec-1.15.jar"
     containerized.taskmanager.env.HADOOP_CLASSPATH: "/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*:/usr/lib/flink/hudi/commons-codec-1.15.jar"
     pipeline.auto-watermark-interval: "1s"
@@ -90,7 +90,7 @@ spec:
     # the Parquet write buffers live, not to managed memory (no RocksDB).
     taskmanager.memory.managed.fraction: "0.1"
     parallelism.default: "${JOB_PARALLELISM}"
-    pipeline.max-parallelism: "256"
+    pipeline.max-parallelism: "512"
     table.exec.source.idle-timeout: "30s"
     sql-client.execution.result-mode: tableau
     table.dml-sync: "false"
@@ -122,25 +122,24 @@ spec:
           # us-east-1 via IMDS and die with a 401.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
-          - name: SOURCE_ROWS_PER_SECOND
-            value: "${SOURCE_ROWS_PER_SECOND}"
-          # Read only by 00-source.sql when SOURCE_MODE=s3json (01-s3json-source.sql);
-          # harmless under the default datagen source.
-          - name: S3JSON_SOURCE_PATH
-            value: "${S3JSON_SOURCE_PATH}"
-          - name: S3JSON_MONITOR_INTERVAL
-            value: "${S3JSON_MONITOR_INTERVAL}"
-          # % of events attributed to a hot 5% slice of CID_HOST_COUNT
-          - name: HOT_KEY_FRACTION
-            value: "${HOT_KEY_FRACTION}"
-          # CID source-mockup fan-out. CID_DAY_SPREAD is the one to watch: dt is
-          # the partition column, so it sets the PARTITION COUNT on this table.
-          - name: CID_CUSTOMER_COUNT
-            value: "${CID_CUSTOMER_COUNT}"
-          - name: CID_HOST_COUNT
-            value: "${CID_HOST_COUNT}"
-          - name: CID_DAY_SPREAD
-            value: "${CID_DAY_SPREAD}"
+          # Read by 00-source.sql (01-raw-s3sqs.sql). SQS_QUEUE_URL is the ONE
+          # value that differs between the two manifests (<prefix>-paimon vs
+          # <prefix>-iceberg); render_manifest fills it per format. The
+          # TaskManagers need none of these: the executor runs on the JM only,
+          # and the connector options it substitutes travel to the TMs inside
+          # the job graph.
+          - name: SQS_QUEUE_URL
+            value: "${SQS_QUEUE_URL}"
+          - name: SQS_SOURCE_JAR
+            value: "${SQS_SOURCE_JAR}"
+          - name: SQS_POLL_THREADS
+            value: "${SQS_POLL_THREADS}"
+          # A whole option line ('max-pending-splits' = 'N',) or empty for the
+          # connector default — rendered from SQS_MAX_PENDING, see the script.
+          - name: SQS_MAX_PENDING_OPT
+            value: "${SQS_MAX_PENDING_OPT}"
+          - name: SQS_VISIBILITY_TIMEOUT
+            value: "${SQS_VISIBILITY_TIMEOUT}"
           # Substituted into the sink DDL's 'bucket' and bucket-key line. -1
           # (unaware-bucket) by default, computed in build-deploy-cid.sh; the
           # key line is empty unless PAIMON_BUCKETS >= 1.

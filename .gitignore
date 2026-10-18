@@ -14,3 +14,7 @@ cdc-pipeline/bench-results
 *pycache*
 # Account-specific values for throughput-benchmark/.bench-env
 .bench-env.local
+# deploy-cid-monitor.sh collector pids
+throughput-benchmark/monitoring/.collectors.pid
+# Maven build output
+throughput-benchmark/sqs-delta-filename/target/

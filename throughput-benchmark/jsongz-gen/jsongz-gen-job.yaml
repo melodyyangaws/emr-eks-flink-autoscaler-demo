@@ -5,33 +5,35 @@
 # below is a render-time placeholder; the script asserts none survive. (Keep
 # braced placeholders out of these comments: they would trip that check.)
 #
-# Deployment (the file keeps its old -job name): JSONGZ_REPLICAS pods, each
-# running WORKERS generator processes capped at POD_ROWS_PER_SECOND, so the
-# cluster rate is replicas x per-pod rate and `run-jsongz-gen.sh scale N`
-# changes it. Pods have no index; each seeds its RNG from its own pod name
-# (downward API), so file names cannot collide across pods.
+# Job, not Deployment: parallelism JSONGZ_REPLICAS pods, each running WORKERS
+# generator processes capped at POD_ROWS_PER_SECOND, so the cluster rate is
+# replicas x per-pod rate and `run-jsongz-gen.sh scale N` patches parallelism.
+# completions is left unset: the Job is done once a pod succeeds and the rest
+# have finished, and no new pods start after that. Pods have no index; each
+# seeds its RNG from its own pod name (downward API), so file names cannot
+# collide across pods.
 #
-# Fixed window, not run-until-stopped: every pod writes for DURATION_SECONDS
-# from its own start, but never past RUN_DEADLINE_EPOCH (render time +
-# duration + 600 s for node launch + pip; replaces activeDeadlineSeconds). Then it
-# IDLES rather than exiting, because a Deployment restarts exited pods and
-# each restart would open a new window. A pod restarted or scaled up after
-# the deadline writes nothing. `stop` scales to 0.
+# Fixed 30-minute window that RELEASES ITS NODES: every pod writes for
+# DURATION_SECONDS from its own start, but never past RUN_DEADLINE_EPOCH
+# (render time + duration + 600 s for node launch + pip), then EXITS 0. The
+# Job completes, its pods are gone, and Karpenter reclaims the nodes; nobody
+# has to run `stop`. A pod restarted after the deadline writes nothing and
+# exits. activeDeadlineSeconds (duration + slack + 300 s, from the
+# run-jsongz-gen.sh start that rendered this file) is only a backstop for a
+# pod that hangs past the shared deadline.
 #
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: cid-jsongz-gen
   namespace: ${NAMESPACE}
 spec:
-  replicas: ${JSONGZ_REPLICAS}
-  # Recreate, not RollingUpdate: a re-start (new deadline) must not surge
-  # extra 60-cpu pods next to the old ones and briefly double the rate.
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: cid-jsongz-gen
+  parallelism: ${JSONGZ_REPLICAS}
+  activeDeadlineSeconds: ${JOB_DEADLINE_SECONDS}
+  backoffLimit: 6
+  # Keep the finished Job (and its pod logs) for an hour so `status` can
+  # still show the DONE lines, then let Kubernetes delete it.
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       annotations:
@@ -39,7 +41,8 @@ spec:
       labels:
         app: cid-jsongz-gen
     spec:
-      restartPolicy: Always
+      # OnFailure: a crashed pod restarts in place; one that finished exits 0.
+      restartPolicy: OnFailure
       # SIGTERM stops the workers and flushes in-flight PUTs before exit.
       terminationGracePeriodSeconds: 60
       # IRSA role that already reads/writes the benchmark bucket (same SA as
@@ -83,7 +86,7 @@ spec:
         - name: RUN_DEADLINE_EPOCH
           value: "${RUN_DEADLINE_EPOCH}"
         - name: IDLE_AFTER_DONE
-          value: "1"
+          value: "0"
         - name: POD_NAME
           valueFrom:
             fieldRef:

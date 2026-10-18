@@ -1,37 +1,23 @@
 -- ============================================================================
--- S3 gzipped-NDJSON Stream Source — the alternative to 01-datagen-source.sql
+-- Parse stage — gzip NDJSON lines into the 34-column source view
 -- ============================================================================
--- Selected with SOURCE_MODE=s3json in build-deploy-cid.sh, which uploads THIS
--- file as 00-source.sql instead of 01-datagen-source.sql. SOURCE_MODE=datagen
--- (the default) restores the original in-memory datagen source unchanged; the
--- two files are the only difference between the modes.
+-- NOT a runnable file on its own. upload_scripts() in build-deploy-cid.sh
+-- concatenates 01-raw-s3sqs.sql and THIS file into each format's 00-source.sql.
+-- The raw fragment defines s3json_raw(line STRING), one gzip NDJSON line per
+-- row; everything from here on reads only that. The text below is therefore
+-- byte-identical between the Paimon and Iceberg jobs. Edit the parse here,
+-- never in the raw fragment.
 --
--- It defines the SAME view name (datagen_source) with the SAME 34 columns in
--- the SAME order and types as 01-datagen-source.sql stage 4, so
--- ../paimon/04-pipeline.sql, ../iceberg/04-pipeline.sql and both sink tables
--- are untouched. The view keeps the datagen name on purpose: renaming it would
--- mean editing both pipelines and losing the one-file switch.
+-- It defines the view datagen_source with the 34 columns of both sink tables,
+-- in the same order and types, which ../paimon/04-pipeline.sql and
+-- ../iceberg/04-pipeline.sql read. The name is historical (the jobs were once
+-- fed by Flink's datagen connector) and kept so the pipelines need no edit.
 --
--- WHAT IT READS. The .json.gz files written by ../../jsongz-gen/ (the real
--- landing zone's layout without its x=00/ shard level):
---   <S3JSON_SOURCE_PATH>/year=/month=/day=/hour=/customerId=/productCode=/
---       <coupledTraceId>_NNN_new.json.gz
--- 'source.monitor-interval' makes the filesystem source CONTINUOUS: it lists
--- the path every interval and reads every file it has not seen before, so
--- files the generator adds while the job runs are picked up. Files already
--- under the path when the job starts are read too — point S3JSON_SOURCE_PATH at
--- a fresh prefix (or clean it) for a run that should see only new data.
---
--- GZIP IS TRANSPARENT. Flink's FileInputFormat picks a decompressor by file
--- extension (.gz -> GzipInflaterInputStreamFactory) and then reads the file as
--- one unsplittable split, so each .json.gz is one split, one line = one row.
---
--- THE SOURCE IS NO LONGER FREE. The datagen source can never be the bottleneck;
--- this one can. Per row it does an S3 GET share, an inflate and a JSON parse
--- of the 4 KB line. If a run shows backpressure with idle sinks, the read side
--- — not the table format — is the wall, and the result does not compare with
--- datagen-mode runs. There is also no rate knob: the job reads as fast as it
--- can, so the rate is whatever the generator (JSONGZ_ROWS_PER_SECOND) lands.
+-- THE SOURCE IS NOT FREE. Per row it does an S3 GET share, an inflate and a
+-- JSON parse of the 4 KB line. If a run shows backpressure with idle sinks,
+-- the read side — not the table format — is the wall. There is also no rate
+-- knob: the job reads as fast as it can, so the rate is whatever the
+-- generator (JSONGZ_ROWS_PER_SECOND) lands.
 --
 -- PARSE ONCE. Stage 1 uses Hive's json_tuple (HiveModule; the jars ship in
 -- the EMR image's /opt/flink/lib), which parses the line ONCE and returns
@@ -43,33 +29,7 @@
 -- arrays/objects re-serialized as JSON text, which stage 2 parses again. Those
 -- strings are a few dozen bytes, not 4 KB. An absent key or a JSON null gives
 -- NULL, exactly as JSON_VALUE did.
---
--- KNOWN LIMIT: the continuous enumerator remembers every path it has processed,
--- in JobManager memory and in every checkpoint. At the generator's ~600 files/s
--- that is ~2M paths an hour — fine for a benchmark-length run, not for days.
--- And the FIRST listing, at job (re)start, is synchronous on the JobMaster's
--- RPC thread: a large backlog under the path blocks it past the 60 s ask
--- timeout and the JM crash-loops (exit 239, "requestJobStatus ... timed out").
--- Hence a fresh prefix per run (.bench-env sets S3JSON_SOURCE_PATH and the
--- generator's OUTPUT_URI together).
---
--- Knobs (env on the JobManager, threaded through by build-deploy-cid.sh):
---   S3JSON_SOURCE_PATH        default s3a://<bucket>/cid-landing-jsongz/
---   S3JSON_MONITOR_INTERVAL   default 10s
 -- ============================================================================
-
--- Raw format: the verbatim line, which is exactly what event_json must carry.
--- The table is NOT declared PARTITIONED BY: the key=value directories are the
--- producer's layout, not columns we need, and an unpartitioned filesystem
--- table still enumerates the path recursively.
-CREATE TEMPORARY TABLE s3json_raw (
-    line STRING
-) WITH (
-    'connector'               = 'filesystem',
-    'path'                    = '${S3JSON_SOURCE_PATH}',
-    'format'                  = 'raw',
-    'source.monitor-interval' = '${S3JSON_MONITOR_INTERVAL:10s}'
-);
 
 -- Core stays first in the module order, but that does NOT protect every
 -- Flink function: those outside the core module (DATE_FORMAT, at least) lose
@@ -100,7 +60,7 @@ LATERAL TABLE(json_tuple(r.line,
     objectBmData_s, tags_j, dst_s, src_s, dpt_s, spt_s, winEventId_s
 );
 
--- Stage 2: the public view, column-for-column with 01-datagen-source.sql.
+-- Stage 2: the public view, column-for-column with the sink tables.
 -- eventTimeDT is parsed from the ISO string rather than converted from the
 -- epoch millis, so no session time zone is involved; the source writes UTC 'Z'.
 CREATE TEMPORARY VIEW datagen_source AS
@@ -134,14 +94,14 @@ SELECT
     processHashId,
     processFilePath,
     processCmd,
-    -- Never present in the source; NULL exactly as in datagen mode.
+    -- Never present in the source; always NULL.
     CAST(NULL AS STRING)                                    AS request,
     objectHostName,
     objectHashId,
     objectFilePath,
     objectUser,
-    -- Scalar in the data, ARRAY<STRING> in the schema: same 1-element wrap as
-    -- datagen mode. Likewise dst and src below.
+    -- Scalar in the data, ARRAY<STRING> in the schema: wrapped as a 1-element
+    -- array. Likewise dst and src below.
     CASE WHEN objectCmd_s IS NOT NULL THEN ARRAY[objectCmd_s] END AS objectCmd,
     -- providerName is the "provider" key inside objectBmData, which is itself a
     -- JSON-encoded STRING (a short one) — hence the second, small parse.
@@ -151,9 +111,8 @@ SELECT
     CASE WHEN src_s IS NOT NULL THEN ARRAY[src_s] END       AS src,
     TRY_CAST(dpt_s AS INT)                              AS dpt,
     TRY_CAST(spt_s AS INT)                              AS spt,
-    -- Not in the raw data (see the MISMATCH note in 01-datagen-source.sql);
-    -- datagen mode synthesises it for Windows rows, this mode reads what is
-    -- there, which is NULL. The column is kept so the sinks see 34 columns.
+    -- Not in the raw data (the sample extract has no winEventId field), so
+    -- this reads NULL. The column is kept so the sinks see 34 columns.
     TRY_CAST(winEventId_s AS INT)                       AS winEventId
 FROM (
     SELECT *,

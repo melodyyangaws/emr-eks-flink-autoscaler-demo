@@ -7,17 +7,17 @@
 # base — it bundles Paimon 1.3.2 AND Iceberg 1.10.0-amzn-1):
 #   paimon  : append-only table, PARTITIONED BY (dt), bucketed on uuid
 #   iceberg : format v2, append-only, PARTITIONED BY (dt), distribution-mode=none
-# Both fed by a built-in datagen source at 4 KiB mean row. The rate is
-# SOURCE_ROWS_PER_SECOND, default 2,000,000 rows/s ≈ 7.63 GiB/s; .bench-env
-# raises it to 2,097,152 = exactly 8 GiB/s, which is the benchmark's stated
-# target. It is a rate LIMIT, not a guarantee — the 2026-10-05 runs delivered
-# ~555 K rows/s against it. Do not quote a GiB/s figure here that is not
-# derived from SOURCE_ROWS_PER_SECOND; four such literals had drifted to three
-# different numbers before 2026-10-06.
+# Both read the same gzip NDJSON files (~4 KiB mean row) that jsongz-gen/
+# lands under OUTPUT_URI (.bench-env). Each PUT fires an S3 event
+# to SNS cid-landing-jsongz-events, which fans out to one SQS queue per job
+# (<SQS_QUEUE_PREFIX>-paimon / -iceberg); the sqs-delta-filename connector
+# reads the files those messages name. There is no rate knob here: the jobs
+# read as fast as they can, so the offered rate is whatever the generator
+# lands (JSONGZ_ROWS_PER_SECOND in jsongz-gen/run-jsongz-gen.sh).
 #
 # APPEND-ONLY. Both sinks are pure INSERT: no primary key, no upsert, no
 # equality/merge-on-read deletes, no changelog producer, and the pipelines are
-# INSERT INTO ... SELECT over a datagen view with no stateful operator, so the
+# INSERT INTO ... SELECT over the source view with no stateful operator, so the
 # planner cannot emit a retraction. The formats are therefore compared on
 # encode + upload + commit + small-file compaction, NOT on merge-on-read cost.
 # Results are NOT comparable with the earlier upsert series in bench-results/.
@@ -33,16 +33,15 @@
 #   ./build-deploy-cid.sh deploy iceberg
 #   ./build-deploy-cid.sh deploy both           # side by side: measures contention, not a write path
 #   ./build-deploy-cid.sh render                # write flink-cid-<fmt>-deployed.yaml, don't apply
-#   ./build-deploy-cid.sh monitor               # FlinkDeployments + pods
 #   ./build-deploy-cid.sh cleanup [paimon|iceberg|both]   # delete the CR(s); asks "yes"; keeps data
 # deploy always deletes and re-CREATEs the CR, since EMR stages jarURI on CREATE only.
 # Suspend without deleting:
 #   kubectl patch flinkdeployment flink-cid-<fmt> -n emr-flink --type=merge \
 #     -p '{"spec":{"job":{"state":"suspended"}}}'
-# Knobs (env, defaults below): SOURCE_MODE=datagen|s3json (+S3JSON_SOURCE_PATH),
-#   SOURCE_ROWS_PER_SECOND, JOB_PARALLELISM, PAIMON_BUCKETS (-1 = unaware),
-#   ICEBERG_COMPAT, WRITE_BUFFER, CID_CUSTOMER_COUNT, CID_HOST_COUNT,
-#   CID_DAY_SPREAD, HOT_KEY_FRACTION, JM_NODEPOOL, TM_NODEPOOL.
+# Knobs (env, defaults below): SQS_QUEUE_PREFIX, SQS_POLL_THREADS,
+#   SQS_MAX_PENDING, SQS_VISIBILITY_TIMEOUT, SQS_SOURCE_JAR, JOB_PARALLELISM,
+#   PAIMON_BUCKETS (-1 = unaware), ICEBERG_COMPAT, WRITE_BUFFER, JM_NODEPOOL,
+#   TM_NODEPOOL.
 # Changing JOB_PARALLELISM/PAIMON_BUCKETS or ICEBERG_COMPAT requires dropping the
 # tables first (README "Teardown"): the bucket count is fixed at CREATE TABLE.
 ###############################################################################
@@ -63,12 +62,10 @@ export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
 # ---------------------------------------------------------------------------
 export EMR_VERSION=${EMR_VERSION:-7.13.0}
 export IMAGE_TAG=${IMAGE_TAG:-$EMR_VERSION}
-export SOURCE_ROWS_PER_SECOND=${SOURCE_ROWS_PER_SECOND:-2000000}
-# This rate needs real parallelism. At the default 2,000,000 rows/s (≈7.63
-# GiB/s) 128 subtasks is ~61 MiB/s per subtask on the write path; at
-# .bench-env's 160 subtasks and 8 GiB/s it is ~51 MiB/s. Scale up only if the
-# source backpressures on BOTH formats — that means the harness, not the format,
-# is the wall.
+# Each subtask parses as well as writes (~1 core per subtask at ~100 us of CPU
+# per row), so parallelism caps the rate a job can absorb; .bench-env sizes it
+# against the generator's rate. Scale up only if the source backpressures on
+# BOTH formats — that means the harness, not the format, is the wall.
 export JOB_PARALLELISM=${JOB_PARALLELISM:-128}
 
 # Paimon 'bucket': -1 (unaware-bucket) by default, matching the Iceberg side,
@@ -90,87 +87,49 @@ else
     export PAIMON_BUCKETS=-1 PAIMON_BUCKET_KEY_OPT=""
 fi
 
-# Endpoint-skew knob.
-# HOT_KEY_FRACTION: percentage of rows routed to the hot slice [0,99].
-#   0  = uniform (default; what the earlier series used)
-#   80 = 80% of rows attributed to a hot 5% slice of the endpoints (80/20 shape)
-# It substitutes into 01-datagen-source.sql via pod env on the JobManager.
+# ---------------------------------------------------------------------------
+# Source: S3 event notifications via SQS (the only source)
+# ---------------------------------------------------------------------------
+# upload_scripts() publishes 01-raw-s3sqs.sql + 01-parse-s3json.sql as each
+# format's 00-source.sql. Data shape and rate are whatever jsongz-gen/ lands;
+# its own knobs (CID_CUSTOMER_COUNT, CID_HOST_COUNT, JSONGZ_*) live there.
 #
-# WHAT IT MEANS SINCE THE SCHEMA CHANGE. The sink tables are APPEND-ONLY now
-# (schema_sample.sql has no primary key), so there is no key for a row to be
-# "hot" on and skew no longer drives LSM key-merge or delete-file work — which
-# was the entire point of this knob in the upsert era. The selector now routes
-# the ENDPOINT identity instead: HOT_KEY_FRACTION% of events are attributed to a
-# hot 5% slice of CID_HOST_COUNT (CID_HOST_COUNT/20). That still changes real
-# work — a few noisy hosts make the endpoint columns dictionary-encode better —
-# but it is a much weaker lever than it was. Do not read an old 80/20 result as
-# comparable with a new one.
-#
-# It does NOT affect Paimon's bucket distribution. 'bucket-key' = 'uuid', and
-# uuid comes from r_uuid, a full-range draw this knob never touches.
-#
-# It still changes the BYTES the writers encode, so changing it invalidates
-# comparison with runs at a different value; .bench-env sets 80.
-export HOT_KEY_FRACTION=${HOT_KEY_FRACTION:-0}
-if [[ ! "$HOT_KEY_FRACTION" =~ ^[0-9]+$ ]] || (( HOT_KEY_FRACTION > 99 )); then
-    error "HOT_KEY_FRACTION must be an integer 0..99 (got '$HOT_KEY_FRACTION').
-       It is compared against a datagen 'selector' drawn in [0,99]."
+# One queue per format, both subscribed to SNS cid-landing-jsongz-events, so
+# each job sees every file: <prefix>-paimon and <prefix>-iceberg. The URL is
+# built per format in render_manifest (sqs_queue_url).
+export SQS_QUEUE_PREFIX=${SQS_QUEUE_PREFIX:-cid-landing-jsongz}
+# Concurrent ReceiveMessage loops in the source's enumerator.
+export SQS_POLL_THREADS=${SQS_POLL_THREADS:-8}
+if [[ ! "$SQS_POLL_THREADS" =~ ^[0-9]+$ ]] || (( SQS_POLL_THREADS < 1 )); then
+    error "SQS_POLL_THREADS must be an integer >= 1 (got '$SQS_POLL_THREADS')"
 fi
-
-# ---------------------------------------------------------------------------
-# Source selection (added 2026-10-08)
-# ---------------------------------------------------------------------------
-# SOURCE_MODE picks which file upload_scripts() publishes as 00-source.sql.
-# Both define the same datagen_source view (same 34 columns), so nothing else
-# in the pipeline changes:
-#   datagen (default) — sql-scripts/common/01-datagen-source.sql, the in-memory
-#                       rate-limited generator. The original behaviour; set
-#                       this (or unset SOURCE_MODE) to switch back.
-#   s3json            — sql-scripts/common/01-s3json-source.sql, a CONTINUOUS
-#                       filesystem source over the gzipped NDJSON written by
-#                       jsongz-gen/. SOURCE_ROWS_PER_SECOND and the CID_*/
-#                       HOT_KEY_FRACTION knobs do nothing in this mode — the
-#                       rate and data shape are whatever the generator lands.
-export SOURCE_MODE=${SOURCE_MODE:-datagen}
-case "$SOURCE_MODE" in
-    datagen|s3json) ;;
-    *) error "SOURCE_MODE must be 'datagen' or 's3json' (got '$SOURCE_MODE')." ;;
-esac
-# Must be the generator's OUTPUT_URI (jsongz-gen/run-jsongz-gen.sh), as s3a://
-# — the image's Hadoop S3A is what the filesystem connector resolves. Every
-# file already under the prefix is read at job start, so use a fresh prefix
-# for a run that should see only newly added files.
-export S3JSON_SOURCE_PATH=${S3JSON_SOURCE_PATH:-s3a://${BUCKET_NAME}/cid-landing-jsongz/}
-# How often the source re-lists the path for new files.
-export S3JSON_MONITOR_INTERVAL=${S3JSON_MONITOR_INTERVAL:-10s}
-
-# ---------------------------------------------------------------------------
-# CID source-mockup knobs
-# ---------------------------------------------------------------------------
-# The datagen source reproduces the shape of the real security-telemetry extract
-# (cid_9011075d_sample_masked). These three control its fan-out; every other
-# distribution in sql-scripts/common/01-datagen-source.sql is a measured
-# frequency from that sample and is deliberately NOT parameterised.
-#
-# CID_CUSTOMER_COUNT: distinct customerId values (also partition_cust). 16 keeps
-#   the column dictionary-encoded, as it is in the source's per-customer files.
-# CID_HOST_COUNT: distinct endpoints. 1024 ≈ the sample's measured 1,047 — this
-#   is the cardinality that drives endpointGuid/endpointHostName/vpcId encoding.
-# CID_DAY_SPREAD: how many distinct dt values the generator emits, i.e. how many
-#   PARTITIONS the sink tables get. 1 matches the source extract (a single-hour
-#   dump) and is the default.
-#
-#   READ THIS BEFORE RAISING CID_DAY_SPREAD. dt is the partition column on both
-#   sinks. Raising it multiplies open files per writer by the day count on both
-#   sides — 64 writers x N days of concurrently-open Parquet files — which turns
-#   the benchmark into a small-file test. It does NOT make the Iceberg side
-#   distribute better either: write.distribution-mode is 'none' precisely so that
-#   one dt value cannot serialize all writes into one subtask, and that choice is
-#   independent of the day count. Raise it only to exercise multi-partition
-#   commit cost, and say so when reporting the result.
-export CID_CUSTOMER_COUNT=${CID_CUSTOMER_COUNT:-16}
-export CID_HOST_COUNT=${CID_HOST_COUNT:-1024}
-export CID_DAY_SPREAD=${CID_DAY_SPREAD:-1}
+# Cap on received-but-unassigned splits. EMPTY = the connector's own default:
+# the option line is then not rendered at all, because the executor
+# substitutes an empty env var as '' (it only falls back to a ${VAR:default}
+# when the var is ABSENT), and '' is not an integer. Same trick as
+# PAIMON_BUCKET_KEY_OPT.
+export SQS_MAX_PENDING=${SQS_MAX_PENDING:-}
+if [[ -n "$SQS_MAX_PENDING" ]]; then
+    [[ "$SQS_MAX_PENDING" =~ ^[0-9]+$ ]] \
+        || error "SQS_MAX_PENDING must be an integer or empty (got '$SQS_MAX_PENDING')"
+    export SQS_MAX_PENDING_OPT="'max-pending-splits' = '${SQS_MAX_PENDING}',"
+else
+    export SQS_MAX_PENDING_OPT=""
+fi
+# How long a received message stays hidden. It must outlast the 60 s
+# checkpoint interval plus a file's read time, or the message reappears and
+# its file is read twice. A Flink Duration string.
+export SQS_VISIBILITY_TIMEOUT=${SQS_VISIBILITY_TIMEOUT:-15min}
+if [[ ! "$SQS_VISIBILITY_TIMEOUT" =~ ^[0-9]+(ms|s|min|h)$ ]]; then
+    error "SQS_VISIBILITY_TIMEOUT must be a duration like '15min' or '900s' (got '$SQS_VISIBILITY_TIMEOUT')"
+fi
+# The connector jar, as the SQL's ADD JAR sees it. s3a:// because it is
+# resolved by the image's Flink FileSystem (Hadoop S3A), not by the AWS CLI.
+# upload_scripts() uploads to the s3:// form of the same key.
+# Built from sqs-delta-filename/ (mvn -q package; the shaded jar is the main
+# artifact) when missing or older than its sources.
+export SQS_SOURCE_JAR=${SQS_SOURCE_JAR:-s3a://${BUCKET_NAME}/flink/jars/sqs-delta-filename.jar}
+SQS_CONNECTOR_DIR=sqs-delta-filename
 
 # ---------------------------------------------------------------------------
 # Paimon write path — FIXED at Paimon's defaults. Change it only if testing Paimon at huge scale, not for a fair comparison with Iceberg.
@@ -194,7 +153,13 @@ export PAIMON_WRITE_ONLY=${PAIMON_WRITE_ONLY:-false}
 if [[ "$PAIMON_WRITE_ONLY" != true && "$PAIMON_WRITE_ONLY" != false ]]; then
     echo "PAIMON_WRITE_ONLY must be true or false, got '$PAIMON_WRITE_ONLY'" >&2; exit 1
 fi
-export PAIMON_WRITE_BUFFER_SPILLABLE=true
+# Exception: PAIMON_WRITE_BUFFER_SPILLABLE=false may be set per run (2026-10-11)
+# with PAIMON_WRITE_ONLY=true: a full write buffer then flushes an L0 file in
+# the record path instead of spilling a sorted run for the barrier to merge.
+export PAIMON_WRITE_BUFFER_SPILLABLE=${PAIMON_WRITE_BUFFER_SPILLABLE:-true}
+if [[ "$PAIMON_WRITE_BUFFER_SPILLABLE" != true && "$PAIMON_WRITE_BUFFER_SPILLABLE" != false ]]; then
+    echo "PAIMON_WRITE_BUFFER_SPILLABLE must be true or false, got '$PAIMON_WRITE_BUFFER_SPILLABLE'" >&2; exit 1
+fi
 
 # Paimon write buffer size. The default 128 MiB is the same as Iceberg's
 export WRITE_BUFFER=${WRITE_BUFFER:-128mb}
@@ -384,32 +349,19 @@ display_config() {
     echo "  Namespace:         $NAMESPACE"
     echo "  EMR Version:       $EMR_VERSION"
     echo "  Image:             emr-flink-cdc-paimon:${IMAGE_TAG} (shared with cdc-pipeline)"
-    if [[ "$SOURCE_MODE" == "s3json" ]]; then
-    echo "  Source:            SOURCE_MODE=s3json — continuous gzip NDJSON from"
-    echo "                     $S3JSON_SOURCE_PATH (re-listed every $S3JSON_MONITOR_INTERVAL)"
-    echo "                     ^ rate is set by the generator, not SOURCE_ROWS_PER_SECOND"
-    else
-    echo "  Source:            SOURCE_MODE=datagen — streaming datagen (rate-limited), CID telemetry mockup"
-    fi
-    echo "  Source rate:       $SOURCE_ROWS_PER_SECOND rows/s x 4096 B mean ≈ $(( SOURCE_ROWS_PER_SECOND * 4096 / 1024 / 1024 / 1024 )) GiB/s (mean; row size varies)"
-    echo "                     ^ calibrated to the 4 KB/row requirement (modelled"
-    echo "                       mean 4099 B); sample's own mean is 3817 B."
+    echo "  Source:            gzip NDJSON keys from S3 events on SQS"
+    echo "                     queues ${SQS_QUEUE_PREFIX}-{paimon,iceberg} (one per format)"
+    echo "                     poll-threads=$SQS_POLL_THREADS max-pending=${SQS_MAX_PENDING:-<connector default>} visibility=$SQS_VISIBILITY_TIMEOUT"
+    echo "                     jar: $SQS_SOURCE_JAR"
+    echo "                     ^ rate and data shape are set by jsongz-gen/, not here"
     echo "  Job parallelism:   $JOB_PARALLELISM"
     echo "  Paimon buckets:    $PAIMON_BUCKETS (-1 = unaware-bucket, no shuffle; fixed at CREATE TABLE)"
-    echo "  Endpoint skew:     HOT_KEY_FRACTION=$HOT_KEY_FRACTION (0=uniform; % of rows on a hot 5% of hosts)"
-    echo "  CID fan-out:       customers=$CID_CUSTOMER_COUNT hosts=$CID_HOST_COUNT days=$CID_DAY_SPREAD"
-    if [[ "$CID_DAY_SPREAD" -gt 1 ]]; then
-        echo "                     ^ days>1 means $CID_DAY_SPREAD dt PARTITIONS on both sinks,"
-        echo "                       so $(( PAIMON_BUCKETS >= 1 ? PAIMON_BUCKETS : JOB_PARALLELISM ))x${CID_DAY_SPREAD} (paimon, by $( (( PAIMON_BUCKETS >= 1 )) && echo bucket || echo subtask)) /"
-        echo "                       ${JOB_PARALLELISM}x${CID_DAY_SPREAD} (iceberg, by subtask) concurrently-open files."
-        echo "                       Report this with any result — it is not comparable to days=1."
-    fi
     # The tables are append-only now; make sure nobody reads a new number as
     # comparable with the upsert-era series.
     echo "  Table shape:       APPEND-ONLY, PARTITIONED BY (dt), 34 cols (schema_sample.sql)"
     echo "                     ^ no primary key. NOT comparable with pre-CID upsert runs."
     echo "  Iceberg compat:    $ICEBERG_COMPAT (paimon metadata.iceberg.storage = $PAIMON_ICEBERG_STORAGE)"
-    echo "  Paimon write path: write-only=$PAIMON_WRITE_ONLY spillable=$PAIMON_WRITE_BUFFER_SPILLABLE (spillable fixed)"
+    echo "  Paimon write path: write-only=$PAIMON_WRITE_ONLY spillable=$PAIMON_WRITE_BUFFER_SPILLABLE"
     echo "                     ^ inline compaction on; the write buffer spills and"
     echo "                       external-merges at the checkpoint barrier."
     echo "  Paimon write buf:  $WRITE_BUFFER (write-buffer-size INSERT hint; heap"
@@ -449,6 +401,61 @@ verify_s3_object() {
     echo "  ✓ ${size} B  ${uri}"
 }
 
+# Per-format queue: the Paimon job reads <prefix>-paimon, Iceberg <prefix>-iceberg.
+sqs_queue_url() {
+    echo "https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${SQS_QUEUE_PREFIX}-$1"
+}
+
+# The shaded sqs-delta-filename connector jar, rebuilt when it is missing or
+# any file under src/ or the pom is newer than it. Sets SQS_JAR_LOCAL (a
+# global, not stdout, so error() is not swallowed by a command substitution).
+# original-*.jar (the pre-shade artifact) does not match the glob; -sources,
+# -tests and -javadoc jars are filtered out, and the newest remaining jar wins.
+newest_sqs_jar() {
+    ls -t "${SQS_CONNECTOR_DIR}"/target/sqs-delta-filename-*.jar 2>/dev/null \
+        | grep -vE -- '-(sources|tests|javadoc)\.jar$' | head -1 || true
+}
+build_sqs_jar() {
+    local dir=$SQS_CONNECTOR_DIR
+    [[ -f "${dir}/pom.xml" ]] || error "The SQS source needs the connector source at ${dir}/pom.xml"
+    SQS_JAR_LOCAL=$(newest_sqs_jar)
+    if [[ -z "$SQS_JAR_LOCAL" ]] \
+       || [[ -n "$(find "${dir}/src" "${dir}/pom.xml" -type f -newer "$SQS_JAR_LOCAL" 2>/dev/null | head -1)" ]]; then
+        log "Building ${dir} (mvn -q package)..."
+        ( cd "$dir" && mvn -q package ) || error "mvn package failed in ${dir}"
+        SQS_JAR_LOCAL=$(newest_sqs_jar)
+        [[ -n "$SQS_JAR_LOCAL" ]] || error "mvn package produced no ${dir}/target/sqs-delta-filename-*.jar"
+    else
+        log "✓ ${SQS_JAR_LOCAL} is up to date with its sources"
+    fi
+}
+
+# Read-only preflight for the SQS source: what each queue already holds is
+# what the job will read first. Visible = waiting; NotVisible = received by a
+# consumer (e.g. a job that was just deleted) and not yet deleted — those come
+# back after the visibility timeout. NO purge here; see the README.
+check_sqs_backlog() {
+    local fmt url counts
+    for fmt in "$@"; do
+        url=$(sqs_queue_url "$fmt")
+        counts=$(aws sqs get-queue-attributes --queue-url "$url" --region "$AWS_REGION" \
+                   --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+                   --query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible]' \
+                   --output text 2>/dev/null) \
+          || error "Cannot read SQS queue ${url}
+       It must exist (subscribed to SNS cid-landing-jsongz-events) before an
+       the job starts; check SQS_QUEUE_PREFIX and the region."
+        read -r _vis _invis <<<"$counts"
+        echo "  ${fmt}: ${SQS_QUEUE_PREFIX}-${fmt}  visible=${_vis} in-flight=${_invis}"
+        if (( _vis + _invis > 0 )); then
+            warn "${SQS_QUEUE_PREFIX}-${fmt} already holds $(( _vis + _invis )) message(s): the job
+       reads those files first. If they belong to an earlier run, purge first:
+         aws sqs purge-queue --queue-url ${url} --region ${AWS_REGION}"
+        fi
+    done
+    unset _vis _invis
+}
+
 upload_scripts() {
     log "Uploading executor and SQL scripts to S3..."
     # This IS what the job runs. spec.job.jarURI points at this key; EMR on
@@ -459,29 +466,33 @@ upload_scripts() {
     aws s3 cp flink-cid-executor.py "$exec_uri" --region "$AWS_REGION"
     verify_s3_object "$exec_uri"
 
-    # EVERY source variant, whatever SOURCE_MODE is, so S3 always holds the
-    # full script set. They go to common/, which no job's --sql-dir points
-    # at: the executor runs every .sql in its directory, so a second source
-    # file in <fmt>/ would define datagen_source twice. Only the copy below,
-    # 00-source.sql, is what a job runs.
+    # The source fragments go to common/, which no job's --sql-dir points at:
+    # neither runs on its own (the parse fragment needs the raw one first).
+    # Only the concatenated copy below, 00-source.sql, is what a job runs.
     local common_uri="s3://${BUCKET_NAME}/flink/cid-sql/common"
     aws s3 sync sql-scripts/common/ "${common_uri}/" --region "$AWS_REGION" --delete
     for f in sql-scripts/common/*.sql; do
         verify_s3_object "${common_uri}/$(basename "$f")"
     done
 
-    # SOURCE_MODE picks the file; both define the same datagen_source view.
-    # (Burst mode and its bounded JSON replay source were removed on 2026-10-03;
-    # s3json is a continuous source, not that.)
-    local src_file src_desc
-    case "$SOURCE_MODE" in
-        s3json)
-            src_file="sql-scripts/common/01-s3json-source.sql"
-            src_desc="continuous gzip NDJSON from ${S3JSON_SOURCE_PATH}" ;;
-        *)
-            src_file="sql-scripts/common/01-datagen-source.sql"
-            src_desc="unbounded datagen at ${SOURCE_ROWS_PER_SECOND} rows/s" ;;
+    # The connector jar. Its key is SQS_SOURCE_JAR with the scheme swapped
+    # to s3:// for the CLI; ADD JAR reads the s3a:// form.
+    local jar_uri
+    case "$SQS_SOURCE_JAR" in
+        s3a://*) jar_uri="s3://${SQS_SOURCE_JAR#s3a://}" ;;
+        s3://*)  jar_uri="$SQS_SOURCE_JAR" ;;
+        *) error "SQS_SOURCE_JAR must be s3a:// or s3:// (got '$SQS_SOURCE_JAR')" ;;
     esac
+    build_sqs_jar
+    aws s3 cp "$SQS_JAR_LOCAL" "$jar_uri" --region "$AWS_REGION"
+    verify_s3_object "$jar_uri"
+
+    # The RAW fragment (defines s3json_raw) followed by the parse fragment,
+    # concatenated into a local temp file, so the parse text cannot drift
+    # between formats.
+    local src_file
+    src_file=$(mktemp "${TMPDIR:-/tmp}/cid-00-source.XXXXXX")
+    cat sql-scripts/common/01-raw-s3sqs.sql sql-scripts/common/01-parse-s3json.sql > "$src_file"
 
     local fmt f
     for fmt in $FORMATS; do
@@ -490,20 +501,23 @@ upload_scripts() {
         # The source runs FIRST in each format's directory (00- sorts before
         # 02-), before the USE CATALOG switch — the temporary source table must
         # live in default_catalog, which 04-pipeline.sql references explicitly.
+        # The same file for both formats: the queue URL differs per format but
+        # is a ${SQS_QUEUE_URL} the executor fills from the JM env.
         aws s3 cp "$src_file" \
             "s3://${BUCKET_NAME}/flink/cid-sql/${fmt}/00-source.sql" \
             --region "$AWS_REGION"
         # Verified per LOCAL file rather than by counting remote keys: the
         # executor globs --sql-dir and runs whatever is there in name order, so
         # a file that failed to sync is a pipeline silently missing a step, not
-        # an error. 00-source.sql is checked separately — it is a rename of the
-        # common/ file and has no counterpart in sql-scripts/<fmt>/.
+        # an error. 00-source.sql is checked separately — it is built from the
+        # common/ fragments and has no counterpart in sql-scripts/<fmt>/.
         for f in "sql-scripts/${fmt}"/*.sql; do
             verify_s3_object "s3://${BUCKET_NAME}/flink/cid-sql/${fmt}/$(basename "$f")"
         done
         verify_s3_object "s3://${BUCKET_NAME}/flink/cid-sql/${fmt}/00-source.sql"
     done
-    log "✓ Format SQL uploaded (SOURCE_MODE=${SOURCE_MODE}: ${src_desc})"
+    rm -f "$src_file"
+    log "✓ Format SQL uploaded (source: gzip NDJSON keys from SQS ${SQS_QUEUE_PREFIX}-<fmt>)"
 }
 
 # ONLY the Iceberg database is pre-created here — same split as the CDC
@@ -556,16 +570,14 @@ render_manifest() {
         -e "s|\${EMR_EXECUTION_ROLE_ARN}|${EMR_EXECUTION_ROLE_ARN}|g" \
         -e "s|\${EMR_VERSION}|${EMR_VERSION}|g" \
         -e "s|\${IMAGE_TAG}|${IMAGE_TAG}|g" \
-        -e "s|\${SOURCE_ROWS_PER_SECOND}|${SOURCE_ROWS_PER_SECOND}|g" \
         -e "s|\${JOB_PARALLELISM}|${JOB_PARALLELISM}|g" \
         -e "s|\${PAIMON_BUCKETS}|${PAIMON_BUCKETS}|g" \
         -e "s|\${PAIMON_BUCKET_KEY_OPT}|${PAIMON_BUCKET_KEY_OPT}|g" \
-        -e "s|\${HOT_KEY_FRACTION}|${HOT_KEY_FRACTION}|g" \
-        -e "s|\${S3JSON_SOURCE_PATH}|${S3JSON_SOURCE_PATH}|g" \
-        -e "s|\${S3JSON_MONITOR_INTERVAL}|${S3JSON_MONITOR_INTERVAL}|g" \
-        -e "s|\${CID_CUSTOMER_COUNT}|${CID_CUSTOMER_COUNT}|g" \
-        -e "s|\${CID_HOST_COUNT}|${CID_HOST_COUNT}|g" \
-        -e "s|\${CID_DAY_SPREAD}|${CID_DAY_SPREAD}|g" \
+        -e "s|\${SQS_QUEUE_URL}|$(sqs_queue_url "$fmt")|g" \
+        -e "s|\${SQS_SOURCE_JAR}|${SQS_SOURCE_JAR}|g" \
+        -e "s|\${SQS_POLL_THREADS}|${SQS_POLL_THREADS}|g" \
+        -e "s|\${SQS_MAX_PENDING_OPT}|${SQS_MAX_PENDING_OPT}|g" \
+        -e "s|\${SQS_VISIBILITY_TIMEOUT}|${SQS_VISIBILITY_TIMEOUT}|g" \
         -e "s|\${PAIMON_ICEBERG_STORAGE}|${PAIMON_ICEBERG_STORAGE}|g" \
         -e "s|\${PAIMON_WRITE_ONLY}|${PAIMON_WRITE_ONLY}|g" \
         -e "s|\${PAIMON_WRITE_BUFFER_SPILLABLE}|${PAIMON_WRITE_BUFFER_SPILLABLE}|g" \
@@ -604,7 +616,7 @@ main() {
     local action=${1:-help}
     echo "============================================================================"
     echo "  Flink Throughput Benchmark: Paimon vs Iceberg — APPEND-ONLY"
-    echo "  EMR ${EMR_VERSION}, $(( SOURCE_ROWS_PER_SECOND * 4096 / 1024 / 1024 / 1024 )) GiB/s target, 4 KiB mean row, cid_events"
+    echo "  EMR ${EMR_VERSION}, S3 -> SQS gzip NDJSON source, 4 KiB mean row, cid_events"
     echo "============================================================================"
 
     case $action in
@@ -646,6 +658,9 @@ main() {
             # format directories (FORMATS), so calling it inside the loop would
             # re-upload the same objects twice.
             upload_scripts
+            log "SQS backlog (read-only; the job reads these first):"
+            if [[ "$fmt" == "both" ]]; then check_sqs_backlog $DEPLOY_TARGETS
+            else check_sqs_backlog "$fmt"; fi
             for f in $DEPLOY_TARGETS; do
                 [[ "$fmt" == "$f" || "$fmt" == "both" ]] || continue
                 manifest=$(render_manifest "$f")
@@ -676,16 +691,11 @@ main() {
                 warn "A rows/s number you intend to quote must come from one"
                 warn "format at a time, with the other suspended or deleted."
             fi
-            # Each format needs its own LOCAL_PORT: collect-metrics.sh defaults
-            # every invocation to 8091, so a second collector on the default
-            # port reads the FIRST job's samples.
-            local port=8091
             for f in ${deployed[@]+"${deployed[@]}"}; do
                 echo "  Watch:  kubectl get flinkdeployment flink-cid-${f} -n ${NAMESPACE} -w"
                 echo "  UI:     kubectl port-forward svc/flink-cid-${f}-rest 8081:8081 -n ${NAMESPACE}"
-                echo "  Metrics: LOCAL_PORT=${port} ./monitoring/collect-metrics.sh ${f} 30 3600"
-                port=$(( port + 1 ))
             done
+            echo "  Monitor: ./monitoring/deploy-cid-monitor.sh   (logs: kubectl logs -f deployment/flink-cid-monitor -n ${NAMESPACE})"
             ;;
         cleanup)
             local fmt=${2:-both}
@@ -700,12 +710,8 @@ main() {
             done
             log "✓ Cleanup complete (S3 warehouse/Glue tables left in place)"
             ;;
-        monitor)
-            kubectl get flinkdeployment -n "$NAMESPACE" | grep -E 'NAME|cid' || true
-            kubectl get pods -n "$NAMESPACE" | grep -E 'NAME|cid' || true
-            ;;
         help|*)
-            echo "Usage: $0 {upload|render|deploy TARGET|cleanup [TARGET]|monitor}"
+            echo "Usage: $0 {upload|render|deploy TARGET|cleanup [TARGET]}"
             echo ""
             echo "  upload             Create Glue DBs, upload + verify executor and SQL in S3 (no kubectl)"
             echo "  render             Render all manifests, upload scripts, prep Glue/ConfigMap"
@@ -715,7 +721,6 @@ main() {
             echo "                     either write path — deploy warns when you do it."
             echo "  cleanup [paimon|iceberg|both]"
             echo "                     Delete deployment(s); warehouse data is kept"
-            echo "  monitor            Show benchmark FlinkDeployments and pods"
             echo ""
             echo "NO COMPACTION SHIPS WITH THIS PROJECT. The paimon-compact target, the"
             echo "Spark iceberg-compaction/ harness, burst mode and the jsongen dataset"
@@ -729,29 +734,24 @@ main() {
             echo "Build it (once) with: cd ../cdc-pipeline && ./build-deploy-generic.sh build"
             echo ""
             echo "Required env: AWS_REGION AWS_ACCOUNT_ID BUCKET_NAME EMR_EXECUTION_ROLE_ARN"
-            echo "Knobs: SOURCE_ROWS_PER_SECOND JOB_PARALLELISM IMAGE_TAG"
-            echo "       SOURCE_MODE=datagen|s3json (default datagen). s3json reads the"
-            echo "       gzip NDJSON from S3JSON_SOURCE_PATH (jsongz-gen/), continuously."
+            echo "Knobs: JOB_PARALLELISM IMAGE_TAG"
+            echo "       The source is the gzip NDJSON jsongz-gen/ lands, read from S3"
+            echo "       events on SQS queues \${SQS_QUEUE_PREFIX}-paimon / -iceberg"
+            echo "       (default prefix cid-landing-jsongz) via the sqs-delta-filename"
+            echo "       connector; no listing. upload builds + uploads its jar to"
+            echo "       SQS_SOURCE_JAR, and deploy prints each queue's backlog first"
+            echo "       (it does not purge)."
+            echo "       SQS_POLL_THREADS (8), SQS_MAX_PENDING (empty = connector default),"
+            echo "       SQS_VISIBILITY_TIMEOUT (15min)."
             echo "       PAIMON_BUCKETS=N (default -1 = unaware-bucket) — Paimon 'bucket';"
             echo "       N >= 1 = fixed buckets on uuid, use N = JOB_PARALLELISM."
             echo "       BAKED IN at CREATE TABLE: drop cid_events before changing it."
-            echo "       HOT_KEY_FRACTION=0..99 (default 0=uniform; 80=80/20 skew)"
-            echo "       Routes the ENDPOINT identity, not a primary key — the tables"
-            echo "       are append-only, so skew no longer drives merge/delete work."
-            echo "       It changes the generated BYTES, so it invalidates comparison"
-            echo "       across values."
-            echo "       CID_CUSTOMER_COUNT=N (default 16) — distinct customerId values"
-            echo "       CID_HOST_COUNT=N (default 1024) — distinct endpoints (sample: 1047)"
-            echo "       CID_DAY_SPREAD=N (default 1) — distinct dt values, i.e. the"
-            echo "       PARTITION COUNT on both sinks. >1 multiplies concurrently-open"
-            echo "       files per writer by N on both sides; report it with any result."
             echo "       ICEBERG_COMPAT=true|false (default false) — Paimon's per-commit"
             echo "       Iceberg metadata export, i.e. Paimon as the CDC pipeline runs it."
             echo "       Baked in at table creation: drop the Paimon table before flipping."
-            echo "       NOT configurable: Paimon's write path is pinned to"
-            echo "       write-only=false + write-buffer-spillable=true (Paimon's own"
-            echo "       defaults, and the only configuration this project measures)."
-            echo "       The WRITE_ONLY and SPILLABLE env knobs were removed 2026-10-05."
+            echo "       PAIMON_WRITE_ONLY=true|false (default false) and"
+            echo "       PAIMON_WRITE_BUFFER_SPILLABLE=true|false (default true): per-run"
+            echo "       exceptions to Paimon's defaults; label any result taken with them."
             echo "       WRITE_BUFFER=<size> (default 128mb) — Paimon write-buffer-size."
             echo "       Only moves bytes between RAM and spill files; the bytes the"
             echo "       barrier external-merges are set by rate x checkpoint interval."
@@ -769,8 +769,7 @@ main() {
             echo "Side-by-side run (both writers, started together):"
             echo "  source .bench-env"
             echo "  $0 deploy both"
-            echo "  LOCAL_PORT=8091 ./monitoring/collect-metrics.sh paimon 30 3600 &"
-            echo "  LOCAL_PORT=8092 ./monitoring/collect-metrics.sh iceberg 30 3600 &"
+            echo "  ./monitoring/deploy-cid-monitor.sh"
             exit 1
             ;;
     esac

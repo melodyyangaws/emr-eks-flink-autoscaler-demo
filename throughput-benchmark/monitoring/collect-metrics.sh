@@ -62,7 +62,7 @@ JOB_ID=$(curl -sf "${BASE}/jobs" | jq -r '.jobs[] | select(.status=="RUNNING") |
 # "Global Committer". Match the writer, never the committer — committer
 # records/sec counts committables (files), not rows.
 VERTICES=$(curl -sf "${BASE}/jobs/${JOB_ID}")
-SOURCE_VID=$(echo "$VERTICES" | jq -r '.vertices[] | select(.name | test("datagen_source|Source:")) | .id' | head -1)
+SOURCE_VID=$(echo "$VERTICES" | jq -r '.vertices[] | select(.name | test("Source:")) | .id' | head -1)
 SINK_VID=$(echo "$VERTICES"   | jq -r '.vertices[] | select(.name | test("IcebergStreamWriter|Writer")) | select(.name | test("Committer") | not) | .id' | head -1)
 [[ -n "$SOURCE_VID" && -n "$SINK_VID" ]] || { echo "Could not resolve source/sink vertex ids; vertices are:" >&2; echo "$VERTICES" | jq -r '.vertices[].name' >&2; exit 1; }
 

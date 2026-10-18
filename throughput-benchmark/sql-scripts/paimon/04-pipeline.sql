@@ -1,5 +1,5 @@
 -- ============================================================================
--- Pipeline — datagen source into the sink
+-- Pipeline — the SQS-fed source view into the sink
 -- ============================================================================
 -- The source is a TEMPORARY table living in default_catalog (it is created
 -- before the USE CATALOG switch), so it is referenced fully qualified here.
@@ -14,10 +14,11 @@
 -- @Immutable-annotated CoreOptions fields (verified with javap against
 -- paimon-flink-1.20-1.3.x — 15 fields, none of these), so the hints are legal.
 --
--- write-only=false and write-buffer-spillable=true are FIXED, and
--- build-deploy-cid.sh hardcodes them — the ${VAR:default} syntax here is just
--- the substitution mechanism, not an invitation to vary them. Paimon's own
--- defaults, and the only configuration this project measures; the exploratory
+-- write-only=false and write-buffer-spillable=true are the defaults (Paimon's
+-- own) and the configuration this project scores. build-deploy-cid.sh allows
+-- PAIMON_WRITE_ONLY=true (2026-10-09) and PAIMON_WRITE_BUFFER_SPILLABLE=false
+-- (2026-10-11) per run as labelled exceptions; a result taken with either must
+-- say so. Historically the exploratory
 -- write-only=true / spillable=false arms, and the dedicated
 -- flink-cid-paimon-compact job that write-only=true required, were removed on
 -- 2026-10-05 and 2026-10-03 respectively. Iceberg's writer has no equivalent of
@@ -40,7 +41,7 @@
 --
 -- The column list below is SELECT * in spirit: datagen_source projects exactly
 -- the 34 columns of 03-sink.sql in the same order (see
--- ../common/01-datagen-source.sql stage 4). They are written out explicitly so
+-- ../common/01-parse-s3json.sql stage 2). They are written out explicitly so
 -- a schema drift on either side fails at plan time with a named column rather
 -- than silently mis-assigning positionally.
 -- ============================================================================

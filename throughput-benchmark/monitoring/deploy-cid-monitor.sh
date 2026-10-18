@@ -11,15 +11,62 @@ set -euo pipefail
 # every other artifact the cluster runs; the pod fetches it at boot, so
 # `kubectl rollout restart` alone re-pulls the latest code.
 #
+# It also starts collect-metrics.sh locally for each RUNNING flink-cid-* job
+# (Paimon on LOCAL_PORT 8091, Iceberg on 8092), so the per-30 s CSVs in
+# bench-results/ come with the side-by-side table. They outlive this script;
+# `stop` ends them. Starting again replaces any collectors already running.
+#
 # Usage:
-#   ./deploy-cid-monitor.sh          upload the code, apply, restart, wait
-#   ./deploy-cid-monitor.sh stop     scale to 0 (Deployment and config kept)
+#   ./deploy-cid-monitor.sh          upload the code, apply, restart, wait, start collectors
+#   ./deploy-cid-monitor.sh stop     scale to 0 (Deployment and config kept), stop collectors
+#
+# Knobs: COLLECT=0 skips the collectors; COLLECT_INTERVAL (30) and
+# COLLECT_DURATION (7200) are passed to collect-metrics.sh.
 
 export AWS_REGION="${AWS_REGION:-us-west-2}"
 export NAMESPACE="${NAMESPACE:-emr-flink}"
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RESULTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/bench-results"
+# One "<pid> <format>" line per collector this script started.
+COLLECTOR_PIDS="${SCRIPT_DIR}/.collectors.pid"
+
+stop_collectors() {
+    [[ -f "${COLLECTOR_PIDS}" ]] || return 0
+    local pid fmt
+    while read -r pid fmt; do
+        # The collector's port-forward is its child; kill it first, because a
+        # SIGTERM'd bash does not run the collector's EXIT trap.
+        pkill -P "${pid}" 2>/dev/null || true
+        kill "${pid}" 2>/dev/null && echo "  ✓ stopped ${fmt} collector (pid ${pid})"
+    done < "${COLLECTOR_PIDS}"
+    rm -f "${COLLECTOR_PIDS}"
+}
+
+start_collectors() {
+    [[ "${COLLECT:-1}" == 0 ]] && { echo "  COLLECT=0: collectors not started"; return 0; }
+    mkdir -p "${RESULTS_DIR}"
+    local fmt port=8091 stamp state log
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    for fmt in paimon iceberg; do
+        state=$(kubectl get flinkdeployment "flink-cid-${fmt}" -n "${NAMESPACE}" \
+                  -o jsonpath='{.status.jobStatus.state}' 2>/dev/null || true)
+        if [[ "${state}" != RUNNING ]]; then
+            echo "  - ${fmt}: job ${state:-not deployed}, no collector"
+        else
+            log="${RESULTS_DIR}/collect-${fmt}-${stamp}.log"
+            LOCAL_PORT=${port} nohup "${SCRIPT_DIR}/collect-metrics.sh" "${fmt}" \
+                "${COLLECT_INTERVAL:-30}" "${COLLECT_DURATION:-7200}" > "${log}" 2>&1 &
+            echo "$! ${fmt}" >> "${COLLECTOR_PIDS}"
+            echo "  ✓ ${fmt} collector pid $! on :${port} -> bench-results/cid-${fmt}-*.csv (log ${log##*/})"
+        fi
+        port=$(( port + 1 ))
+    done
+}
+
 if [[ "${1:-}" == "stop" ]]; then
     kubectl scale deployment/flink-cid-monitor -n "${NAMESPACE}" --replicas=0
+    stop_collectors
     echo "✓ Monitor stopped. Start it again with: $0"
     exit 0
 fi
@@ -33,7 +80,6 @@ export MONITOR_SERVICE_ACCOUNT="${MONITOR_SERVICE_ACCOUNT:-starrocks-sa}"
 export MONITOR_CODE_PREFIX="${MONITOR_CODE_PREFIX:-s3://${BUCKET_NAME}/flink/monitoring}"
 MONITOR_CODE_PREFIX="${MONITOR_CODE_PREFIX%/}"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOYED_MANIFEST="${SCRIPT_DIR}/monitor-deployment-deployed.yaml"
 # Must match the FETCH list in monitor-deployment.yaml.
 MONITOR_FILES=(flink_cid_monitor.py entrypoint.py requirements.txt)
@@ -72,5 +118,8 @@ fi
 kubectl apply -f "${DEPLOYED_MANIFEST}"
 kubectl rollout restart deployment/flink-cid-monitor -n "${NAMESPACE}"
 kubectl rollout status deployment/flink-cid-monitor -n "${NAMESPACE}" --timeout=300s
+
+stop_collectors
+start_collectors
 
 echo "✓ Deployed:  kubectl logs -f deployment/flink-cid-monitor -n ${NAMESPACE}"

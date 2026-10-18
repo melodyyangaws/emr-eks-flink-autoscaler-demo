@@ -2,18 +2,19 @@
 ###############################################################################
 # Raw landing-zone generator — gzipped NDJSON on S3 — submit / observe
 #
-# The simple path: cid_jsongz_gen.py renders CID telemetry rows (same fields
-# and distributions as ../sql-scripts/common/01-datagen-source.sql) and PUTs
-# .json.gz files in the source's S3 layout. No Flink, no table format. The
-# Flink datagen -> Paimon/Iceberg path (../build-deploy-cid.sh) is untouched.
+# The simple path: cid_jsongz_gen.py renders CID telemetry rows (the fields
+# and distributions of the real sample extract) and PUTs .json.gz files in the
+# source's S3 layout. No Flink, no table format. S3 event notifications
+# announce each file on SQS, which is how the Flink -> Paimon/Iceberg jobs
+# (../build-deploy-cid.sh) read them.
 #
 # Usage:
-#   ./run-jsongz-gen.sh start     # render + ConfigMap + Deployment; pods write 30 min, then idle
-#   ./run-jsongz-gen.sh scale N   # change the replica count (rate = N x JSONGZ_ROWS_PER_POD)
+#   ./run-jsongz-gen.sh start     # render + ConfigMap + Job; pods write 30 min, then exit (nodes released)
+#   ./run-jsongz-gen.sh scale N   # change the Job parallelism (rate = N x JSONGZ_ROWS_PER_POD)
 #   ./run-jsongz-gen.sh status    # pods + last stats line per pod
 #   ./run-jsongz-gen.sh logs      # follow the first pod (or POD=N, Nth by name)
-#   ./run-jsongz-gen.sh stop      # scale to 0 (data already written stays)
-#   ./run-jsongz-gen.sh clean     # delete Deployment, legacy Job and ConfigMap
+#   ./run-jsongz-gen.sh stop      # delete the Job now, before the window ends (data already written stays)
+#   ./run-jsongz-gen.sh clean     # delete the Job, legacy Deployment and ConfigMap
 #   ./run-jsongz-gen.sh local     # 30 s on this machine -> /tmp/cid-jsongz
 #   ./run-jsongz-gen.sh render    # write jsongz-gen-job-deployed.yaml, don't apply
 #
@@ -42,15 +43,15 @@ export AWS_REGION=${AWS_REGION:-us-west-2}
 export NAMESPACE=${NAMESPACE:-emr-flink}
 export OUTPUT_URI=${OUTPUT_URI:-s3://${BUCKET_NAME:?BUCKET_NAME not set}/cid-landing-jsongz}
 
-# The rate knobs have their OWN names. .bench-env's SOURCE_ROWS_PER_SECOND
-# drives the Flink datagen path, and sourcing it here must not silently
-# retarget this one. The cap is PER POD; cluster rate = replicas x per-pod.
+# The rate knobs are JSONGZ_*: this generator alone sets the benchmark's
+# offered rate (the Flink jobs read as fast as they can). The cap is PER POD;
+# cluster rate = replicas x per-pod.
 # 500,000 rows/s/pod (60 workers, ~8.3K rows/s each) was delivered at the cap
 # on m6i.16xlarge in the 2026-10-09 run, i.e. ~2 GB/s raw per pod.
 export JSONGZ_ROWS_PER_POD=${JSONGZ_ROWS_PER_POD:-500000}
 # Replicas: JSONGZ_REPLICAS if set, else ceil(JSONGZ_ROWS_PER_SECOND / per-pod).
 # The default 1,500,000 rows/s (~6.1 GB/s raw, ~0.3 GB/s gz) gives 3 pods.
-# `scale N` changes it on a running Deployment.
+# `scale N` changes it on a running Job.
 export JSONGZ_ROWS_PER_SECOND=${JSONGZ_ROWS_PER_SECOND:-1500000}
 if [ -z "${JSONGZ_REPLICAS:-}" ] && [ -n "${TOTAL_PODS:-}" ]; then
     warn "TOTAL_PODS is the old Job knob; using it as JSONGZ_REPLICAS=${TOTAL_PODS}"
@@ -63,8 +64,8 @@ else
     SIZING="JSONGZ_REPLICAS=${JSONGZ_REPLICAS} (set explicitly)"
 fi
 export JSONGZ_REPLICAS
-# Fixed 30-minute window: every pod writes for 1800 s, then idles until
-# stopped. DURATION_SECONDS may only SHORTEN it (1..1800, e.g. a quick test);
+# Fixed 30-minute window: every pod writes for 1800 s, then exits, the Job
+# completes and Karpenter releases the nodes. DURATION_SECONDS may only SHORTEN it (1..1800, e.g. a quick test);
 # there is no run-until-stopped mode. Validated in check_duration below.
 MAX_DURATION_SECONDS=1800
 export DURATION_SECONDS=${DURATION_SECONDS:-$MAX_DURATION_SECONDS}
@@ -77,8 +78,9 @@ DEADLINE_SLACK_SECONDS=600
 export WORKERS=${WORKERS:-60}
 export GZIP_LEVEL=${GZIP_LEVEL:-6}
 # MB-sized files (~7 MB gz mean, ~1.3-10 MB), not the real extract's ~0.4 MB:
-# ~13x fewer objects for the Flink source to list, track and open. 2500 gives
-# back the sample's small-file shape. See ROWS_PER_FILE in cid_jsongz_gen.py.
+# ~13x fewer objects (SQS messages) for the Flink source to track and open.
+# 2500 gives back the sample's small-file shape. See ROWS_PER_FILE in
+# cid_jsongz_gen.py.
 export ROWS_PER_FILE=${ROWS_PER_FILE:-40000}
 export CID_CUSTOMER_COUNT=${CID_CUSTOMER_COUNT:-16}
 export CID_HOST_COUNT=${CID_HOST_COUNT:-1024}
@@ -89,15 +91,18 @@ export CID_HOST_COUNT=${CID_HOST_COUNT:-1024}
 # jsongz-gen-job.yaml.
 export GEN_NODEPOOL=${GEN_NODEPOOL:-executor-memorynodepool}
 
-DEPLOY=cid-jsongz-gen
-LEGACY_JOB=cid-jsongz-gen     # the generator used to be an Indexed Job
+JOB=cid-jsongz-gen
+LEGACY_DEPLOY=cid-jsongz-gen  # the generator used to be a Deployment (pods idled after the window)
+# activeDeadlineSeconds backstop, past the shared write deadline: only a hung
+# pod ever hits it.
+JOB_DEADLINE_MARGIN_SECONDS=300
 CM=cid-jsongz-gen
 MANIFEST="$HERE/jsongz-gen-job.yaml"
 DEPLOYED_MANIFEST="$HERE/jsongz-gen-job-deployed.yaml"
 # Every placeholder in jsongz-gen-job.yaml. envsubst leaves anything outside
 # this list as a literal ${...}, which render() then rejects.
 RENDER_VARS='${NAMESPACE} ${JSONGZ_REPLICAS} ${RUN_DEADLINE_EPOCH} ${GEN_NODEPOOL}
-${AWS_REGION} ${OUTPUT_URI} ${JSONGZ_ROWS_PER_POD} ${DURATION_SECONDS}
+${AWS_REGION} ${OUTPUT_URI} ${JSONGZ_ROWS_PER_POD} ${DURATION_SECONDS} ${JOB_DEADLINE_SECONDS}
 ${WORKERS} ${GZIP_LEVEL} ${ROWS_PER_FILE} ${CID_CUSTOMER_COUNT} ${CID_HOST_COUNT}'
 
 check_duration() {
@@ -109,6 +114,7 @@ check_duration() {
     export DURATION_SECONDS
     [[ "$JSONGZ_REPLICAS" =~ ^[0-9]+$ ]] || error "JSONGZ_REPLICAS='${JSONGZ_REPLICAS}' is not a whole number"
     export RUN_DEADLINE_EPOCH=$(( $(date +%s) + DURATION_SECONDS + DEADLINE_SLACK_SECONDS ))
+    export JOB_DEADLINE_SECONDS=$(( DURATION_SECONDS + DEADLINE_SLACK_SECONDS + JOB_DEADLINE_MARGIN_SECONDS ))
 }
 
 render() {
@@ -125,7 +131,7 @@ summary() {
     info "Sizing:      $SIZING"
     info "Rate cap:    ${JSONGZ_REPLICAS} x ${JSONGZ_ROWS_PER_POD} = ${total} rows/s ≈ $(awk -v r="$total" 'BEGIN{printf "%.2f GB/s raw, %.2f GB/s gz", r*4096/1e9, r*205/1e9}')"
     info "Pod size:    ${WORKERS} cpu / 24Gi per pod on ${GEN_NODEPOOL}, one pod per node"
-    info "Duration:    ${DURATION_SECONDS}s ≈ $(awk -v r="$total" -v d="$DURATION_SECONDS" 'BEGIN{printf "%.1f TB raw / %.2f TB gz", r*d*4096/1e12, r*d*205/1e12}') if the cap is reached, then pods idle"
+    info "Duration:    ${DURATION_SECONDS}s ≈ $(awk -v r="$total" -v d="$DURATION_SECONDS" 'BEGIN{printf "%.1f TB raw / %.2f TB gz", r*d*4096/1e12, r*d*205/1e12}') if the cap is reached, then pods exit and nodes are released"
     if [ "$DURATION_SECONDS" -lt "$MAX_DURATION_SECONDS" ]; then
         warn "DURATION_SECONDS=${DURATION_SECONDS}: shorter than the standard ${MAX_DURATION_SECONDS}s run"
     fi
@@ -141,10 +147,11 @@ cmd_start() {
         --from-file=cid_jsongz_gen.py="$HERE/cid_jsongz_gen.py" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
     # The old Indexed Job (same name, same pod label) would double the rate.
-    kubectl delete job "$LEGACY_JOB" -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null
-    # Re-applying is fine for a Deployment: the new deadline changes the pod
-    # template, and strategy Recreate replaces every pod with a fresh window.
-    log "Deployment $DEPLOY: ${JSONGZ_REPLICAS} replicas"
+    kubectl delete deployment "$LEGACY_DEPLOY" -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null
+    # A Job's pod template is immutable, so a re-start replaces the Job (and
+    # any pods still writing) rather than applying over it.
+    kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null
+    log "Job $JOB: parallelism ${JSONGZ_REPLICAS}, hard stop after ${JOB_DEADLINE_SECONDS}s"
     kubectl apply -f "$DEPLOYED_MANIFEST" >/dev/null
     log "Started. ./run-jsongz-gen.sh status  (stats every 10 s per pod)"
 }
@@ -152,12 +159,12 @@ cmd_start() {
 cmd_scale() {
     local n=${1:-}
     [[ "$n" =~ ^[0-9]+$ ]] || error "usage: ./run-jsongz-gen.sh scale N"
-    kubectl scale deployment "$DEPLOY" -n "$NAMESPACE" --replicas="$n"
+    kubectl patch job "$JOB" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"parallelism\":${n}}}"
     log "Scaled to ${n}. New pods write only until the deadline set by the last start."
 }
 
 cmd_status() {
-    kubectl get deployment "$DEPLOY" -n "$NAMESPACE" 2>/dev/null || true
+    kubectl get job "$JOB" -n "$NAMESPACE" 2>/dev/null || true
     kubectl get pods -n "$NAMESPACE" -l app=cid-jsongz-gen -o wide 2>/dev/null || true
     echo
     local total=0 pods
@@ -172,29 +179,30 @@ cmd_status() {
     done
     echo
     local reps per
-    reps=$(kubectl get deployment "$DEPLOY" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
-    per=$(kubectl get deployment "$DEPLOY" -n "$NAMESPACE" \
+    reps=$(kubectl get job "$JOB" -n "$NAMESPACE" -o jsonpath='{.spec.parallelism}' 2>/dev/null || true)
+    per=$(kubectl get job "$JOB" -n "$NAMESPACE" \
         -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="POD_ROWS_PER_SECOND")].value}' 2>/dev/null || true)
     info "Cluster rate: $(awk -v t="$total" 'BEGIN{printf "%.0f rows/s ≈ %.2f GB/s raw", t, t*4096/1e9}') (cap ${reps:-?} x ${per:-?} rows/s)"
 }
 
 cmd_logs() {
     local idx=${POD:-0} p
-    # Deployment pods have no index: POD=N is the Nth pod by name.
+    # Job pods have no index: POD=N is the Nth pod by name.
     p=$(kubectl get pods -n "$NAMESPACE" -l app=cid-jsongz-gen -o name | sort | sed -n "$((idx + 1))p")
     [ -n "$p" ] || error "no pod #${idx}"
     kubectl logs -f "$p" -n "$NAMESPACE"
 }
 
 cmd_stop() {
-    # Scale to 0 like ../monitoring/deploy-cid-monitor.sh stop; start re-applies.
-    kubectl scale deployment "$DEPLOY" -n "$NAMESPACE" --replicas=0
+    # Only needed to end a run early: the Job finishes on its own after the
+    # window. Pods get SIGTERM and flush in-flight PUTs; start re-creates it.
+    kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true
     log "Stopped. Files already written under $OUTPUT_URI are kept."
 }
 
 cmd_clean() {
-    kubectl delete deployment "$DEPLOY" -n "$NAMESPACE" --ignore-not-found --wait=true
-    kubectl delete job "$LEGACY_JOB" -n "$NAMESPACE" --ignore-not-found --wait=true
+    kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true
+    kubectl delete deployment "$LEGACY_DEPLOY" -n "$NAMESPACE" --ignore-not-found --wait=true
     kubectl delete configmap "$CM" -n "$NAMESPACE" --ignore-not-found
     log "Cleaned. Files already written under $OUTPUT_URI are kept."
 }

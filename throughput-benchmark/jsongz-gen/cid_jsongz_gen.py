@@ -5,13 +5,13 @@ CID gzipped-NDJSON generator — the simple path.
 
 Writes .json.gz files to S3 with the same field set and value distributions
 as the real source extract (cid_9011075d_sample_masked) and the same layout
-minus its x=00/ shard level, matching the
-Flink datagen mockup (../sql-scripts/common/01-datagen-source.sql). No Flink, no
-table format: just gzip files on S3, which is what the upstream producer drops.
+minus its x=00/ shard level. No Flink, no table format: just gzip files on S3,
+which is what the upstream producer drops.
 
-It does NOT replace the Flink datagen path — that still feeds the Paimon/Iceberg
-write benchmark. This is for when the thing under test is a reader of the raw
-landing zone (Flink filesystem source, Spark, Glue, COPY INTO, ...).
+It is the data source of the Paimon/Iceberg write benchmark: S3 event
+notifications announce each file on SQS, and the Flink jobs read them through
+the sqs-delta-filename connector (../build-deploy-cid.sh). Any other reader
+of the raw landing zone (Spark, Glue, COPY INTO, ...) can use it too.
 
 TARGETS (per row, means)
     uncompressed  ~4,096 B   (real sample: 3,818 B)
@@ -26,8 +26,9 @@ sample, the fraction of rows whose value equals one in the previous 8 rows:
 because each real file is ONE agent upload: one customerId, one coupledTraceId,
 1-25 endpoints sorted together, ~60 process names, rows in time order. The
 generator reproduces exactly that shape (per-file pools, endpoint runs, sticky
-processes, monotonic timestamps). Random per-row hex pads — what the Flink
-mockup uses to hit 4 KB — would cap the ratio near 5x and are NOT used here.
+processes, monotonic timestamps). Random per-row hex pads — what the retired
+Flink datagen mockup used to hit 4 KB — would cap the ratio near 5x and are NOT
+used here.
 
 THROUGHPUT. One worker process renders + gzips ~60-90 MB/s raw (gzip level 6
 dominates). 6 GB/s therefore needs ~80 worker processes cluster-wide; see
@@ -77,8 +78,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Value ladders — the same cumulative frequencies (out of 10,000) as the CASE
-# ladders in 01-datagen-source.sql, so both generators emit one distribution.
+# Value ladders — cumulative frequencies (out of 10,000) measured on the
+# sample, carried over from the retired Flink datagen mockup's CASE ladders.
 # ---------------------------------------------------------------------------
 def ladder(pairs):
     cum = [c for c, _ in pairs]
@@ -185,11 +186,11 @@ def frag(d):
     entry, then concatenated per row. This is where the speed comes from."""
     return json.dumps(d, separators=(',', ':'))[1:-1]
 
-# Command-line widths carry the 4 KB row calibration, the same lever the Flink
-# mockup uses (sample means: processCmd 322 B, processCmdNormalized 236 B,
-# parentCmd 137 B, parentCmdNormalized 105 B, objectCmd 105 B). They are wider
-# here than there because this generator's other fields are leaner; the widths
-# are cheap in gzip terms since a command repeats across its burst.
+# Command-line widths carry the 4 KB row calibration (sample means: processCmd
+# 322 B, processCmdNormalized 236 B, parentCmd 137 B, parentCmdNormalized
+# 105 B, objectCmd 105 B). They are wider than the sample's because this
+# generator's other fields are leaner; the widths are cheap in gzip terms
+# since a command repeats across its burst.
 PROCESS_CMD_LEN = 900
 PROCESS_CMD_NORM_LEN = 600
 PARENT_CMD_LEN = 360

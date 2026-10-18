@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS cid_events (
     eventTimeDT      TIMESTAMP(6),
     eventTime        BIGINT,
     -- The whole raw JSON line, verbatim (the VARIANT-equivalent). ~95 of the
-    -- source's 170 fields; see ../common/01-datagen-source.sql for which.
+    -- source's 170 fields: whatever ../../jsongz-gen/cid_jsongz_gen.py wrote.
     event_json       STRING,
     filterRiskLevel  STRING,
     eventId          STRING,
@@ -127,39 +127,3 @@ CREATE TABLE IF NOT EXISTS cid_events (
     'fs.s3.impl' = 'org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
 );
-
--- ============================================================================
--- MISMATCHES between schema_sample.sql and the real sample extract
--- ============================================================================
--- Verified against all 189,013 records of cid_9011075d_sample_masked. The
--- columns above follow schema_sample.sql, so the generator bridges each gap;
--- recorded here because anyone comparing this table against the raw files will
--- hit all five.
---
--- 1. request, providerName, winEventId do not occur in the extract at all
---    (0 of 189,013 records). Kept as columns. request is emitted NULL;
---    providerName is populated from objectBmData's embedded "provider" key at
---    its real 1.9% rate; winEventId is gated to Windows rows (8.28%).
--- 2. objectCmd, dst, src are declared ARRAY<STRING> but are always scalar
---    STRINGs in the data (93,141 / 62,899 / 62,970 records, zero arrays). The
---    generator wraps each in a 1-element array for these columns while
---    event_json keeps the scalar form, so the raw line stays faithful.
---    endpointIp and tags ARE genuinely arrays and need no wrapping.
--- 3. eventSubId is declared STRING but is an int in the data (all 189,013
---    records). Carried as STRING here; event_json carries the int.
--- 4. eventTime is declared BIGINT but is a string-encoded epoch-millis in the
---    data ('1789948607072'), and eventTimeDT is declared TIMESTAMP(6) but is an
---    ISO-8601 string with MILLISECOND precision ('2026-09-20T23:56:47.072Z').
---    Both are parsed into their declared types for these columns and kept in
---    their original string form inside event_json. The declared (6) is wider
---    than the data's (3) because Paimon's Iceberg export requires 4..9; the
---    extra digits are always zero, so nothing is fabricated.
--- 5. ingestionTime, dt and partition_cust do not exist in the source at all —
---    they are derived. ingestionTime is wall-clock ingest time (so
---    ingestionTime - eventTimeDT is end-to-end latency), dt is the event date,
---    partition_cust is customerId.
---
--- Columns that are legitimately near-empty rather than mismatched:
--- filterRiskLevel 2.3%, tags 2.8%, hostName 0.1% (106 records),
--- objectHostName 3 records. Their null density is reproduced, not filled in.
--- ============================================================================

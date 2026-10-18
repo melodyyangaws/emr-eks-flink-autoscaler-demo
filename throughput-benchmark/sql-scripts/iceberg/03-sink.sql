@@ -42,9 +42,9 @@
 --     FlinkSink$Builder.distributeDataStream switches from
 --     EqualityFieldKeySelector to PartitionKeySelector, whose getKey returns
 --     PartitionKey.toPath() — a STRING like "dt=2026-09-21" — which Flink runs
---     through MathUtils.murmurHash into key groups. With CID_DAY_SPREAD=1
---     (the default, matching the single-hour source extract) there is exactly
---     ONE distinct dt value, so hash distribution would route EVERY row to ONE
+--     through MathUtils.murmurHash into key groups. The generator stamps rows
+--     with wall-clock UTC time, so a run has ONE distinct dt value (two across
+--     midnight) and hash distribution would route EVERY row to ONE
 --     subtask. That is not a skew tax, it is a total serialization of the
 --     writer.
 --
@@ -127,7 +127,7 @@ CREATE TABLE IF NOT EXISTS cid_events (
     eventTimeDT      TIMESTAMP(6),
     eventTime        BIGINT,
     -- The whole raw JSON line, verbatim (the VARIANT-equivalent). ~95 of the
-    -- source's 170 fields; see ../common/01-datagen-source.sql for which.
+    -- source's 170 fields: whatever ../../jsongz-gen/cid_jsongz_gen.py wrote.
     event_json       STRING,
     filterRiskLevel  STRING,
     eventId          STRING,
