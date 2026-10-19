@@ -31,12 +31,20 @@ FE_POD="${FE_POD:-kube-starrocks-fe-0}"
 AWS_REGION="${AWS_REGION:-us-west-2}"
 : "${BUCKET_NAME:?BUCKET_NAME is not set (.bench-env)}"
 TABLE_NAME="${TABLE_NAME:-cid_events}"
-PAIMON_DB="${PAIMON_DB:-flink_cid_paimon_db}"
-ICEBERG_DB="${ICEBERG_DB:-flink_cid_iceberg_db}"
-PAIMON_TABLE_ROOT="${PAIMON_TABLE_ROOT:-s3://${BUCKET_NAME}/cid-warehouse-paimon/${PAIMON_DB}.db/${TABLE_NAME}}"
-ICEBERG_TABLE_ROOT="${ICEBERG_TABLE_ROOT:-s3://${BUCKET_NAME}/cid-warehouse-iceberg/${ICEBERG_DB}.db/${TABLE_NAME}}"
+# CID_SUFFIX (e.g. -r2) selects a second set of tables beside the first: its own
+# warehouses (cid-warehouse-<fmt>-r2/) and Glue databases (flink_cid_<fmt>_db_r2),
+# as build-deploy-cid.sh writes them with the same CID_SUFFIX. Empty = the original set.
+CID_SUFFIX="${CID_SUFFIX:-}"
+[[ "$CID_SUFFIX" =~ ^(-[a-z0-9]+)?$ ]] || { echo "CID_SUFFIX='${CID_SUFFIX}' must be empty or like -r2" >&2; exit 1; }
+QB_DB_SUFFIX="${CID_SUFFIX//-/_}"
+PAIMON_DB="${PAIMON_DB:-flink_cid_paimon_db${QB_DB_SUFFIX}}"
+ICEBERG_DB="${ICEBERG_DB:-flink_cid_iceberg_db${QB_DB_SUFFIX}}"
+PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE:-s3://${BUCKET_NAME}/cid-warehouse-paimon${CID_SUFFIX}}"
+ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-s3://${BUCKET_NAME}/cid-warehouse-iceberg${CID_SUFFIX}}"
+PAIMON_TABLE_ROOT="${PAIMON_TABLE_ROOT:-${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/${TABLE_NAME}}"
+ICEBERG_TABLE_ROOT="${ICEBERG_TABLE_ROOT:-${ICEBERG_WAREHOUSE}/${ICEBERG_DB}.db/${TABLE_NAME}}"
 # Paimon's Iceberg-compatibility export (ICEBERG_COMPAT=true in .bench-env).
-PMNICE_TABLE_ROOT="${PMNICE_TABLE_ROOT:-s3://${BUCKET_NAME}/cid-warehouse-paimon/iceberg/${PAIMON_DB}/${TABLE_NAME}}"
+PMNICE_TABLE_ROOT="${PMNICE_TABLE_ROOT:-${PAIMON_WAREHOUSE}/iceberg/${PAIMON_DB}/${TABLE_NAME}}"
 FLINK_JOBS="${FLINK_JOBS:-flink-cid-paimon flink-cid-iceberg}"
 SUITE="${SUITE:-all}"
 RUNS="${RUNS:-3}"
@@ -285,5 +293,64 @@ qb_stop_writers() {
         (( $(date +%s) < deadline )) || qb_die "writers still running after 600s:${busy}"
         qb_log "waiting for writers to stop:${busy}"
         sleep 15
+    done
+}
+
+# ── Suite plumbing shared by both harnesses ─────────────────────────────────
+# The results CSV, with its header when new.
+qb_csv_init() { mkdir -p "$(dirname "$1")"; [[ -f "$1" ]] || echo "$QB_CSV_HEADER" > "$1"; }
+
+# Start <suite> the same way on both engines: snapshot stops the writers first
+# (it needs them stopped), then the window is resolved and logged in one format.
+qb_start_suite() {   # <hot|snapshot>
+    if [[ "$1" == hot ]]; then
+        qb_resolve_hot
+        qb_log "hot: dt=${QB_HOT_DT} [${QB_HOT_FROM}, ${QB_HOT_TO}) on eventTimeDT"
+    else
+        qb_stop_writers
+        qb_resolve_snapshot
+        qb_log "snapshot: dt=${QB_SNAPSHOT_DT} S4=[${QB_S4_FROM}, ${QB_S4_TO}) (${QB_S4_HOW:-})"
+    fi
+}
+
+# The arms of a suite are ratioed against each other, so a writer change
+# between them (~89x on snapshot) makes the suite meaningless. 0 = unchanged;
+# otherwise it logs and returns 1, and the caller does not record the suite.
+qb_writers_unchanged() {   # <writer state at suite start> <suite>
+    local now; now=$(qb_writer_state)
+    [[ "$now" == "$1" ]] && return 0
+    qb_log "writer state changed during the $2 suite (was: $1, now: ${now}); $2 not recorded"
+    return 1
+}
+
+# One engine at a time: the two share the bucket, and each side's numbers are
+# only fair with the other idle. Checked on the CLUSTER, so it also catches a
+# run from another laptop or the in-cluster runner (qb-runner.sh):
+#   - no cid_events query on the StarRocks FE (qb_assert_fe_idle)
+#   - neither warm DuckDB server busy (its /health, read inside the pod)
+#   - locally, no other harness process (<self> = starrocks | duckdb-warm)
+# Before 2026-10-19 starrocks.sh checked only the FE, and only before snapshot,
+# so it would start while a DuckDB server was mid-query. ALLOW_CONCURRENT=1
+# skips all of it.
+qb_assert_alone() {   # <self: starrocks|duckdb-warm>
+    [[ "${ALLOW_CONCURRENT:-0}" == 1 ]] && return 0
+    local other s busy
+    case "$1" in
+        starrocks)   other=$(pgrep -fl 'querybench/duckdb-warm\.sh run' | grep -v 'bash -c' || true) ;;
+        duckdb-warm) other=$(pgrep -fl 'querybench/starrocks\.sh' | grep -v 'bash -c' || true) ;;
+        *)           qb_die "qb_assert_alone: unknown harness '$1'" ;;
+    esac
+    [[ -z "$other" ]] || qb_die "another benchmark is running (ALLOW_CONCURRENT=1 to override):
+${other}"
+    qb_assert_fe_idle
+    for s in hot snapshot; do
+        kubectl get deploy "duckdb-warm-${s}" -n "$NAMESPACE" >/dev/null 2>&1 || continue
+        busy=$(kubectl exec -n "$NAMESPACE" "deploy/duckdb-warm-${s}" -c duckdb -- python3 -c \
+            'import json, urllib.request; print(json.load(urllib.request.urlopen("http://localhost:8080/health", timeout=10))["busy"])' 2>/dev/null || echo unreachable)
+        case "$busy" in
+            False)       ;;
+            True)        qb_die "duckdb-warm-${s} is busy with another run (ALLOW_CONCURRENT=1 to override)" ;;
+            *)           qb_log "duckdb-warm-${s}: busy state unreadable (${busy}); assuming idle" ;;
+        esac
     done
 }

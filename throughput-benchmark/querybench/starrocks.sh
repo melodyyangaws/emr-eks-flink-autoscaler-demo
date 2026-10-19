@@ -31,16 +31,35 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 AUDIT="${AUDIT:-/opt/starrocks/fe/log/fe.audit.log}"
 ARMS="${ARMS:-paimon pmn_as_iceberg iceberg}"
-PAIMON_CATALOG="${PAIMON_CATALOG:-cid_paimon_catalog}"
+# Catalogs that name a warehouse path get the CID_SUFFIX too (lib.sh), so each
+# set of tables has its own; the Glue Iceberg catalog finds either set by database.
+PAIMON_CATALOG="${PAIMON_CATALOG:-cid_paimon_catalog${QB_DB_SUFFIX}}"
 ICEBERG_CATALOG="${ICEBERG_CATALOG:-cid_iceberg_catalog}"
 # hadoop, not glue: Paimon registers its export in Glue with PaimonStorageHandler,
 # which StarRocks' Glue Iceberg catalog cannot load.
-PMNICE_CATALOG="${PMNICE_CATALOG:-cid_pmn_as_ice}"
-PMNICE_WAREHOUSE="${PMNICE_WAREHOUSE:-s3://${BUCKET_NAME}/cid-warehouse-paimon/iceberg/}"
+PMNICE_CATALOG="${PMNICE_CATALOG:-cid_pmn_as_ice${QB_DB_SUFFIX}}"
+PMNICE_WAREHOUSE="${PMNICE_WAREHOUSE:-${PAIMON_WAREHOUSE}/iceberg/}"
 CSV="${OUT_DIR}/starrocks-${STAMP}.csv"
 # Unique per run: a killed earlier run's markers in the same log must never match.
 RUN_ID="${STAMP}_$$"
 QB_TABLE="cid_events"     # reached by name after SET CATALOG / USE
+# ${TABLE} is filled per arm in build_script (arm_table): with a pinned version
+# (hot-interleave.sh exports SR_PIN_ICEBERG / SR_PIN_PMNICE / SR_PIN_PAIMON),
+# every query of the arm reads that one table version, the same one DuckDB
+# reads, however long the run takes.
+QB_DEFER=TABLE
+arm_table() {   # <arm>
+    local id=""
+    case "$1" in
+        iceberg)        id="${SR_PIN_ICEBERG:-}" ;;
+        pmn_as_iceberg) id="${SR_PIN_PMNICE:-}" ;;
+        paimon)         id="${SR_PIN_PAIMON:-}" ;;
+    esac
+    # CAST: StarRocks types a small literal (the Paimon export's ids are Paimon's
+    # snapshot numbers, e.g. 89) as TINYINT and rejects it ("Unsupported type for
+    # table version", 2026-10-19).
+    if [[ -n "$id" ]]; then echo "cid_events FOR VERSION AS OF CAST(${id} AS BIGINT)"; else echo "cid_events"; fi
+}
 QB_BYTES_FN="LENGTH"      # StarRocks LENGTH counts bytes
 
 arm_target() {   # <arm> -> "catalog db"
@@ -113,7 +132,7 @@ build_script() {   # <arm> <suite> <rendered sql>
             [[ -z "$line" ]] && continue
             [[ "$narrow" == *" ${qi} "* ]] && echo "SET connector_io_tasks_per_scan_operator = 1;"
             echo "SELECT 'MARK_${RUN_ID}_${1}_${pass}_${qi}';"
-            echo "$line"
+            echo "${line//'${TABLE}'/$(arm_table "$1")}"
             [[ "$narrow" == *" ${qi} "* ]] && echo "SET connector_io_tasks_per_scan_operator = 2;"
             qi=$(( qi + 1 ))
         done <<< "$3"
@@ -191,7 +210,7 @@ ensure_catalog() {   # <arm>
         paimon) ddl="CREATE EXTERNAL CATALOG IF NOT EXISTS ${PAIMON_CATALOG} PROPERTIES (
     \"type\" = \"paimon\",
     \"paimon.catalog.type\" = \"filesystem\",
-    \"paimon.catalog.warehouse\" = \"s3://${BUCKET_NAME}/cid-warehouse-paimon/\",
+    \"paimon.catalog.warehouse\" = \"${PAIMON_WAREHOUSE}/\",
     \"aws.s3.region\" = \"${AWS_REGION}\",
     \"aws.s3.use_aws_sdk_default_behavior\" = \"true\"
 )" ;;
@@ -288,17 +307,14 @@ run_suite() {   # <suite> <rendered sql> <dt>
         qb_log "${s}: arm ${arm}..."
         run_arm_in_pod "$arm" "$s" "$sql"
     done
-    # The arms of a suite are ratioed against each other, so a writer change
-    # between them (~89x on snapshot) makes the suite meaningless.
-    [[ "$(qb_writer_state)" == "$writers" ]] \
-        || qb_die "writer state changed during the ${s} suite (was: ${writers}, now: $(qb_writer_state)); ${s} not recorded"
+    qb_writers_unchanged "$writers" "$s" || exit 1
     sleep 4   # the FE appends audit records asynchronously
     raw=$(audit_since "${mark%% *}" "${mark#* }")
     recs=$(parse_audit <<<"$raw")
     n=$(grep -c . <<<"$recs")
     (( n >= 3 )) || qb_die "parsed only ${n} audit records for ${s} since ${mark#* } (pod clock); no rows written"
 
-    [[ -f "$CSV" ]] || echo "$QB_CSV_HEADER" > "$CSV"
+    qb_csv_init "$CSV"
     { echo "# suite=${s} writers: ${writers}"
       echo "# suite=${s} dt=${dt} runs=${RUNS} warmup=${WARMUP} arms=${ARMS} run_id=${RUN_ID}"
       echo "$state"; } >> "$CSV"
@@ -345,18 +361,19 @@ main() {
     done
 
     for arm in $ARMS; do ensure_catalog "$arm"; done
+    qb_assert_alone starrocks
     qb_log "run ${RUN_ID}: suites=$(qb_suites) arms=${ARMS} runs=${RUNS}+${WARMUP} warmup datacache=$([[ "${SR_DATACACHE:-1}" == 0 ]] && echo off || echo on)"
 
     for s in $(qb_suites); do
+        # qb_start_suite: snapshot stops the writers, then the window is
+        # resolved again and logged. Hot's window ends now, not at script start;
+        # snapshot's derived S4 window is re-resolved once the writers have stopped.
+        qb_start_suite "$s"
         if [[ "$s" == hot ]]; then
-            qb_resolve_hot   # the window ends now, not at script start
             HOT_SQL=$(render_suite hot) || qb_die "hot suite failed to render"
-            qb_log "hot window: dt=${QB_HOT_DT} [${QB_HOT_FROM}, ${QB_HOT_TO})"
             run_suite hot "$HOT_SQL" "$QB_HOT_DT"
         else
-            qb_assert_fe_idle
-            qb_stop_writers
-            qb_log "snapshot: dt=${QB_SNAPSHOT_DT} S4=[${QB_S4_FROM}, ${QB_S4_TO}) (${QB_S4_HOW:-})"
+            SNAP_SQL=$(render_suite snapshot) || qb_die "snapshot suite failed to render"
             run_suite snapshot "$SNAP_SQL" "$QB_SNAPSHOT_DT"
         fi
     done

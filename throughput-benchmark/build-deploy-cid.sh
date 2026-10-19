@@ -98,6 +98,14 @@ fi
 # each job sees every file: <prefix>-paimon and <prefix>-iceberg. The URL is
 # built per format in render_manifest (sqs_queue_url).
 export SQS_QUEUE_PREFIX=${SQS_QUEUE_PREFIX:-cid-landing-jsongz}
+# CID_SUFFIX (e.g. -r2) writes a second set of tables beside the first: its own
+# warehouses (cid-warehouse-<fmt>-r2/), Glue databases (flink_cid_<fmt>_db_r2) and
+# checkpoint/HA paths (flink/cid-<fmt>-r2/), so the first set stays untouched and
+# queryable, and a new job can never restore the old one's state. The query
+# harness (querybench/lib.sh) reads the same CID_SUFFIX. Empty = the original set.
+export CID_SUFFIX=${CID_SUFFIX:-}
+[[ "$CID_SUFFIX" =~ ^(-[a-z0-9]+)?$ ]] || { echo "CID_SUFFIX must be empty or like -r2, got '$CID_SUFFIX'" >&2; exit 1; }
+export CID_DB_SUFFIX=${CID_SUFFIX//-/_}
 # Concurrent ReceiveMessage loops in the source's enumerator.
 export SQS_POLL_THREADS=${SQS_POLL_THREADS:-8}
 if [[ ! "$SQS_POLL_THREADS" =~ ^[0-9]+$ ]] || (( SQS_POLL_THREADS < 1 )); then
@@ -456,6 +464,94 @@ check_sqs_backlog() {
     unset _vis _invis
 }
 
+# ── S3 -> SNS link (the bucket's event notification) ─────────────────────────
+# Which landing files reach the queues is decided by an event notification ON
+# THE BUCKET, not by anything in this repo: OUTPUT_URI only tells the generator
+# where to write.
+# OUTPUT_URI (.bench-env) is the ONE landing location: the generator writes
+# only there, and each job's source reads only keys under it ('key-prefix' in
+# 01-raw-s3sqs.sql, from LANDING_KEY_PREFIX in render_manifest).
+: "${OUTPUT_URI:?OUTPUT_URI is not set: source .bench-env}"
+[[ "$OUTPUT_URI" == s3://*/* ]] || { echo "OUTPUT_URI must be s3://bucket/prefix, got '$OUTPUT_URI'" >&2; exit 1; }
+export SNS_TOPIC_NAME=${SNS_TOPIC_NAME:-cid-landing-jsongz-events}
+landing_bucket() { local p=${OUTPUT_URI#s3://}; echo "${p%%/*}"; }
+landing_prefix() { local p=${OUTPUT_URI#s3://}; p=${p#*/}; echo "${p%/}/"; }
+sns_topic_arn()  { echo "arn:aws:sns:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SNS_TOPIC_NAME}"; }
+
+# The prefix the bucket notifies SNS_TOPIC_NAME for ("" if none).
+notified_prefix() {
+    aws s3api get-bucket-notification-configuration --bucket "$(landing_bucket)" \
+        --region "$AWS_REGION" --output json \
+      | python3 -c 'import json, sys
+for c in json.load(sys.stdin).get("TopicConfigurations", []):
+    if c.get("TopicArn") == sys.argv[1]:
+        rules = c.get("Filter", {}).get("Key", {}).get("FilterRules", [])
+        print(next((r["Value"] for r in rules if r["Name"].lower() == "prefix"), ""))
+        break' "$(sns_topic_arn)"
+}
+
+# Set the bucket's notification for SNS_TOPIC_NAME to OUTPUT_URI's prefix
+# (+ .json.gz, ObjectCreated), keeping every other notification on the bucket,
+# then prove it end to end: an empty gzip file under the prefix must show up in
+# BOTH queues. Only the test file's messages and S3's s3:TestEvent (sent on
+# every configuration change) are deleted; anything else received is made
+# visible again at once. Refuses while a writer is RUNNING, so
+# no job can read the test file.
+cmd_notify() {
+    local bucket prefix topic cfg key fmt url found i
+    [[ "$OUTPUT_URI" == s3://* ]] || error "OUTPUT_URI must be s3://bucket/prefix (got '${OUTPUT_URI}')"
+    bucket=$(landing_bucket); prefix=$(landing_prefix); topic=$(sns_topic_arn)
+    if kubectl get flinkdeployment -n "$NAMESPACE" -o jsonpath='{.items[*].status.jobStatus.state}' 2>/dev/null | grep -q RUNNING; then
+        error "A Flink writer is RUNNING; it would read the test file. Suspend both first:
+         kubectl patch flinkdeployment flink-cid-{paimon,iceberg} -n ${NAMESPACE} --type=merge -p '{\"spec\":{\"job\":{\"state\":\"suspended\"}}}'"
+    fi
+    cfg=$(mktemp)
+    aws s3api get-bucket-notification-configuration --bucket "$bucket" --region "$AWS_REGION" --output json \
+      | python3 -c 'import json, sys
+topic, prefix = sys.argv[1], sys.argv[2]
+d = json.load(sys.stdin)
+d.pop("ResponseMetadata", None)
+mine = {"Id": prefix.strip("/") + "-to-sns", "TopicArn": topic, "Events": ["s3:ObjectCreated:*"],
+        "Filter": {"Key": {"FilterRules": [{"Name": "Prefix", "Value": prefix},
+                                           {"Name": "Suffix", "Value": ".json.gz"}]}}}
+d["TopicConfigurations"] = [c for c in d.get("TopicConfigurations", []) if c.get("TopicArn") != topic] + [mine]
+print(json.dumps(d))' "$topic" "$prefix" > "$cfg" || error "Cannot read the notification configuration of bucket ${bucket}"
+    log "Setting the notification on bucket ${bucket}: ${prefix}*.json.gz -> SNS ${SNS_TOPIC_NAME}"
+    aws s3api put-bucket-notification-configuration --bucket "$bucket" --region "$AWS_REGION" \
+        --notification-configuration "file://${cfg}" || error "put-bucket-notification-configuration failed"
+    rm -f "$cfg"
+
+    key="${prefix}_notify-test/$(date -u +%Y%m%dT%H%M%SZ)-$$.json.gz"
+    printf '' | gzip > "${TMPDIR:-/tmp}/notify-test.json.gz"
+    aws s3 cp --quiet "${TMPDIR:-/tmp}/notify-test.json.gz" "s3://${bucket}/${key}" --region "$AWS_REGION" \
+        || error "Cannot write the test file s3://${bucket}/${key}"
+    log "Test file s3://${bucket}/${key}; waiting for it on both queues..."
+    for fmt in $DEPLOY_TARGETS; do
+        url=$(sqs_queue_url "$fmt"); found=0
+        for i in 1 2 3 4 5 6 7 8 9; do
+            found=$(aws sqs receive-message --queue-url "$url" --region "$AWS_REGION" --max-number-of-messages 10 \
+                      --wait-time-seconds 10 --visibility-timeout 30 --output json \
+                | python3 -c 'import json, subprocess, sys
+key, url, region = sys.argv[1:4]
+hit = 0
+for m in (json.load(sys.stdin) if not sys.stdin.isatty() else {}).get("Messages", []):
+    # S3 also sends an s3:TestEvent whenever the configuration changes: delete it too.
+    ours = key in m["Body"] or "s3:TestEvent" in m["Body"]
+    act = ["delete-message"] if ours else ["change-message-visibility", "--visibility-timeout", "0"]
+    hit |= key in m["Body"]
+    subprocess.run(["aws", "sqs", *act, "--queue-url", url, "--region", region,
+                    "--receipt-handle", m["ReceiptHandle"]], check=True, capture_output=True)
+print(int(hit))' "$key" "$url" "$AWS_REGION" 2>/dev/null || echo 0)
+            [[ "$found" == 1 ]] && break
+        done
+        if [[ "$found" == 1 ]]; then log "✓ ${SQS_QUEUE_PREFIX}-${fmt}: test event received (and deleted)"
+        else warn "${SQS_QUEUE_PREFIX}-${fmt}: no event for the test file within ~90 s"; fi
+    done
+    aws s3 rm --quiet "s3://${bucket}/${key}" --region "$AWS_REGION"
+    rm -f "${TMPDIR:-/tmp}/notify-test.json.gz"
+    log "✓ Test file removed. Files under ${prefix} now reach both queues."
+}
+
 upload_scripts() {
     log "Uploading executor and SQL scripts to S3..."
     # This IS what the job runs. spec.job.jarURI points at this key; EMR on
@@ -529,7 +625,7 @@ upload_scripts() {
 # "IllegalArgumentException: Can not create a Path from an empty string"
 # in HiveCatalog.getTableLocation.
 create_glue_databases() {
-    local db="flink_cid_iceberg_db"
+    local db="flink_cid_iceberg_db${CID_DB_SUFFIX}"
     if aws glue get-database --name "$db" --region "$AWS_REGION" &>/dev/null; then
         log "✓ Glue database exists: $db"
     else
@@ -542,7 +638,7 @@ create_glue_databases() {
     # Guard against the empty-LocationUri trap for the Paimon database: if it
     # exists WITHOUT a location (e.g. created by an earlier version of this
     # script), Paimon table creation will fail — refuse to proceed.
-    local paimon_db="flink_cid_paimon_db" loc
+    local paimon_db="flink_cid_paimon_db${CID_DB_SUFFIX}" loc
     if aws glue get-database --name "$paimon_db" --region "$AWS_REGION" &>/dev/null; then
         loc=$(aws glue get-database --name "$paimon_db" --region "$AWS_REGION" \
                 --query 'Database.LocationUri' --output text)
@@ -576,6 +672,7 @@ render_manifest() {
         -e "s|\${SQS_QUEUE_URL}|$(sqs_queue_url "$fmt")|g" \
         -e "s|\${SQS_SOURCE_JAR}|${SQS_SOURCE_JAR}|g" \
         -e "s|\${SQS_POLL_THREADS}|${SQS_POLL_THREADS}|g" \
+        -e "s|\${LANDING_KEY_PREFIX}|$(landing_prefix)|g" \
         -e "s|\${SQS_MAX_PENDING_OPT}|${SQS_MAX_PENDING_OPT}|g" \
         -e "s|\${SQS_VISIBILITY_TIMEOUT}|${SQS_VISIBILITY_TIMEOUT}|g" \
         -e "s|\${PAIMON_ICEBERG_STORAGE}|${PAIMON_ICEBERG_STORAGE}|g" \
@@ -588,6 +685,8 @@ render_manifest() {
         -e "s|\${ICEBERG_S3_MULTIPART_SIZE_BYTES}|${ICEBERG_S3_MULTIPART_SIZE_BYTES}|g" \
         -e "s|\${ICEBERG_S3_MULTIPART_THREADS}|${ICEBERG_S3_MULTIPART_THREADS}|g" \
         -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL}|g" \
+        -e "s|\${CID_SUFFIX}|${CID_SUFFIX}|g" \
+        -e "s|\${CID_DB_SUFFIX}|${CID_DB_SUFFIX}|g" \
         -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL}|g" \
         "$template" > "$output"
 
@@ -697,6 +796,12 @@ main() {
             done
             echo "  Monitor: ./monitoring/deploy-cid-monitor.sh   (logs: kubectl logs -f deployment/flink-cid-monitor -n ${NAMESPACE})"
             ;;
+        notify)
+            # Point the bucket's S3 event notification at OUTPUT_URI's prefix and
+            # check a test file reaches both queues (see cmd_notify).
+            check_env_vars
+            cmd_notify
+            ;;
         cleanup)
             local fmt=${2:-both}
             warn "Deleting flink-cid deployment(s): ${fmt}"
@@ -716,6 +821,9 @@ main() {
             echo "  upload             Create Glue DBs, upload + verify executor and SQL in S3 (no kubectl)"
             echo "  render             Render all manifests, upload scripts, prep Glue/ConfigMap"
             echo "  deploy paimon|iceberg|both"
+            echo "  notify                      Point the bucket's S3 event notification at"
+            echo "                              OUTPUT_URI's prefix and test it through both queues"
+            echo "                              (deploy refuses to start while they differ)"
             echo "                     Deploy one writer, or 'both' for a side-by-side"
             echo "                     run. Both at once measures CONTENTION, not"
             echo "                     either write path — deploy warns when you do it."

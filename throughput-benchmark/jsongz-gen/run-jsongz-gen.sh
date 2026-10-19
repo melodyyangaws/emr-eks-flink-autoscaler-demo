@@ -9,13 +9,11 @@
 # (../build-deploy-cid.sh) read them.
 #
 # Usage:
-#   ./run-jsongz-gen.sh start     # render + ConfigMap + Job; pods write 30 min, then exit (nodes released)
+#   ./run-jsongz-gen.sh start     # render + ConfigMap + Job; pods write DURATION_SECONDS, then exit (0 = until stop)
 #   ./run-jsongz-gen.sh scale N   # change the Job parallelism (rate = N x JSONGZ_ROWS_PER_POD)
 #   ./run-jsongz-gen.sh status    # pods + last stats line per pod
 #   ./run-jsongz-gen.sh logs      # follow the first pod (or POD=N, Nth by name)
-#   ./run-jsongz-gen.sh stop      # delete the Job now, before the window ends (data already written stays)
-#   ./run-jsongz-gen.sh clean     # delete the Job, legacy Deployment and ConfigMap
-#   ./run-jsongz-gen.sh local     # 30 s on this machine -> /tmp/cid-jsongz
+#   ./run-jsongz-gen.sh stop      # delete the Job and ConfigMap; ends a DURATION_SECONDS=0 run (data already written stays)
 #   ./run-jsongz-gen.sh render    # write jsongz-gen-job-deployed.yaml, don't apply
 #
 # Size: JSONGZ_REPLICAS (default ceil(JSONGZ_ROWS_PER_SECOND / JSONGZ_ROWS_PER_POD)
@@ -41,7 +39,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export AWS_REGION=${AWS_REGION:-us-west-2}
 export NAMESPACE=${NAMESPACE:-emr-flink}
-export OUTPUT_URI=${OUTPUT_URI:-s3://${BUCKET_NAME:?BUCKET_NAME not set}/cid-landing-jsongz}
+# The one landing location, from .bench-env only: the jobs read nothing else
+# ('key-prefix' in 01-raw-s3sqs.sql), so no fallback path here.
+export OUTPUT_URI=${OUTPUT_URI:?OUTPUT_URI is not set: source .bench-env}
 
 # The rate knobs are JSONGZ_*: this generator alone sets the benchmark's
 # offered rate (the Flink jobs read as fast as they can). The cap is PER POD;
@@ -64,17 +64,13 @@ else
     SIZING="JSONGZ_REPLICAS=${JSONGZ_REPLICAS} (set explicitly)"
 fi
 export JSONGZ_REPLICAS
-# Fixed 30-minute window: every pod writes for 1800 s, then exits, the Job
-# completes and Karpenter releases the nodes. DURATION_SECONDS may only SHORTEN it (1..1800, e.g. a quick test);
-# there is no run-until-stopped mode. Validated in check_duration below.
-MAX_DURATION_SECONDS=1800
-export DURATION_SECONDS=${DURATION_SECONDS:-$MAX_DURATION_SECONDS}
-# Hard stop shared by all pods (RUN_DEADLINE_EPOCH = render time + duration +
-# this slack for Karpenter node launch, pip install and pod start). Replaces
-# the Job's activeDeadlineSeconds: a restarted or scaled-up pod never writes
-# past it. 600, not the Job's old 300: on 2026-10-09 node launch + pip took
-# ~330 s, so the 2100 s Job deadline killed the pods just short of 1800 s.
-DEADLINE_SLACK_SECONDS=600
+# DURATION_SECONDS is the only time setting:
+#   > 0  every pod writes that long from its own start (default 1800),
+#        then exits; the Job completes and Karpenter releases the nodes.
+#   0    every pod writes until stopped: `stop`, or querybench/hot-watch.sh once
+#        the hot query test is done (2026-10-19: a 1-hour generator stopped
+#        mid-test, so a hot run is not given a fixed length).
+export DURATION_SECONDS=${DURATION_SECONDS:-1800}
 export WORKERS=${WORKERS:-60}
 export GZIP_LEVEL=${GZIP_LEVEL:-6}
 # MB-sized files (~7 MB gz mean, ~1.3-10 MB), not the real extract's ~0.4 MB:
@@ -93,28 +89,21 @@ export GEN_NODEPOOL=${GEN_NODEPOOL:-executor-memorynodepool}
 
 JOB=cid-jsongz-gen
 LEGACY_DEPLOY=cid-jsongz-gen  # the generator used to be a Deployment (pods idled after the window)
-# activeDeadlineSeconds backstop, past the shared write deadline: only a hung
-# pod ever hits it.
-JOB_DEADLINE_MARGIN_SECONDS=300
 CM=cid-jsongz-gen
 MANIFEST="$HERE/jsongz-gen-job.yaml"
 DEPLOYED_MANIFEST="$HERE/jsongz-gen-job-deployed.yaml"
 # Every placeholder in jsongz-gen-job.yaml. envsubst leaves anything outside
 # this list as a literal ${...}, which render() then rejects.
-RENDER_VARS='${NAMESPACE} ${JSONGZ_REPLICAS} ${RUN_DEADLINE_EPOCH} ${GEN_NODEPOOL}
-${AWS_REGION} ${OUTPUT_URI} ${JSONGZ_ROWS_PER_POD} ${DURATION_SECONDS} ${JOB_DEADLINE_SECONDS}
+RENDER_VARS='${NAMESPACE} ${JSONGZ_REPLICAS} ${GEN_NODEPOOL}
+${AWS_REGION} ${OUTPUT_URI} ${JSONGZ_ROWS_PER_POD} ${DURATION_SECONDS}
 ${WORKERS} ${GZIP_LEVEL} ${ROWS_PER_FILE} ${CID_CUSTOMER_COUNT} ${CID_HOST_COUNT}'
 
 check_duration() {
     [[ "$DURATION_SECONDS" =~ ^[0-9]+$ ]] \
-        || error "DURATION_SECONDS='${DURATION_SECONDS}' is not a whole number of seconds (1..${MAX_DURATION_SECONDS})"
+        || error "DURATION_SECONDS='${DURATION_SECONDS}' is not a whole number of seconds (0 = until stopped)"
     DURATION_SECONDS=$((10#$DURATION_SECONDS))
-    [ "$DURATION_SECONDS" -ge 1 ] && [ "$DURATION_SECONDS" -le "$MAX_DURATION_SECONDS" ] \
-        || error "DURATION_SECONDS=${DURATION_SECONDS} out of range: the run is fixed at ${MAX_DURATION_SECONDS}s (30 min); only a shorter override 1..${MAX_DURATION_SECONDS} is allowed"
     export DURATION_SECONDS
     [[ "$JSONGZ_REPLICAS" =~ ^[0-9]+$ ]] || error "JSONGZ_REPLICAS='${JSONGZ_REPLICAS}' is not a whole number"
-    export RUN_DEADLINE_EPOCH=$(( $(date +%s) + DURATION_SECONDS + DEADLINE_SLACK_SECONDS ))
-    export JOB_DEADLINE_SECONDS=$(( DURATION_SECONDS + DEADLINE_SLACK_SECONDS + JOB_DEADLINE_MARGIN_SECONDS ))
 }
 
 render() {
@@ -131,11 +120,12 @@ summary() {
     info "Sizing:      $SIZING"
     info "Rate cap:    ${JSONGZ_REPLICAS} x ${JSONGZ_ROWS_PER_POD} = ${total} rows/s ≈ $(awk -v r="$total" 'BEGIN{printf "%.2f GB/s raw, %.2f GB/s gz", r*4096/1e9, r*205/1e9}')"
     info "Pod size:    ${WORKERS} cpu / 24Gi per pod on ${GEN_NODEPOOL}, one pod per node"
-    info "Duration:    ${DURATION_SECONDS}s ≈ $(awk -v r="$total" -v d="$DURATION_SECONDS" 'BEGIN{printf "%.1f TB raw / %.2f TB gz", r*d*4096/1e12, r*d*205/1e12}') if the cap is reached, then pods exit and nodes are released"
-    if [ "$DURATION_SECONDS" -lt "$MAX_DURATION_SECONDS" ]; then
-        warn "DURATION_SECONDS=${DURATION_SECONDS}: shorter than the standard ${MAX_DURATION_SECONDS}s run"
+    if [ "$DURATION_SECONDS" -eq 0 ]; then
+        info "Duration:    until stopped (./run-jsongz-gen.sh stop, or querybench/hot-watch.sh); ≈ $(awk -v r="$total" 'BEGIN{printf "%.1f TB raw / %.2f TB gz", r*3600*4096/1e12, r*3600*205/1e12}') per hour if the cap is reached"
+        warn "DURATION_SECONDS=0: nothing stops it by itself; run ./run-jsongz-gen.sh stop when done"
+    else
+        info "Duration:    ${DURATION_SECONDS}s ≈ $(awk -v r="$total" -v d="$DURATION_SECONDS" 'BEGIN{printf "%.1f TB raw / %.2f TB gz", r*d*4096/1e12, r*d*205/1e12}') if the cap is reached, then pods exit and nodes are released"
     fi
-    info "Deadline:    no writes after $(date -u -r "$RUN_DEADLINE_EPOCH" +%H:%M:%SZ 2>/dev/null || date -u -d "@$RUN_DEADLINE_EPOCH" +%H:%M:%SZ) (now + duration + ${DEADLINE_SLACK_SECONDS}s)"
 }
 
 cmd_start() {
@@ -151,7 +141,7 @@ cmd_start() {
     # A Job's pod template is immutable, so a re-start replaces the Job (and
     # any pods still writing) rather than applying over it.
     kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null
-    log "Job $JOB: parallelism ${JSONGZ_REPLICAS}, hard stop after ${JOB_DEADLINE_SECONDS}s"
+    log "Job $JOB: parallelism ${JSONGZ_REPLICAS}, $([ "$DURATION_SECONDS" -eq 0 ] && echo 'until stopped' || echo "${DURATION_SECONDS}s per pod")"
     kubectl apply -f "$DEPLOYED_MANIFEST" >/dev/null
     log "Started. ./run-jsongz-gen.sh status  (stats every 10 s per pod)"
 }
@@ -160,7 +150,7 @@ cmd_scale() {
     local n=${1:-}
     [[ "$n" =~ ^[0-9]+$ ]] || error "usage: ./run-jsongz-gen.sh scale N"
     kubectl patch job "$JOB" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"parallelism\":${n}}}"
-    log "Scaled to ${n}. New pods write only until the deadline set by the last start."
+    log "Scaled to ${n}. New pods write DURATION_SECONDS from their own start (0: until stopped)."
 }
 
 cmd_status() {
@@ -170,7 +160,7 @@ cmd_status() {
     local total=0 pods
     pods=$(kubectl get pods -n "$NAMESPACE" -l app=cid-jsongz-gen -o name 2>/dev/null)
     for p in $pods; do
-        line=$(kubectl logs "$p" -n "$NAMESPACE" --tail=20 2>/dev/null | grep -E 'rows/s|^DONE|^IDLE' | tail -1 || true)
+        line=$(kubectl logs "$p" -n "$NAMESPACE" --tail=20 2>/dev/null | grep -E 'rows/s|^DONE' | tail -1 || true)
         printf '%-45s %s\n' "${p#pod/}" "${line:-<no stats yet>}"
         # The number just before "rows/s"; the "[   80s]" prefix has a variable
         # field count, so a fixed $2 picks up "80s]".
@@ -194,25 +184,11 @@ cmd_logs() {
 }
 
 cmd_stop() {
-    # Only needed to end a run early: the Job finishes on its own after the
-    # window. Pods get SIGTERM and flush in-flight PUTs; start re-creates it.
+    # Ends a DURATION_SECONDS=0 run, or a timed one early. Pods get SIGTERM and
+    # flush in-flight PUTs; start re-creates the Job and ConfigMap.
     kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true
-    log "Stopped. Files already written under $OUTPUT_URI are kept."
-}
-
-cmd_clean() {
-    kubectl delete job "$JOB" -n "$NAMESPACE" --ignore-not-found --wait=true
-    kubectl delete deployment "$LEGACY_DEPLOY" -n "$NAMESPACE" --ignore-not-found --wait=true
     kubectl delete configmap "$CM" -n "$NAMESPACE" --ignore-not-found
-    log "Cleaned. Files already written under $OUTPUT_URI are kept."
-}
-
-cmd_local() {
-    rm -rf /tmp/cid-jsongz
-    log "30 s local run -> /tmp/cid-jsongz (uncapped, all cores)"
-    OUTPUT_URI=file:///tmp/cid-jsongz DURATION_SECONDS=30 POD_ROWS_PER_SECOND=1e12 \
-        WORKERS=${LOCAL_WORKERS:-$(python3 -c 'import os; print(os.cpu_count())')} \
-        RUN_DEADLINE_EPOCH= IDLE_AFTER_DONE=0 python3 "$HERE/cid_jsongz_gen.py"
+    log "Stopped. Files already written under $OUTPUT_URI are kept."
 }
 
 case "${1:-}" in
@@ -221,8 +197,6 @@ case "${1:-}" in
     logs)   cmd_logs ;;
     scale)  cmd_scale "${2:-}" ;;
     stop)   cmd_stop ;;
-    clean)  cmd_clean ;;
-    local)  cmd_local ;;
     render) check_duration; summary; render ;;
-    *)      sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *)      sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

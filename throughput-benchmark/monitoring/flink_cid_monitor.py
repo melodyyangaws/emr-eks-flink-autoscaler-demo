@@ -61,6 +61,10 @@ class FlinkMetricsSnapshot:
     last_checkpoint_size: int = 0
     is_backpressured: bool = False
     uptime_ms: int = 0
+    # Sum of the source subtasks' numRecordsOutPerSecond: Flink's own rate meter
+    # (a smoothed per-second rate), unaffected by the REST counter cache.
+    records_out_per_sec: float = 0.0
+    job_state: str = ""
 
 
 @dataclass
@@ -76,7 +80,21 @@ class PipelineReport:
     flink_snapshots: list = field(default_factory=list)
     table_snapshots_start: dict = field(default_factory=dict)
     table_snapshots_end: dict = field(default_factory=dict)
+    # Headline rows/s: commit_records_per_sec when the window saw a commit,
+    # else meter_records_per_sec, else counter_records_per_sec (see generate_report).
     throughput_records_per_sec: float = 0.0
+    throughput_source: str = ""
+    # Rows the table committed / time between commits (the last commit before
+    # the window is the anchor): exact, the same method as the write-ups.
+    commit_records_per_sec: float = 0.0
+    commits_in_window: int = 0
+    # Median of the source rate meter over the window's RUNNING samples.
+    meter_records_per_sec: float = 0.0
+    # Source counter delta / time over the longest stretch without a restart.
+    # The REST counters are cached and move in steps, so this is the least
+    # reliable of the three; kept for comparison.
+    counter_records_per_sec: float = 0.0
+    restarts_in_window: int = 0
     throughput_bytes_per_sec: float = 0.0
     total_records_processed: int = 0
     total_bytes_processed: int = 0
@@ -149,7 +167,7 @@ class FlinkCIDMonitor:
         # data-file bytes. Paimon's committer counter (sink.numBytesOut) also
         # counts compaction rewrites, so its bytes come from APPEND commits in
         # the table metadata instead (_paimon_append_stats).
-        pattern = re.compile(r"^(Source__.*\.numRecordsOut|(IcebergStreamWriter|Writer).*\.numRecordsIn"
+        pattern = re.compile(r"^(Source__.*\.numRecordsOut(PerSecond)?|(IcebergStreamWriter|Writer).*\.numRecordsIn"
                              r"|.*\.committedDataFilesByteCount)$")
         found = {}
         for vertex in details.get("vertices", []):
@@ -180,7 +198,7 @@ class FlinkCIDMonitor:
         if not details:
             return {}
 
-        totals = {"records_in": 0, "records_out": 0, "bytes_in": 0, "bytes_out": 0}
+        totals = {"records_in": 0, "records_out": 0, "bytes_in": 0, "bytes_out": 0, "rate_out": 0.0}
 
         # Records come from OPERATOR-scoped metrics, not vertex-level ones. A
         # vertex's numRecordsIn/Out only counts records crossing a vertex
@@ -197,8 +215,11 @@ class FlinkCIDMonitor:
                 f"?get={','.join(quote(i, safe='') for i in ids)}&agg=sum"
             )
             for m in data or []:
-                val = int(float(m.get("sum", m.get("value", "0"))))
-                if m["id"].startswith("Source__"):
+                raw = float(m.get("sum", m.get("value", "0")))
+                val = int(raw)
+                if m["id"].endswith("PerSecond"):
+                    totals["rate_out"] += raw
+                elif m["id"].startswith("Source__"):
                     totals["records_out"] += val
                 elif "Byte" in m["id"]:  # Iceberg committedDataFilesByteCount
                     totals["bytes_out"] += val
@@ -281,6 +302,8 @@ class FlinkCIDMonitor:
             last_checkpoint_size=cp_stats.get("latest_size", 0),
             is_backpressured=bp,
             uptime_ms=uptime,
+            records_out_per_sec=vertex_metrics.get("rate_out", 0.0),
+            job_state=(details or {}).get("state", ""),
         )
 
     # ── Iceberg / Glue Table Stats ──────────────────────────────────
@@ -401,6 +424,67 @@ class FlinkCIDMonitor:
             log.warning("Paimon metadata read failed for %s.%s: %s",
                         self.glue_database, table_name, e)
         return ts
+
+    def _paimon_commits(self, table_name: str, start_id: int, end_id: int) -> list:
+        """[(commit time s, rows added)] for snapshots start_id..end_id, APPEND
+        only (COMPACT rewrites rows already counted). start_id is the anchor:
+        the last commit before the window."""
+        out = []
+        s3, bucket, table_prefix = self._paimon_s3(table_name)
+        for sid in range(start_id, end_id + 1):
+            try:
+                snap = json.loads(s3.get_object(
+                    Bucket=bucket, Key=f"{table_prefix}/snapshot/snapshot-{sid}")["Body"].read())
+            except Exception as e:
+                log.warning("Paimon snapshot-%d of %s unreadable, skipped: %s", sid, table_name, e)
+                continue
+            if snap.get("commitKind") == "APPEND" or sid == start_id:
+                out.append((snap["timeMillis"] / 1000.0, int(snap.get("deltaRecordCount") or 0)))
+        return out
+
+    def _iceberg_commits(self, table_name: str) -> list:
+        """[(commit time s, rows added)] for every snapshot in the current metadata."""
+        try:
+            tbl = self.catalog.load_table(f"{self.glue_database}.{table_name}")
+            return [(sn.timestamp_ms / 1000.0, int((sn.summary or {}).get("added-records") or 0))
+                    for sn in (tbl.metadata.snapshots or [])]
+        except Exception as e:
+            log.warning("Iceberg commit history unreadable for %s.%s: %s", self.glue_database, table_name, e)
+            return []
+
+    @staticmethod
+    def _counter_rate(snaps: list):
+        """(rows/s, rows, bytes, seconds, restarts) from the source counters over
+        the longest stretch of RUNNING samples with no counter drop. Non-RUNNING
+        samples are left out; each drop (counters reset) is one restart."""
+        run = [x for x in snaps if x.job_state in ("", "RUNNING")]
+        segments, cur, restarts = [], run[:1], 0
+        for prev, x in zip(run, run[1:]):
+            if x.records_out < prev.records_out:
+                restarts += 1
+                segments.append(cur)
+                cur = [x]
+            else:
+                cur.append(x)
+        segments.append(cur)
+        seg = max(segments, key=lambda g: g[-1].timestamp - g[0].timestamp if len(g) >= 2 else -1)
+        if len(seg) < 2 or seg[-1].timestamp <= seg[0].timestamp:
+            return 0.0, 0, 0, 0.0, restarts
+        dt = seg[-1].timestamp - seg[0].timestamp
+        rows = seg[-1].records_out - seg[0].records_out
+        return rows / dt, rows, seg[-1].bytes_out - seg[0].bytes_out, dt, restarts
+
+    @staticmethod
+    def _commit_rate(commits: list, t0: float, t1: float):
+        """(rows/s, commits) from commits in (t0, t1], over the time since the
+        last commit at or before t0. (0, n) when there is no anchor or commit."""
+        commits = sorted(commits)
+        anchor = [c for c in commits if c[0] <= t0]
+        inside = [c for c in commits if t0 < c[0] <= t1]
+        if not anchor or not inside:
+            return 0.0, len(inside)
+        span = inside[-1][0] - anchor[-1][0]
+        return (sum(r for _, r in inside) / span if span > 0 else 0.0), len(inside)
 
     def _paimon_append_stats(self, table_name: str, start_id: int, end_id: int) -> dict:
         """Files, rows and bytes added by APPEND commits in (start_id, end_id].
@@ -601,19 +685,24 @@ class FlinkCIDMonitor:
         report.table_snapshots_end = table_end
 
         sample_dt = report.duration_seconds
+        valid = [s for s in flink_snapshots if s.records_out > 0 or s.num_checkpoints > 0]
         if len(flink_snapshots) >= 2:
-            # Use last VALID snapshot to handle mid-monitoring job restarts
-            # (when job crashes, records/checkpoints drop to 0)
-            valid = [s for s in flink_snapshots if s.records_out > 0 or s.num_checkpoints > 0]
-            first = valid[0] if valid else flink_snapshots[0]
-            last = valid[-1] if valid else flink_snapshots[-1]
-            dt = last.timestamp - first.timestamp
+            # A restart resets the task counters, so a drop in records_out splits
+            # the window. Differencing across it gave a negative row count
+            # (Iceberg, 2026-10-18 12:49Z). The counter rate comes from the
+            # longest stretch without one; the restart is reported.
+            (report.counter_records_per_sec, report.total_records_processed,
+             report.total_bytes_processed, dt, report.restarts_in_window) = self._counter_rate(flink_snapshots)
             if dt > 0:
-                report.total_records_processed = last.records_out - first.records_out
-                report.total_bytes_processed = last.bytes_out - first.bytes_out
-                report.throughput_records_per_sec = report.total_records_processed / dt
                 report.throughput_bytes_per_sec = report.total_bytes_processed / dt
                 sample_dt = dt
+            if report.restarts_in_window:
+                report.errors.append(f"job restarted {report.restarts_in_window}x in the window "
+                                     "(counters reset); counter rate from the longest clean stretch")
+        rates = [s.records_out_per_sec for s in flink_snapshots
+                 if s.records_out_per_sec > 0 and s.job_state in ("", "RUNNING")]
+        if rates:
+            report.meter_records_per_sec = statistics.median(rates)
 
         cp_durations = [s.last_checkpoint_duration_ms for s in flink_snapshots
                         if s.last_checkpoint_duration_ms > 0]
@@ -675,6 +764,29 @@ class FlinkCIDMonitor:
                          s.snapshot_count, e.snapshot_count,
                          s.current_snapshot_id, e.current_snapshot_id)
 
+        # Commit-based rows/s: the headline. Rows each commit added / time
+        # between commits, from the table's own history, so no counter caching,
+        # no restart artefacts (replayed rows are not committed twice).
+        window_end = time.time()
+        for t in self.tables:
+            s, e = table_start.get(t), table_end.get(t)
+            if self.catalog_config.get("type") == "hadoop":
+                commits = (self._paimon_commits(t, s.current_snapshot_id, e.current_snapshot_id)
+                           if s and e and s.current_snapshot_id is not None and e.current_snapshot_id is not None
+                           else [])
+            else:
+                commits = self._iceberg_commits(t)
+            rate, n = self._commit_rate(commits, monitor_start_ts, window_end)
+            report.commit_records_per_sec += rate
+            report.commits_in_window += n
+        if report.commit_records_per_sec > 0:
+            report.throughput_records_per_sec, report.throughput_source = report.commit_records_per_sec, "commits"
+        elif report.meter_records_per_sec > 0:
+            report.throughput_records_per_sec, report.throughput_source = report.meter_records_per_sec, "rate meter"
+        else:
+            report.throughput_records_per_sec, report.throughput_source = report.counter_records_per_sec, "counter"
+        log.info("Throughput %s: %.0f rows/s (%s) | restarts %d",
+                 label, report.throughput_records_per_sec, report.throughput_source, report.restarts_in_window)
         log.info("Monitoring complete: %s", label)
         return report
 
@@ -708,14 +820,16 @@ class FlinkCIDMonitor:
             ["Parallelism", report_a.parallelism, report_b.parallelism, ""],
             ["Duration (s)", f"{report_a.duration_seconds:.0f}", f"{report_b.duration_seconds:.0f}", ""],
             ["─" * 30, "─" * 15, "─" * 15, "─" * 10],
-            ["Records Processed",
+            ["Throughput (rows/s)",
+             f"{report_a.throughput_records_per_sec:,.0f} ({report_a.throughput_source})",
+             f"{report_b.throughput_records_per_sec:,.0f} ({report_b.throughput_source})",
+             delta_pct(report_a.throughput_records_per_sec, report_b.throughput_records_per_sec)],
+            ["Restarts in window",
+             report_a.restarts_in_window, report_b.restarts_in_window, ""],
+            ["Records Processed (counter)",
              f"{report_a.total_records_processed:,}",
              f"{report_b.total_records_processed:,}",
              delta_pct(report_a.total_records_processed, report_b.total_records_processed)],
-            ["Throughput (rec/s)",
-             f"{report_a.throughput_records_per_sec:,.1f}",
-             f"{report_b.throughput_records_per_sec:,.1f}",
-             delta_pct(report_a.throughput_records_per_sec, report_b.throughput_records_per_sec)],
             ["Committed bytes/s (Parquet)",
              fmt_bytes(report_a.throughput_bytes_per_sec),
              fmt_bytes(report_b.throughput_bytes_per_sec),
@@ -789,6 +903,12 @@ class FlinkCIDMonitor:
             "start_time": report.start_time,
             "end_time": report.end_time,
             "throughput_records_per_sec": round(report.throughput_records_per_sec, 2),
+            "throughput_source": report.throughput_source,
+            "commit_records_per_sec": round(report.commit_records_per_sec, 2),
+            "commits_in_window": report.commits_in_window,
+            "meter_records_per_sec": round(report.meter_records_per_sec, 2),
+            "counter_records_per_sec": round(report.counter_records_per_sec, 2),
+            "restarts_in_window": report.restarts_in_window,
             "throughput_bytes_per_sec": round(report.throughput_bytes_per_sec, 2),
             "total_records_processed": report.total_records_processed,
             "total_bytes_processed": report.total_bytes_processed,

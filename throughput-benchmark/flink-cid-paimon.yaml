@@ -67,8 +67,8 @@ spec:
     # disk), not in Flink state — like the Iceberg job, checkpointed state is
     # small, so hashmap-on-heap avoids RocksDB amplification.
     state.backend.type: hashmap
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cid-paimon/checkpoints/
-    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cid-paimon/savepoints/
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cid-paimon${CID_SUFFIX}/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cid-paimon${CID_SUFFIX}/savepoints/
     heartbeat.timeout: "180s"
     heartbeat.interval: "20s"
     heartbeat.rpc-failure-threshold: "10"
@@ -98,7 +98,7 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cid-paimon/ha
+    storageDir: s3://${BUCKET_NAME}/flink/cid-paimon${CID_SUFFIX}/ha
     replicas: 1
     resource:
       memory: 8Gi
@@ -112,9 +112,9 @@ spec:
         - name: flink-main-container
           env:
           - name: PAIMON_WAREHOUSE
-            value: "s3://${BUCKET_NAME}/cid-warehouse-paimon/"
+            value: "s3://${BUCKET_NAME}/cid-warehouse-paimon${CID_SUFFIX}/"
           - name: GLUE_DATABASE
-            value: "flink_cid_paimon_db"
+            value: "flink_cid_paimon_db${CID_DB_SUFFIX}"
           - name: AWS_REGION
             value: "${AWS_REGION}"
           # The legacy Hadoop/Hive Glue client reads AWS_DEFAULT_REGION; the
@@ -134,6 +134,9 @@ spec:
             value: "${SQS_SOURCE_JAR}"
           - name: SQS_POLL_THREADS
             value: "${SQS_POLL_THREADS}"
+          # The key prefix of OUTPUT_URI: the source reads only files under it.
+          - name: LANDING_KEY_PREFIX
+            value: "${LANDING_KEY_PREFIX}"
           # A whole option line ('max-pending-splits' = 'N',) or empty for the
           # connector default — rendered from SQS_MAX_PENDING, see the script.
           - name: SQS_MAX_PENDING_OPT
@@ -174,6 +177,15 @@ spec:
       memory: 16Gi
       cpu: 4
     podTemplate:
+      metadata:
+        annotations:
+          # Karpenter must not consolidate a node away from under a TaskManager.
+          # executor-memorynodepool is WhenEmptyOrUnderutilized: when the
+          # generator's pods finish, the TM nodes look underutilized and their
+          # TMs were evicted ("Evicted pod: Underutilized"), and each loss is a
+          # full job restart (2026-10-10, again 2026-10-18 17:05Z). The fix
+          # belongs on the pods, not the nodepool, which other workloads share.
+          karpenter.sh/do-not-disrupt: "true"
       spec:
         containers:
         - name: flink-main-container

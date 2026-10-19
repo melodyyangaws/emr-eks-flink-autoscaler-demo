@@ -106,7 +106,11 @@ done
 # Leftover from when the code rode in a ConfigMap; a no-op once it is gone.
 kubectl delete configmap flink-cid-monitor-code -n "${NAMESPACE}" --ignore-not-found
 
-envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${MONITOR_CODE_PREFIX}' \
+# CID_SUFFIX must match the one the jobs were deployed with (build-deploy-cid.sh).
+export CID_SUFFIX="${CID_SUFFIX:-}"
+[[ "$CID_SUFFIX" =~ ^(-[a-z0-9]+)?$ ]] || { echo "CID_SUFFIX must be empty or like -r2, got '$CID_SUFFIX'" >&2; exit 1; }
+export CID_DB_SUFFIX="${CID_SUFFIX//-/_}"
+envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${MONITOR_CODE_PREFIX} ${CID_SUFFIX} ${CID_DB_SUFFIX}' \
   < "${SCRIPT_DIR}/monitor-deployment.yaml" > "${DEPLOYED_MANIFEST}"
 # envsubst leaves anything outside its allow-list as a literal ${...}, which is
 # valid YAML and only fails later, inside the pod.

@@ -40,16 +40,9 @@ enough CPU.
 Environment knobs:
     OUTPUT_URI               s3://bucket/prefix  or  file:///tmp/dir  (required)
     POD_ROWS_PER_SECOND      this pod's cap, default 500000 (≈2 GB/s @4 KB)
-    DURATION_SECONDS         run length, default 1800 (30 min) and the maximum;
-                             1..1800 only shortens it. 0 / run-until-killed is
-                             not supported.
-    RUN_DEADLINE_EPOCH       optional hard stop (unix seconds) shared by all
-                             pods: writing ends at min(start + DURATION_SECONDS,
-                             this). A pod restarted or scaled up after it
-                             writes nothing.
-    IDLE_AFTER_DONE          1 = after the window, sleep until SIGTERM instead
-                             of exiting (a Deployment restarts exited pods,
-                             which would start a new window). Default 0.
+    DURATION_SECONDS         > 0: write for that many seconds, then exit
+                             (default 1800, 30 min).
+                             0: write until stopped (SIGTERM / Ctrl-C).
     WORKERS                  processes in this pod, default = CPU count
     POD_NAME                 RNG seed salt, from the downward API (default
                              HOSTNAME); pods need no index to stay distinct
@@ -563,23 +556,16 @@ def worker(idx, cfg, counters, stop):
             stop.wait(ahead)
     sink.close()
 
-MAX_DURATION_SECONDS = 1800     # fixed 30-min run; DURATION_SECONDS can only shorten it
-
 def main():
     output = os.environ.get('OUTPUT_URI') or (sys.argv[1] if len(sys.argv) > 1 else None)
     if not output:
         raise SystemExit('usage: OUTPUT_URI=s3://bucket/prefix cid_jsongz_gen.py')
-    raw_duration = os.environ.get('DURATION_SECONDS', str(MAX_DURATION_SECONDS)).strip()
-    if not raw_duration.isdigit() or not 1 <= int(raw_duration) <= MAX_DURATION_SECONDS:
-        raise SystemExit('DURATION_SECONDS=%r rejected: the run is fixed at %d s (30 min); '
-                         'only a shorter whole-second override 1..%d is allowed'
-                         % (raw_duration, MAX_DURATION_SECONDS, MAX_DURATION_SECONDS))
+    raw_duration = os.environ.get('DURATION_SECONDS', '1800').strip()   # default 30 min
+    if not raw_duration.isdigit():
+        raise SystemExit('DURATION_SECONDS=%r rejected: whole seconds, or 0 = until stopped (default 1800, 30 min)'
+                         % raw_duration)
     workers = int(os.environ.get('WORKERS', os.cpu_count()))
-    duration = float(raw_duration)
-    deadline = os.environ.get('RUN_DEADLINE_EPOCH', '').strip()
-    if deadline:
-        duration = min(duration, float(deadline) - time.time())
-    idle_after = os.environ.get('IDLE_AFTER_DONE', '0') == '1'
+    duration = int(raw_duration) or float('inf')    # 0 = until stopped
     cfg = {
         'output': output,
         'rate': float(os.environ.get('POD_ROWS_PER_SECOND', '500000')),
@@ -592,12 +578,9 @@ def main():
         'gzip_level': int(os.environ.get('GZIP_LEVEL', '6')),
         'upload_threads': int(os.environ.get('UPLOAD_THREADS', '4')),
     }
-    if duration <= 0:
-        print('IDLE %s: RUN_DEADLINE_EPOCH has passed, writing nothing' % cfg['pod_name'], flush=True)
-        idle_forever(idle_after)
-        return
-    print('cid-jsongz-gen pod %s: %d workers, pod cap %.0f rows/s (%.0f/worker), %.0f s -> %s'
-          % (cfg['pod_name'], workers, cfg['rate'], cfg['rate'] / workers, duration, output),
+    print('cid-jsongz-gen pod %s: %d workers, pod cap %.0f rows/s (%.0f/worker), %s -> %s'
+          % (cfg['pod_name'], workers, cfg['rate'], cfg['rate'] / workers,
+             '%d s' % duration if duration != float('inf') else 'until stopped', output),
           flush=True)
 
     counters = mp.Array('d', 4)          # rows, raw bytes, gz bytes, files
@@ -629,20 +612,6 @@ def main():
         print('DONE %.0f rows, %.2f GB raw, %.2f GB gz, %.0f files, mean row %.0f B / gz %.0f B'
               % (cur[0], cur[1] / 1e9, cur[2] / 1e9, cur[3], cur[1] / cur[0], cur[2] / cur[0]),
               flush=True)
-    idle_forever(idle_after)
-
-def idle_forever(enabled):
-    """Deployment mode: hold the pod after the window so it is not restarted."""
-    if not enabled:
-        return
-    print('IDLE window closed; sleeping until stopped (scale to 0 / delete)', flush=True)
-    # Nothing left to flush: exit at once. An explicit handler, not SIG_DFL,
-    # because the container execs python as PID 1, which ignores default
-    # SIGTERM and would sit out the whole termination grace period.
-    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
-    while True:
-        time.sleep(3600)
 
 if __name__ == '__main__':
     main()

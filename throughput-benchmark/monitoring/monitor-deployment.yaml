@@ -14,19 +14,20 @@ data:
   PAIMON_FLINK_URL: "http://flink-cid-paimon-rest:8081"
   ICEBERG_FLINK_URL: "http://flink-cid-iceberg-rest:8081"
   AWS_REGION: "${AWS_REGION}"
-  PAIMON_GLUE_DB: "flink_cid_paimon_db"
-  ICEBERG_GLUE_DB: "flink_cid_iceberg_db"
-  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-paimon"
-  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-iceberg/"
+  # CID_SUFFIX (e.g. -r2) = the set of tables build-deploy-cid.sh wrote with the
+  # same suffix; without it the monitor reads the ORIGINAL tables and shows no
+  # new files while the jobs commit to the -r2 ones (2026-10-18).
+  PAIMON_GLUE_DB: "flink_cid_paimon_db${CID_DB_SUFFIX}"
+  ICEBERG_GLUE_DB: "flink_cid_iceberg_db${CID_DB_SUFFIX}"
+  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-paimon${CID_SUFFIX}"
+  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-iceberg${CID_SUFFIX}/"
   # One table per pipeline in this benchmark (vs the CDC pipeline's four).
   CDC_TABLES: "cid_events"
-  # Same window/poll discipline as the CDC monitor: throughput is the
-  # records_out delta across MONITOR_DURATION, so keep it a multiple of
-  # POLL_INTERVAL.
+  # Headline throughput is rows committed / time between commits, from the
+  # tables' history; Keep MONITOR_DURATION a multiple of POLL_INTERVAL.
   MONITOR_DURATION: "120"
   POLL_INTERVAL: "20"
   REPEAT_INTERVAL: "60"
-  RUN_MODE: "continuous"
   # Where deploy-cid-monitor.sh uploaded the monitor code. S3 rather than a
   # ConfigMap because flink_cid_monitor.py is ~36 KB and growing, and a
   # ConfigMap is a 1 MiB-capped etcd object that every API-server client can

@@ -3,5 +3,5 @@
 SELECT COUNT(*) AS rows_in_window
 FROM ${TABLE}
 WHERE dt = '${HOT_DT}'
-  AND ingestionTime >= '${HOT_FROM}'
-  AND ingestionTime <  '${HOT_TO}';
+  AND eventTimeDT >= '${HOT_FROM}'
+  AND eventTimeDT <  '${HOT_TO}';

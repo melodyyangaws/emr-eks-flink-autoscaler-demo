@@ -29,7 +29,7 @@ spec:
             topologyKey: kubernetes.io/hostname
       nodeSelector:
         kubernetes.io/arch: amd64                  # = StarRocks' BEs
-        karpenter.sh/nodepool: driver-nodepool     # = StarRocks (starrocks-placement.sh); never consolidated while busy
+        karpenter.sh/nodepool: driver-nodepool     # = StarRocks (cdc-pipeline/helm/starrocks-eks-values.yaml); never consolidated while busy
         karpenter.k8s.aws/instance-family: m5      # = StarRocks' BEs: changing CPU family moved timings 20-36%
         karpenter.k8s.aws/instance-size: 8xlarge   # 32 vcpu / 128Gi, the smallest m5 that holds 18 cpu / 72Gi
         karpenter.sh/capacity-type: on-demand      # a spot reclaim would drop the warm cache

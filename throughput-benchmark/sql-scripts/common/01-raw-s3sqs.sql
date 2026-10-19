@@ -6,7 +6,7 @@
 -- s3json_raw(line STRING); the json_tuple parse is in the parse fragment.
 --
 -- WHAT IT READS. The same .json.gz objects jsongz-gen/ lands, but it never
--- lists the bucket. Each PUT under cid-landing-jsongz-r4/*.json.gz fires an S3
+-- lists the bucket. Each PUT under cid-landing-jsongz/*.json.gz fires an S3
 -- event to SNS cid-landing-jsongz-events, which fans out to one queue per
 -- format (<SQS_QUEUE_PREFIX>-paimon, <SQS_QUEUE_PREFIX>-iceberg), so the two
 -- jobs each see every file. The connector long-polls its queue and turns each
@@ -48,6 +48,9 @@ CREATE TEMPORARY TABLE s3json_raw (
     -- The events carry bucket + key; this is the scheme the connector puts in
     -- front of them to open the object through Flink's FileSystem.
     'path-scheme'        = 's3a',
+    -- Only files under OUTPUT_URI (.bench-env): an event for any other key is
+    -- skipped, so the job reads the one landing location the generator writes.
+    'key-prefix'         = '${LANDING_KEY_PREFIX}',
     'key-suffix'         = '.json.gz',
     'poll-threads'       = '${SQS_POLL_THREADS:8}',
     ${SQS_MAX_PENDING_OPT}

@@ -4,22 +4,29 @@
 # Notes for this environment (loadtest-mcp / us-west-2):
 #   - Chart 1.11.x nests component specs under the `starrocks:` key. Earlier
 #     charts (<= 1.8) used top-level starrocksFESpec/starrocksBeSpec.
-#   - Image tag is left empty so the chart's appVersion is used, which on chart
-#     1.11.7 resolves to the floating `4.1-latest` tag (the cluster reported
-#     4.1.4 via SELECT CURRENT_VERSION()). The sink tables are Iceberg
-#     format-version 2 and Paimon 1.3 with deletion vectors, which need a recent
-#     StarRocks — stay on 4.1.x and do not pin to an older minor.
-#     Caveat: `4.1-latest` is mutable, so the engine version drifts whenever a
-#     pod restarts. Pin an exact tag (e.g. "4.1.4") before capturing benchmark
-#     numbers you intend to compare across runs.
+#   - Image tags are left empty HERE and pinned by the deploy script instead:
+#     starrocks/deploy-starrocks.sh passes --set starrocks.starrocks{FE,Be}Spec.image.tag
+#     from $IMAGE_TAG (default 4.1.4). An empty tag falls back to the chart
+#     appVersion, which on chart 1.11.7 is the floating `4.1-latest` tag — mutable,
+#     so the engine version drifts whenever a pod restarts. Pinning is required
+#     before capturing benchmark numbers you intend to compare across runs.
+#     The sink tables are Iceberg format-version 2 and Paimon 1.3 with deletion
+#     vectors, which need a recent StarRocks — stay on 4.1.x, do not pin an older
+#     minor. If you prefer to pin here rather than via the script, uncomment the
+#     `tag:` lines below and run with IMAGE_TAG= (empty) so the two do not fight.
 #   - S3/Glue access uses IRSA: the pods run with a ServiceAccount annotated
 #     with the EMR execution role, which already carries the S3 + Glue read
 #     permissions the external catalogs need. The catalogs therefore use
 #     aws.s3.use_aws_sdk_default_behavior (web identity), NOT use_instance_profile
 #     — the node instance profile has no S3/Glue access on this cluster.
 
+# The operator toggle is operator.starrocksOperator.enabled, NOT operator.enabled
+# — the latter is not a key the chart reads and is silently ignored. Left explicit
+# (it already defaults to true) so the one-release install is obvious: this chart
+# renders operator + cluster together and cannot be split into two Helm releases.
 operator:
-  enabled: true
+  starrocksOperator:
+    enabled: true
 
 # The chart does NOT create the FE/BE pod ServiceAccount — it only references an
 # existing one by name (starrocksFESpec.serviceAccount / starrocksBeSpec.serviceAccount).
@@ -39,8 +46,39 @@ starrocks:
     replicas: 1
     image:
       repository: starrocks/fe-ubuntu
+      # Empty = chart appVersion = mutable `4.1-latest`; the deploy script --sets
+      # this from $IMAGE_TAG. Pin it before capturing comparable benchmark numbers.
       tag: ""
+      # tag: "4.1.4"
     serviceAccount: starrocks-sa
+    # No OpenTelemetry auto-instrumentation. The cluster's CloudWatch
+    # Observability add-on auto-annotates workloads and injects its Java agent
+    # (JAVA_TOOL_OPTIONS=-javaagent, X-Ray sampling) into the FE's JVM and the
+    # BEs' embedded JVM, which runs the Java-based readers (native Paimon among
+    # them): a tracer on StarRocks only, against warm DuckDB (2026-10-17).
+    annotations:
+      instrumentation.opentelemetry.io/inject-java: "false"
+      instrumentation.opentelemetry.io/inject-python: "false"
+      instrumentation.opentelemetry.io/inject-nodejs: "false"
+      instrumentation.opentelemetry.io/inject-dotnet: "false"
+    # Karpenter driver-nodepool (on-demand; consolidates only EMPTY nodes, so a
+    # busy pod is never moved), m5 like the warm DuckDB servers it is compared
+    # with. Without a nodeSelector the pods landed anywhere: on 2026-10-17 the FE
+    # and two BEs sat on shared managed-nodegroup m5.4xlarge nodes, BE-1 and
+    # BE-2 on the SAME node, and a restarted BE-0 on an executor-pool m5.8xlarge.
+    nodeSelector:
+      karpenter.sh/nodepool: driver-nodepool
+      karpenter.sh/capacity-type: on-demand
+      kubernetes.io/arch: amd64
+      karpenter.k8s.aws/instance-family: m5
+      karpenter.k8s.aws/instance-size: 2xlarge
+    # Never on a BE node: the FE first landed on BE-0's node and shared its CPU.
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: {app.kubernetes.io/component: be}
+          topologyKey: kubernetes.io/hostname
     resources:
       requests:
         cpu: 2
@@ -59,8 +97,39 @@ starrocks:
     replicas: 3
     image:
       repository: starrocks/be-ubuntu
+      # Empty = chart appVersion = mutable `4.1-latest`; the deploy script --sets
+      # this from $IMAGE_TAG. Pin it before capturing comparable benchmark numbers.
       tag: ""
+      # tag: "4.1.4"
     serviceAccount: starrocks-sa
+    # No OpenTelemetry auto-instrumentation. The cluster's CloudWatch
+    # Observability add-on auto-annotates workloads and injects its Java agent
+    # (JAVA_TOOL_OPTIONS=-javaagent, X-Ray sampling) into the FE's JVM and the
+    # BEs' embedded JVM, which runs the Java-based readers (native Paimon among
+    # them): a tracer on StarRocks only, against warm DuckDB (2026-10-17).
+    annotations:
+      instrumentation.opentelemetry.io/inject-java: "false"
+      instrumentation.opentelemetry.io/inject-python: "false"
+      instrumentation.opentelemetry.io/inject-nodejs: "false"
+      instrumentation.opentelemetry.io/inject-dotnet: "false"
+    # Karpenter driver-nodepool (on-demand; consolidates only EMPTY nodes, so a
+    # busy pod is never moved), m5 like the warm DuckDB servers it is compared
+    # with. Without a nodeSelector the pods landed anywhere: on 2026-10-17 the FE
+    # and two BEs sat on shared managed-nodegroup m5.4xlarge nodes, BE-1 and
+    # BE-2 on the SAME node, and a restarted BE-0 on an executor-pool m5.8xlarge.
+    nodeSelector:
+      karpenter.sh/nodepool: driver-nodepool
+      karpenter.sh/capacity-type: on-demand
+      kubernetes.io/arch: amd64
+      karpenter.k8s.aws/instance-family: m5
+      karpenter.k8s.aws/instance-size: 2xlarge
+    # One BE per node: 8 vcpu / 32Gi each holds its 6 cpu / 24Gi limit + daemonsets.
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: {app.kubernetes.io/component: be}
+          topologyKey: kubernetes.io/hostname
     resources:
       requests:
         cpu: 4

@@ -6,10 +6,11 @@
 # Here each suite gets a long-lived server (duckdb_warm_server.py) that keeps one
 # DuckDB process, its S3 secret and a block cache sized like StarRocks' datacache.
 #
-#   ./duckdb-warm.sh up [hot|snapshot|both]     start the server(s), wait until ready
+#   SUITE=hot ./duckdb-warm.sh up               start the server(s) for SUITE only (hot ->
+#                                               duckdb-warm-hot); or up hot|snapshot|both
 #   ./duckdb-warm.sh status                     health, busy flag, cache size
 #   SUITE=hot|snapshot|all ./duckdb-warm.sh run run the suite(s) on the server(s)
-#   ./duckdb-warm.sh clear-cache [suite]        empty the block cache (cold start)
+#   ./duckdb-warm.sh clear-cache [suite]        empty the block cache (cold start); default: SUITE
 #   ./duckdb-warm.sh down [hot|snapshot|both]   delete the server(s) and their cache
 #
 # Parity with StarRocks (checked on the cluster 2026-10-13, StarRocks 4.1.4):
@@ -142,7 +143,7 @@ cmd_status() {
     local s
     for s in hot snapshot; do
         if kubectl get deploy "$(name_of "$s")" -n "$NAMESPACE" >/dev/null 2>&1 && pf_up "$s"; then
-            echo "${s}: $(api "$s" GET /health)"
+            echo "${s}: $(api "$s" GET '/health?cache=1')"
         else
             echo "${s}: not running"
         fi
@@ -167,22 +168,6 @@ cmd_clear() {
 }
 
 # ── run ─────────────────────────────────────────────────────────────────────
-# A StarRocks benchmark shares the S3 bucket and, on StarRocks'
-# side, the cluster: running both at once is not a fair comparison.
-assert_alone() {
-    [[ "${ALLOW_CONCURRENT:-0}" == 1 ]] && return 0
-    local other s
-    other=$(pgrep -fl 'querybench/starrocks\.sh' | grep -v 'bash -c' || true)
-    [[ -z "$other" ]] || qb_die "another benchmark is running (ALLOW_CONCURRENT=1 to override):
-${other}"
-    for s in hot snapshot; do
-        kubectl get deploy "$(name_of "$s")" -n "$NAMESPACE" >/dev/null 2>&1 || continue
-        pf_up "$s" && [[ "$(api "$s" GET /health | jget busy)" == True ]] \
-            && qb_die "$(name_of "$s") is busy with another run"
-    done
-    return 0
-}
-
 # One pass of one query: submit, poll until done, job JSON on stdout. The
 # poll has a deadline (the query timeout + 5 min): the server's in-process
 # timeout (con.interrupt) did not stop an I/O-bound scan on 2026-10-17, which was
@@ -193,14 +178,20 @@ ${other}"
 run_pass() {   # $1 suite, $2 arm, $3 query file, $4 rendered sql file
     local s="$1" arm="$2" f="$3" name body id j state="" to deadline
     name=$(qb_query_name "$f"); to=$(qb_query_timeout "$s")
+    # A pinned table version (hot-interleave.sh): DUCK_PIN_ICEBERG / DUCK_PIN_PAIMON
+    # hold the copied metadata.json every query of the run reads.
+    local pin=""; [[ "$arm" == iceberg ]] && pin="${DUCK_PIN_ICEBERG:-}" || pin="${DUCK_PIN_PAIMON:-}"
     body=$(python3 - "$4" "$s" "$arm" "$name" "$to" \
              "$(qb_query_flag "$f" allow-zero-rows && echo 1 || echo 0)" \
-             "$(qb_query_flag "$f" leading-col-is-label && echo 1 || echo 0)" <<'EOF'
+             "$(qb_query_flag "$f" leading-col-is-label && echo 1 || echo 0)" "$pin" <<'EOF'
 import json, sys
 a = sys.argv
-print(json.dumps({"sql": open(a[1]).read(), "suite": a[2], "arm": a[3], "name": a[4],
-                  "runs": 1, "warmup": 0, "timeout_s": int(a[5]),
-                  "allow_zero_rows": a[6] == "1", "leading_col_is_label": a[7] == "1"}))
+d = {"sql": open(a[1]).read(), "suite": a[2], "arm": a[3], "name": a[4],
+     "runs": 1, "warmup": 0, "timeout_s": int(a[5]),
+     "allow_zero_rows": a[6] == "1", "leading_col_is_label": a[7] == "1"}
+if a[8]:
+    d["metadata"] = a[8]
+print(json.dumps(d))
 EOF
 )
     id=$(api "$s" POST /query "$body" | jget id 2>/dev/null || true)
@@ -281,12 +272,7 @@ EOF
 run_suite() {   # $1 suite
     local s="$1" dir arm f n=0 writers rows bad
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
-    if [[ "$s" == hot ]]; then
-        qb_resolve_hot; qb_log "hot: dt=${QB_HOT_DT} [${QB_HOT_FROM}, ${QB_HOT_TO})"
-    else
-        qb_stop_writers
-        qb_resolve_snapshot; qb_log "snapshot: dt=${QB_SNAPSHOT_DT} S4=[${QB_S4_FROM}, ${QB_S4_TO}) (${QB_S4_HOW:-})"
-    fi
+    qb_start_suite "$s"
     for f in $(qb_query_files "$s"); do
         n=$((n + 1)); qb_render "$f" > "${dir}/$(printf '%02d' "$n").sql" || qb_die "render failed: ${f}"
     done
@@ -298,12 +284,7 @@ run_suite() {   # $1 suite
         echo "# arm=${arm}" >> "$LOG"
         run_arm "$s" "$arm" "$dir" "$rows"
     done
-    # Same rule as starrocks.sh: arms are ratioed against each other, so a writer
-    # change between them makes the suite meaningless.
-    if [[ "$(qb_writer_state)" != "$writers" ]]; then
-        qb_log "writer state changed during the ${s} suite (was: ${writers}, now: $(qb_writer_state)); ${s} not recorded"
-        rm -rf "$dir"; return 1
-    fi
+    qb_writers_unchanged "$writers" "$s" || { rm -rf "$dir"; return 1; }
     cat "$rows" >> "$CSV"
     bad=$(grep -cv ',OK,' "$rows" || true)
     qb_log "${s}: $(grep -c . "$rows" || true) queries, ${bad} not OK"
@@ -313,9 +294,8 @@ run_suite() {   # $1 suite
 
 cmd_run() {
     local s rc=0
-    assert_alone
-    mkdir -p "$OUT_DIR"
-    [[ -f "$CSV" ]] || echo "$QB_CSV_HEADER" > "$CSV"
+    qb_assert_alone duckdb-warm
+    qb_csv_init "$CSV"
     qb_log "duckdb_warm: arms=${ARMS} suite=${SUITE} runs=${RUNS}+${WARMUP} stamp=${STAMP}"
     for s in $(qb_suites); do run_suite "$s" || rc=1; done
     qb_log "results: ${CSV}  log: ${LOG}"
@@ -323,10 +303,17 @@ cmd_run() {
 }
 
 case "${1:-run}" in
-    up)          cmd_up "${2:-both}" ;;
+    up)          cmd_up "${2:-$SUITE}" ;;          # SUITE=hot -> only the hot server
     status)      cmd_status ;;
     run)         cmd_run ;;
-    clear-cache) cmd_clear "${2:-both}" ;;
+    clear-cache) cmd_clear "${2:-$SUITE}" ;;
+    pin)         # Pin both tables' current version for one run; prints shell exports.
+                 pf_up "${2:-$SUITE}" || qb_die "$(name_of "${2:-$SUITE}") is not up"
+                 api "${2:-$SUITE}" POST /pin "{\"tag\": \"${STAMP}\"}" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+if "error" in d: sys.exit("pin failed: " + d["error"])
+print("export DUCK_PIN_ICEBERG=%s DUCK_PIN_PAIMON=%s" % (d["iceberg"]["metadata"], d["paimon"]["metadata"]))
+print("export SR_PIN_ICEBERG=%s SR_PIN_PMNICE=%s SR_PIN_PAIMON=%s" % (d["iceberg"]["snapshot_id"], d["paimon"]["snapshot_id"], d["paimon"]["paimon_snapshot_id"] or ""))' ;;
     down)        cmd_down "${2:-both}" ;;
     *)           qb_die "usage: $0 up|status|run|clear-cache|down [hot|snapshot|both]" ;;
 esac

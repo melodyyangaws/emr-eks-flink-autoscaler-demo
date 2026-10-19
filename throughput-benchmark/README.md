@@ -31,7 +31,7 @@ the tag exists in ECR before rendering.
 ```bash
 cd throughput-benchmark
 source .bench-env                    # compulsory, always first — needs .bench-env.local, see below
-./jsongz-gen/run-jsongz-gen.sh start # put gzip NDJSON source data to s3 for 30 min max for 6GB/s. Run once.
+./jsongz-gen/run-jsongz-gen.sh start # put gzip NDJSON source data to s3 with the rate of 3 million rows/s. Hot watch script will terminate the datagen when hot query benchmark is completed.
 
 # ingest/writer performance test
 ./build-deploy-cid.sh upload         # executor + SQL to S3, verified
@@ -86,8 +86,21 @@ is an unaware-bucket append table with no shuffle, like the Iceberg side. Set
 Run every step from `throughput-benchmark/` in one shell that has done
 `source .bench-env` first. It sets the generator's landing prefix
 (`OUTPUT_URI`). The jobs never list it; they read the files announced on SQS.
-The prefix is **fixed**: the bucket's S3 event notifications fire for
-`cid-landing-jsongz-r4/` only, so a file written anywhere else is never read.
+The bucket's S3 event notification fires for **one** prefix (now
+`cid-landing-jsongz/`), so a file written anywhere else is never read.
+- **The notification lives on the bucket, not in this repo.** Changing
+  `OUTPUT_URI` alone does not move it. On 2026-10-18 that disconnected both jobs
+  for 18 minutes without an error.
+- **`./build-deploy-cid.sh notify`** sets the notification from `OUTPUT_URI`. It
+  keeps the SNS topic, the `.json.gz` suffix and any other rule on the bucket.
+  It then sends an empty test file through to both queues and removes it.
+  It refuses to run while a writer is running.
+- **`OUTPUT_URI` is the one landing location.**
+  - **The generator** writes only there. `run-jsongz-gen.sh` has no fallback
+    path.
+  - **Each job's source** reads only keys under it. `'key-prefix'` in
+    `01-raw-s3sqs.sql` comes from `LANDING_KEY_PREFIX`, which
+    `build-deploy-cid.sh` derives from `OUTPUT_URI`.
 What is reset between runs is the **queues** — see
 [Reading through SQS](#reading-through-sqs).
 
@@ -109,15 +122,16 @@ evict each other in a loop: a displaced writer TM's replacement hits
 ### 2. Start the data generator
 
 The jobs read the `.json.gz` files this lands, so start it before or alongside
-the writers, or they have nothing to read. `OUTPUT_URI` must be under
-`s3://$BUCKET_NAME/cid-landing-jsongz-r4/`, the only prefix with notifications.
+the writers, or they have nothing to read. `OUTPUT_URI` must be the notified prefix
+(`s3://$BUCKET_NAME/cid-landing-jsongz/`); after changing it, run
+`./build-deploy-cid.sh notify`.
 
 ```bash
-./jsongz-gen/run-jsongz-gen.sh start                # Job, 3 pods; each writes DURATION_SECONDS (1..1800, max 30 min), then exits and its node is released
+./jsongz-gen/run-jsongz-gen.sh start                # Job, 3 pods; each writes DURATION_SECONDS (default 1800; 0 = until stopped, for a hot query run), then exits and its node is released
 ./jsongz-gen/run-jsongz-gen.sh scale 4              # change Job parallelism (rate = N x 500K rows/s)
 ./jsongz-gen/run-jsongz-gen.sh status               # per-pod rows/s, MB/s
 ./jsongz-gen/run-jsongz-gen.sh logs                 # follow the first pod (POD=N for another)
-./jsongz-gen/run-jsongz-gen.sh stop                 # end a run early (deletes the Job); written files stay
+./jsongz-gen/run-jsongz-gen.sh stop                 # end a run (deletes the Job + ConfigMap); written files stay
 ```
 
 Knobs, sizing and file layout:
@@ -191,8 +205,8 @@ kubectl port-forward svc/flink-cid-paimon-rest 8081:8081 -n emr-flink   # one jo
 ./monitoring/deploy-cid-monitor.sh        # upload code, apply, restart, wait, start collectors
 kubectl logs -f deployment/flink-cid-monitor -n emr-flink
 ./monitoring/deploy-cid-monitor.sh stop   # scale to 0 and stop collectors; re-run without args to start
-COLLECT=0 ./monitoring/deploy-cid-monitor.sh                # monitor pod only
-COLLECT_INTERVAL=15 COLLECT_DURATION=3600 ./monitoring/deploy-cid-monitor.sh
+COLLECT=0 ./monitoring/deploy-cid-monitor.sh  # deploy the monitor without the local collectors
+COLLECT_INTERVAL=30 COLLECT_DURATION=3600 ./monitoring/deploy-cid-monitor.sh
 ```
 `collect-metrics.sh paimon|iceberg [interval-s] [duration-s]` still runs on its
 own. A second concurrent copy needs its own `LOCAL_PORT`: both default to 8091,
@@ -202,10 +216,23 @@ The script uploads the three monitor files to
 `boto3` under its IRSA service account. After a code change, just re-run
 `./monitoring/deploy-cid-monitor.sh`: it re-uploads to S3 and does a rollout restart.
 
-**Reading the comparison table.** "Records Processed" and "Throughput (rec/s)"
-are rows out of the source operator (`Source__*.numRecordsOut`) over the sampling
-window; rows written are `IcebergStreamWriter`/`Writer` `numRecordsIn`. "New
-Records in Tables" comes from table snapshots. (Vertex-level counts only see
+**Reading the comparison table.** "Throughput (rows/s)" is the one throughput
+row, with its source in brackets:
+- **`commits`:** the rows each table commit added, divided by the time between
+  commits. It's read from the table's own history, with the last commit before
+  the window as the anchor. It's exact, and it's the same method the
+  `bench-results/` write-ups use.
+- **`rate meter`:** used when the window saw no commit. It's the median of the
+  source subtasks' `numRecordsOutPerSecond`.
+- **`counter`:** the last resort, the change in the source `numRecordsOut`
+  counters divided by the time. Those REST counters are cached and move in
+  steps, so this is the least reliable.
+
+"Restarts in window" counts counter resets. The rates behind all three are in
+the JSON report (`commit_`, `meter_`, `counter_records_per_sec`).
+
+Rows written are `IcebergStreamWriter`/`Writer` `numRecordsIn`. "New Records in
+Tables" comes from table snapshots. (Vertex-level counts only see
 records crossing a vertex boundary; Iceberg chains source → IcebergStreamWriter
 into one vertex, which once read as ~3 rec/s and −100%. `collect-metrics.sh`
 has the same fix.) "Committed bytes/s (Parquet)" and "New Bytes in Tables" are
@@ -222,8 +249,9 @@ Paimon's figure is lower than its append file count. An S3 listing would also
 see compaction inputs that haven't expired yet and files written before their
 commit.
 
-All of these step once per commit, so a 120 s window catches one or two
-commits. The vertex `numBytesIn/Out` used earlier counted only network-shuffle
+All of these step once per commit. `MONITOR_DURATION` is 120 s per job, about
+two 60 s commits; the commit rate is taken from the last commit before the
+window to the last one inside it. The vertex `numBytesIn/Out` used earlier counted only network-shuffle
 bytes, a few KB/s in a chained job.
 Flink REST counters update in steps, so rec/s over the monitor's short window can
 read below a point sample. In the first run the monitor showed Iceberg 1.198M vs
@@ -260,7 +288,7 @@ and is not.
 
 ```bash
 # 7a. Stop the writers FIRST — the generator too, if it is still running.
-./jsongz-gen/run-jsongz-gen.sh clean            # delete the Job + ConfigMap; files stay
+./jsongz-gen/run-jsongz-gen.sh stop             # delete the Job + ConfigMap; files stay
 # Then the Flink writers — suspend, or delete with `cleanup` (prompts "yes").
 kubectl patch flinkdeployment flink-cid-paimon -n emr-flink --type=merge \
   -p '{"spec":{"job":{"state":"suspended"}}}'
@@ -355,6 +383,8 @@ kubectl scale deployment flink-cid-monitor -n emr-flink --replicas=0
 
 ## Query benchmarks — the read half
 
+**Step-by-step guide and run times per arm:** [querybench/README.md](querybench/README.md).
+
 Ten queries, two engines, the same tables. `querybench/lib.sh` holds everything
 both engines must agree on (query files, rendering, windows, partition, timeout,
 median, CSV format, writer stop), so a cross-engine gap measures engines, not
@@ -445,7 +475,9 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run    # suspends the writers, like t
 
 **Running a benchmark that survives the laptop.** `./querybench/qb-runner.sh
 start '<cmd>'` runs one step in an in-cluster Job (`qb-runner`, on
-`driver-nodepool`, `do-not-disrupt`), so closing the laptop does not stop it.
+`driver-nodepool`, `do-not-disrupt`), so closing the laptop does not stop it. The
+Job and its permissions are in `querybench/qb-runner.yaml`; the script ships the
+code bundle and applies that template.
 - **Permissions:** a namespace Role only (pod exec / port-forward, deployment
   restarts, FlinkDeployment read / patch), and **no AWS credentials**. Pin
   `SNAPSHOT_DT` and `SNAPSHOT_S4_FROM`/`_TO` (or `HOT_TO`) so `lib.sh` never
@@ -453,9 +485,9 @@ start '<cmd>'` runs one step in an in-cluster Job (`qb-runner`, on
 - **`wait_for_sr_run <RUN_ID>`** at the start of `<cmd>` waits until that
   `starrocks.sh` run has nothing left in the FE pod, so the engines never
   overlap.
-- **`logs`** follows the output, **`fetch`** copies the pod's `bench-results/`
-  into the local one, **`delete`** removes the Job, its ConfigMap and Secret.
-  The pod keeps its results for 7 days.
+- **`logs`** follows the output. **`fetch`** copies the pod's `bench-results/`
+  into the local one, then removes the Job, its ConfigMap and Secret (`KEEP=1`
+  keeps them). The pod keeps its results for 1 day.
 
 ```bash
 ./querybench/qb-runner.sh start 'wait_for_sr_run <RUN_ID>; STAMP=<stamp> SUITE=snapshot SNAPSHOT_DT=2026-10-10 \
@@ -466,14 +498,26 @@ start '<cmd>'` runs one step in an in-cluster Job (`qb-runner`, on
 
 **Placement.** Both engines run on Karpenter's `driver-nodepool` (on-demand,
 consolidates only empty nodes). Warm DuckDB is pinned there by `duckdb-warm.yaml`.
-StarRocks is pinned by `./querybench/starrocks-placement.sh`:
-- **What it patches:** the live StarRocksCluster, to m5.2xlarge with one BE per
-  node and the FE off the BE nodes.
-- **No auto-instrumentation:** it also opts the FE and BEs out of the CloudWatch
-  add-on's OpenTelemetry injection, which had put a Java agent in StarRocks only.
-- **Run it again after any `helm upgrade` from `cdc-pipeline/`,** which does not
-  carry these settings.
-- **`show`** prints each pod's node and `otel=none|INJECTED`.
+StarRocks is pinned by its Helm values,
+`cdc-pipeline/helm/starrocks-eks-values.yaml` (`starrocksFESpec` / `starrocksBeSpec`):
+- **Placement:** `nodeSelector` for m5.2xlarge on `driver-nodepool`, and
+  `podAntiAffinity` so there is one BE per node and the FE stays off the BE
+  nodes.
+- **No auto-instrumentation:** pod `annotations` opt the FE and BEs out of the
+  CloudWatch add-on's OpenTelemetry injection. That injection had put a Java
+  agent in StarRocks only.
+- **They survive a `helm upgrade`,** because they're in the values. Until
+  2026-10-19 a separate `starrocks-placement.sh` patched them onto the live
+  cluster, and an upgrade dropped them.
+- **Check before a run** that no pod has the agent. This prints nothing when
+  clean:
+
+  ```bash
+  for p in $(kubectl get pods -n emr-flink -l app.starrocks.ownerreference/name -o name); do
+      kubectl get -n emr-flink "$p" -o jsonpath='{.spec.containers[*].env[?(@.name=="JAVA_TOOL_OPTIONS")].value}' \
+        | grep -q javaagent && echo "$p: OpenTelemetry agent INJECTED"
+  done
+  ```
 
 **Comparing the two engines.** `querybench/compare.py` builds one markdown table
 per suite from both CSVs. It shows median seconds per arm and like-for-like
@@ -755,30 +799,29 @@ format; the jobs read them through SQS
   `TOTAL_PODS` to set (a stray one is honoured as `JSONGZ_REPLICAS`, with a
   warning). This is the **only** rate knob in the benchmark: the Flink jobs
   read as fast as they can.
-- **Run length: a fixed 30 minutes (1800 s).** Every pod writes for 1800 s
-  from its own start, then **idles** (it does not exit, since a Deployment
-  would restart it and open a new window); `stop` scales to 0.
-  `DURATION_SECONDS` can only **shorten** the run (1..1800, e.g.
-  `DURATION_SECONDS=120` for a smoke test). `0`, non-integers and values above
-  1800 are rejected, and there is no run-until-stopped mode. `start` also
-  stamps a shared `RUN_DEADLINE_EPOCH` = now + duration + 300 s (pip install,
-  pod start, final flush): a pod restarted or scaled up later writes only
-  until then, and not at all after it.
+- **Run length: `DURATION_SECONDS`, the only time setting.**
+  - **`> 0`:** every pod writes that long from its own start (default 1800,
+    e.g. `DURATION_SECONDS=120` for a smoke test), then exits. The Job
+    completes and its nodes are released.
+  - **`0`:** every pod writes until stopped: `stop`, or `querybench/hot-watch.sh`
+    after a hot query test. Nothing stops it by itself.
+
+  Anything but a whole number of seconds is rejected. A pod restarted after a
+  failure, or added by `scale N`, writes a full `DURATION_SECONDS` from its own
+  start.
 - **No pod index.** Each pod seeds its RNG from its own name (downward API),
   so file names cannot collide across replicas.
 
 ```bash
 cd throughput-benchmark/jsongz-gen
-./run-jsongz-gen.sh local                 # 30 s on this machine -> /tmp/cid-jsongz
 source ../.bench-env
 ./run-jsongz-gen.sh render                # sizing summary + write jsongz-gen-job-deployed.yaml (no apply)
-./run-jsongz-gen.sh start                 # render, ConfigMap, kubectl apply -f the deployed file; writes 30 min
-./run-jsongz-gen.sh scale 4               # replicas -> 4 (new pods stop at the same deadline)
+./run-jsongz-gen.sh start                 # render, ConfigMap, kubectl apply -f the deployed file; writes DURATION_SECONDS
+./run-jsongz-gen.sh scale 4               # replicas -> 4 (new pods write DURATION_SECONDS from their own start)
 ./run-jsongz-gen.sh status                # per-pod rows/s, MB/s, B/row, ratio
-./run-jsongz-gen.sh stop                  # scale to 0; written files stay
-./run-jsongz-gen.sh clean                 # delete Deployment, legacy Job, ConfigMap
+./run-jsongz-gen.sh stop                  # delete the Job + ConfigMap; written files stay
 # Knobs: JSONGZ_REPLICAS JSONGZ_ROWS_PER_POD JSONGZ_ROWS_PER_SECOND(-> replicas)
-#        DURATION_SECONDS(1..1800, shorten only) WORKERS
+#        DURATION_SECONDS(seconds, 0 = until stopped; default 1800) WORKERS
 #        GZIP_LEVEL ROWS_PER_FILE CID_CUSTOMER_COUNT CID_HOST_COUNT OUTPUT_URI
 #        GEN_NODEPOOL
 ```
@@ -811,7 +854,7 @@ historical) with the 34 columns of both sinks, so its `json_tuple` parse is
 byte-identical across the two formats.
 
 ```bash
-cd throughput-benchmark && source .bench-env          # OUTPUT_URI = .../cid-landing-jsongz-r4
+cd throughput-benchmark && source .bench-env          # OUTPUT_URI = .../cid-landing-jsongz
 ./jsongz-gen/run-jsongz-gen.sh start
 ./build-deploy-cid.sh deploy paimon     # builds + uploads the jar, prints the backlog, deploys
 ```
@@ -830,7 +873,7 @@ cd throughput-benchmark && source .bench-env          # OUTPUT_URI = .../cid-lan
 Infrastructure (provisioned outside this script; `deploy` only reads it):
 
 ```
-s3://$BUCKET_NAME/cid-landing-jsongz-r4/*.json.gz   ObjectCreated notifications
+s3://$BUCKET_NAME/cid-landing-jsongz/*.json.gz   ObjectCreated notifications
   └─> SNS cid-landing-jsongz-events
         ├─> SQS cid-landing-jsongz-paimon    read by flink-cid-paimon
         └─> SQS cid-landing-jsongz-iceberg   read by flink-cid-iceberg
@@ -863,7 +906,7 @@ an `AccessDenied` from the source means the policy is missing from that role.
   done   # SQS allows one purge per queue per 60 s, and it takes up to 60 s to finish
   ```
 - **Only new objects are announced.** Files already under a prefix, and any
-  prefix other than `cid-landing-jsongz-r4/`, produce no events. To read them,
+  prefix other than `cid-landing-jsongz/`, produce no events. To read them,
   enqueue them with the backfill tool at `sqs-delta-filename/backfill/`,
   which turns an existing prefix's keys into queue messages.
 - The TaskManagers need no SQS env vars: the executor substitutes the
@@ -1220,27 +1263,30 @@ throughput-benchmark/
 │   └── iceberg/                     # catalog + v2 append sink + pipeline
 ├── monitoring/                      # everything that measures the writers
 │   ├── collect-metrics.sh           #   streaming samples -> bench-results/cid-*.csv
-│   ├── deploy-cid-monitor.sh        #   side-by-side console monitor (Deployment)
+│   ├── deploy-cid-monitor.sh        #   start (no args) / stop: the monitor Deployment + local collectors
+│   ├── entrypoint.py                #   monitor main loop (continuous)
 │   ├── flink_cid_monitor.py         #   monitor code (forked from cdc-pipeline)
 │   └── monitor-deployment.yaml      #   envsubst template; -deployed.yaml is generated
-├── build-deploy-cid.sh              # upload / render / deploy / cleanup (no build)
+├── build-deploy-cid.sh              # upload / render / deploy / notify / cleanup (no build)
 ├── querybench/                      # READ half: StarRocks + DuckDB query benchmark
 │   ├── lib.sh                       #   shared: env, windows, render, timeout,
 │   │                                #   median, CSV header, writer stop, FE-idle check
 │   ├── starrocks.sh                 #   3 arms, timed from the FE AUDIT LOG
-│   ├── starrocks-placement.sh       #   pin StarRocks to driver-nodepool, opt out of OTel
-│   ├── duckdb-warm.sh               #   warm DuckDB: up / status / run / clear-cache / down
+│   ├── duckdb-warm.sh               #   warm DuckDB: up / status / run / clear-cache / pin / down
 │   ├── duckdb_warm_server.py        #   the server: one DuckDB process, cache_httpfs
 │   ├── duckdb-warm.yaml             #   envsubst Deployment (m5.8xlarge, 18 cpu / 72Gi)
 │   ├── gp3-fast-sc.yaml             #   StorageClass for DuckDB's cache disk (1000 MB/s)
-│   ├── qb-runner.sh                 #   run a step in an in-cluster Job (laptop-independent)
+│   ├── hot-interleave.sh            #   hot suite: pinned versions, engines interleaved per pass
+│   ├── hot-watch.sh                 #   after the hot test: stop generator, writers, monitor, duckdb-warm-hot
+│   ├── qb-runner.sh                 #   start / logs / fetch: a step in an in-cluster Job (laptop-independent)
+│   ├── qb-runner.yaml               #   its Job + ServiceAccount/Role template (envsubst)
 │   ├── compare.py                   #   StarRocks vs DuckDB markdown report from two CSVs
 │   ├── hot/H1..H6*.sql              #   the queries. Filename = name = order.
 │   └── snapshot/S1..S4*.sql
 ├── jsongz-gen/                      # RAW landing zone: gzipped NDJSON on S3, no Flink
 │   ├── cid_jsongz_gen.py            #   the generator (multiprocess, boto3 PUTs)
-│   ├── jsongz-gen-job.yaml          #   Deployment, one pod per node (60 cpu -> 16xlarge)
-│   ├── run-jsongz-gen.sh            #   start / scale / status / logs / stop / clean / local / render
+│   ├── jsongz-gen-job.yaml          #   Job, one pod per node (60 cpu -> 16xlarge)
+│   ├── run-jsongz-gen.sh            #   start / scale / status / logs / stop / render
 │   └── jsongz-gen-job-deployed.yaml #   rendered manifest — GENERATED, gitignored
 └── bench-results/
 ```
@@ -1335,10 +1381,14 @@ equalized without breaking the setup, so cite them alongside results.
   write buffer and forces a restart from the last checkpoint — up to a minute of
   re-done work at a 60 s interval — so the job stays live, healthy-looking and
   well below its achievable rate. *A restart-tolerant job can still be a starved
-  one.* `karpenter.sh/do-not-disrupt: "true"` is currently set **only** on
-  `querybench/duckdb-warm.yaml` and `qb-runner`'s Job, **not** on either FlinkDeployment's pod
-  templates; add it there before a scoring run. The fix belongs in these
-  manifests, never in the nodepool — that spec is shared with other workloads.
+  one.* `karpenter.sh/do-not-disrupt: "true"` is set on both FlinkDeployments'
+  TaskManager pod templates (`flink-cid-{paimon,iceberg}.yaml`, since
+  2026-10-18), as well as on `querybench/duckdb-warm.yaml` and `qb-runner`'s Job.
+  - **Without it,** the generator's pods finishing left the TM nodes
+    underutilized, and Karpenter evicted the TMs (`Evicted pod: Underutilized`),
+    a full job restart each time.
+  - **The fix belongs in these manifests,** never in the nodepool: that spec is
+    shared with other workloads.
 - **Don't run alongside the CDC benchmark jobs** — same nodepools, and the
   Kyverno single-AZ policy plus Karpenter `limits.cpu` caps mean they starve
   each other.

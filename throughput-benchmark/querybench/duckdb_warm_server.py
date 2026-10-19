@@ -132,9 +132,8 @@ def refresh_secret(force=False):
     secret_at = time.time()
 
 
-def table_expr(arm):
-    """= the old duckdb.sh table_expr: the current metadata.json, pinned to a key we own,
-    because the writers delete old versions within ~60 s (404 mid-scan)."""
+def current_metadata(arm):
+    """The table's current metadata.json (not copied)."""
     if arm == "paimon":
         v = run(["aws", "s3", "cp", PMNICE_TABLE_ROOT + "/metadata/version-hint.text", "-"]).strip()
         if not v.isdigit():
@@ -147,6 +146,18 @@ def table_expr(arm):
             raise RuntimeError("no metadata_location on %s.%s" % (ICEBERG_DB, TABLE_NAME))
     else:
         raise RuntimeError("arm must be iceberg|paimon, got %r" % arm)
+    return loc
+
+
+def table_expr(arm, metadata=None):
+    """The scan expression for one query. `metadata` (from /pin) is a fixed,
+    already-copied metadata.json shared by every query of the run, so all
+    queries, and StarRocks, read one table version. Without it: the current
+    metadata.json, pinned to a key we own, because the writers delete old
+    versions within ~60 s (404 mid-scan)."""
+    if metadata:
+        return "iceberg_scan('%s')" % metadata
+    loc = current_metadata(arm)
     if PIN_SNAPSHOT:
         key = "%s/%s" % (PIN_PREFIX, loc.rsplit("/", 1)[1])
         run(["aws", "s3api", "copy-object", "--bucket", BUCKET, "--key", key,
@@ -155,18 +166,47 @@ def table_expr(arm):
     return "iceberg_scan('%s')" % loc
 
 
+def pin_versions(tag):
+    """Copy both tables' current metadata.json to keys this pod owns, once per
+    run, and return each copy with its current snapshot id. Both engines then
+    read exactly this table state: DuckDB through the copied metadata.json,
+    StarRocks through FOR VERSION AS OF <snapshot_id>. For the Paimon export the
+    version number N of vN.metadata.json is Paimon's own snapshot id, which
+    the native Paimon arm pins to."""
+    out = {}
+    for arm in ("iceberg", "paimon"):
+        loc = current_metadata(arm)
+        key = "%s/run-%s/%s" % (PIN_PREFIX, tag, loc.rsplit("/", 1)[1])
+        run(["aws", "s3api", "copy-object", "--bucket", BUCKET, "--key", key, "--copy-source", loc[len("s3://"):]])
+        meta = json.loads(run(["aws", "s3", "cp", "s3://%s/%s" % (BUCKET, key), "-"]))
+        out[arm] = {"metadata": "s3://%s/%s" % (BUCKET, key), "source": loc,
+                    "snapshot_id": meta.get("current-snapshot-id")}
+        if arm == "paimon":
+            name = loc.rsplit("/", 1)[1]
+            out[arm]["paimon_snapshot_id"] = int(name[1:].split(".")[0]) if name.startswith("v") else None
+    return out
+
+
 def attempt(sql, timeout_s):
-    """One timed execution. Returns (status, ms, rows). A timer interrupts it."""
-    timer = threading.Timer(timeout_s, con.interrupt)
+    """One timed execution. Returns (status, ms, rows). A timer interrupts it.
+
+    On its OWN cursor: a DuckDB connection is not safe to share between threads.
+    Sharing `con` with the /health thread (2026-10-18) let one thread fetch the
+    other's result: a COUNT(*) came back as the cache size (245,022,069,168) or
+    as no row at all (ZERO_SCAN). A cursor shares the database (settings,
+    secrets, the cache) but has its own result."""
+    cur = con.cursor()
+    timer = threading.Timer(timeout_s, cur.interrupt)
     t0 = time.perf_counter()
     timer.start()
     try:
-        rows = con.execute(sql).fetchall()
+        rows = cur.execute(sql).fetchall()
         return "OK", int((time.perf_counter() - t0) * 1000), rows
     except duckdb.InterruptException:
         return "TIMEOUT", None, None
     finally:
         timer.cancel()
+        cur.close()
 
 
 def run_query(job, q):
@@ -175,7 +215,7 @@ def run_query(job, q):
     job.update(state="running", started=time.time(), times=[])
     status, rows, table = "OK", None, None
     try:
-        table = table_expr(q["arm"])
+        table = table_expr(q["arm"], q.get("metadata"))
         sql = q["sql"].replace("${TABLE}", table)
         if "${" in sql:
             raise RuntimeError("unresolved placeholder")
@@ -211,10 +251,15 @@ def worker(job, q):
 
 
 def cache_bytes():
+    """Disk cache size. Call only while holding `lock`, so it never runs next to
+    a benchmark query; on its own cursor for the same reason as attempt()."""
+    cur = con.cursor()
     try:
-        return con.execute("SELECT cache_httpfs_get_ondisk_data_cache_size()").fetchone()[0]
+        return cur.execute("SELECT cache_httpfs_get_ondisk_data_cache_size()").fetchone()[0]
     except Exception:
         return None
+    finally:
+        cur.close()
 
 
 class H(BaseHTTPRequestHandler):
@@ -230,9 +275,19 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/health":
-            busy = lock.locked()
-            self.reply(200, dict(INFO, busy=busy, cache_disk_bytes=None if busy else cache_bytes()))
+        if self.path.split("?")[0] == "/health":
+            # Cheap by default: the harness calls /health before every request.
+            # Measuring the disk cache walks its directory, slow once it fills,
+            # and holding the query lock for it made queries submitted meanwhile
+            # come back "busy" (6 of 12 refused, 2026-10-19). Only ?cache=1
+            # measures it, under the lock and only when no query is running.
+            busy, cb = lock.locked(), None
+            if "cache=1" in self.path and lock.acquire(blocking=False):
+                try:
+                    busy, cb = False, cache_bytes()
+                finally:
+                    lock.release()
+            self.reply(200, dict(INFO, busy=busy, cache_disk_bytes=cb))
         elif self.path.startswith("/job/"):
             j = jobs.get(self.path[5:])
             self.reply(200 if j else 404, j or {"error": "no such job"})
@@ -243,17 +298,30 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/query":
-            if lock.locked():
+            # Wait briefly for a /health?cache=1 or clear_cache to finish rather
+            # than refusing; a real query in progress still answers 409.
+            if not lock.acquire(timeout=30):
                 return self.reply(409, {"error": "busy: one query at a time"})
+            lock.release()
             jid = uuid.uuid4().hex[:12]
             jobs[jid] = {"id": jid, "state": "queued", "name": body.get("name"), "arm": body.get("arm")}
             threading.Thread(target=worker, args=(jobs[jid], body), daemon=True).start()
             self.reply(202, {"id": jid})
+        elif self.path == "/pin":
+            # One table version for the whole run (hot-interleave.sh).
+            try:
+                self.reply(200, pin_versions(body.get("tag") or str(int(time.time()))))
+            except Exception as e:
+                self.reply(500, {"error": "%s: %s" % (type(e).__name__, str(e)[:300])})
         elif self.path == "/clear_cache":
             if not lock.acquire(blocking=False):
                 return self.reply(409, {"error": "busy"})
             try:
-                con.execute("SELECT cache_httpfs_clear_cache()").fetchall()
+                cur = con.cursor()
+                try:
+                    cur.execute("SELECT cache_httpfs_clear_cache()").fetchall()
+                finally:
+                    cur.close()
                 self.reply(200, {"cache_disk_bytes": cache_bytes()})
             finally:
                 lock.release()

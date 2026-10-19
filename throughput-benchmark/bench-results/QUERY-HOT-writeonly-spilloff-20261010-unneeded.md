@@ -1,5 +1,11 @@
 # Hot query benchmark: DuckDB vs StarRocks, Paimon vs Iceberg (`writeonly-spilloff`)
 
+> **Marked unneeded (2026-10-18).** This run used the cold DuckDB harness, which
+> has since been removed and timed a fresh process per attempt. StarRocks' data
+> cache was off, and the window was on each writer's `ingestionTime`, so the two
+> formats did not hold the same rows. It is not comparable with the warm hot run
+> on the `-r2` tables. It is kept for history only.
+
 **Configuration markers:** the tables written by the
 [writeonly-spilloff run](FLINK-THROUGHPUT-writeonly-spilloff-20261010.md)
 (`JOB_PARALLELISM=320`, `PAIMON_WRITE_ONLY=true`,
@@ -15,8 +21,8 @@ generator still writing (14:48:42Z → ~15:18:42Z). Suite `hot`, queries H1–H6
 window would be committed in both tables (see "Rows in the window").
 
 **Source data:**
-- `bench-results/duckdb-20261010T150541Z-writeonly-spilloff.csv`
-- `bench-results/starrocks-20261010T150541Z-writeonly-spilloff.csv`
+- `bench-results/duckdb-20261010T150541Z-writeonly-spilloff-unneeded.csv`
+- `bench-results/starrocks-20261010T150541Z-writeonly-spilloff-unneeded.csv`
 - The per-arm DuckDB logs and both harness logs
   (`duckdb-{iceberg,paimon}-20261010T150541Z.log`,
   `qb-{duckdb,starrocks}-hot-wo-nospill-20261010T150541Z.log`) are in the macOS

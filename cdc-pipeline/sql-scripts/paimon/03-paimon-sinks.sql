@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'bucket' = '-1',
+    'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'bucket' = '-1',
+    'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
-    'bucket' = '-1',
+    'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',
@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_date_str VARCHAR,
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
-    'bucket' = '-1',
+    'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
     'file.format' = 'parquet',

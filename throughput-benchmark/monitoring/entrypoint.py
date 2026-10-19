@@ -39,7 +39,6 @@ MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "60"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 REPEAT_INTERVAL = int(os.environ.get("REPEAT_INTERVAL", "300"))
 REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports")
-RUN_MODE = os.environ.get("RUN_MODE", "continuous")
 
 
 def build_monitor(flink_url, glue_db, warehouse, tables, catalog_type="glue"):
@@ -122,13 +121,7 @@ def main():
     log.info("  Paimon  : %s  db=%s", PAIMON_FLINK_URL, PAIMON_GLUE_DB)
     log.info("  Iceberg : %s  db=%s", ICEBERG_FLINK_URL, ICEBERG_GLUE_DB)
     log.info("  Tables  : %s", CDC_TABLES)
-    log.info("  Mode    : %s", RUN_MODE)
     log.info("  Duration: %ds  Poll: %ds  Repeat: %ds", MONITOR_DURATION, POLL_INTERVAL, REPEAT_INTERVAL)
-
-    if RUN_MODE == "once":
-        run_single_cycle()
-        log.info("Single run complete. Exiting.")
-        return
 
     while True:
         try:

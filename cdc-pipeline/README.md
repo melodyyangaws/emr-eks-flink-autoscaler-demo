@@ -44,8 +44,8 @@ A complete **real-time Change Data Capture (CDC)** pipeline with dual lakehouse 
 ┌─────────────────────────────────────────────────────────────────────┐
 │              Generic Flink CDC SQL Executor (PyFlink)               │
 │  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  • Script itself mounted from ConfigMap flink-cdc-executor-py│  │
-│  │    at /opt/flink/usrlib (NOT downloaded from S3 — see below) │   │
+│  │  • Script is the job.jarURI (s3://…/flink-cdc-executor.py);  │  │
+│  │    EMR on EKS stages it into /opt/flink/usrlib for us        │   │
 │  │  • Loads modular SQL scripts from S3                        │   │
 │  │  • Substitutes env vars (${MYSQL_HOST}, ${GLUE_DATABASE})   │   │
 │  │  • Executes: catalog → sources → sinks → pipelines          │   │
@@ -222,8 +222,8 @@ echo $MYSQL_HOST  # verify
 
 1. Install EMR on EKS Flink Operator (if needed)
 2. Set environment variables
-3. Create the MySQL password Secret and the executor-script ConfigMap
-4. Build Docker image + upload SQL scripts to S3
+3. Create the MySQL password Secret
+4. Build Docker image + upload the executor script and SQL scripts to S3
 5. **Render** the manifests, then apply both in one `kubectl` call
 
 ```bash
@@ -240,18 +240,13 @@ export LAKEHOUSE_FORMAT=both  # paimon | iceberg | both
 #    (see 0-MYSQL-SETUP-GUIDE.md; default name is flink-cdc-mysql-env)
 kubectl get secret flink-cdc-mysql-env -n emr-flink   # verify it exists
 
-# 2. Executor-script ConfigMap. flink-cdc-executor.py is mounted from this
-#    ConfigMap at /opt/flink/usrlib — it is NOT fetched from S3, and
-#    build-deploy-generic.sh does NOT create it. Re-run this after every edit
-#    to flink-cdc-executor.py or the JobManager runs the old copy:
-kubectl create configmap flink-cdc-executor-py -n emr-flink \
-  --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-# 3. Build and push the image to ECR, and upload the SQL scripts to S3
+# 2. Build and push the image to ECR, and upload the SQL scripts to S3.
+#    This also uploads flink-cdc-executor.py to the job.jarURI key, which EMR on
+#    EKS stages into /opt/flink/usrlib for the JobManager — so re-run `build`
+#    after editing the executor script.
 ./build-deploy-generic.sh build
 
-# 4. Render flink-cdc-{paimon,iceberg}-deployed.yaml WITHOUT applying, then
+# 3. Render flink-cdc-{paimon,iceberg}-deployed.yaml WITHOUT applying, then
 #    apply both at once. `deploy` applies Paimon, waits for it to reconcile,
 #    then applies Iceberg — the jobs start ~30s apart, which invalidates a
 #    Paimon-vs-Iceberg comparison because whichever starts first snapshots a
@@ -412,26 +407,41 @@ success and duration, as a delta over a sampling window):
 SELECT * FROM flink_iceberg_db.customers LIMIT 10;
 ```
 
-**Athena (Paimon)** — query via Athena Notebook :
+**Athena (Paimon)** — the `flink_paimon_db` tables are `table_type = PAIMON` and
+Athena cannot read them. Two ways round it; the first is the one verified here.
+
+*Athena SQL, via a shadow Glue database.* Register Paimon's exported Iceberg
+metadata (`paimon-warehouse/iceberg/...`) as an Iceberg table in a separate Glue
+database, then query it normally. `StorageDescriptor.Columns` must be populated
+or projections fail with `Relation contains no accessible columns`. Full recipe
+in [4-STARROCKS-OLAP-ENGINE.md §2.1](4-STARROCKS-OLAP-ENGINE.md), results in
+[bench-results/ATHENA-PAIMON-TEST-20260928.md](bench-results/ATHENA-PAIMON-TEST-20260928.md).
+```sql
+SELECT COUNT(*) FROM paimon_athena_test.customers;
+```
+
+*Athena Notebook.* Needs `athena:StartCalculationExecution`, which the admin role
+in this account does not currently have.
 ```json
-# custom spark properties
+# custom spark properties — SparkCatalog, not SparkSessionCatalog
 {
-    "spark.sql.catalog.paimon_iceberg": "org.apache.iceberg.spark.SparkSessionCatalog",
+    "spark.sql.catalog.paimon_iceberg": "org.apache.iceberg.spark.SparkCatalog",
     "spark.sql.catalog.paimon_iceberg.type": "hadoop",
     "spark.sql.catalog.paimon_iceberg.warehouse": "s3://$PAIMON_WAREHOUSE/iceberg"
 }
 ```
 
-```sql
+```python
 spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
 spark.sql("SELECT * FROM paimon_iceberg.flink_paimon_db.customers LIMIT 10").show()
 ```
 
 **StarRocks on EKS** — native support for both Paimon and Iceberg:
 ```bash
-./deploy-starrocks.sh install-iam
-./deploy-starrocks.sh connection
-mysql -h <STARROCKS_FE_LB> -P 9030 -u root
+./starrocks/deploy-starrocks.sh install-iam   # one Helm release into emr-flink
+./starrocks/deploy-starrocks.sh connection
+# The FE service is ClusterIP — there is no LoadBalancer endpoint:
+kubectl exec -it -n emr-flink kube-starrocks-fe-0 -- mysql -h127.0.0.1 -P9030 -uroot
 ```
 
 > See [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md) for full catalog setup, query examples, performance/cost comparison, and decision tree.
@@ -497,7 +507,8 @@ comparisons come from the monitor and the benchmark harness (see
 
 | Issue | Solution |
 |-------|----------|
-| `NoSuchFileException: /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py` | The `flink-cdc-executor-py` ConfigMap is missing or stale. The operator's `jarURI` download lands in a volume the main container never mounts, so the script **must** come from the ConfigMap — re-create it (see Step 1) and re-deploy |
+| `NoSuchFileException: /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py` | The `job.jarURI` object is missing from S3, so the operator's staging initContainer had nothing to place in `/opt/flink/usrlib`. Re-run `./build-deploy-generic.sh build` to re-upload `flink-cdc-executor.py`, then re-deploy |
+| `initContainers[0].volumeMounts[0].name: Not found: "flink-artifact"`, FlinkDeployment wedged in `UPGRADING` | A pod template supplied its own `volumes:` list that omitted `flink-artifact`, which the operator's staging initContainer needs. Don't add a `volumes:` list to the JobManager pod template; if the CR already holds the injected initContainer, strip it with `kubectl patch flinkdeployment <name> -n emr-flink --type=json -p '[{"op":"remove","path":"/spec/jobManager/podTemplate/spec/initContainers"}]'` (or delete and re-apply the CR) |
 | Spec change (resources, parallelism, pod template) didn't take effect | `upgradeMode: last-state` means a bare `kubectl apply` won't pick it up. DELETE the FlinkDeployment, wait for the pods to go, check for leftover HA ConfigMaps, then apply |
 | Job cycles RUNNING → RESTARTING → CREATED → RUNNING for no visible reason | Karpenter consolidation. `executor-memorynodepool` runs `consolidationPolicy: WhenEmptyOrUnderutilized` / `consolidateAfter: 2m` with a 25% Underutilized budget, so it evicts nodes still hosting RUNNING TaskManagers. With `failover-strategy: full` one lost TM restarts the whole graph. Look for `Disrupting NodeClaim: Underutilized` and `Evicted pod: Underutilized`; the JM only shows `NoResourceAvailableException` / an RPC `TimeoutException` |
 | `AWSGlueClientFactory - No region info found, using SDK default region: us-east-1` + `EC2MetadataUtils` + `Unauthorized (Status Code: 401)` | **Noise on the JobManager, not a failure.** The job reaches RUNNING with these lines present and they do not appear in steady-state TM logs at all. Setting `AWS_DEFAULT_REGION` does NOT suppress it — that was tested with both vars confirmed in the resolved container env. The legacy EMR Glue client takes its region from the Hadoop/Hive Configuration, not the process env. Look elsewhere (usually Karpenter, above) for a restart cause |
@@ -512,7 +523,8 @@ comparisons come from the monitor and the benchmark harness (see
 | Data generator connects but no data | Check pod logs for per-operation errors; ensure ConfigMap is redeployed |
 | Monitor `PaimonStorageHandler` error | Monitor uses Glue API fallback for Paimon tables |
 | Athena Spark can't read Paimon tables | Use Hadoop catalog in Athena Spark; set `metadata.iceberg.format-version = '2'` |
-| Athena SQL can't read Paimon tables | Manually change table_type property to `Icberg` in Glue Catalog |
+| Athena SQL can't read Paimon tables | Register the exported Iceberg metadata as `table_type = ICEBERG` in a **separate** Glue database — see [4-STARROCKS-OLAP-ENGINE.md §2.1](4-STARROCKS-OLAP-ENGINE.md). Don't edit `flink_paimon_db` in place; Paimon's committer owns those entries |
+| `COLUMN_NOT_FOUND: Relation contains no accessible columns` | The Glue table has an empty `StorageDescriptor.Columns`. Athena reads the column list from Glue and the data from Iceberg metadata; populate columns from the metadata JSON's `current-schema-id` schema |
 | StarRocks SA conflict | Annotate existing SA with Helm release metadata |
 | Flink image build fails locally | Builds run in-cluster with Kaniko; no local Docker needed |
 | Monitor pod stuck `ContainerCreating`/no logs | First boot pip-installs pyiceberg+pyarrow (~2 min); check `kubectl logs` again |
@@ -525,8 +537,6 @@ comparisons come from the monitor and the benchmark harness (see
 - ☑️ 1 RDS MySQL instance (binlog-enabled, CDC user configured)
 - ☑️ 1 ECR repository (Flink CDC image, built in-cluster with Kaniko)
 - ☑️ 2 FlinkDeployments (Paimon + Iceberg pipelines), 1 JM + 8 TMs each
-- ☑️ 1 `flink-cdc-executor-py` ConfigMap (the PyFlink entrypoint — created by hand,
-  **not** by `build-deploy-generic.sh`)
 - ☑️ 1 Data generator (`mixed` Deployment or `upsert` StatefulSet, ConfigMap-based script)
 - ☑️ 1 Monitor Deployment (Flink REST API + Glue/pyiceberg stats)
 - ☑️ 4 Paimon tables on S3 (with Iceberg compatibility metadata)
@@ -546,9 +556,12 @@ comparisons come from the monitor and the benchmark harness (see
 **Flink Version**: 1.20
 **Paimon Version**: 1.3.2 (newest release still publishing `paimon-spark-3.5`; 1.4.x dropped it)
 **Iceberg Version**: 1.10.0-amzn-1
-**StarRocks Version**: 4.1.x — `SELECT CURRENT_VERSION()` reported `4.1.4-4a9848e`.
-Neither the chart nor the images are pinned: `starrocks/deploy-starrocks.sh` passes no
-`--version` to `helm upgrade --install`, and `helm/starrocks-eks-values.yaml` leaves
-`image.tag: ""` so the chart's floating `4.1-latest` default applies. A fresh install
-can therefore land on a newer build than the one benchmarked.
+**StarRocks Version**: 4.1.4 — `SELECT CURRENT_VERSION()` reported `4.1.4-4a9848e`.
+Both the chart and the images are now pinned: `starrocks/deploy-starrocks.sh` passes
+`--version ${CHART_VERSION:-1.11.7}` and `--set starrocks.starrocks{FE,Be}Spec.image.tag`
+from `${IMAGE_TAG:-4.1.4}`. `helm/starrocks-eks-values.yaml` still leaves
+`image.tag: ""`, which would otherwise resolve to the chart appVersion — the mutable
+`4.1-latest` tag — so do not override `IMAGE_TAG` to empty for benchmark runs.
+Note `helm list` reports APP VERSION as `4.1-latest` regardless; that column is the
+chart's appVersion, not the image tag pulled.
 **MySQL Version**: 8.0.45

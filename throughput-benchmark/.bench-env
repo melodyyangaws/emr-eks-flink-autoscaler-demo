@@ -6,9 +6,6 @@
 
 # Account-specific values live in .bench-env.local (git-ignored), sourced here
 # so it overrides the placeholders below. Create it with your own:
-#   export AWS_ACCOUNT_ID=<id>
-#   export BUCKET_NAME=emr-on-eks-test-<id>-us-west-2
-#   export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::<id>:role/emr-on-eks-test-execution-role
 export AWS_REGION=us-west-2
 export AWS_ACCOUNT_ID=account
 export BUCKET_NAME=emr-on-eks-test-account-us-west-2
@@ -48,11 +45,17 @@ export S3A_MULTIPART_THRESHOLD=32M
 
 # The landing prefix the generator writes (jsongz-gen/, OUTPUT_URI). The jobs
 # never list it: they read only the files announced on SQS (S3 → SNS
-# cid-landing-jsongz-events → one queue per job,
+# cid-landing-jsongz-events → one queue per flink throughput job,
 # cid-landing-jsongz-{paimon,iceberg}).
-# The S3 event notifications fire for cid-landing-jsongz-r4/ ONLY, so a file
+# The S3 event notifications fire for cid-landing-jsongz/ ONLY, so a file
 # written anywhere else is never read; to replay an older prefix, enqueue it
 # with sqs-delta-filename/backfill/. The queues are the source's state: a
 # message left from an earlier run is a file the next run reads first, so
 # purge both queues between runs (README).
-export OUTPUT_URI=s3://${BUCKET_NAME}/cid-landing-jsongz-r4
+
+export OUTPUT_URI=s3://${BUCKET_NAME}/cid-landing-jsongz
+
+# Data Generator run length: 0 means producing source data until stopped via "run-jsongz-gen.sh stop", or
+# "querybench/hot-watch.sh" once the hot query test is done
+
+export DURATION_SECONDS=0
