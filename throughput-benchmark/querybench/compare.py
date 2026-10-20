@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """StarRocks vs DuckDB, one markdown table per suite, from the two engines' CSVs
-(both carry lib.sh's QB_CSV_HEADER).
+(both carry lib/querybench.sh's QB_CSV_HEADER).
 
   ./querybench/compare.py --sr bench-results/starrocks-<STAMP>.csv \\
                           --duck bench-results/duckdb_warm-<STAMP>.csv [--suite snapshot]
@@ -65,7 +65,7 @@ def cell(r):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--sr", required=True, help="StarRocks CSV (starrocks.sh)")
-    ap.add_argument("--duck", required=True, help="DuckDB CSV (duckdb-warm.sh; older cold duckdb.sh CSVs work too)")
+    ap.add_argument("--duck", required=True, help="DuckDB CSV (duckdb-warm.sh)")
     ap.add_argument("--suite", choices=["hot", "snapshot"], help="one suite only (default: every suite found)")
     a = ap.parse_args()
     data = {}

@@ -31,11 +31,13 @@ FORMAT=${1:?usage: $0 paimon|iceberg [interval] [duration]}
 [[ "$FORMAT" == "paimon" || "$FORMAT" == "iceberg" ]] || { echo "Unknown format '$FORMAT'" >&2; exit 1; }
 INTERVAL=${2:-30}
 DURATION=${3:-7200}
-NAMESPACE=${NAMESPACE:-emr-flink}
+# NAMESPACE, BENCH_DIR (and .bench-env), like every other script here.
+# shellcheck source=../lib/common.sh
+source "$(cd "$(dirname "$0")" && pwd)/../lib/common.sh"
 DEPLOYMENT="flink-cid-${FORMAT}"
 PORT=${LOCAL_PORT:-8091}
 
-OUTDIR="$(cd "$(dirname "$0")/.." && pwd)/bench-results"
+OUTDIR="${BENCH_DIR}/bench-results"
 mkdir -p "$OUTDIR"
 OUTFILE="${OUTDIR}/cid-${FORMAT}-$(date -u +%Y%m%dT%H%M%SZ).csv"
 

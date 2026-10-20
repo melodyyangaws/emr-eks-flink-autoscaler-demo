@@ -111,6 +111,12 @@ def init():
         # StarRocks caches Parquet footers and object metadata too.
         "SET parquet_metadata_cache=true",
         "SET enable_http_metadata_cache=true",
+        # Off: DuckDB's own external file cache (default on since 1.3) keeps
+        # remote file data in the buffer pool, within memory_limit (44 GB),
+        # i.e. a second data cache beside cache_httpfs's CACHE_MEM_BYTES. With
+        # it, DuckDB could hold far more of the data in memory than StarRocks'
+        # 3 x 3.888 GiB datacache (2026-10-20); cache_httpfs is the only one.
+        "SET enable_external_file_cache=false",
     ]:
         con.execute(sql)
     return info
@@ -210,8 +216,8 @@ def attempt(sql, timeout_s):
 
 
 def run_query(job, q):
-    """= the old duckdb.sh pod_run for one query: warm-up passes, timed passes, median,
-    and the same ZERO_SCAN guard (an empty scan is never reported as a win)."""
+    """One query: warm-up passes, timed passes, median, and the ZERO_SCAN guard
+    (an empty scan is never reported as a win)."""
     job.update(state="running", started=time.time(), times=[])
     status, rows, table = "OK", None, None
     try:
@@ -332,7 +338,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     vol = init()
     refresh_secret(force=True)
-    INFO = {"pod": POD, "suite": ENV.get("SUITE"), "duckdb": duckdb.__version__,
+    INFO = {"pod": POD, "duckdb": duckdb.__version__,
             "memory_limit": ENV["DUCKDB_MEMORY_LIMIT"], "threads": int(ENV["DUCKDB_THREADS"]),
             "cache_mem_bytes": CACHE_MEM_BYTES,
             "pin_snapshot": PIN_SNAPSHOT, **vol}

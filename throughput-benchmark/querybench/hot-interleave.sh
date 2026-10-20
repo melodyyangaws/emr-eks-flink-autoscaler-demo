@@ -3,25 +3,12 @@
 # INTERLEAVED pass by pass, so neither engine runs on a later table or under a
 # different write load than the other.
 #
-# Pinning a window (eventTimeDT) fixes the ROWS; it does not fix the TABLE. On
-# 2026-10-19 StarRocks ran during the backlog drain and DuckDB 30-60 min later
-# against idle writers, with more snapshots and manifests to plan over. This
-# script, after the window is committed in both tables:
-#   1. pins one version of each table (duckdb-warm.sh pin: one copied
-#      metadata.json for DuckDB, the matching snapshot ids for StarRocks'
-#      FOR VERSION AS OF), and checks StarRocks can read each pinned version;
-#   2. runs warm-up, then timed passes 1..RUNS, each pass on StarRocks (all arms)
-#      and then on DuckDB (all arms);
-#   3. merges the timed passes into one median CSV per engine.
-#
+# Pinning a window (eventTimeDT) fixes the ROWS. 
+# The test is only valid if both tables have the same ROWS in that window, and the same ROWS in the pinned versions. 
 #   HOT_TO='YYYY-MM-DD HH:MM:SS' ./querybench/hot-interleave.sh   # or omit: now - 5 min
 # Knobs: RUNS (3), WAIT_COMMIT_S (5400: give-up for the committed-window check),
-# CID_SUFFIX. Needs the writers RUNNING and duckdb-warm-hot up, and the
-# generator writing until the last pass: start it with DURATION_SECONDS=0 (until
-# stopped) and let hot-watch.sh stop it once this is done. The .pins file records whether it was
-# still writing before the first pass and after the last; run it from the
-# laptop or inside qb-runner.sh (no AWS calls of its own: the pin goes through
-# the DuckDB server, the counts through StarRocks).
+# STABLE_CHECKS (10: one-minute checks for both writers to be RUNNING before
+# giving up), TEST_SUFFIX.
 #
 # Output: bench-results/starrocks-<STAMP>.csv and duckdb_warm-<STAMP>.csv (the
 # medians, $QB_CSV_HEADER), the per-pass CSVs <...>-<STAMP>-p<N>.csv, and
@@ -29,14 +16,33 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SUITE=hot
-# shellcheck source=lib.sh
-source "${HERE}/lib.sh"
+# shellcheck source=../lib/querybench.sh
+source "${HERE}/../lib/querybench.sh"
 RUNS="${RUNS:-3}"
 WAIT_COMMIT_S="${WAIT_COMMIT_S:-5400}"
 BASE="$STAMP"
 ICE_T="cid_iceberg_catalog.${ICEBERG_DB}.cid_events"
 PMN_T="cid_pmn_as_ice${QB_DB_SUFFIX}.${PAIMON_DB}.cid_events"
 PAI_T="cid_paimon_catalog${QB_DB_SUFFIX}.${PAIMON_DB}.cid_events"
+
+# ── 0. Writers RUNNING ───────────────────────────────────────────────────────
+# Goes on as soon as both are RUNNING; otherwise checks again a minute later,
+# up to STABLE_CHECKS times, then gives up. No fixed wait: querybench/run.sh starts
+# this after bringing up duckdb-warm (~5-10 min on a fresh node), which is the
+# writers' settling time. (Until 2026-10-20 it always waited 10 minutes.)
+STABLE_CHECKS="${STABLE_CHECKS:-10}"
+for (( c = 1; ; c++ )); do
+    s=$(kubectl get flinkdeployment $FLINK_JOBS -n "$NAMESPACE" -o jsonpath='{.items[*].status.jobStatus.state}' 2>/dev/null || true)
+    [[ "$s" == "RUNNING RUNNING" ]] && { qb_log "writers RUNNING (check ${c})"; break; }
+    (( c < STABLE_CHECKS )) || qb_die "the writers are not both RUNNING after ${STABLE_CHECKS} checks: ${s:-none}"
+    qb_log "writers not both RUNNING yet (${s:-none}), check ${c}/${STABLE_CHECKS}; again in 60s"
+    sleep 60
+done
+
+# StarRocks' catalogs for this TEST_SUFFIX: starrocks.sh creates them on its
+# first run, but the window counts below need them first (2026-10-19, -r3: the
+# Paimon-export count failed until the catalog existed).
+"${HERE}/starrocks.sh" catalogs || qb_die "cannot create or read the StarRocks catalogs"
 
 # ── 1. A window both tables have committed ──────────────────────────────────
 export HOT_TO="${HOT_TO:-$(qb_utc_minus_sec "$(date -u '+%Y-%m-%d %H:%M:%S')" 300)}"
@@ -61,7 +67,7 @@ ROWS="$i"
 qb_log "window committed in both tables: ${ROWS} rows"
 
 # ── 2. One table version for the whole run ─────────────────────────────────
-pins=$("${HERE}/duckdb-warm.sh" pin hot) || qb_die "pin failed (is duckdb-warm-hot up?)"
+pins=$("${HERE}/duckdb-warm.sh" pin) || qb_die "pin failed (is duckdb-warm up?)"
 eval "$pins"
 export DUCK_PIN_ICEBERG DUCK_PIN_PAIMON SR_PIN_ICEBERG SR_PIN_PMNICE SR_PIN_PAIMON
 # StarRocks must read each pinned version, and see the same window rows there.
@@ -117,7 +123,7 @@ done
 GEN_END=$(gen_live)
 echo "generator: before the first pass ${GEN_START}, after the last pass ${GEN_END}" >> "${OUT_DIR}/hot-interleave-${BASE}.pins"
 qb_log "generator after the last pass: ${GEN_END}"
-[[ "$GEN_END" == STOPPED ]] && qb_log "WARNING: the generator stopped before the last pass ended: the later passes ran without live writes (start it with DURATION_SECONDS=0 and hot-watch.sh)"
+[[ "$GEN_END" == STOPPED ]] && qb_log "WARNING: the generator stopped before the last pass ended: the later passes ran without live writes (start it with DURATION_SECONDS=0 and qb-watch.sh)"
 
 # ── 4. Medians of the timed passes ──────────────────────────────────────────
 python3 - "$OUT_DIR" "$BASE" "$RUNS" "$QB_CSV_HEADER" <<'EOF'

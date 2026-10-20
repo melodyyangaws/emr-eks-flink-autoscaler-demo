@@ -1,16 +1,24 @@
-# In-cluster runner for one query-benchmark step (qb-runner.sh start). Rendered
-# by qb-runner.sh with envsubst over NAME, NAMESPACE and KUBECTL_VERSION only:
-# every other $... below is for the container's shell and stays literal.
+# In-cluster Job for a query test or its watcher (querybench/run.sh start). Rendered
+# by querybench/run.sh with envsubst over NAME, NAMESPACE, KUBECTL_VERSION and
+# ROLE_ARN only: every other $... below is for the container's shell and stays
+# literal.
 #
 # Permissions: a namespace Role, nothing cluster-wide. Exec into the FE and
 # port-forward to the DuckDB servers, restart those servers (deployments), read
 # and suspend the Flink writers, read the other runner's Job, delete the
-# generator's, scale the job monitor to 0 and take duckdb-warm-hot down
-# (hot-watch.sh). No AWS credentials: the step must run with
-# pinned windows (SNAPSHOT_DT, SNAPSHOT_S4_FROM/TO; HOT_TO).
+# generator's, scale the job monitor to 0, take duckdb-warm down and delete the
+# runner's ConfigMap and Secret (qb-watch.sh).
+#
+# AWS: the ServiceAccount assumes the execution role (IRSA; its trust already
+# covers every ServiceAccount in the namespace), so the runner can upload its
+# bench-results/ to S3 when the test ends. That upload is what lets the Job end
+# on its own: it used to sleep a day for `querybench/run.sh fetch` to copy them out.
 apiVersion: v1
 kind: ServiceAccount
-metadata: {name: ${NAME}, namespace: ${NAMESPACE}}
+metadata:
+  name: ${NAME}
+  namespace: ${NAMESPACE}
+  annotations: {eks.amazonaws.com/role-arn: "${ROLE_ARN}"}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -20,7 +28,7 @@ rules:
 - {apiGroups: [""], resources: [pods/exec, pods/portforward], verbs: [create, get]}
 - {apiGroups: [apps], resources: [deployments, replicasets], verbs: [get, list, watch, patch, delete]}
 - {apiGroups: [apps], resources: [deployments/scale], verbs: [get, patch, update]}
-- {apiGroups: [""], resources: [configmaps], verbs: [delete]}
+- {apiGroups: [""], resources: [configmaps, secrets], verbs: [delete]}
 - {apiGroups: [flink.apache.org], resources: [flinkdeployments], verbs: [get, list, patch]}
 - {apiGroups: [batch], resources: [jobs], verbs: [get, list, delete]}
 ---
@@ -34,8 +42,9 @@ apiVersion: batch/v1
 kind: Job
 metadata: {name: ${NAME}, namespace: ${NAMESPACE}, labels: {app: ${NAME}}}
 spec:
-  backoffLimit: 0                       # disable restart.A re-run would requery and double-record
-  activeDeadlineSeconds: 86400         # 1 day fetch window
+  backoffLimit: 0                       # no restart: a re-run would requery and double-record
+  activeDeadlineSeconds: 86400          # 1 day: the longest a test may run
+  ttlSecondsAfterFinished: 86400        # keep the finished Job and its log a day, then delete it
   template:
     metadata:
       labels: {app: ${NAME}}
@@ -65,16 +74,16 @@ spec:
         - |
           set -uo pipefail
           apt-get update -qq >/dev/null && apt-get install -y -qq curl procps >/dev/null
+          pip install -q --no-cache-dir awscli >/dev/null 2>&1 || echo "awscli install failed: results will not upload"
           curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
           chmod +x /usr/local/bin/kubectl
           kubectl version --client >/dev/null || { echo "kubectl ${KUBECTL_VERSION} does not run here"; exit 1; }
           mkdir -p /work && tar -C /work -xzf /bundle/bundle.tgz && cp /env/bench-env-local /work/.bench-env.local
           mkdir -p /work/bench-results && cd /work
-          echo "== runner $(date -u)"; tail -1 .qb-runner-cmd.sh
+          echo "== runner $(date -u)"; sed -n 's/^# step: /== step: /p' .qb-runner-cmd.sh
           bash .qb-runner-cmd.sh; rc=$?
           echo "status: runner-exit=${rc} $(date -u)"
-          for f in bench-results/*; do echo "===FILE $f"; cat "$f"; done
-          sleep 86400                    # 1 day: keep the results for `qb-runner.sh fetch`
+          exit "$rc"
       volumes:
       - {name: bundle, configMap: {name: ${NAME}}}
       - {name: env, secret: {secretName: ${NAME}}}

@@ -7,7 +7,6 @@ Runs as a long-lived pod in the emr-flink namespace.
 import os
 import sys
 import time
-import json
 import logging
 from datetime import datetime
 
@@ -19,13 +18,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("monitor-entrypoint")
 
-PAIMON_FLINK_URL = os.environ.get("PAIMON_FLINK_URL", "http://flink-cdc-paimon-rest:8081")
-ICEBERG_FLINK_URL = os.environ.get("ICEBERG_FLINK_URL", "http://flink-cdc-iceberg-rest:8081")
+PAIMON_FLINK_URL = os.environ.get("PAIMON_FLINK_URL", "http://flink-cid-paimon-rest:8081")
+ICEBERG_FLINK_URL = os.environ.get("ICEBERG_FLINK_URL", "http://flink-cid-iceberg-rest:8081")
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
-PAIMON_GLUE_DB = os.environ.get("PAIMON_GLUE_DB", "flink_paimon_db")
-ICEBERG_GLUE_DB = os.environ.get("ICEBERG_GLUE_DB", "flink_iceberg_db")
+PAIMON_GLUE_DB = os.environ.get("PAIMON_GLUE_DB", "flink_cid_paimon_db")
+ICEBERG_GLUE_DB = os.environ.get("ICEBERG_GLUE_DB", "flink_cid_iceberg_db")
 # No bucket is hardcoded here: the warehouse roots come from the ConfigMap
-# flink-cdc-monitor-config, which deploy-monitor.sh renders from $BUCKET_NAME.
+# flink-cid-monitor-config, which monitoring/run.sh renders from $BUCKET_NAME.
 # A stale literal here silently pointed the monitor at another account's bucket,
 # so if the vars are missing we fail fast instead of reading the wrong data.
 PAIMON_WAREHOUSE = os.environ.get("PAIMON_WAREHOUSE")
@@ -34,14 +33,15 @@ if not PAIMON_WAREHOUSE or not ICEBERG_WAREHOUSE:
     log.error("PAIMON_WAREHOUSE and ICEBERG_WAREHOUSE must be set "
               "(see monitoring/monitor-deployment.yaml)")
     sys.exit(1)
-CDC_TABLES = os.environ.get("CDC_TABLES", "customers,products,orders,order_items").split(",")
+# The one table each job writes (monitor-deployment.yaml sets it).
+TABLE_NAME = os.environ.get("TABLE_NAME", "cid_events")
 MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "60"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 REPEAT_INTERVAL = int(os.environ.get("REPEAT_INTERVAL", "300"))
-REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports")
+REPORT_OUTPUT_DIR = "/tmp/reports"
 
 
-def build_monitor(flink_url, glue_db, warehouse, tables, catalog_type="glue"):
+def build_monitor(flink_url, glue_db, warehouse, table, catalog_type="glue"):
     """Build a FlinkCIDMonitor with the appropriate pyiceberg catalog.
 
     catalog_type:
@@ -65,7 +65,7 @@ def build_monitor(flink_url, glue_db, warehouse, tables, catalog_type="glue"):
         flink_url=flink_url,
         catalog_config=catalog_config,
         glue_database=glue_db,
-        tables=tables,
+        table=table,
     )
 
 
@@ -86,9 +86,9 @@ def run_single_cycle():
     log.info("=" * 70)
 
     paimon_monitor = build_monitor(
-        PAIMON_FLINK_URL, PAIMON_GLUE_DB, PAIMON_WAREHOUSE, CDC_TABLES, catalog_type="hadoop")
+        PAIMON_FLINK_URL, PAIMON_GLUE_DB, PAIMON_WAREHOUSE, TABLE_NAME, catalog_type="hadoop")
     iceberg_monitor = build_monitor(
-        ICEBERG_FLINK_URL, ICEBERG_GLUE_DB, ICEBERG_WAREHOUSE, CDC_TABLES, catalog_type="glue")
+        ICEBERG_FLINK_URL, ICEBERG_GLUE_DB, ICEBERG_WAREHOUSE, TABLE_NAME, catalog_type="glue")
 
     paimon_report = paimon_monitor.generate_report(
         label="paimon-throughput",
@@ -120,7 +120,7 @@ def main():
     log.info("Flink Throughput Monitor starting")
     log.info("  Paimon  : %s  db=%s", PAIMON_FLINK_URL, PAIMON_GLUE_DB)
     log.info("  Iceberg : %s  db=%s", ICEBERG_FLINK_URL, ICEBERG_GLUE_DB)
-    log.info("  Tables  : %s", CDC_TABLES)
+    log.info("  Table   : %s", TABLE_NAME)
     log.info("  Duration: %ds  Poll: %ds  Repeat: %ds", MONITOR_DURATION, POLL_INTERVAL, REPEAT_INTERVAL)
 
     while True:

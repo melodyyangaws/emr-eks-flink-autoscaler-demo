@@ -1,29 +1,30 @@
-# source this before running build-deploy-cid.sh
+# Loaded by every script through lib/common.sh: no need to source it yourself.
+# A value given on the command line for one run wins over the one set here.
 #
-# NOTE: every value here OVERRIDES build-deploy-cid.sh's default, because
+# NOTE: every value here OVERRIDES flinkwriter/run.sh's default, because
 # the script uses ${VAR:-default}. So a knob changed in the script but left
 # stale here has no effect. 
 
 # Account-specific values live in .bench-env.local (git-ignored), sourced here
-# so it overrides the placeholders below. Create it with your own:
-export AWS_REGION=us-west-2
-export AWS_ACCOUNT_ID=account
-export BUCKET_NAME=emr-on-eks-test-account-us-west-2
-export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::account:role/emr-on-eks-test-execution-role
+# so it overrides the placeholders below. Create it with your actual values:
+export AWS_REGION=yourregion
+export AWS_ACCOUNT_ID=accountid
+export BUCKET_NAME=emr-on-eks-test-accountid-region
+export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::accountid:role/emr-on-eks-test-execution-role
+
 _bench_env_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 [ -f "$_bench_env_dir/.bench-env.local" ] && source "$_bench_env_dir/.bench-env.local"
 unset _bench_env_dir
-export IMAGE_TAG=7.13.0
 
 # 320 subtasks per side (80 TMs). Each subtask saturates ~1 core at ~98 us of
 # CPU per row, so 160 capped each job at ~1.6M rows/s; 2.6M rows/s (the
 # 6-replica generator rate) needs >= 256, and 320 gives ~3.1M of headroom.
-# pipeline.max-parallelism in both flink-cid-*.yaml is 512 to allow it.
+# pipeline.max-parallelism in both flinkwriter/flink-cid-*.yaml is 512 to allow it.
 # The script's own default is 128.
 #
 # Paimon defaults to unaware-bucket (PAIMON_BUCKETS=-1, no shuffle, the same
-# layout as Iceberg), so parallelism no longer sets a bucket count. For a
-# fixed-bucket run, export PAIMON_BUCKETS=$JOB_PARALLELISM (one bucket per writer)
+# layout as Iceberg), so parallelism no longer sets a bucket count. To use bucket strategy,
+# export PAIMON_BUCKETS=$JOB_PARALLELISM (one bucket per writer)
 # and drop cid_events first: the bucket count is baked in at CREATE TABLE.
 export JOB_PARALLELISM=320
 
@@ -43,19 +44,33 @@ export ICEBERG_COMPAT=true
 export S3A_MULTIPART_SIZE=32M
 export S3A_MULTIPART_THRESHOLD=32M
 
-# The landing prefix the generator writes (jsongz-gen/, OUTPUT_URI). The jobs
-# never list it: they read only the files announced on SQS (S3 → SNS
+# The s3 file path the data generator writes. The Flink writers
+# read only the files announced on SQS (S3 → SNS
 # cid-landing-jsongz-events → one queue per flink throughput job,
 # cid-landing-jsongz-{paimon,iceberg}).
 # The S3 event notifications fire for cid-landing-jsongz/ ONLY, so a file
-# written anywhere else is never read; to replay an older prefix, enqueue it
-# with sqs-delta-filename/backfill/. The queues are the source's state: a
+# written anywhere else is never sent to SQS. The queues are the source's state: a
 # message left from an earlier run is a file the next run reads first, so
-# purge both queues between runs (README).
+# purge both queues between test sessions.
 
 export OUTPUT_URI=s3://${BUCKET_NAME}/cid-landing-jsongz
 
-# Data Generator run length: 0 means producing source data until stopped via "run-jsongz-gen.sh stop", or
-# "querybench/hot-watch.sh" once the hot query test is done
+# Data Generator job run length: 0 means producing source data until stopped 
+# by the command "datagen/run.sh stop" or "querybench/qb-watch.sh" 
+# once the hot query test is done
 
 export DURATION_SECONDS=0
+
+# TEST_SUFFIX allows name each benchmark round with a suffix, grouping a set of 
+# S3 wharehouse data files and Glue tables. For example: empty = the
+# original set; "-test4" = cid-warehouse-<fmt>-test4/, Glue flink_cid_<fmt>_db_test4,
+# checkpoint/HA paths flink/cid-<fmt>-test4/, and the query engines, StarRocks &
+# DuckDB both point at the correspoinding table set for the hot query and snapshot query benchmarks.
+# Pick a new one (or wipe the old set) before each test session.
+# Keep it for the whole session: the throughput run and the hot and snapshot
+# tests must all use the same data/table set.
+
+export TEST_SUFFIX="-final"
+
+# Data Generator: 7 replicas ≈ 3.0M rows/s, just under both writers' capacity.
+export JSONGZ_REPLICAS=7

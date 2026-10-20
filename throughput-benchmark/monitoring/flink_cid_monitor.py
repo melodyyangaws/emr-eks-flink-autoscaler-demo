@@ -23,7 +23,6 @@ import boto3
 import fastavro
 import requests
 from pyiceberg.catalog import load_catalog
-from pyiceberg.table import StaticTable
 from tabulate import tabulate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,10 +41,8 @@ class TableSnapshot:
     total_position_deletes: int = 0
     total_equality_deletes: int = 0
     added_delete_files: int = 0
-    added_records: int = 0
-    added_data_files: int = 0
-    added_files_size: int = 0
     current_snapshot_id: Optional[int] = None
+    error: str = ""          # set when the table could not be read
 
 
 @dataclass
@@ -53,14 +50,11 @@ class FlinkMetricsSnapshot:
     timestamp: float
     records_in: int = 0
     records_out: int = 0
-    bytes_in: int = 0
     bytes_out: int = 0
     num_checkpoints: int = 0
     failed_checkpoints: int = 0
     last_checkpoint_duration_ms: int = 0
-    last_checkpoint_size: int = 0
     is_backpressured: bool = False
-    uptime_ms: int = 0
     # Sum of the source subtasks' numRecordsOutPerSecond: Flink's own rate meter
     # (a smoothed per-second rate), unaffected by the REST counter cache.
     records_out_per_sec: float = 0.0
@@ -77,9 +71,8 @@ class PipelineReport:
     parallelism: int = 0
     start_time: str = ""
     end_time: str = ""
-    flink_snapshots: list = field(default_factory=list)
-    table_snapshots_start: dict = field(default_factory=dict)
-    table_snapshots_end: dict = field(default_factory=dict)
+    table_snapshot_start: Optional["TableSnapshot"] = None
+    table_snapshot_end: Optional["TableSnapshot"] = None
     # Headline rows/s: commit_records_per_sec when the window saw a commit,
     # else meter_records_per_sec, else counter_records_per_sec (see generate_report).
     throughput_records_per_sec: float = 0.0
@@ -113,18 +106,20 @@ class PipelineReport:
 
 class FlinkCIDMonitor:
 
-    def __init__(self, flink_url: str, catalog_config: dict, glue_client=None,
-                 glue_database: str = "", tables: list = None):
+    def __init__(self, flink_url: str, catalog_config: dict,
+                 glue_database: str = "", table: str = "cid_events"):
         self.flink_url = flink_url.rstrip("/")
         self.catalog_config = catalog_config
-        self.glue_client = glue_client
         self.glue_database = glue_database
-        self.tables = tables or []
+        # One table per job (cid_events). Paimon is read from its own S3
+        # snapshots ("hadoop" config); Iceberg through the Glue catalog.
+        self.table = table
+        self.is_paimon = catalog_config.get("type") == "hadoop"
         self._catalog = None
 
     @property
     def catalog(self):
-        if self.catalog_config.get("type") == "hadoop":
+        if self.is_paimon:
             return None
         if self._catalog is None:
             self._catalog = load_catalog(self.catalog_config.get("type", "glue"), **self.catalog_config)
@@ -185,7 +180,7 @@ class FlinkCIDMonitor:
             return found
         return {}
 
-    def get_vertex_metrics(self, job_id: str, details: dict = None):
+    def get_vertex_metrics(self, job_id: str, details: dict):
         """Get aggregated record/byte counts from Flink job.
 
         Strategy:
@@ -193,12 +188,10 @@ class FlinkCIDMonitor:
           2. Fallback: vertex metrics from /jobs/{jid} (stale, only updates
              at checkpoint boundaries — causes zero deltas in summary)
         """
-        if details is None:
-            details = self.get_job_details(job_id)
         if not details:
             return {}
 
-        totals = {"records_in": 0, "records_out": 0, "bytes_in": 0, "bytes_out": 0, "rate_out": 0.0}
+        totals = {"records_in": 0, "records_out": 0, "bytes_out": 0, "rate_out": 0.0}
 
         # Records come from OPERATOR-scoped metrics, not vertex-level ones. A
         # vertex's numRecordsIn/Out only counts records crossing a vertex
@@ -241,8 +234,6 @@ class FlinkCIDMonitor:
                     totals["records_in"] += val
                 elif "RecordsOut" in mid:
                     totals["records_out"] += val
-                elif "BytesIn" in mid:
-                    totals["bytes_in"] += val
                 elif "BytesOut" in mid:
                     totals["bytes_out"] += val
 
@@ -252,7 +243,6 @@ class FlinkCIDMonitor:
                 m = vertex.get("metrics", {})
                 totals["records_in"] += m.get("read-records", 0)
                 totals["records_out"] += m.get("write-records", 0)
-                totals["bytes_in"] += m.get("read-bytes", 0)
                 totals["bytes_out"] += m.get("write-bytes", 0)
 
         return totals
@@ -289,34 +279,30 @@ class FlinkCIDMonitor:
         vertex_metrics = self.get_vertex_metrics(job_id, details=details)
         cp_stats = self.get_checkpoint_stats(job_id)
         bp = self._check_backpressure(details)
-        uptime = details.get("duration", 0) if details else 0
         return FlinkMetricsSnapshot(
             timestamp=time.time(),
             records_in=vertex_metrics.get("records_in", 0),
             records_out=vertex_metrics.get("records_out", 0),
-            bytes_in=vertex_metrics.get("bytes_in", 0),
             bytes_out=vertex_metrics.get("bytes_out", 0),
             num_checkpoints=cp_stats.get("count", 0),
             failed_checkpoints=cp_stats.get("failed", 0),
             last_checkpoint_duration_ms=cp_stats.get("latest_duration_ms", 0),
-            last_checkpoint_size=cp_stats.get("latest_size", 0),
             is_backpressured=bp,
-            uptime_ms=uptime,
             records_out_per_sec=vertex_metrics.get("rate_out", 0.0),
             job_state=(details or {}).get("state", ""),
         )
 
     # ── Iceberg / Glue Table Stats ──────────────────────────────────
 
-    def capture_table_snapshot(self, table_name: str, since_ts: float = None) -> TableSnapshot:
-        """Capture table stats — dispatches by catalog type.
+    def capture_table_snapshot(self) -> TableSnapshot:
+        """The table's stats now.
 
-        Paimon (hadoop): scan native S3 warehouse directory for file counts/sizes.
-        Iceberg (glue):  read snapshot summary from Glue catalog.
+        Paimon: its native S3 snapshots (file counts and sizes).
+        Iceberg: the current snapshot's summary, through the Glue catalog.
         """
-        if self.catalog_config.get("type") == "hadoop":
-            return self._capture_table_snapshot_paimon_s3(table_name, since_ts=since_ts)
-        return self._capture_table_snapshot_iceberg(table_name)
+        if self.is_paimon:
+            return self._capture_table_snapshot_paimon_s3(self.table)
+        return self._capture_table_snapshot_iceberg(self.table)
 
     def _capture_table_snapshot_iceberg(self, table_name: str) -> TableSnapshot:
         """Capture native Iceberg table stats from Glue catalog snapshot summary."""
@@ -347,9 +333,6 @@ class FlinkCIDMonitor:
                 ts.total_position_deletes = int(s.get("total-position-deletes") or 0)
                 ts.total_equality_deletes = int(s.get("total-equality-deletes") or 0)
                 ts.added_delete_files = int(s.get("added-delete-files") or 0)
-                ts.added_records = int(s.get("added-records") or 0)
-                ts.added_data_files = int(s.get("added-data-files") or 0)
-                ts.added_files_size = int(s.get("added-files-size") or 0)
 
                 # Compute total bytes: if total-files-size is missing,
                 # sum added-files-size across all snapshots (avoids inspect API
@@ -366,9 +349,11 @@ class FlinkCIDMonitor:
                 log.warning("No snapshots found for %s.%s", self.glue_database, table_name)
 
         except Exception as e:
-            log.info("pyiceberg failed for %s.%s (%s), trying Glue API fallback",
-                     self.glue_database, table_name, e)
-            ts = self._capture_table_snapshot_glue(table_name)
+            # No fallback: the Glue table Parameters (numRows, numFiles, ...)
+            # are not set on a Flink-written Iceberg table, so a Glue read only
+            # ever returned zeros. The figures stay empty and the report says so.
+            log.warning("pyiceberg could not load %s.%s: %s", self.glue_database, table_name, e)
+            ts.error = f"pyiceberg could not load {self.glue_database}.{table_name}: {e}"
         return ts
 
     def _paimon_s3(self, table_name: str):
@@ -385,7 +370,7 @@ class FlinkCIDMonitor:
         resp = s3.get_object(Bucket=bucket, Key=key)
         return list(fastavro.reader(io.BytesIO(resp["Body"].read())))
 
-    def _capture_table_snapshot_paimon_s3(self, table_name: str, since_ts: float = None) -> TableSnapshot:
+    def _capture_table_snapshot_paimon_s3(self, table_name: str) -> TableSnapshot:
         """Table stats from Paimon's own metadata, not an S3 listing.
 
         Layout: <warehouse>/<db>.db/<table>/{snapshot/,manifest/,dt=*/bucket-0/}.
@@ -423,6 +408,7 @@ class FlinkCIDMonitor:
         except Exception as e:
             log.warning("Paimon metadata read failed for %s.%s: %s",
                         self.glue_database, table_name, e)
+            ts.error = f"Paimon metadata read failed for {self.glue_database}.{table_name}: {e}"
         return ts
 
     def _paimon_commits(self, table_name: str, start_id: int, end_id: int) -> list:
@@ -514,118 +500,6 @@ class FlinkCIDMonitor:
                         out["bytes"] += e["_FILE"]["_FILE_SIZE"]
         return out
 
-    def _load_table_from_s3(self, table_name: str):
-        """Load Iceberg table from metadata files written by Paimon or Iceberg.
-
-        Two-tier metadata location strategy:
-          1. Glue table Parameters.metadata_location (Paimon hive-catalog storage)
-          2. S3 version-hint.text fallback (pure Hadoop catalog layout)
-
-        Paimon's IcebergHiveMetadataCommitter with storage=hive-catalog writes
-        metadata files to S3 and registers metadata_location in Glue — it does
-        NOT write version-hint.text (that's a Hadoop catalog convention).
-        """
-        region = self.catalog_config.get("s3.region", "us-west-2")
-        metadata_location = None
-
-        # Strategy 1: Read metadata_location from Glue table properties
-        try:
-            if not self.glue_client:
-                self.glue_client = boto3.client("glue", region_name=region)
-            resp = self.glue_client.get_table(
-                DatabaseName=self.glue_database, Name=table_name)
-            params = resp.get("Table", {}).get("Parameters", {})
-            metadata_location = params.get("metadata_location")
-            if metadata_location:
-                log.info("Glue metadata_location for %s.%s: %s",
-                         self.glue_database, table_name, metadata_location)
-        except Exception as e:
-            log.debug("Glue metadata_location lookup failed for %s: %s", table_name, e)
-
-        # Strategy 2: Fall back to version-hint.text (Hadoop catalog layout)
-        if not metadata_location:
-            warehouse = self.catalog_config["warehouse"].rstrip("/")
-            path = warehouse.replace("s3://", "")
-            bucket = path.split("/", 1)[0]
-            prefix = path.split("/", 1)[1] if "/" in path else ""
-            metadata_prefix = f"{prefix}/{self.glue_database}/{table_name}/metadata"
-
-            s3 = boto3.client("s3", region_name=region)
-            try:
-                resp = s3.get_object(Bucket=bucket, Key=f"{metadata_prefix}/version-hint.text")
-                version = resp["Body"].read().decode("utf-8").strip()
-                metadata_location = f"s3://{bucket}/{metadata_prefix}/v{version}.metadata.json"
-            except Exception:
-                raise FileNotFoundError(
-                    f"No metadata for {self.glue_database}.{table_name}: "
-                    f"no Glue metadata_location and no version-hint.text")
-
-        return StaticTable.from_metadata(metadata_location, {"s3.region": region})
-
-    def _scan_table_files(self, tbl, ts: TableSnapshot) -> TableSnapshot:
-        """Read Iceberg manifest entries for file sizes via inspect API.
-
-        Uses tbl.inspect.data_files() which reads manifest entries directly
-        without applying deletes — avoids pyiceberg's 'equality deletes not
-        supported' error that scan().plan_files() triggers on Flink CDC MoR tables.
-        """
-        try:
-            df = tbl.inspect.data_files()
-            total_size = 0
-            total_records = 0
-            total_files = 0
-            if "file_size_in_bytes" in df.column_names:
-                sizes = df.column("file_size_in_bytes").to_pylist()
-                total_size = sum(s for s in sizes if s is not None)
-                total_files = len(sizes)
-            if "record_count" in df.column_names:
-                counts = df.column("record_count").to_pylist()
-                total_records = sum(c for c in counts if c is not None)
-
-            ts.total_size_bytes = total_size
-            if total_records > 0 and ts.total_records == 0:
-                ts.total_records = total_records
-            if total_files > 0 and ts.total_data_files == 0:
-                ts.total_data_files = total_files
-            log.info("Inspect data_files for %s: records=%d files=%d size=%d",
-                     ts.name, total_records, total_files, total_size)
-        except Exception as e:
-            log.warning("Inspect data_files failed for %s: %s", ts.name, e)
-        return ts
-
-    def _capture_table_snapshot_glue(self, table_name: str) -> TableSnapshot:
-        """Fallback for non-Iceberg tables (e.g. Paimon) using boto3 Glue API."""
-        ts = TableSnapshot(name=table_name)
-        try:
-            if not self.glue_client:
-                region = self.catalog_config.get("region_name",
-                         self.catalog_config.get("s3.region", "us-west-2"))
-                self.glue_client = boto3.client("glue", region_name=region)
-
-            resp = self.glue_client.get_table(
-                DatabaseName=self.glue_database, Name=table_name
-            )
-            tbl = resp.get("Table", {})
-            params = tbl.get("Parameters", {})
-
-            ts.total_records = int(params.get("numRows") or params.get("recordCount") or 0)
-            ts.total_data_files = int(params.get("numFiles") or 0)
-            ts.total_size_bytes = int(params.get("totalSize") or 0)
-            ts.snapshot_count = int(params.get("numSnapshots") or
-                                   params.get("snapshot.num-retained.max") or 0)
-            ts.current_snapshot_id = int(params.get("snapshot.id") or 0) or None
-
-            log.info("Glue fallback for %s.%s: records=%d files=%d size=%d",
-                     self.glue_database, table_name,
-                     ts.total_records, ts.total_data_files, ts.total_size_bytes)
-        except Exception as e:
-            log.warning("Glue fallback also failed for %s.%s: %s",
-                        self.glue_database, table_name, e)
-        return ts
-
-    def capture_all_table_snapshots(self, since_ts: float = None) -> dict[str, TableSnapshot]:
-        return {t: self.capture_table_snapshot(t, since_ts=since_ts) for t in self.tables}
-
     # ── Monitoring Session ──────────────────────────────────────────
 
     def generate_report(self, label: str, monitor_duration: int = 70,
@@ -655,8 +529,8 @@ class FlinkCIDMonitor:
 
         log.info("Job: %s [%s] parallelism=%d", report.job_name, job_id, report.parallelism)
 
-        table_start = self.capture_all_table_snapshots()
-        report.table_snapshots_start = table_start
+        table_start = self.capture_table_snapshot()
+        report.table_snapshot_start = table_start
         monitor_start_ts = time.time()
 
         flink_snapshots = []
@@ -676,13 +550,15 @@ class FlinkCIDMonitor:
             else:
                 break
 
-        report.flink_snapshots = flink_snapshots
         report.end_time = datetime.utcnow().isoformat() + "Z"
 
         # Reset cached catalog to force fresh metadata from Glue for end capture
         self._catalog = None
-        table_end = self.capture_all_table_snapshots(since_ts=monitor_start_ts)
-        report.table_snapshots_end = table_end
+        table_end = self.capture_table_snapshot()
+        report.table_snapshot_end = table_end
+        for ts in (table_start, table_end):
+            if ts.error and ts.error not in report.errors:
+                report.errors.append(ts.error)
 
         sample_dt = report.duration_seconds
         valid = [s for s in flink_snapshots if s.records_out > 0 or s.num_checkpoints > 0]
@@ -722,63 +598,55 @@ class FlinkCIDMonitor:
 
         # Table-level deltas: use max(0, delta) because snapshot expiration
         # can remove old snapshots between start/end, causing negative raw deltas
-        for t in self.tables:
-            s, e = table_start.get(t), table_end.get(t)
-            if s and e:
-                # Paimon: snapshot IDs are monotonically increasing (1,2,3,...) but
-                # snapshot_count is capped by retention (e.g. always 5) → use ID delta.
-                # Iceberg: snapshot IDs are RANDOM 64-bit ints → use snapshot_count delta.
-                is_paimon = self.catalog_config.get("type") == "hadoop"
-                if is_paimon and s.current_snapshot_id is not None and e.current_snapshot_id is not None:
-                    report.total_new_snapshots += max(0, e.current_snapshot_id - s.current_snapshot_id)
-                else:
-                    report.total_new_snapshots += max(0, e.snapshot_count - s.snapshot_count)
-                # Live-file delta on both formats: files added minus files
-                # compaction removed. Iceberg's Flink sink never compacts, so
-                # there it equals files added.
-                report.total_new_data_files += max(0, e.total_data_files - s.total_data_files)
-                report.total_new_delete_files += max(0, e.total_delete_files - s.total_delete_files)
-                report.total_new_position_deletes += max(0, e.total_position_deletes - s.total_position_deletes)
-                report.total_new_equality_deletes += max(0, e.total_equality_deletes - s.total_equality_deletes)
-                report.total_new_records_in_tables += max(0, e.total_records - s.total_records)
-                # Paimon: bytes of files added by APPEND commits in the window,
-                # read from each commit's delta manifests. Iceberg: live-size
-                # delta from the snapshot summary (no compaction to subtract).
-                if is_paimon and s.current_snapshot_id is not None and e.current_snapshot_id is not None:
-                    st = self._paimon_append_stats(t, s.current_snapshot_id, e.current_snapshot_id)
-                    report.total_new_bytes_in_tables += st["bytes"]
-                    report.total_bytes_processed = st["bytes"]
-                    if sample_dt > 0:  # same divisor as rec/s and Iceberg's bytes/s
-                        report.throughput_bytes_per_sec = st["bytes"] / sample_dt
-                    log.info("Paimon %s APPEND commits in window: %d, +%d files, +%d rows, +%d bytes",
-                             t, st["commits"], st["files"], st["records"], st["bytes"])
-                else:
-                    report.total_new_bytes_in_tables += max(0, e.total_size_bytes - s.total_size_bytes)
-                log.info("Table %s (v%d): records %d→%d files %d→%d deletes %d→%d "
-                         "pos_del %d→%d eq_del %d→%d snapshots %d→%d snap_id %s→%s",
-                         t, e.format_version, s.total_records, e.total_records,
-                         s.total_data_files, e.total_data_files,
-                         s.total_delete_files, e.total_delete_files,
-                         s.total_position_deletes, e.total_position_deletes,
-                         s.total_equality_deletes, e.total_equality_deletes,
-                         s.snapshot_count, e.snapshot_count,
-                         s.current_snapshot_id, e.current_snapshot_id)
+        t, s, e = self.table, table_start, table_end
+        # Paimon: snapshot IDs are monotonically increasing (1,2,3,...) but
+        # snapshot_count is capped by retention (e.g. always 5) → use ID delta.
+        # Iceberg: snapshot IDs are RANDOM 64-bit ints → use snapshot_count delta.
+        if self.is_paimon and s.current_snapshot_id is not None and e.current_snapshot_id is not None:
+            report.total_new_snapshots += max(0, e.current_snapshot_id - s.current_snapshot_id)
+        else:
+            report.total_new_snapshots += max(0, e.snapshot_count - s.snapshot_count)
+        # Live-file delta on both formats: files added minus files
+        # compaction removed. Iceberg's Flink sink never compacts, so
+        # there it equals files added.
+        report.total_new_data_files += max(0, e.total_data_files - s.total_data_files)
+        report.total_new_delete_files += max(0, e.total_delete_files - s.total_delete_files)
+        report.total_new_position_deletes += max(0, e.total_position_deletes - s.total_position_deletes)
+        report.total_new_equality_deletes += max(0, e.total_equality_deletes - s.total_equality_deletes)
+        report.total_new_records_in_tables += max(0, e.total_records - s.total_records)
+        # Paimon: bytes of files added by APPEND commits in the window,
+        # read from each commit's delta manifests. Iceberg: live-size
+        # delta from the snapshot summary (no compaction to subtract).
+        if self.is_paimon and s.current_snapshot_id is not None and e.current_snapshot_id is not None:
+            st = self._paimon_append_stats(t, s.current_snapshot_id, e.current_snapshot_id)
+            report.total_new_bytes_in_tables += st["bytes"]
+            report.total_bytes_processed = st["bytes"]
+            if sample_dt > 0:  # same divisor as rec/s and Iceberg's bytes/s
+                report.throughput_bytes_per_sec = st["bytes"] / sample_dt
+            log.info("Paimon %s APPEND commits in window: %d, +%d files, +%d rows, +%d bytes",
+                     t, st["commits"], st["files"], st["records"], st["bytes"])
+        else:
+            report.total_new_bytes_in_tables += max(0, e.total_size_bytes - s.total_size_bytes)
+        log.info("Table %s (v%d): records %d→%d files %d→%d deletes %d→%d "
+                 "pos_del %d→%d eq_del %d→%d snapshots %d→%d snap_id %s→%s",
+                 t, e.format_version, s.total_records, e.total_records,
+                 s.total_data_files, e.total_data_files,
+                 s.total_delete_files, e.total_delete_files,
+                 s.total_position_deletes, e.total_position_deletes,
+                 s.total_equality_deletes, e.total_equality_deletes,
+                 s.snapshot_count, e.snapshot_count,
+                 s.current_snapshot_id, e.current_snapshot_id)
 
         # Commit-based rows/s: the headline. Rows each commit added / time
         # between commits, from the table's own history, so no counter caching,
         # no restart artefacts (replayed rows are not committed twice).
         window_end = time.time()
-        for t in self.tables:
-            s, e = table_start.get(t), table_end.get(t)
-            if self.catalog_config.get("type") == "hadoop":
-                commits = (self._paimon_commits(t, s.current_snapshot_id, e.current_snapshot_id)
-                           if s and e and s.current_snapshot_id is not None and e.current_snapshot_id is not None
-                           else [])
-            else:
-                commits = self._iceberg_commits(t)
-            rate, n = self._commit_rate(commits, monitor_start_ts, window_end)
-            report.commit_records_per_sec += rate
-            report.commits_in_window += n
+        if self.is_paimon:
+            commits = (self._paimon_commits(t, s.current_snapshot_id, e.current_snapshot_id)
+                       if s.current_snapshot_id is not None and e.current_snapshot_id is not None else [])
+        else:
+            commits = self._iceberg_commits(t)
+        report.commit_records_per_sec, report.commits_in_window = self._commit_rate(commits, monitor_start_ts, window_end)
         if report.commit_records_per_sec > 0:
             report.throughput_records_per_sec, report.throughput_source = report.commit_records_per_sec, "commits"
         elif report.meter_records_per_sec > 0:
@@ -922,13 +790,12 @@ class FlinkCIDMonitor:
             "total_new_records_in_tables": report.total_new_records_in_tables,
             "total_new_bytes_in_tables": report.total_new_bytes_in_tables,
             "errors": report.errors,
+            "table": self.table,
             "table_details": {},
         }
-        for t in self.tables:
-            s = report.table_snapshots_start.get(t)
-            e = report.table_snapshots_end.get(t)
-            if s and e:
-                d["table_details"][t] = {
+        s, e = report.table_snapshot_start, report.table_snapshot_end
+        if s and e:
+            d["table_details"] = {
                     "format_version": e.format_version,
                     "snapshots_delta": e.snapshot_count - s.snapshot_count,
                     "records_delta": e.total_records - s.total_records,

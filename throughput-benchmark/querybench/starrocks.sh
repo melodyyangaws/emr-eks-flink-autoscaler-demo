@@ -15,30 +15,33 @@ set -uo pipefail
 #
 # Hot runs first, against RUNNING writers (it reads the last 30 s of data);
 # then the writers are stopped for snapshot (live writers cost ~89x there).
-# Writers are left stopped; resume with ../build-deploy-cid.sh.
+# Writers are left stopped; resume with flinkwriter/run.sh.
 #
 #   ./starrocks.sh                      both suites, all arms, WARMUP=1 RUNS=3
 #   SUITE=hot ./starrocks.sh            one suite (hot|snapshot)
 #   RUNS=5 ./starrocks.sh
 #   ARMS="paimon iceberg" ./starrocks.sh    e.g. when ICEBERG_COMPAT is off
 #   SUSPEND_WRITERS=0 ./starrocks.sh    do not touch the writers
+#   ./starrocks.sh catalogs             only create the arms' catalogs (TEST_SUFFIX's
+#                                       set) and check each reads a row; hot-interleave.sh
+#                                       runs it before counting its window
 #
 # Output: $OUT_DIR/starrocks-<STAMP>.csv ($QB_CSV_HEADER, one row per arm x
 # query; `#` lines carry writer state and partition row counts per suite).
 
 # shellcheck disable=SC1091
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/querybench.sh"
 
-AUDIT="${AUDIT:-/opt/starrocks/fe/log/fe.audit.log}"
+AUDIT="/opt/starrocks/fe/log/fe.audit.log"
 ARMS="${ARMS:-paimon pmn_as_iceberg iceberg}"
-# Catalogs that name a warehouse path get the CID_SUFFIX too (lib.sh), so each
+# Catalogs that name a warehouse path get the TEST_SUFFIX too (lib/querybench.sh), so each
 # set of tables has its own; the Glue Iceberg catalog finds either set by database.
-PAIMON_CATALOG="${PAIMON_CATALOG:-cid_paimon_catalog${QB_DB_SUFFIX}}"
-ICEBERG_CATALOG="${ICEBERG_CATALOG:-cid_iceberg_catalog}"
+PAIMON_CATALOG="cid_paimon_catalog${QB_DB_SUFFIX}"
+ICEBERG_CATALOG="cid_iceberg_catalog"
 # hadoop, not glue: Paimon registers its export in Glue with PaimonStorageHandler,
 # which StarRocks' Glue Iceberg catalog cannot load.
-PMNICE_CATALOG="${PMNICE_CATALOG:-cid_pmn_as_ice${QB_DB_SUFFIX}}"
-PMNICE_WAREHOUSE="${PMNICE_WAREHOUSE:-${PAIMON_WAREHOUSE}/iceberg/}"
+PMNICE_CATALOG="cid_pmn_as_ice${QB_DB_SUFFIX}"
+PMNICE_WAREHOUSE="${PAIMON_WAREHOUSE}/iceberg/"
 CSV="${OUT_DIR}/starrocks-${STAMP}.csv"
 # Unique per run: a killed earlier run's markers in the same log must never match.
 RUN_ID="${STAMP}_$$"
@@ -88,21 +91,12 @@ build_script() {   # <arm> <suite> <rendered sql>
     echo "USE ${t#* };"
     # Per-suite cap shared with DuckDB, so a timeout means the same on both.
     echo "SET query_timeout = $(qb_query_timeout "$2");"
-    # Datacache ON by default (SR_DATACACHE=1): warm-vs-warm with duckdb-warm.sh,
-    # whose server keeps a block cache of the same memory size. Both start empty
-    # (clear both before a run) and both are filled by the same WARMUP pass, so a
-    # cache hit is the engine's, on both sides. SR_DATACACHE=0 is the old
-    # cold-read mode (every pass from S3: a fixed partition is otherwise served
-    # from cache after pass 0, ScanBytes=0, 70s -> 2s); pair it with the cold
-    # DuckDB harness (the cold duckdb.sh was removed 2026-10-18), never with duckdb-warm.sh.
-    if [[ "${SR_DATACACHE:-1}" == 0 ]]; then
-        echo "SET enable_scan_datacache = false;"
-        echo "SET enable_datacache_sharing = false;"
-        echo "SET populate_datacache_mode = 'never';"
-    else
-        echo "SET enable_scan_datacache = true;"
-        echo "SET populate_datacache_mode = 'auto';"
-    fi
+    # Datacache ON (StarRocks' default): warm-vs-warm with duckdb-warm.sh, whose
+    # server keeps a block cache sized like it. Both start empty (clear-caches.sh,
+    # before every test) and both are filled by the same WARMUP pass, so a cache
+    # hit is the engine's, on both sides.
+    echo "SET enable_scan_datacache = true;"
+    echo "SET populate_datacache_mode = 'auto';"
     # Spill: wide aggregates and COUNT(DISTINCT) can reach the memory ceiling.
     echo "SET enable_spill = true;"
     if [[ "$2" == snapshot ]]; then
@@ -292,7 +286,24 @@ run_arm_in_pod() {   # <arm> <suite> <rendered sql>
         (( $(date +%s) - t0 < limit )) || qb_die "${2}: arm ${1} still running after ${limit}s"
     done
     qb_log "${2}: arm ${1} done in $(( $(date +%s) - t0 ))s (mysql exit ${rc})"
+    save_first_rows "$1" "$2" "$f"
     kubectl exec -n "$NAMESPACE" "$FE_POD" -- sh -c "rm -f ${f}.sql ${f}.out ${f}.rc" >/dev/null 2>&1 || true
+}
+
+# Each query's first result row on its last pass -> ${CSV%.csv}-firstrows.csv
+# (arm,suite,query,first_row, fields |-joined), the same file duckdb-warm.sh
+# writes, so summary/summarize.py can check every arm read the same rows (S1's
+# and S4's counts). With -N -B the line after a query's marker is its first row.
+save_first_rows() {   # <arm> <suite> <pod file stem>
+    local out names
+    out=$(kubectl exec -n "$NAMESPACE" "$FE_POD" -- cat "${3}.out" 2>/dev/null) || return 0
+    names=$(for q in $(qb_query_files "$2"); do qb_query_name "$q"; done | tr '\n' ' ')
+    awk -v run="MARK_${RUN_ID}_${1}_" -v arm="$1" -v suite="$2" -v names="$names" '
+        BEGIN { split(names, nm, " ") }
+        index($0, run) == 1 { split(substr($0, length(run) + 1), pq, "_"); qi = pq[2]; want = 1; next }
+        want { gsub(/\t/, "|"); first[qi] = $0; want = 0 }
+        END { for (q in first) print arm "," suite "," nm[q + 1] "," first[q] }
+    ' <<<"$out" >> "${CSV%.csv}-firstrows.csv"
 }
 
 # ── One suite ───────────────────────────────────────────────────────────────
@@ -362,7 +373,7 @@ main() {
 
     for arm in $ARMS; do ensure_catalog "$arm"; done
     qb_assert_alone starrocks
-    qb_log "run ${RUN_ID}: suites=$(qb_suites) arms=${ARMS} runs=${RUNS}+${WARMUP} warmup datacache=$([[ "${SR_DATACACHE:-1}" == 0 ]] && echo off || echo on)"
+    qb_log "run ${RUN_ID}: suites=$(qb_suites) arms=${ARMS} runs=${RUNS}+${WARMUP} warmup"
 
     for s in $(qb_suites); do
         # qb_start_suite: snapshot stops the writers, then the window is
@@ -382,4 +393,10 @@ main() {
 }
 
 # Sourced (e.g. to test a function) -> define only.
-[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if [[ "${1:-}" == catalogs ]]; then
+        for arm in $ARMS; do ensure_catalog "$arm"; qb_log "catalog for ${arm}: ok"; done
+    else
+        main "$@"
+    fi
+fi

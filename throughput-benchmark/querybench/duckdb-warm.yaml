@@ -1,21 +1,20 @@
-# Warm DuckDB server for one suite, rendered by duckdb-warm.sh (envsubst): a
+# Warm DuckDB server for both suites, rendered by duckdb-warm.sh (envsubst): a
 # long-lived pod holding one DuckDB process (duckdb_warm_server.py), the
-# counterpart of the always-up StarRocks cluster. Same node pins and CPU/RAM as
-# the old cold duckdb-job.yaml (removed 2026-10-18), so only "warm vs cold" changed, not the hardware.
+# counterpart of the always-up StarRocks cluster: same total CPU/RAM as its 3 BEs.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${NAME}
   namespace: ${NAMESPACE}
-  labels: {app: duckdb-warm, suite: "${SUITE}"}
+  labels: {app: duckdb-warm}
 spec:
   replicas: 1
-  strategy: {type: Recreate}                # never two servers for one suite
+  strategy: {type: Recreate}                # never two servers at once
   selector:
-    matchLabels: {app: duckdb-warm, suite: "${SUITE}"}
+    matchLabels: {app: duckdb-warm}
   template:
     metadata:
-      labels: {app: duckdb-warm, suite: "${SUITE}"}
+      labels: {app: duckdb-warm}
       annotations:
         karpenter.sh/do-not-disrupt: "true" # consolidation would drop the warm cache
     spec:
@@ -51,7 +50,6 @@ spec:
         - {name: AWS_REGION,           value: "${AWS_REGION}"}
         - {name: AWS_DEFAULT_REGION,   value: "${AWS_REGION}"}   # awscli 1.x reads this one
         - {name: BUCKET_NAME,          value: "${BUCKET_NAME}"}
-        - {name: SUITE,                value: "${SUITE}"}
         - {name: ICEBERG_DB,           value: "${ICEBERG_DB}"}
         - {name: TABLE_NAME,           value: "${TABLE_NAME}"}
         - {name: PMNICE_TABLE_ROOT,    value: "${PMNICE_TABLE_ROOT}"}
