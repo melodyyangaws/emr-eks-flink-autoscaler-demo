@@ -22,7 +22,7 @@ cd emr-eks-flink-autoscaler-demo/throughput-benchmark
 # start the GenAI tool
 claude
 ```
-then ask:
+Ask to start the test from end to end (Flink writer throughput + Query/read performance):
 > follow the readme of this project to start all the test
 
 Ask the test progress at any time:
@@ -40,7 +40,7 @@ shared state: a new `TEST_SUFFIX`, or purging leftover SQS messages. Create
 | 2 | Fill the tables | — | the writers commit while the tables grow | ~30 min |
 | 2b | Query engines | `kubectl apply -f engine-deploy/gp3-fast-sc.yaml`, then `./engine-deploy/deploy-starrocks.sh install`, `./engine-deploy/deploy-duckdb-warm.sh up` | only if StarRocks or DuckDB long-runner server is missing: the fast gp3 disk classes first, then the engines (see [Query engines](#query-engines-before-a-query-test)); | ~5–10 min (new nodes) |
 | 3 | Hot query test | `./bench.sh hot` | DuckDB up, caches emptied, then 1 warm-up + 3 timed passes while the writers run | ~5 min setup + ~1.5 h test |
-| 4 | Snapshot query test | `./bench.sh snapshot` | waits for the hot test complete, stops the writers, compacts both tables once (`COMPACT_BEFORE_SNAPSHOT=true`, [Compaction](#compaction-before-the-snapshot-test)), empties caches, runs StarRocks (3 arms) then DuckDB (2 arms) | compaction 39 min (parallelism 320, 2026-10-22; ~55 min expected at the default 160) + ~6 min stop/caches + StarRocks 2.6 h + DuckDB 1.8 h = **~5.3 h** (2026-10-23: 10-min S1–S3 / 1-min S4 windows, BEs 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi). With the old 25 / 3-min windows: StarRocks ~10.5 h, DuckDB ~6 h |
+| 4 | Snapshot query test | `./bench.sh snapshot` | waits for the hot test complete, stops the writers, compacts both tables once (`COMPACT_BEFORE_SNAPSHOT=true`, [Compaction](#compaction-before-the-snapshot-test)), empties caches, runs StarRocks (3 arms) then DuckDB (2 arms) | **~4.6 h** (run 2026-10-23: compacted tables, 10-min S1–S3 / 1-min S4, BEs 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi): ~6 min stopping writers and emptying caches, StarRocks 2.6 h (`paimon` 38 / `pmn_as_iceberg` 40 / `iceberg` 81 min), DuckDB 1.8 h (`paimon` 56 / `iceberg` 50 min); each arm = 1 warm-up + 3 timed passes. Plus, once, the compaction: 39 min at parallelism 320 (~55 min expected at the default 160). DuckDB's scan-profiling pass (since 2026-10-24) adds one untimed cold pass per DuckDB arm, roughly +15–25 min each. Before (uncompacted, 25 / 3-min windows, 2026-10-21): ~16.5 h |
 | 5 | Summary | `./bench.sh summary` | pulls the results from S3 into `bench-results/BENCH-SUMMARY-<session>.md` | ~3 min |
 
 A full session takes about 7.5 h, most of it the snapshot test (about 19 h before the 2026-10-23 windows). Steps 3 and 4

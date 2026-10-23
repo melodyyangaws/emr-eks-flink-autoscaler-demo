@@ -171,6 +171,15 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
 
 ### DuckDB specifics (`duckdb-warm.sh`; the server: `../engine-deploy/deploy-duckdb-warm.sh`, `duckdb_warm_server.py`)
 
+- **Data scanned** (since 2026-10-24): after an arm's timed passes, each query runs
+  once more, untimed, as `EXPLAIN ANALYZE` with the block cache bypassed. Its HTTPFS
+  `in:` bytes are what the query reads from S3, the counterpart of StarRocks'
+  `ScanBytes`, and go to the CSV's `scan_bytes`. `scan_rows` is the rows the scan
+  returns after the filters pushed into it, not StarRocks' rows-read-before-filters.
+  DuckDB 1.5.6's JSON profile can't give either (its byte/row counters miss Parquet
+  reads, and `custom_profiling_settings` crashes). Runs before 2026-10-24 have no
+  DuckDB scan figures.
+
 - One DuckDB connection for the pod's life; one query at a time.
 - **Pinned metadata (`PIN_SNAPSHOT=1`):** each query reads a copy of the
   table's `metadata.json`. Iceberg keeps only a few, so the live one 404s mid-scan.
@@ -234,6 +243,7 @@ rendering stops the run. `-- bench:` flags: `allow-zero-rows`,
 | `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` | `84049MiB` (82.08 GiB) / `27` | 90% of the 114 Gi pod minus the 22.03 GB cache, the same shares as a BE's `mem_limit` |
 | `DUCKDB_VERSION` | `1.5.6` | DuckDB 2.0 has no stable release yet |
 | `CACHE_MODE` | `on_disk` | `in_mem` = memory cache only |
+| `PROFILE_SCAN` | `1` | DuckDB's scan profile: one untimed pass per arm after the timed ones (hot: after the last pass); `0` skips it |
 
 ---
 
@@ -297,7 +307,7 @@ Median of the timed passes, seconds:
 | S3 | 14.0 | 46.6 | 49.5 | 139.2 | 120.2 |
 | S4 | 280.1 | 244.5 | 314.2 | 245.6 | 219.5 |
 
-Data scanned per query, StarRocks (GB; DuckDB does not report it):
+Data scanned per query, StarRocks (GB; DuckDB recorded none until 2026-10-24, see DuckDB specifics):
 
 | Query | SR `paimon` | SR `pmn_as_iceberg` | SR `iceberg` |
 |---|---|---|---|

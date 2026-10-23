@@ -109,6 +109,28 @@ EOF
     done
 }
 
+# The data one query scans (the server's profile_query): bytes from S3 with the
+# block cache bypassed, and rows out of the scan. Untimed, after the arm's timed
+# passes, so it changes no measured time. "<bytes> <rows>" on stdout, or nothing.
+profile_pass() {   # $1 suite, $2 arm, $3 query file, $4 rendered sql file
+    local s="$1" arm="$2" f="$3" body id j deadline to pin=""
+    to=$(qb_query_timeout "$s")
+    [[ "$arm" == iceberg ]] && pin="${DUCK_PIN_ICEBERG:-}" || pin="${DUCK_PIN_PAIMON:-}"
+    body=$(python3 -c 'import json, sys; d = {"sql": open(sys.argv[1]).read(), "suite": sys.argv[2], "arm": sys.argv[3], "name": sys.argv[4], "timeout_s": int(sys.argv[5]), "profile": True}
+if sys.argv[6]: d["metadata"] = sys.argv[6]
+print(json.dumps(d))' "$4" "$s" "$arm" "$(qb_query_name "$f")" "$to" "$pin")
+    id=$(api POST /query "$body" | jget id 2>/dev/null || true)
+    [[ -n "$id" ]] || return 0
+    deadline=$(( $(date +%s) + to + 300 ))
+    while (( $(date +%s) < deadline )); do
+        sleep "$POLL_S"
+        j=$(api GET "/job/${id}") || continue
+        [[ "$(jget state <<<"$j" 2>/dev/null)" == done ]] || continue
+        [[ "$(jget status <<<"$j")" == OK ]] && echo "$(jget scan_bytes <<<"$j") $(jget scan_rows <<<"$j")"
+        return 0
+    done
+}
+
 restart_server() {
     kubectl rollout restart -n "$NAMESPACE" "deploy/${NAME}" >/dev/null
     kubectl rollout status -n "$NAMESPACE" "deploy/${NAME}" --timeout="${READY_GRACE}s" >/dev/null \
@@ -153,15 +175,25 @@ EOF
             fi
         done
     done
+    # One untimed profiling pass, after the timed ones (PROFILE_SCAN=0 skips it).
+    if [[ "${PROFILE_SCAN:-1}" != 0 ]]; then
+        n=0
+        for f in $files; do
+            n=$((n + 1)); [[ -f "${q}/${n}.bad" ]] && continue
+            profile_pass "$s" "$arm" "$f" "${dir}/$(printf '%02d' "$n").sql" > "${q}/${n}.scan"
+            qb_log "[${arm}/${s}] $(qb_query_name "$f") profile: $(awk '{printf "%.1f GB, %s rows out of the scan", $1/1e9, $2}' "${q}/${n}.scan")"
+        done
+    fi
     n=0
     for f in $files; do
         n=$((n + 1)); name=$(qb_query_name "$f")
-        local med="" st="OK" rr=0
+        local med="" st="OK" rr=0 sb="" srr=""
         [[ -f "${q}/${n}.times" ]] && med=$(qb_median < "${q}/${n}.times")
         [[ -f "${q}/${n}.bad" ]] && st=$(<"${q}/${n}.bad")
         [[ -z "$med" && "$st" == OK ]] && st=ERROR
         [[ -f "${q}/${n}.last" ]] && rr=$(jget result_rows < "${q}/${n}.last")
-        echo "${STAMP},duckdb_warm,${arm},${s},${name},${st},${med},${rr},," >> "$rows"
+        [[ -s "${q}/${n}.scan" ]] && read -r sb srr < "${q}/${n}.scan"
+        echo "${STAMP},duckdb_warm,${arm},${s},${name},${st},${med},${rr},${srr},${sb}" >> "$rows"
         # The last OK pass's first row, as starrocks.sh records it: summary/
         # summarize.py checks every arm read the same rows (S1's, S4's counts).
         [[ -f "${q}/${n}.last" ]] && echo "${arm},${s},${name},$(jget first_row < "${q}/${n}.last")" >> "${CSV%.csv}-firstrows.csv"

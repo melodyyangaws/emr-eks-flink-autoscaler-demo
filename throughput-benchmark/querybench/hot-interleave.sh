@@ -116,6 +116,9 @@ for (( pass = 0; pass <= RUNS; pass++ )); do
     STAMP="${BASE}-p${pass}" RUNS=1 WARMUP=0 "${HERE}/starrocks.sh" >> "${OUT_DIR}/hot-interleave-${BASE}.log" 2>&1 \
         || qb_log "WARNING: StarRocks pass ${pass} exited non-zero (see the log)"
     qb_log "pass ${pass}/${RUNS}: DuckDB"
+    # The scan profile (untimed, after the pass) on the last pass only: the
+    # medians take their scan_rows / scan_bytes from it.
+    PROFILE_SCAN=$(( pass == RUNS && ${PROFILE_SCAN:-1} != 0 ? 1 : 0 )) \
     STAMP="${BASE}-p${pass}" RUNS=1 WARMUP=0 "${HERE}/duckdb-warm.sh" run >> "${OUT_DIR}/hot-interleave-${BASE}.log" 2>&1 \
         || qb_log "WARNING: DuckDB pass ${pass} exited non-zero (see the log)"
 done

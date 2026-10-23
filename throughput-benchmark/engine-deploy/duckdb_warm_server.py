@@ -32,11 +32,15 @@ HTTP, stdlib only; every call returns JSON:
   POST /query             {suite, arm, name, sql, runs, warmup, timeout_s,
                            allow_zero_rows, leading_col_is_label} -> {id}
   GET  /job/<id>          progress, then the result
+  POST /query {..., profile: true}
+                          once, untimed, cache bypassed: scan_bytes / scan_rows
+                          (profile_query)
   POST /clear_cache       empties the block cache (a cold start on demand)
 Queries come back by polling /job, because a snapshot query can run for half an
 hour and a port-forward drops idle connections long before that.
 """
 import json
+import re
 import os
 import statistics
 import subprocess
@@ -251,10 +255,56 @@ def run_query(job, q):
                first_row=first[:200], finished=time.time())
 
 
+_UNITS = {"bytes": 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30, "TiB": 2**40}
+
+
+def profile_query(job, q):
+    """The data a query scans, for the summary's "scanned GB (rows)" tables
+    (StarRocks' audit log has ScanBytes / ScanRows). Run once, untimed, after an
+    arm's timed passes (duckdb-warm.sh), as EXPLAIN ANALYZE with cache_httpfs
+    bypassed (cache_httpfs_type='noop'): the HTTPFS "in:" counter then counts
+    every byte the query reads from S3, where through the cache it counts only
+    misses (0 when warm) and in 512 KB blocks. The cache type is restored after,
+    which keeps the disk cache. DuckDB 1.5.6's JSON profile has no usable
+    counter for this: its total_bytes_read and rows_scanned do not count
+    Parquet reads, and custom_profiling_settings crashes (2026-10-24).
+
+    scan_rows: the rows the TABLE_SCAN operators return, i.e. AFTER the filters
+    DuckDB pushes into the scan. StarRocks' ScanRows counts rows read BEFORE its
+    filters, so the two row counts are not the same quantity; the bytes are."""
+    job.update(state="running", started=time.time())
+    table = table_expr(q["arm"], q.get("metadata"))
+    sql = q["sql"].replace("${TABLE}", table)
+    refresh_secret()
+    cur = con.cursor()
+    timer = threading.Timer(q["timeout_s"], cur.interrupt)
+    try:
+        cur.execute("SET cache_httpfs_type='noop'")
+        timer.start()
+        t0 = time.perf_counter()
+        txt = "\n".join(r[1] for r in cur.execute("EXPLAIN ANALYZE " + sql).fetchall())
+        ms = int((time.perf_counter() - t0) * 1000)
+    except duckdb.InterruptException:
+        job.update(state="done", status="TIMEOUT", finished=time.time()); return
+    finally:
+        timer.cancel()
+        try:
+            cur.execute("SET cache_httpfs_type='%s'" % CACHE_MODE)
+        finally:
+            cur.close()
+    m = re.search(r"\bin:\s*([\d.]+)\s*(bytes|KiB|MiB|GiB|TiB)", txt)
+    scan_bytes = int(float(m.group(1)) * _UNITS[m.group(2)]) if m else None
+    rows = [int(r.replace(",", "")) for r in re.findall(r"TABLE_SCAN[\s\S]*?([\d,]+) rows", txt)]
+    job.update(state="done", status="OK" if scan_bytes is not None else "ERROR",
+               scan_bytes=scan_bytes, scan_rows=sum(rows) if rows else None, profile_ms=ms,
+               table=table, finished=time.time(),
+               **({} if scan_bytes is not None else {"error": "no HTTPFS 'in:' line in EXPLAIN ANALYZE"}))
+
+
 def worker(job, q):
     with lock:
         try:
-            run_query(job, q)
+            (profile_query if q.get("profile") else run_query)(job, q)
         except Exception:
             job.update(state="done", status="ERROR", error=traceback.format_exc()[-400:])
 

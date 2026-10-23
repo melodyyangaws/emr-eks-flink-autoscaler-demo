@@ -240,11 +240,21 @@ def query_section(num, title, suite, stamp, results, F):
             wins[best] = wins.get(best, 0) + 1
         L += [f"| {q} | " + " | ".join((f"**{cell(out.get((*x, q)))}**" if x == best else cell(out.get((*x, q)))) for x in arms) + " |"]
     L += [""]
-    sr = [x for x in arms if x[0] == "starrocks"]
-    if any(out.get((*x, q), {}).get("scan_bytes") for x in sr for q in qs):
-        L += ["StarRocks scanned GB (rows):", "", "| Query | " + " | ".join(label(*x) for x in sr) + " |", "|---" * (len(sr) + 1) + "|"]
-        gb = lambda r: f"{int(r['scan_bytes']) / 1e9:,.1f} ({int(r['scan_rows']) / 1e6:,.0f}M)" if r and r.get("scan_bytes") else "-"
-        L += [f"| {q} | " + " | ".join(gb(out.get((*x, q))) for x in sr) + " |" for q in qs] + [""]
+    # Every arm with scan figures: StarRocks from its audit log; DuckDB from the
+    # untimed profiling pass after each arm (duckdb-warm.sh, since 2026-10-24).
+    has = lambda x: any(out.get((*x, q), {}).get("scan_bytes") for q in qs)
+    sc = [x for x in arms if has(x)]
+    if sc:
+        duck = any(x[0] != "starrocks" for x in sc)
+        L += [("Scanned GB (rows):" if duck else "StarRocks scanned GB (rows):"), "",
+              "| Query | " + " | ".join(label(*x) for x in sc) + " |", "|---" * (len(sc) + 1) + "|"]
+        rows = lambda r: f" ({int(r['scan_rows']) / 1e6:,.0f}M)" if r.get("scan_rows") else ""
+        gb = lambda r: f"{int(r['scan_bytes']) / 1e9:,.1f}{rows(r)}" if r and r.get("scan_bytes") else "-"
+        L += [f"| {q} | " + " | ".join(gb(out.get((*x, q))) for x in sc) + " |" for q in qs] + [""]
+        if duck:
+            L += ["GB: bytes read from S3 (StarRocks: `ScanBytes`, cache hits included; DuckDB: one untimed "
+                  "pass with its block cache bypassed). Rows are not the same quantity: StarRocks counts rows read "
+                  "before its filters, DuckDB the rows its scan returns after the filters pushed into it.", ""]
     if bad:
         L += ["**Passes not OK** (a query not OK on every pass has no median):", ""] + [f"- {b}" for b in bad] + [""]
 
