@@ -15,11 +15,11 @@ A **flexible, SQL-driven** approach to Flink CDC that eliminates the need to reb
 
 > **Two things here are easy to get wrong, so read them before Quick Start:**
 >
-> 1. The **SQL scripts** come from S3. The **executor script itself
->    (`flink-cdc-executor.py`) does not** — it is mounted from the
->    `flink-cdc-executor-py` ConfigMap, and nothing in
->    `build-deploy-generic.sh` creates or refreshes that ConfigMap. See
->    [The executor script comes from a ConfigMap](#the-executor-script-comes-from-a-configmap).
+> 1. Both the **SQL scripts** and the **executor script itself
+>    (`flink-cdc-executor.py`)** come from S3, uploaded by
+>    `./build-deploy-generic.sh build`. Editing the executor locally changes
+>    nothing until you re-run `build`. See
+>    [The executor script comes from S3](#the-executor-script-comes-from-s3).
 > 2. Re-deploying after a spec change is **DELETE + APPLY**, not `kubectl apply`.
 >    See [Change CDC Configuration](#change-cdc-configuration).
 
@@ -125,9 +125,9 @@ export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-tes
 export LAKEHOUSE_FORMAT=both
 ```
 
-### 2. Create the MySQL Secret and the executor ConfigMap
+### 2. Create the MySQL Secret
 
-Neither of these is created by `build-deploy-generic.sh`. Both are prerequisites.
+This is not created by `build-deploy-generic.sh` — it is a prerequisite.
 
 ```bash
 # MySQL password — the manifests read it at pod start via
@@ -135,19 +135,13 @@ Neither of these is created by `build-deploy-generic.sh`. Both are prerequisites
 # with key MYSQL_PASSWORD. No password is ever written into a manifest, rendered
 # or otherwise. Create it per 0-MYSQL-SETUP-GUIDE.md, then verify:
 kubectl get secret flink-cdc-mysql-env -n emr-flink
-
-# Executor script — mounted at /opt/flink/usrlib from this ConfigMap.
-# Re-run after EVERY edit to flink-cdc-executor.py, or the JobManager silently
-# runs the previous copy.
-kubectl create configmap flink-cdc-executor-py -n emr-flink \
-  --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
-  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ### 3. Build, Render, Apply
 
 ```bash
-# build docker images, upload SQL scripts to s3 (one-off)
+# build docker images, upload the executor + SQL scripts to s3 (re-run after any
+# edit to flink-cdc-executor.py)
 ./build-deploy-generic.sh build
 
 # Render the *-deployed.yaml manifests WITHOUT applying, then apply both at once.
@@ -201,44 +195,42 @@ kubectl port-forward svc/flink-cdc-paimon-rest 8081:8081 -n emr-flink
 
 ---
 
-### The executor script comes from a ConfigMap
+### The executor script comes from S3
 
-`flink-cdc-executor.py` is mounted into the JobManager at `/opt/flink/usrlib`
-from the `flink-cdc-executor-py` ConfigMap. The `job.jarURI` in the manifests
-still points at
-`s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py`, but that path is
-**not** how the file arrives.
+`flink-cdc-executor.py` is the `job.jarURI`:
 
-The operator's artifact plumbing is broken for this case. It injects an `aws-cli`
-initContainer that downloads `jarURI` into a volume named `flink-artifact` at
-`/flink-artifact`, but the main container never mounts that volume — it mounts
-`user-artifacts-volume` at `/opt/flink/artifacts`, while the job args point at a
-third path, `/opt/flink/usrlib/`. The download succeeds (the initContainer exits
-0) and the file is then discarded with the volume, so `PythonDriver` fails with:
-
-```
-java.nio.file.NoSuchFileException: /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py
+```yaml
+job:
+  jarURI: s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py
+  args: ["-py", "/opt/flink/usrlib/flink-cdc-executor.py", ...]
 ```
 
-(That `/tmp/pyflink` path is where `PythonEnvUtils` symlinks the `-py` argument,
-so the message names the temp copy rather than the missing source.) Mounting the
-ConfigMap directly at `/opt/flink/usrlib` puts the file exactly where the args
-already expect it; the directory is empty in the image, so shadowing it costs
-nothing.
+EMR on EKS supports an `s3://` jarURI natively — no manual volume mount is
+needed. The operator injects an `aws-cli` initContainer *together with its own
+`flink-artifact` volume* and stages the object into `/opt/flink/usrlib`, which is
+exactly where the `-py` argument points.
 
 **Consequences for the workflow:**
 
-- `build-deploy-generic.sh` does not create or refresh this ConfigMap. Doing it is
-  on you.
-- Editing `flink-cdc-executor.py` and re-running `build` changes nothing — the S3
-  copy is never read. Refresh the ConfigMap:
+- `upload_scripts_to_s3()` in `build-deploy-generic.sh` pushes the local file to
+  that key, so editing `flink-cdc-executor.py` requires re-running
+  `./build-deploy-generic.sh build` (or a bare
+  `aws s3 cp flink-cdc-executor.py s3://${BUCKET_NAME}/flink/scripts/`) before
+  the change can take effect.
+- The staging happens at pod start, so a running JobManager keeps the old copy.
+  Delete and re-apply the FlinkDeployment (below).
+- **Do not add a `volumes:` list to the JobManager pod template.** The operator
+  owns `flink-artifact`; a pod template that supplies `volumes:` without it
+  leaves the injected initContainer with nothing to mount and the Deployment is
+  rejected with
+  `initContainers[0].volumeMounts[0].name: Not found: "flink-artifact"`, wedging
+  the FlinkDeployment in `UPGRADING`. Once that injection is persisted in the CR,
+  server-side apply merges with it rather than removing it — recover with
   ```bash
-  kubectl create configmap flink-cdc-executor-py -n emr-flink \
-    --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
-    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl patch flinkdeployment flink-cdc-paimon -n emr-flink --type=json \
+    -p '[{"op":"remove","path":"/spec/jobManager/podTemplate/spec/initContainers"}]'
   ```
-- A ConfigMap change does not restart a running JobManager. Delete and re-apply
-  the FlinkDeployment (below).
+  or by deleting and recreating the CR.
 
 ### Change CDC Configuration
 
@@ -255,8 +247,8 @@ aws s3 cp sql-scripts/common/02-cdc-sources.sql \
 **Then restart — DELETE + APPLY, in that order.** A bare `kubectl apply` is not
 enough: `upgradeMode: last-state` means the operator restores the running job
 from its last checkpoint and will not pick up most spec changes (pod template,
-resources, parallelism, env, mounted ConfigMap contents). The SQL is also parsed
-once at job submission, so a re-upload alone changes nothing on a running job.
+resources, parallelism, env). The SQL is also parsed once at job submission, so a
+re-upload alone changes nothing on a running job.
 
 ```bash
 # 1. Delete
@@ -270,7 +262,7 @@ kubectl get pods -n emr-flink | grep flink-cdc
 #    leader info in these; if any survive the delete, the new JobManager will
 #    recover the OLD job graph and your change is silently ignored.
 kubectl get configmap -n emr-flink | grep flink-cdc
-#    Expected to remain: flink-cdc-executor-py (yours), flink-cdc-monitor-* .
+#    Expected to remain: flink-cdc-monitor-* (the monitor's code ConfigMap).
 #    Expected to be GONE: flink-cdc-<job>-cluster-config-map and
 #                         flink-cdc-<job>-<hash>-config-map
 #    Delete any that linger:
@@ -440,8 +432,9 @@ python flink-cdc-executor.py \
 ./build-deploy-generic.sh cleanup
 ```
 
-Neither `render` nor `deploy` creates the `flink-cdc-executor-py` ConfigMap or the
-MySQL Secret. Both are prerequisites — see step 2 of Quick Start.
+Neither `render` nor `deploy` creates the MySQL Secret — it is a prerequisite, see
+step 2 of Quick Start. Neither uploads `flink-cdc-executor.py` either; that is
+`build`'s job.
 
 `LAKEHOUSE_FORMAT` (`paimon` | `iceberg` | `both`, default `both`) selects which
 manifests each action touches. Required environment variables: `AWS_REGION`
@@ -527,13 +520,15 @@ aws s3 ls s3://${BUCKET_NAME}/flink/sql-scripts/paimon/
 java.nio.file.NoSuchFileException: /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py
 ```
 
-**Solution**: The `flink-cdc-executor-py` ConfigMap is missing. The `jarURI`
-download is discarded by the operator, so the ConfigMap is the only source of the
-file. See
-[The executor script comes from a ConfigMap](#the-executor-script-comes-from-a-configmap).
+**Solution**: The `job.jarURI` object is missing from S3, so the operator's
+staging initContainer had nothing to place in `/opt/flink/usrlib`. (The
+`/tmp/pyflink` path in the message is where `PythonEnvUtils` symlinks the `-py`
+argument, so the error names the temp copy rather than the missing source.) See
+[The executor script comes from S3](#the-executor-script-comes-from-s3).
 
 ```bash
-kubectl get configmap flink-cdc-executor-py -n emr-flink
+aws s3 ls s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py
+./build-deploy-generic.sh build   # re-uploads it
 ```
 
 ### A config change had no effect
@@ -545,8 +540,9 @@ script, re-applied, and the job behaves exactly as before.
 checkpoint rather than re-submitting it. Do the full DELETE + APPLY, including the
 leftover-HA-ConfigMap check — see
 [Change CDC Configuration](#change-cdc-configuration). Also re-run
-`./build-deploy-generic.sh render` if the change was in a template, and refresh
-the `flink-cdc-executor-py` ConfigMap if it was in the Python.
+`./build-deploy-generic.sh render` if the change was in a template, or
+`./build-deploy-generic.sh build` to re-upload the executor if it was in the
+Python.
 
 ### Job cycles RUNNING → RESTARTING → CREATED → RUNNING
 

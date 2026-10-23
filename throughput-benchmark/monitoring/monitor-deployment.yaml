@@ -1,5 +1,5 @@
-# Throughput-benchmark monitor — SAME code as cdc-pipeline/monitoring, second
-# instance pointed at the flink-cid-* jobs.
+# Throughput-benchmark monitor — a second instance of the cdc-pipeline/monitoring
+# design, pointed at the flink-cid-* jobs. Its code is throughput-benchmark/monitoring/.
 #
 # Same no-image-build design as the CDC monitor: stock python:3.11-slim and
 # pip install at boot. The code arrives from S3 rather than from a ConfigMap —
@@ -14,21 +14,22 @@ data:
   PAIMON_FLINK_URL: "http://flink-cid-paimon-rest:8081"
   ICEBERG_FLINK_URL: "http://flink-cid-iceberg-rest:8081"
   AWS_REGION: "${AWS_REGION}"
-  PAIMON_GLUE_DB: "flink_cid_paimon_db"
-  ICEBERG_GLUE_DB: "flink_cid_iceberg_db"
-  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-paimon"
-  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-iceberg/"
-  # One table per pipeline in this benchmark (vs the CDC pipeline's four).
-  CDC_TABLES: "cid_events"
-  # Same window/poll discipline as the CDC monitor: throughput is the
-  # records_out delta across MONITOR_DURATION, so keep it a multiple of
-  # POLL_INTERVAL.
+  # TEST_SUFFIX (e.g. -r2) = the set of tables flinkwriter/run.sh wrote with the
+  # same suffix; without it the monitor reads the ORIGINAL tables and shows no
+  # new files while the jobs commit to the -r2 ones (2026-10-18).
+  PAIMON_GLUE_DB: "flink_cid_paimon_db${TEST_DB_SUFFIX}"
+  ICEBERG_GLUE_DB: "flink_cid_iceberg_db${TEST_DB_SUFFIX}"
+  PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-paimon${TEST_SUFFIX}"
+  ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/cid-warehouse-iceberg${TEST_SUFFIX}/"
+  # The one table each job writes.
+  TABLE_NAME: "cid_events"
+  # Headline throughput is rows committed / time between commits, from the
+  # tables' history; Keep MONITOR_DURATION a multiple of POLL_INTERVAL.
   MONITOR_DURATION: "120"
   POLL_INTERVAL: "20"
   REPEAT_INTERVAL: "60"
-  RUN_MODE: "continuous"
-  # Where deploy-cid-monitor.sh uploaded the monitor code. S3 rather than a
-  # ConfigMap because flink_cdc_monitor.py is ~36 KB and growing, and a
+  # Where monitoring/run.sh uploaded the monitor code. S3 rather than a
+  # ConfigMap because flink_cid_monitor.py is ~36 KB and growing, and a
   # ConfigMap is a 1 MiB-capped etcd object that every API-server client can
   # read — the same reason the Flink jobs already take their SQL and
   # flink-cid-executor.py from s3://${BUCKET_NAME}/flink/scripts/. One upload
@@ -75,7 +76,7 @@ spec:
           import os, boto3
           bucket, _, prefix = os.environ["MONITOR_CODE_PREFIX"][5:].partition("/")
           s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"])
-          for name in ("flink_cdc_monitor.py", "entrypoint.py", "requirements.txt"):
+          for name in ("flink_cid_monitor.py", "entrypoint.py", "requirements.txt"):
               key = prefix + "/" + name
               s3.download_file(bucket, key, "/app/" + name)
               print("fetched s3://%s/%s" % (bucket, key), flush=True)

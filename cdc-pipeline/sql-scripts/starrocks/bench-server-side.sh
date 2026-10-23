@@ -266,6 +266,19 @@ pick() { # tag pass_min qi col
         '$1==t && $2>=w && $3==q {print $c}' | med
 }
 
+# A failed query still writes an audit record, with a small Time and ScanRows=0 —
+# which reads as the FASTEST possible result. Observed for real: Iceberg Q4 and Q6
+# died with "Memory of process exceed limit" while joining the un-compacted
+# order_items table, and the table reported 27ms/0 rows and 575ms/0 rows, i.e. an
+# OOM was scored as a 3x and 9x win over Paimon. The audit State field is the only
+# thing that distinguishes the two, so any slot with a non-EOF pass is reported as
+# ERR rather than timed. Never delete this check: without it the benchmark rewards
+# whichever format fails hardest.
+errs() { # tag pass_min qi  -> count of failed passes in this slot
+    printf '%s\n' "$PARSED" | awk -v t="$1" -v w="$2" -v q="$3" \
+        '$1==t && $2>=w && $3==q && $7!="EOF" && $7!="OK" {n++} END{print n+0}'
+}
+
 for s in $RUN_SUITES; do
     if [[ "$s" == snapshot ]]; then names="$SNAPSHOT_NAMES"; else names="$HOT_NAMES"; fi
     set -- $names
@@ -286,15 +299,23 @@ for s in $RUN_SUITES; do
         p_sb=$(pick "P${s}" "$WARMUP" "$qi" 6)
         i_sb=$(pick "I${s}" "$WARMUP" "$qi" 6)
 
-        if [[ "$p_ms" == "-" || "$i_ms" == "-" || "$p_ms" == 0 ]]; then
+        # Failed passes invalidate the slot before any median is believed.
+        p_err=$(errs "P${s}" "$WARMUP" "$qi")
+        i_err=$(errs "I${s}" "$WARMUP" "$qi")
+        (( p_err > 0 )) && { p_ms="ERR"; p_sr="ERR"; p_sb="ERR"; }
+        (( i_err > 0 )) && { i_ms="ERR"; i_sr="ERR"; i_sb="ERR"; }
+
+        if [[ "$p_ms" == "ERR" || "$i_ms" == "ERR" ]]; then
+            ratio="FAILED"
+        elif [[ "$p_ms" == "-" || "$i_ms" == "-" || "$p_ms" == 0 ]]; then
             ratio="n/a"
         else
             ratio=$(awk -v a="$i_ms" -v b="$p_ms" 'BEGIN{printf "%.2fx", a/b}')
         fi
         printf '%-20s %9s %9s %8s %13s %13s\n' "$name" "$p_ms" "$i_ms" "$ratio" "$p_sr" "$i_sr"
 
-        srr=$(awk -v a="$i_sr" -v b="$p_sr" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else print "n/a" }')
-        sbr=$(awk -v a="$i_sb" -v b="$p_sb" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else print "n/a" }')
+        srr=$(awk -v a="$i_sr" -v b="$p_sr" 'BEGIN{ if(b+0>0 && a!="ERR" && b!="ERR") printf "%.2fx", a/b; else print "n/a" }')
+        sbr=$(awk -v a="$i_sb" -v b="$p_sb" 'BEGIN{ if(b+0>0 && a!="ERR" && b!="ERR") printf "%.2fx", a/b; else print "n/a" }')
         {
           echo "${STAMP},${s},${name},time_ms,${p_ms},${i_ms},${ratio}"
           echo "${STAMP},${s},${name},scan_rows,${p_sr},${i_sr},${srr}"

@@ -27,7 +27,8 @@ Complete guide for setting up interactive query engines on top of your Paimon an
 │  Option 1: AWS Athena (Serverless)                         │
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │  • Iceberg: Native support via Glue                  │  │
-│  │  • Paimon: Via Athena Spark + Hadoop catalog         │  │
+│  │  • Paimon: SQL on exported Iceberg metadata (2.1),   │  │
+│  │            or Athena Spark + Hadoop catalog (2.2)    │  │
 │  │  • Pay-per-query pricing                             │  │
 │  │  • No infrastructure management                      │  │
 │  └──────────────────────────────────────────────────────┘  │
@@ -130,9 +131,70 @@ SELECT * FROM flink_iceberg_db."customers$manifests";
 
 **⚠️ Paimon tables are registered in Glue as `table_type = PAIMON`. Athena cannot read them directly.**
 
-Paimon's Iceberg compatibility mode (`metadata.iceberg.storage = 'hive-catalog'`) writes Iceberg-format metadata under the `iceberg/` subdirectory in S3. Use **Athena Spark** with a Hadoop catalog to read this metadata directly, bypassing Glue's `PaimonStorageHandler`.
+Paimon's Iceberg compatibility mode (`metadata.iceberg.storage = 'hive-catalog'`) writes Iceberg-format metadata under the `iceberg/` subdirectory in S3. There are two ways to read it; **2.1 is the one verified on this account.**
 
-#### 2.1 Athena Spark Notebook
+#### 2.1 Athena SQL, via a shadow Glue database (verified)
+
+Register Paimon's *exported* Iceberg metadata as a normal Iceberg table in a
+**separate** Glue database. Plain Athena SQL then reads it — no Spark needed.
+Use a separate database because the `flink_paimon_db` entries are owned by
+Paimon's `IcebergHiveMetadataCommitter` and carry `table_type = PAIMON`.
+
+```python
+import boto3, json
+glue, s3 = boto3.client("glue"), boto3.client("s3")
+BUCKET, SRC_DB, DST_DB = "<bucket>", "flink_paimon_db", "paimon_athena_test"
+
+ICE2HIVE = {"long": "bigint", "timestamptz": "timestamp"}   # rest map 1:1
+
+for t in ["customers", "products", "orders", "order_items"]:
+    base = f"paimon-warehouse/iceberg/{SRC_DB}/{t}/metadata"
+    # version-hint.text names the current metadata version
+    v = s3.get_object(Bucket=BUCKET, Key=f"{base}/version-hint.text")["Body"].read().decode().strip()
+    mkey = f"{base}/v{v}.metadata.json"
+    meta = json.load(s3.get_object(Bucket=BUCKET, Key=mkey)["Body"])
+    schema = next(s for s in meta["schemas"] if s["schema-id"] == meta["current-schema-id"])
+    cols = [{"Name": f["name"], "Type": ICE2HIVE.get(f["type"], f["type"])}
+            for f in schema["fields"]]
+
+    glue.create_table(DatabaseName=DST_DB, TableInput={
+        "Name": t, "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"table_type": "ICEBERG",
+                       "metadata_location": f"s3://{BUCKET}/{mkey}"},
+        "StorageDescriptor": {
+            "Location": f"s3://{BUCKET}/paimon-warehouse/{SRC_DB}.db/{t}",
+            "Columns": cols,
+        }})
+```
+
+Then query from the Athena Console (data source `AwsDataCatalog`, database
+`paimon_athena_test`) exactly like any Iceberg table:
+
+```sql
+SELECT COUNT(*) FROM customers;
+
+SELECT order_status, COUNT(*) AS cnt, SUM(total_amount) AS revenue
+FROM orders GROUP BY order_status ORDER BY cnt DESC;
+```
+
+> **`Columns` is not optional.** With an empty column list, `COUNT(*)` still
+> succeeds — it is answered from manifest statistics and scans 0 bytes — but any
+> projection fails with `COLUMN_NOT_FOUND: Relation contains no accessible
+> columns`. Athena takes the column list from Glue while taking the data from
+> the Iceberg metadata, so both have to be right.
+
+> **`metadata_location` pins a snapshot.** The registered table is frozen at the
+> `v<N>.metadata.json` you named and does not advance as Paimon commits. Re-read
+> `version-hint.text` and `UpdateTable` to refresh.
+
+Measured on a suspended-job snapshot (16.8M customers / 86.4M orders / 137.6M
+order_items): `COUNT(*)` 0.8 s / 0 B scanned, `GROUP BY order_status` 3.3 s /
+303 MB, a join over `order_items ⋈ products` 2.9 s / 937 MB.
+`COUNT(*) = COUNT(DISTINCT customer_id)` exactly, confirming the Iceberg reader
+honours Paimon's LSM merge and deletion vectors rather than double-counting
+superseded row versions. Full results: `bench-results/ATHENA-PAIMON-TEST-20260928.md`.
+
+#### 2.2 Athena Spark Notebook
 
 ```python
 # Configure Iceberg Hadoop catalog — reads metadata files directly from S3
@@ -150,9 +212,21 @@ spark.sql("""
 """).show()
 ```
 
-> **Why Hadoop catalog?** The GlueCatalog tries to load `PaimonStorageHandler` (not on Athena's classpath) and fails with `ClassNotFoundException`. The Hadoop catalog reads Iceberg `v*.metadata.json` files directly from S3.
+> **Why Hadoop catalog?** The GlueCatalog tries to load `PaimonStorageHandler` (not on Athena's classpath) and fails with `ClassNotFoundException`. The Hadoop catalog reads Iceberg `v*.metadata.json` files directly from S3, resolving the current version from `version-hint.text` in the same prefix.
 
 > **Important:** Paimon sink tables must have `'metadata.iceberg.format-version' = '2'` (not `'3'`). Athena engine v3 only supports Iceberg format V2.
+
+> **Use `SparkCatalog`, not `SparkSessionCatalog`.** `SparkSessionCatalog` exists
+> only to override the *default* catalog (`spark_catalog`) so Hive and Iceberg
+> tables can coexist under it; it is wrong for a named catalog like
+> `paimon_iceberg`.
+
+> **Not verified on this account.** `StartSession` on the Spark workgroup
+> (`icebergv3`) succeeds and reaches `IDLE`, but `StartCalculationExecution` is
+> refused with `UNAUTHORIZED` — a restriction on the calling identity, not on
+> Paimon or the execution role. Use section 2.1 instead unless that permission is
+> granted. Also note `StartSession` rejects `DefaultExecutorDpuSize` for this
+> engine config; pass `{"MaxConcurrentDpus": 2}` alone.
 
 ---
 
@@ -168,58 +242,136 @@ export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output tex
 export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
 export EKS_CLUSTER_NAME=loadtest-mcp
 
-# Install IRSA + operator + cluster
+# Install IRSA + operator + cluster.
+# Defaults, all overridable: NAMESPACE=emr-flink, RELEASE_NAME=starrocks,
+# CHART_VERSION=1.11.7, IMAGE_TAG=4.1.4.
 ./starrocks/deploy-starrocks.sh install-iam
 ```
 
 This creates:
 - IAM policy `StarRocksS3GluePolicy` (S3 + Glue read access)
-- IRSA service account `starrocks-sa` in `$NAMESPACE` (script default: `starrocks`)
-- StarRocks operator + FE/BE cluster via Helm
+- IRSA service account `starrocks-sa` in `$NAMESPACE` (default: `emr-flink`)
+- StarRocks operator + FE/BE cluster as **one** Helm release named `starrocks`
 
 Cluster shape comes from `helm/starrocks-eks-values.yaml`: **1 FE** (2–4 cpu,
 8–16 Gi, 50 Gi gp3) and **3 BE** (4–6 cpu, 16–24 Gi, 200 Gi gp3 each).
 
-> **Two things in the repo disagree about the namespace.** The script defaults to
-> `NAMESPACE=starrocks`, while `helm/starrocks-eks-values.yaml` says StarRocks is
-> installed into `emr-flink` because the execution role's trust policy allows
-> `system:serviceaccount:emr-flink:*`. If you deploy into `starrocks`, the
-> `starrocks-sa` ServiceAccount there is **not** covered by that trust policy and
-> the external catalogs will fail on S3/Glue. Either set `NAMESPACE=emr-flink` or
-> widen the trust policy — the chart does not create the SA, it only references
-> one by name.
+If you install by hand instead of via the script, this is the command the script
+runs — note the single release and the two pins:
+
+```bash
+helm repo add starrocks https://starrocks.github.io/starrocks-kubernetes-operator
+helm repo update
+helm upgrade --install starrocks starrocks/kube-starrocks \
+  --version 1.11.7 \
+  --namespace emr-flink \
+  --values helm/starrocks-eks-values.yaml \
+  --set starrocks.starrocksFESpec.image.tag=4.1.4 \
+  --set starrocks.starrocksBeSpec.image.tag=4.1.4 \
+  --wait --timeout 15m
+```
+
+> **The operator and the cluster cannot be split into two Helm releases.** Chart
+> 1.11.x has exactly two top-level values keys — verify with
+> `helm show values starrocks/kube-starrocks --version 1.11.7 | grep '^[a-zA-Z]'`,
+> which prints only `operator:` and `starrocks:`. There is no `starrocksCluster`
+> top-level key and no `operator.enabled`; the real switches are nested
+> (`operator.starrocksOperator.enabled`, `starrocks.starrocksCluster.*`). So
+> `--set operator.enabled=…` and `--set starrocksCluster.enabled=…` are silently
+> ignored — `helm template` output is byte-identical with them set either way —
+> and **both** releases render the full chart. The first release takes Helm
+> ownership of `ServiceAccount/starrocks` and `ConfigMap/kube-starrocks-{fe,be}-cm`,
+> and the second then dies with:
+> ```
+> Error: unable to continue with install: ServiceAccount "starrocks" in namespace
+> "emr-flink" exists and cannot be imported into the current release: invalid
+> ownership metadata; annotation validation error: key "meta.helm.sh/release-name"
+> must equal "starrocks": current value is "starrocks-operator"
+> ```
+> and, once that one is annotated away, the same error for
+> `ConfigMap "kube-starrocks-be-cm"`. Install once, as one release.
 >
-> **The chart version is not pinned.** `deploy-starrocks.sh` runs
-> `helm upgrade --install … starrocks/kube-starrocks` with no `--version`, so it
-> takes whatever the repo's latest is. The values file is written for `>= 1.11`
-> (component specs nested under `starrocks:`) and the image tags are left empty,
-> which resolves to the chart appVersion — currently the **floating `4.1-latest`
-> tag**. That means the engine version drifts on every pod restart. Pin both the
-> chart (`--version`) and an exact image tag (e.g. `4.1.4`) before capturing
-> numbers you intend to compare across runs.
+> **The namespace must be `emr-flink`.** The chart does not create the FE/BE
+> ServiceAccount — it only references one by name
+> (`starrocks.starrocks{FE,Be}Spec.serviceAccount: starrocks-sa`). That SA gets its
+> S3 + Glue access from `emr-on-eks-test-execution-role`, whose trust policy allows
+> `system:serviceaccount:emr-flink:*` and nothing else. A `starrocks-sa` in any
+> other namespace is not covered, and the external catalogs fail on S3/Glue. The
+> script now defaults `NAMESPACE=emr-flink` for this reason; the rationale is in the
+> header comments of `helm/starrocks-eks-values.yaml`. Note the side effect: this is
+> a *shared* namespace, so `uninstall` no longer deletes it (see 3.6).
+>
+> **Both the chart and the images are pinned.** Chart 1.11.7's appVersion is
+> `4.1-latest` — a **mutable** tag, so with `image.tag: ""` the engine version
+> drifts on every pod restart. The script pins `CHART_VERSION=1.11.7` and
+> `IMAGE_TAG=4.1.4`, passing the tag as
+> `--set starrocks.starrocks{FE,Be}Spec.image.tag`. The values file leaves
+> `image.tag: ""` with a commented-out `tag: "4.1.4"` alongside if you prefer to pin
+> there instead; in that case run with `IMAGE_TAG=` so the two do not fight.
+> Verified on the running cluster: `starrocks/fe-ubuntu:4.1.4` and
+> `starrocks/be-ubuntu:4.1.4`, while `helm list -n emr-flink` still reports the
+> release's APP VERSION as `4.1-latest` (that column is the chart's appVersion, not
+> the image actually pulled — do not read the engine version off it).
 
 ### 3.2 Connect to StarRocks
 
+There is no external endpoint. `helm/starrocks-eks-values.yaml` sets
+`starrocksFESpec.service.type: ClusterIP`, so the FE service has no
+`.status.loadBalancer.ingress` and never will.
+
 ```bash
-# Get FE load balancer endpoint
-./deploy-starrocks.sh connection
+# Print the FE service/pod and every working access path
+./starrocks/deploy-starrocks.sh connection
 
-# Or manually
-STARROCKS_FE=$(kubectl get svc kube-starrocks-fe-service -n starrocks \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+# Path 1 — exec into the FE pod. This is what the bench scripts do.
+kubectl exec -it -n emr-flink kube-starrocks-fe-0 -- mysql -h127.0.0.1 -P9030 -uroot
 
-mysql -h $STARROCKS_FE -P 9030 -u root
+# Path 2 — port-forward, then use a local mysql client
+kubectl port-forward -n emr-flink svc/kube-starrocks-fe-service 9030:9030 8030:8030 &
+mysql -h 127.0.0.1 -P 9030 -u root
 ```
+
+The `root` user has no password in this deployment (`initPassword.enabled` is left
+at the chart default of `false`).
+
+> **Do not query `.status.loadBalancer` on the FE service.** It returns empty
+> forever, not "empty until the LB provisions" — verify with
+> `kubectl get svc -n emr-flink | grep starrocks`, which shows all four StarRocks
+> services as `ClusterIP` with no `EXTERNAL-IP`. Earlier revisions of this section
+> and of `get_connection_info()` printed an empty endpoint and a `mysql -h <blank>`
+> command line.
+>
+> **Two services match the `fe` label**, and the one you want is not the first
+> alphabetically. `kubectl get svc -l app.kubernetes.io/component=fe` returns the
+> headless `kube-starrocks-fe-search` (`CLUSTER-IP: None`, FE peer discovery) *and*
+> the real `kube-starrocks-fe-service`. A `jsonpath='{.items[0]...}'` selects the
+> headless one; filter on `{.items[?(@.spec.clusterIP!="None")]}` instead.
+>
+> **Component labels are `app.kubernetes.io/component`**, not
+> `app.starrocks.io/component`. On chart 1.11.7 the latter matches nothing
+> (`kubectl get pods -l app.starrocks.io/component=fe` → "No resources found"); the
+> StarRocks-specific label actually present is `app.starrocks.ownerreference/name`.
 
 ### 3.3 Configure Catalogs
 
-```sql
--- Create Paimon catalog
-SOURCE sql-scripts/starrocks/01-starrocks-paimon-catalog.sql;
+The two catalog files carry `${BUCKET_NAME}` / `${AWS_REGION}` placeholders, so
+render them first, then pipe them in. `install`/`install-iam` render them to `/tmp`
+for you and print these commands; to do it by hand:
 
--- Create Iceberg catalog
-SOURCE sql-scripts/starrocks/02-starrocks-iceberg-catalog.sql;
+```bash
+for f in 01-starrocks-paimon-catalog.sql 02-starrocks-iceberg-catalog.sql; do
+  sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
+    sql-scripts/starrocks/$f > /tmp/$f
+  kubectl exec -i -n emr-flink kube-starrocks-fe-0 \
+    -- mysql -h127.0.0.1 -P9030 -uroot < /tmp/$f
+done
 ```
+
+> **`SOURCE` will not work here.** It is a client-side mysql command that reads a
+> path on the machine running the client, and the client is running inside the FE
+> pod — which has no copy of this repo (`ls /` in `kube-starrocks-fe-0` shows a bare
+> Ubuntu root). Pipe the rendered file into `kubectl exec -i` instead, or
+> `port-forward` and run a local client where the relative paths do resolve.
 
 ### 3.4 Query Both Formats
 
@@ -247,9 +399,23 @@ FROM iceberg_catalog.flink_iceberg_db.customers;
 ### 3.5 Monitor StarRocks
 
 ```bash
-./deploy-starrocks.sh monitor
-kubectl get pods -n starrocks
+# Release, StarRocksCluster CR, and the StarRocks pods/services/PVCs only
+./starrocks/deploy-starrocks.sh monitor
+
+# Or directly. Filter by label — emr-flink also holds the Flink operator and the
+# CDC TaskManagers, so an unfiltered get buries the 5 StarRocks pods.
+kubectl get pods -n emr-flink -l app.kubernetes.io/component=fe
+kubectl get pods -n emr-flink -l app.kubernetes.io/component=be
+
+# Cluster-level health, from the operator's point of view
+kubectl get starrockscluster -n emr-flink
 ```
+
+`kubectl get starrockscluster` is the quickest single check —
+`PHASE/FESTATUS/BESTATUS` all reading `running` means the operator considers the
+cluster reconciled. Note the operator pod carries plain `app=kube-starrocks-operator`,
+not the `app.kubernetes.io/component` label the FE/BE pods use, so it does not
+appear in the label-filtered gets above.
 
 **Cost:** ~$300–500/month for the 1 FE + 3 BE shape above (rough order of
 magnitude; it is EC2 + EBS, so it tracks whatever nodes the BEs land on).
@@ -264,30 +430,44 @@ Prefer editing the `StarRocksCluster` CR so the operator stays in agreement with
 the desired state:
 
 ```bash
-kubectl get starrockscluster -n starrocks
-kubectl edit starrockscluster <name> -n starrocks   # set starrocksBeSpec.replicas
+kubectl get starrockscluster -n emr-flink            # name is kube-starrocks
+kubectl edit starrockscluster kube-starrocks -n emr-flink   # set starrocksBeSpec.replicas
 ```
 
-Scaling the BE StatefulSet directly (`kubectl scale statefulset … -n starrocks`)
+Scaling the BE StatefulSet directly (`kubectl scale statefulset … -n emr-flink`)
 works for a quick pause, but the operator will reconcile it back to the CR's
 `replicas` — change the CR if you want the reduction to stick.
 
-> **`helm uninstall` does not delete the PVCs.** Each BE holds a 200 Gi gp3
-> volume and the FE a 50 Gi one, and StatefulSet PVCs outlive the StatefulSet by
-> design. `./starrocks/deploy-starrocks.sh cleanup` does
-> `kubectl delete namespace $NAMESPACE`, which *does* take the PVCs with it — but
-> a bare `helm uninstall` leaves them billing. After any uninstall:
+Tear down with:
+
+```bash
+./starrocks/deploy-starrocks.sh uninstall
+```
+
+> **The uninstall does not delete the namespace, deliberately.** `emr-flink` is
+> shared with the Flink operator and the CDC jobs, so deleting it would take the
+> whole pipeline with it. Older revisions of the script did
+> `kubectl delete namespace $NAMESPACE` — safe only while the default was a
+> dedicated `starrocks` namespace, and destructive once the default moved to
+> `emr-flink` for the IRSA trust policy (3.1).
+>
+> **`helm uninstall` does not delete the PVCs either**, so the script deletes them
+> explicitly by label. StatefulSet PVCs outlive the StatefulSet by design, and the
+> deployed shape holds eight of them: 3 × 200 Gi BE data, 3 × 20 Gi BE log,
+> 50 Gi FE meta, 5 Gi FE log — all gp3 (confirmed with
+> `kubectl get pvc -n emr-flink`; note the 20 Gi BE log and 5 Gi FE log volumes are
+> created by the chart and are not in `starrocks-eks-values.yaml`). After any
+> uninstall, or after a bare `helm uninstall`:
 > ```bash
-> kubectl get pvc -n starrocks
+> kubectl get pvc -n emr-flink -l app.kubernetes.io/component=be
+> kubectl get pvc -n emr-flink -l app.kubernetes.io/component=fe
 > ```
 > and delete what you no longer need. Leftover PVCs also mean a fresh install can
 > pick up stale BE data directories.
 >
-> Neither the scale-down ordering nor the PVC retention behaviour is asserted
-> anywhere in the repo's scripts, and StarRocks is **not currently deployed on
-> this cluster** (`helm list -n starrocks` is empty, and
-> `kubectl get starrockscluster,pvc -n starrocks` returns no resources), so
-> the two notes above were not verified in-cluster.
+> The scale-down ordering (BEs before FE) is not asserted anywhere in the repo's
+> scripts and was not exercised in-cluster; the PVC retention behaviour and the
+> resource inventory above were verified against the live deployment.
 
 ---
 
@@ -295,10 +475,14 @@ works for a quick pause, but the operator will reconcile it back to the CR's
 
 | Issue | Solution |
 |-------|----------|
-| StarRocks SA Helm conflict | `kubectl annotate sa starrocks -n starrocks meta.helm.sh/release-name=starrocks --overwrite` |
-| FE label query returns empty | Use `app.starrocks.io/component=fe` (not `app.kubernetes.io/component=fe`) |
+| `ServiceAccount "starrocks" … cannot be imported into the current release` | You are installing the chart twice. Collapse to one release (section 3.1) — the annotate workaround only defers the same failure to `ConfigMap/kube-starrocks-be-cm` |
+| FE label query returns empty | Use `app.kubernetes.io/component=fe`. `app.starrocks.io/component` matches nothing on chart 1.11.7 |
+| FE service endpoint is empty | Expected — the FE service is `ClusterIP`. Use `kubectl exec` or `port-forward` (section 3.2) |
+| `kubectl get svc -l …component=fe` returns the wrong service | Two match; the headless `fe-search` sorts first. Filter `{.items[?(@.spec.clusterIP!="None")]}` |
+| External catalogs fail on S3/Glue | `starrocks-sa` is outside `emr-flink`, so the execution role's trust policy (`system:serviceaccount:emr-flink:*`) does not cover it |
+| Engine version changed between benchmark runs | `image.tag: ""` resolved to the mutable `4.1-latest`. Pin `IMAGE_TAG` (section 3.1) |
 | FE "not alive yet" on first boot | Normal — FE tries to find peers, times out ~30s, then bootstraps as leader |
-| Athena `PaimonStorageHandler` error | Use Hadoop catalog in Athena Spark (see section 2.1) |
+| Athena `PaimonStorageHandler` error | Use Athena SQL on a shadow Glue database (section 2.1), or the Hadoop catalog in Athena Spark (section 2.2) |
 | Athena can't read Paimon's exported Iceberg metadata | Set `metadata.iceberg.format-version = '2'` in Paimon sink tables — Athena engine v3 reads Iceberg V2 only |
 
 ---

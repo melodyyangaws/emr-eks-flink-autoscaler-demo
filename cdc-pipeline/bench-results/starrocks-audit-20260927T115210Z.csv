@@ -33,5 +33,5 @@ stamp,suite,query,metric,paimon,iceberg,ratio_iceberg_over_paimon
 20260927T115210Z,state,products,rows_and_files,160118409,160300671,ice_files=396 ice_snaps=12
 20260927T115210Z,state,orders,rows_and_files,440044431,374334719,ice_files=283 ice_snaps=22
 20260927T115210Z,state,order_items,rows_and_files,596577180,424313527,ice_files=313 ice_snaps=22
-20260927T115210Z,location,bucket,s3_bucket,emr-on-eks-test-633458367150-us-west-2,emr-on-eks-test-633458367150-us-west-2,same
-20260927T115210Z,location,prefix,s3_prefix,emr-on-eks-test-633458367150-us-west-2/paimon-warehouse/,iceberg-warehouse/flink_iceberg_db.db,distinct
+20260927T115210Z,location,bucket,s3_bucket,emr-on-eks-test-account-us-west-2,emr-on-eks-test-account-us-west-2,same
+20260927T115210Z,location,prefix,s3_prefix,emr-on-eks-test-account-us-west-2/paimon-warehouse/,iceberg-warehouse/flink_iceberg_db.db,distinct

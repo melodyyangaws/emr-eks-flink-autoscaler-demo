@@ -1,0 +1,43 @@
+# gp3 at its maximum throughput, for warm DuckDB's on-disk block cache
+# (duckdb-warm.yaml, CACHE_MODE=on_disk). Same as the cluster's `gp3` class
+# except speed: default gp3 is 3000 IOPS / 125 MB/s, which held DuckDB's cache
+# reads at 130 MB/s with 0 MB/s from S3, because cache_httpfs has
+# no way to fall back to S3.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-fast
+  labels: {app: duckdb-warm}
+parameters:
+  encrypted: "true"
+  fstype: ext4
+  type: gp3
+  iops: "16000"
+  throughput: "850"
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+# The StarRocks BEs' class (deploy-starrocks.sh sets the BEs' storageClassName
+# to it, and the chart gives it to each BE's data, log and spill volumes).
+# Fixed so that the 3 BEs together get what gp3-fast gives DuckDB behind its
+# m5.8xlarge, ~850 MB/s and 16,000 IOPS:
+#   throughput 283 MB/s x 3 = 849 MB/s;  iops 5333 x 3 = 15,999
+# 283 MB/s needs >= 1132 IOPS (0.25 MB/s per IOPS). Both stay under an
+# m5.2xlarge BE node's ~360 MB/s / 12,000 IOPS sustained EBS limit.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-starrocks-be
+  labels: {app: kube-starrocks}
+parameters:
+  encrypted: "true"
+  fstype: ext4
+  type: gp3
+  iops: "5333"
+  throughput: "283"
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false

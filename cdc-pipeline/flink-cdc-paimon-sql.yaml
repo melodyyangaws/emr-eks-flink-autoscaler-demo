@@ -7,7 +7,7 @@ spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
   image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${IMAGE_TAG}
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
 
   flinkConfiguration:
@@ -156,46 +156,15 @@ spec:
     storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon/ha/
     replicas: 1
     resource:
-      memory: 16Gi
+      memory: 8Gi
       cpu: 4
     podTemplate:
       spec:
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${JM_NODEPOOL}
-        # flink-cdc-executor.py is mounted here from a ConfigMap built out of the
-        # local file, NOT fetched from S3. The operator's own artifact plumbing is
-        # broken for this path: it injects an `aws-cli` initContainer that
-        # downloads jarURI into volume `flink-artifact` at /flink-artifact, but the
-        # main container never mounts that volume — it mounts `user-artifacts-volume`
-        # at /opt/flink/artifacts instead, while the job args point at a third path,
-        # /opt/flink/usrlib/. The download succeeds (initContainer exits 0) and the
-        # file is then thrown away with the volume, so PythonDriver fails with
-        #   java.nio.file.NoSuchFileException:
-        #     /tmp/pyflink/<uuid>/<uuid>/flink-cdc-executor.py
-        # (that /tmp/pyflink path is where PythonEnvUtils symlinks the -py argument,
-        # so the message names the temp copy rather than the missing source).
-        # Mounting the ConfigMap directly at /opt/flink/usrlib puts the file exactly
-        # where the args already expect it. /opt/flink/usrlib is empty in the image,
-        # so shadowing it costs nothing. Refresh after editing the script with:
-        #   kubectl create configmap flink-cdc-executor-py -n emr-flink \
-        #     --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
-        #     --dry-run=client -o yaml | kubectl apply -f -
-        volumes:
-        - name: executor-py
-          configMap:
-            name: flink-cdc-executor-py
         containers:
         - name: flink-main-container
-          volumeMounts:
-          - name: executor-py
-            mountPath: /opt/flink/usrlib
-          # Password is never templated into this manifest — MYSQL_PASSWORD is
-          # injected at pod start from Secret ${MYSQL_ENV_SECRET_NAME} (key
-          # MYSQL_PASSWORD). envFrom is used rather than an env[].valueFrom
-          # secretKeyRef because the EMR Flink operator's pod-template env merge
-          # emits an empty `value: ""` next to `valueFrom`, which the Kubernetes
-          # API rejects ("may not be specified when `value` is not empty").
           envFrom:
           - secretRef:
               name: ${MYSQL_ENV_SECRET_NAME}
@@ -262,35 +231,12 @@ spec:
         containers:
         - name: flink-main-container
           env:
-          # AWS_REGION must be set on the TaskManager, not just the JobManager.
-          # Paimon's IcebergHiveMetadataCommitter and the EMR Glue client run in
-          # the TM (CommitterOperator.initializeState). Without a region the
-          # AWSGlueClientFactory logs "No region info found, using SDK default
-          # region: us-east-1" and blocks on a cross-region Glue call, which
-          # stalls initializeState until heartbeat.timeout (180s) kills the TM —
-          # the job then fails with "The heartbeat of TaskManager ... timed out"
-          # and nothing in the JM log names the real cause.
           - name: AWS_REGION
             value: "${AWS_REGION}"
           # The Hadoop/Hive Glue client reads AWS_DEFAULT_REGION, the v2 SDK
           # reads AWS_REGION. Set both so neither path falls back to us-east-1.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
-        # THIS is what restarts the job, not the Glue region log lines above.
-        # executor-memorynodepool has consolidationPolicy:
-        # WhenEmptyOrUnderutilized with consolidateAfter: 2m and a 25%
-        # Underutilized disruption budget, so Karpenter actively deletes nodes
-        # that are still hosting RUNNING TaskManagers. Captured directly:
-        #   nodeclaim/... DisruptionTerminating  Disrupting NodeClaim: Underutilized
-        #   pod/flink-cdc-paimon-taskmanager-1-23  Evicted pod: Underutilized
-        # Losing one TM with jobmanager.execution.failover-strategy: full (set
-        # above, deliberately) restarts the entire 808-task graph, so the job
-        # cycles RUNNING -> RESTARTING -> CREATED -> RUNNING. Over ~12 minutes the
-        # pool oscillated 2 -> 6 -> 4 nodes and TM attempt indices reached -25,
-        # roughly 10 wasted TM generations. The matching JM exception is
-        # "NoResourceAvailableException" / an RPC TimeoutException on a Writer
-        # subtask — nothing that names Karpenter.
-        #
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${TM_NODEPOOL}

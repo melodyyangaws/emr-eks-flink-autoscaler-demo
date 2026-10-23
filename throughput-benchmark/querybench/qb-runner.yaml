@@ -1,0 +1,92 @@
+# In-cluster Job for a query test or its watcher (querybench/run.sh start). Rendered
+# by querybench/run.sh with envsubst over NAME, NAMESPACE, KUBECTL_VERSION and
+# ROLE_ARN only: every other $... below is for the container's shell and stays
+# literal.
+#
+# Permissions: a namespace Role, nothing cluster-wide. Exec into the FE and
+# port-forward to the DuckDB servers, restart those servers (deployments), read
+# and suspend the Flink writers, read the other runner's Job, delete the
+# generator's, scale the job monitor to 0, take duckdb-warm down and delete the
+# runner's ConfigMap and Secret (qb-watch.sh).
+#
+# AWS: the ServiceAccount assumes the execution role (IRSA; its trust already
+# covers every ServiceAccount in the namespace), so the runner can upload its
+# bench-results/ to S3 when the test ends. That upload is what lets the Job end
+# on its own: it used to sleep a day for `querybench/run.sh fetch` to copy them out.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${NAME}
+  namespace: ${NAMESPACE}
+  annotations: {eks.amazonaws.com/role-arn: "${ROLE_ARN}"}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: ${NAME}, namespace: ${NAMESPACE}}
+rules:
+- {apiGroups: [""], resources: [pods, pods/log], verbs: [get, list, watch]}
+- {apiGroups: [""], resources: [pods/exec, pods/portforward], verbs: [create, get]}
+- {apiGroups: [apps], resources: [deployments, replicasets], verbs: [get, list, watch, patch, delete]}
+- {apiGroups: [apps], resources: [deployments/scale], verbs: [get, patch, update]}
+- {apiGroups: [""], resources: [configmaps, secrets], verbs: [delete]}
+- {apiGroups: [flink.apache.org], resources: [flinkdeployments], verbs: [get, list, patch]}
+- {apiGroups: [batch], resources: [jobs], verbs: [get, list, delete]}
+# qb-watch.sh: engine-deploy/deploy-starrocks.sh down (the cluster and its FE/BE volumes)
+- {apiGroups: [starrocks.com], resources: [starrocksclusters], verbs: [get, list, delete]}
+- {apiGroups: [""], resources: [persistentvolumeclaims], verbs: [get, list, delete]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: ${NAME}, namespace: ${NAMESPACE}}
+subjects: [{kind: ServiceAccount, name: ${NAME}, namespace: ${NAMESPACE}}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: ${NAME}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: ${NAME}, namespace: ${NAMESPACE}, labels: {app: ${NAME}}}
+spec:
+  backoffLimit: 0                       # no restart: a re-run would requery and double-record
+  activeDeadlineSeconds: 86400          # 1 day: the longest a test may run
+  ttlSecondsAfterFinished: 86400        # keep the finished Job and its log a day, then delete it
+  template:
+    metadata:
+      labels: {app: ${NAME}}
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+        instrumentation.opentelemetry.io/inject-java: "false"
+        instrumentation.opentelemetry.io/inject-python: "false"
+        instrumentation.opentelemetry.io/inject-nodejs: "false"
+        instrumentation.opentelemetry.io/inject-dotnet: "false"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: ${NAME}
+      nodeSelector:
+        karpenter.sh/nodepool: driver-nodepool
+        karpenter.sh/capacity-type: on-demand
+        kubernetes.io/arch: amd64
+      containers:
+      - name: runner
+        image: python:3.12-slim
+        resources: {requests: {cpu: "500m", memory: 1Gi}, limits: {cpu: "1", memory: 2Gi}}
+        env: [{name: NAMESPACE, value: "${NAMESPACE}"}]
+        volumeMounts:
+        - {name: bundle, mountPath: /bundle}       # querybench/, .bench-env, .qb-runner-cmd.sh
+        - {name: env, mountPath: /env}             # .bench-env.local
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -uo pipefail
+          apt-get update -qq >/dev/null && apt-get install -y -qq curl procps >/dev/null
+          pip install -q --no-cache-dir awscli >/dev/null 2>&1 || echo "awscli install failed: results will not upload"
+          curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client >/dev/null || { echo "kubectl ${KUBECTL_VERSION} does not run here"; exit 1; }
+          mkdir -p /work && tar -C /work -xzf /bundle/bundle.tgz && cp /env/bench-env-local /work/.bench-env.local
+          mkdir -p /work/bench-results && cd /work
+          echo "== runner $(date -u)"; sed -n 's/^# step: /== step: /p' .qb-runner-cmd.sh
+          bash .qb-runner-cmd.sh; rc=$?
+          echo "status: runner-exit=${rc} $(date -u)"
+          exit "$rc"
+      volumes:
+      - {name: bundle, configMap: {name: ${NAME}}}
+      - {name: env, secret: {secretName: ${NAME}}}

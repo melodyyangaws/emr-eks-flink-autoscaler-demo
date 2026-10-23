@@ -10,3 +10,32 @@ cdc-pipeline/mysql-cdc-env.sh
 # Runtime logs
 *.log
 cdc-pipeline/bench-results
+#python
+*pycache*
+# Account-specific values for throughput-benchmark/.bench-env
+.bench-env.local
+# monitoring/run.sh collector pids
+throughput-benchmark/monitoring/.collectors.pid
+# Maven build output
+throughput-benchmark/datagen/sqs-delta-filename/target/
+#benchmark results
+throughput-benchmark/querybench/bench-results/
+
+# Editors and IDEs: per-user settings and language-server state
+.vscode/
+.idea/
+*.iml
+# Scala Metals (and the Bloop / BSP build servers it starts)
+.metals/
+.bloop/
+.bsp/
+# macOS Finder metadata
+.DS_Store
+# Python local environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+# throughput-benchmark/querybench/run.sh writes this while bundling a Job, then deletes it
+throughput-benchmark/.qb-runner-cmd.sh
+# GenAI tool
+*claude

@@ -7,17 +7,12 @@ spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
   image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${IMAGE_TAG}
-  imagePullPolicy: Always
+  imagePullPolicy: IfNotPresent
   emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
 
   flinkConfiguration:
     # S3 Configuration
     fs.s3a.endpoint.region: ${AWS_REGION}
-    # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
-    # job.autoscaler.scale-down.interval: "0"
-    # # restart with local-recovery is still needed
-    # # in order to redistribute states, update DAG etc by adaptive-scheduler
-    # job.autoscaler.restart.time-tracking.enabled: "true"
     job.autoscaler.scaling.enabled: "false"
     job.autoscaler.enabled: "false"
     # job.autoscaler.stabilization.interval: "1m"
@@ -140,39 +135,15 @@ spec:
     storageDir: s3://${BUCKET_NAME}/flink/cdc-iceberg/ha
     replicas: 1
     resource:
-      memory: 16Gi
+      memory: 8Gi
       cpu: 4
     podTemplate:
       spec:
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${JM_NODEPOOL}
-        # flink-cdc-executor.py is mounted here from a ConfigMap built out of the
-        # local file, NOT fetched from S3 — same operator artifact bug as the Paimon
-        # job: the injected `aws-cli` initContainer downloads jarURI into volume
-        # `flink-artifact` at /flink-artifact, which the main container never mounts
-        # (it mounts `user-artifacts-volume` at /opt/flink/artifacts), while the job
-        # args point at /opt/flink/usrlib/. The file is downloaded and discarded, and
-        # PythonDriver fails with NoSuchFileException on its /tmp/pyflink temp copy.
-        # Keep in lockstep with the Paimon job. Refresh the ConfigMap with:
-        #   kubectl create configmap flink-cdc-executor-py -n emr-flink \
-        #     --from-file=flink-cdc-executor.py=./flink-cdc-executor.py \
-        #     --dry-run=client -o yaml | kubectl apply -f -
-        volumes:
-        - name: executor-py
-          configMap:
-            name: flink-cdc-executor-py
         containers:
         - name: flink-main-container
-          volumeMounts:
-          - name: executor-py
-            mountPath: /opt/flink/usrlib
-          # Password is never templated into this manifest — MYSQL_PASSWORD is
-          # injected at pod start from Secret ${MYSQL_ENV_SECRET_NAME} (key
-          # MYSQL_PASSWORD). envFrom is used rather than an env[].valueFrom
-          # secretKeyRef because the EMR Flink operator's pod-template env merge
-          # emits an empty `value: ""` next to `valueFrom`, which the Kubernetes
-          # API rejects ("may not be specified when `value` is not empty").
           envFrom:
           - secretRef:
               name: ${MYSQL_ENV_SECRET_NAME}
@@ -185,17 +156,6 @@ spec:
             value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
-          # Set for the v1 SDK's DefaultAwsRegionProviderChain, which reads
-          # AWS_DEFAULT_REGION where the v2 SDK reads AWS_REGION. Kept in lockstep
-          # with the Paimon job. Do NOT read it as a fix for the
-          # "AWSGlueClientFactory - No region info found, using SDK default region:
-          # us-east-1" -> EC2MetadataUtils -> "Unauthorized (Status Code: 401)"
-          # sequence: that claim was tested and is false. Both AWS_REGION and
-          # AWS_DEFAULT_REGION were confirmed present in the resolved container env
-          # and the sequence still appeared, because the legacy EMR Glue client
-          # takes its region from the Hadoop/Hive Configuration it is handed, not
-          # from the process environment. See the longer note in
-          # flink-cdc-paimon-sql.yaml — that job is where it was diagnosed.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
           - name: GLUE_DATABASE
@@ -233,14 +193,6 @@ spec:
           # reads AWS_REGION. Set both so neither path falls back to us-east-1.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
-        # Same Karpenter consolidation exposure as the Paimon job: this nodepool
-        # runs consolidationPolicy WhenEmptyOrUnderutilized / consolidateAfter 2m,
-        # so nodes hosting RUNNING TaskManagers get evicted as "Underutilized",
-        # and with failover-strategy: full one lost TM restarts all 520 tasks. The
-        # fit table (8100m cpu / 32868Mi per TM -> 1/3/5/7 TMs on
-        # 4x/8x/12x/16xlarge) and the fragmented-instance-mix feedback loop are
-        # documented in full in flink-cdc-paimon-sql.yaml. Nodepool cpu limits are
-        # not a factor. Keep in lockstep — TM placement is a fair-comparison knob.
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
           karpenter.sh/nodepool: ${TM_NODEPOOL}
