@@ -7,7 +7,7 @@ tables the Flink writers produce. The write half and table set-up are in
 | Suite | Reads | Writers | Queries |
 |---|---|---|---|
 | **hot** | a 30 s `eventTimeDT` window of today's partition (~90M rows) | running | H1–H6 (`hot/`) |
-| **snapshot** | one closed `dt` partition (~4.6B rows); S4 a 3-min slice | stopped | S1–S4 (`snapshot/`) |
+| **snapshot** | a 10-min `eventTimeDT` window of one closed `dt` (~1.8B rows at 3M rows/s); S4 a 1-min slice inside it (25 and 3 min until 2026-10-23) | stopped | S1–S4 (`snapshot/`) |
 
 | Engine | Arm | Reader → data |
 |---|---|---|
@@ -53,9 +53,11 @@ Both tests run as Jobs in the cluster, so closing the laptop does not stop them.
    `FORCE=1` replaces it.
 2. **Deletes the old watcher Job.**
 3. **Snapshot only:** stops the generator, suspends both writers (waits until no
-   TaskManager is left), and picks the partition and S4 slice.
-4. **Starts DuckDB** (`duckdb-warm`) if it isn't up, and checks `/health` says
-   `busy: false`. A new node takes ~5–10 min.
+   TaskManager is left), and picks the partition, the S1–S3 window and the S4 slice.
+4. **Starts StarRocks and DuckDB** if they aren't up: StarRocks when its FE or
+   any of the 3 BEs is not Ready (`../engine-deploy/deploy-starrocks.sh install`,
+   ~5 min), DuckDB (`duckdb-warm`) likewise; checks DuckDB's `/health` says
+   `busy: false`. New nodes take ~5–10 min.
 5. **Empties both caches** (`clear-caches.sh`): each StarRocks BE's datacache
    (delete + restart, one BE at a time), then a DuckDB restart. Checks every BE
    reports `DiskUsage: 0B`. It refuses while a `cid_events` query runs.
@@ -67,7 +69,10 @@ Both tests run as Jobs in the cluster, so closing the laptop does not stop them.
    `s3://$BUCKET_NAME/querybench-results/session<TEST_SUFFIX>/<STAMP>-<suite>/`.
 7. **Starts the watcher Job** (`qb-watch.sh`). Every 10 min it checks the
    runner. When the runner ends it stops the generator, suspends the writers,
-   scales the monitor to 0 and takes DuckDB down.
+   scales the monitor to 0, takes DuckDB down and takes StarRocks down
+   (`deploy-starrocks.sh down`: FE/BE pods and volumes, so their nodes go too;
+   the Helm release and operator stay). `STOP_STARROCKS=0` keeps StarRocks up,
+   e.g. to run the snapshot test right after the hot one without a reinstall.
 
 Notes:
 - Finished Jobs delete themselves after a day.
@@ -76,7 +81,7 @@ Notes:
 - The laptop's metric collectors are not stopped by the watcher:
   `./monitoring/run.sh stop`.
 - DuckDB keeps the `TEST_SUFFIX` it started with. After changing it, run
-  `./querybench/duckdb-warm.sh up`.
+  `./engine-deploy/deploy-duckdb-warm.sh up`.
 
 ---
 
@@ -99,9 +104,18 @@ snapshots, under a different write load.
 ## Snapshot test
 
 - **Partition:** `SNAPSHOT_DT` = the oldest `dt` present in both tables.
-- **S4 slice:** `SNAPSHOT_S4_MINUTES` (3) of `eventTimeDT`, centred in the span
-  both tables were committing, 120 s clear of each end.
-- Pin either by hand: `SNAPSHOT_DT=2026-10-10 SNAPSHOT_S4_FROM='2026-10-10 15:06:00' SNAPSHOT_S4_TO='2026-10-10 15:09:00'`.
+- **S1–S3 window:** `SNAPSHOT_MINUTES` (10) of `eventTimeDT`, centred in the
+  span both tables were committing, 120 s clear of each end. `0` = the whole
+  partition.
+  - Why: the partition's size depends on how long the writers ran. 2 h at 3M
+    rows/s put ~22B rows in one `dt`, and full-partition S1–S3 ran
+    out of BE memory or hit the 1 h timeout. 10 min ≈ 1.8B rows.
+- **S4 slice:** `SNAPSHOT_S4_MINUTES` (1), centred inside the S1–S3 window. The
+  3-min slice used before read ~340 GB, ~75% of each engine's disk cache, and
+  pushed S1–S3 out of it between passes; the 1-min slice reads ~120–160 GB.
+- Pin by hand (all `YYYY-MM-DD HH:MM:SS`): example - `SNAPSHOT_DT=2026-10-20
+  SNAPSHOT_FROM='2026-10-20 13:25:00' SNAPSHOT_TO='2026-10-20 13:50:00'
+  SNAPSHOT_S4_FROM='2026-10-20 13:36:00' SNAPSHOT_S4_TO='2026-10-20 13:39:00'`.
 - **Writers must be stopped.** Live, the same query took 89× longer (332 s vs
   3.7 s). If writer state changes during a suite, it is not recorded.
 
@@ -110,13 +124,13 @@ snapshots, under a different write load.
 The laptop must stay awake, and nothing stops the generator or writers afterwards.
 
 ```bash
-./querybench/duckdb-warm.sh up          # start DuckDB
+./engine-deploy/deploy-duckdb-warm.sh up      # start DuckDB
 ./querybench/clear-caches.sh            # empty both caches
 ./querybench/hot-interleave.sh          # hot, both engines
 SUITE=snapshot ./querybench/starrocks.sh        # suspends the writers itself
 SUITE=snapshot ./querybench/duckdb-warm.sh run
-./querybench/duckdb-warm.sh status      # health, busy, cache bytes
-./querybench/duckdb-warm.sh down
+./engine-deploy/deploy-duckdb-warm.sh status  # health, busy, cache bytes
+./engine-deploy/deploy-duckdb-warm.sh down
 ```
 
 ---
@@ -125,10 +139,10 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
 
 | | StarRocks | DuckDB |
 |---|---|---|
-| Hardware | 3 BEs × 6 cpu / 24 Gi (m5) | one pod, 18 cpu / 72 Gi (m5.8xlarge) |
+| Hardware | 3 BEs × 9 cpu / 38 Gi (m5.4xlarge) | one pod, 27 cpu / 114 Gi, 27 threads (m5.8xlarge) |
 | Node pool | `driver-nodepool` | `driver-nodepool` |
 | Process | always up | one long-lived server |
-| Data cache | datacache: 150 GiB disk + ~4.2 GB memory per BE | `cache_httpfs`: 450 GiB disk (gp3-fast) + 12.5 GB memory |
+| Data cache | datacache: 150 GiB disk + 7.34 GB memory per BE (20% of the 34.2 GiB `mem_limit`) (disk: `gp3-starrocks-be`, 283 MB/s / 5333 IOPS, once `engine-deploy/deploy-starrocks.sh` has run) | `cache_httpfs`: 450 GiB disk (gp3-fast) + 22.03 GB memory, plus DuckDB's own external file cache (its default) inside the 44 GB `memory_limit` |
 | Timing | FE audit log, planning included | in the server, execute + fetch, planning included |
 | Arms | one at a time | one at a time |
 
@@ -155,7 +169,7 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
   adaptive I/O tasks; S4 uses `1` (`-- bench: io-tasks=1`), or it fills the
   BE's query memory.
 
-### DuckDB specifics (`duckdb-warm.sh`, `duckdb_warm_server.py`)
+### DuckDB specifics (`duckdb-warm.sh`; the server: `../engine-deploy/deploy-duckdb-warm.sh`, `duckdb_warm_server.py`)
 
 - One DuckDB connection for the pod's life; one query at a time.
 - **Pinned metadata (`PIN_SNAPSHOT=1`):** each query reads a copy of the
@@ -166,8 +180,13 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
 - A pass gets the query timeout + 5 min. Past that the server restarts and
   loses its cache (the log says so).
 - S3 access through IRSA, refreshed every 20 min outside the timer.
-- The cache disk must be `gp3-fast` (`gp3-fast-sc.yaml`, 1000 MB/s): on default
+- The cache disk must be `gp3-fast` (`../engine-deploy/gp3-fast-sc.yaml`, 850 MB/s): on default
   gp3 the cache was slower than S3.
+- The StarRocks BEs' disks: `../engine-deploy/deploy-starrocks.sh` puts them on
+  `gp3-starrocks-be`, 283 MB/s / 5333 IOPS each, so the 3 BEs together match
+  DuckDB's ~850 MB/s / 16,000 IOPS. Use `install` for a new cluster, or
+  `migrate-be-disks` for the running one (one BE at a time). Sessions before
+  that ran StarRocks on default gp3 (125 MB/s / 3000 IOPS per BE).
 
 ---
 
@@ -184,8 +203,8 @@ order. A new file just runs.
 | `H4_hot_narrow_agg` | `GROUP BY` one narrow column: projection pushdown |
 | `H5_hot_wide_json` | bytes of `event_json` (~3.3 KB/row): file count and size. `payload_bytes` must match across engines |
 | `H6_hot_customer_agg` | `COUNT(DISTINCT)` per customer: hash table, spill |
-| `S1_partition_count` | full-partition `COUNT(*)`: the row count to normalise by |
-| `S2_narrow_agg` | H4 over the whole partition |
+| `S1_partition_count` | `COUNT(*)` over the snapshot window: the row count to normalise by |
+| `S2_narrow_agg` | H4 over the snapshot window |
 | `S3_risk_distinct` | `COUNT(DISTINCT customerId)` by risk level: memory pressure |
 | `S4_wide_json` | JSON decode over the S4 slice; not comparable with S1–S3 |
 
@@ -207,11 +226,12 @@ rendering stops the run. `-- bench:` flags: `allow-zero-rows`,
 | `HOT_TO` / `HOT_WINDOW_SECONDS` | now − 5 min / `30` | the hot window |
 | `STABLE_CHECKS` / `WAIT_COMMIT_S` | `10` / `5400` | hot: writer and commit waits |
 | `SNAPSHOT_DT` | oldest `dt` in both | snapshot partition |
-| `SNAPSHOT_S4_MINUTES` / `_FROM` / `_TO` | `3` / derived | S4 slice |
+| `SNAPSHOT_MINUTES` / `SNAPSHOT_FROM` / `_TO` | `10` / derived | S1–S3 window; `0` = whole partition |
+| `SNAPSHOT_S4_MINUTES` / `_FROM` / `_TO` | `1` / derived | S4 slice |
 | `SUSPEND_WRITERS` | `1` | `0` = never touch the writers |
 | `WATCH_INTERVAL_S` | `600` | watcher check interval |
 | `FORCE` / `ALLOW_CONCURRENT` | off | replace a running runner / skip the one-engine guard |
-| `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` | `44GB` / `18` | under the 72 Gi pod limit (the cache is counted separately) |
+| `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` | `84049MiB` (82.08 GiB) / `27` | 90% of the 114 Gi pod minus the 22.03 GB cache, the same shares as a BE's `mem_limit` |
 | `DUCKDB_VERSION` | `1.5.6` | DuckDB 2.0 has no stable release yet |
 | `CACHE_MODE` | `on_disk` | `in_mem` = memory cache only |
 
@@ -219,8 +239,8 @@ rendering stops the run. `-- bench:` flags: `allow-zero-rows`,
 
 ## Output
 
-`bench-results/starrocks-<STAMP>.csv` and `duckdb_warm-<STAMP>.csv`, one row
-per arm × query:
+In S3 under `querybench-results/session<TEST_SUFFIX>/<STAMP>-<suite>/`:
+`starrocks-<STAMP>.csv` and `duckdb_warm-<STAMP>.csv`, one row per arm × query:
 
 ```
 stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
@@ -234,15 +254,16 @@ stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes
 - `*-firstrows.csv`: first result rows, which the summary uses to check S1/S4
   counts match across arms (a mismatch marks the run INVALID).
 
-Compare one suite side by side (only CSVs from the same run):
+`./bench.sh summary` turns them into the session's findings. To compare one
+suite by hand (only CSVs from the same run):
 
 ```bash
-python3 querybench/compare.py --sr bench-results/starrocks-<STAMP>.csv \
-    --duck bench-results/duckdb_warm-<STAMP>.csv --suite snapshot
+aws s3 sync s3://$BUCKET_NAME/querybench-results/session<TEST_SUFFIX>/<STAMP>-snapshot/ /tmp/qb/
+python3 querybench/compare.py --sr /tmp/qb/starrocks-<STAMP>.csv \
+    --duck /tmp/qb/duckdb_warm-<STAMP>.csv --suite snapshot
 ```
 
-The DuckDB log can contain the bucket name. `summary/run.sh` masks it; mask it
-yourself in anything else you commit.
+The DuckDB log can contain the bucket name; mask it in anything you commit.
 
 ---
 
@@ -257,15 +278,43 @@ yourself in anything else you commit.
 
 H5 dominates (75–95 s per pass); the rest takes seconds once warm.
 
-**Snapshot** (`RUNS=1 WARMUP=1`, 4.64B rows, 2026-10-17): ~6 h.
+**Snapshot** (`RUNS=3 WARMUP=1`, run `20261023T003027Z`): **~4.5 h** of queries
+after ~6 min of stopping writers and emptying caches. Compacted `-final2` tables,
+S1–S3 over 10 min of `eventTimeDT` (1.80B rows), S4 over 1 min (181M rows);
+StarRocks 3 BEs × 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi.
 
-| Arm | Time |
+| Arm | Time (warm-up + 3 timed passes) |
 |---|---|
-| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | ~68 / ~58 / ~86 min |
-| DuckDB `paimon` / `iceberg` | ~67 / ~86 min |
+| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | 38 / 40 / 81 min (2,288 / 2,379 / 4,849 s) |
+| DuckDB `paimon` / `iceberg` | 56 / 50 min (3,389 / 3,006 s) |
 
-The warm-up pass (empty caches, reads S3) takes most of the time. Each extra
-timed pass adds ~20–40 min per arm.
+Median of the timed passes, seconds:
+
+| Query | SR `paimon` | SR `pmn_as_iceberg` | SR `iceberg` | DuckDB `paimon` | DuckDB `iceberg` |
+|---|---|---|---|---|---|
+| S1 | 36.0 | 15.5 | 41.9 | 106.5 | 90.2 |
+| S2 | 11.5 | 31.1 | 52.6 | 139.7 | 121.0 |
+| S3 | 14.0 | 46.6 | 49.5 | 139.2 | 120.2 |
+| S4 | 280.1 | 244.5 | 314.2 | 245.6 | 219.5 |
+
+Data scanned per query, StarRocks (GB; DuckDB does not report it):
+
+| Query | SR `paimon` | SR `pmn_as_iceberg` | SR `iceberg` |
+|---|---|---|---|
+| S1 | 8.8 | 15.6 | 63.6 |
+| S2 | 9.0 | 20.5 | 74.8 |
+| S3 | 8.8 | 20.1 | 68.9 |
+| S4 | 121.7 | 126.1 | 156.2 |
+| one pass (S1–S4) | ~148 | ~182 | ~364 |
+
+A pass now fits each engine's 450 GiB disk cache, so the timed passes are cache
+hits; the warm-up pass, from S3, is the slowest (e.g. StarRocks `iceberg` S2:
+1,661 s cold, 44 s warm). StarRocks reads 2.8× more bytes from the Iceberg table
+than from Paimon's export (geometric mean).
+
+Before (25-min S1–S3, 3-min S4, uncompacted, BEs 6 cpu / 24 Gi, DuckDB 18 cpu /
+72 Gi, 2026-10-21): StarRocks ~10.5 h (171 / 190 / ~190 min per arm), DuckDB ~6 h;
+a pass read ~450 GB per arm, about the whole 450 GiB cache.
 
 ---
 

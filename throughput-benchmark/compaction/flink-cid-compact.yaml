@@ -1,0 +1,135 @@
+# One-off compaction of one format's cid_events table (flink-cid-compact.py),
+# as a BATCH job. Rendered per format by compaction/run.sh into
+# flink-cid-compact-<fmt>-deployed.yaml (gitignored: bucket, account ID, role).
+#
+# The writers' manifest (flinkwriter/flink-cid-<fmt>.yaml), minus what a
+# bounded job does not need: no SQS source, no checkpointing. The same image,
+# EMR release, nodepools, TM shape (4 cpu / 16 Gi, 4 slots) and parallelism
+# knob, so both formats' compactions run on what their writers ran on.
+#
+# Differences from the writers, on purpose:
+# - highAvailabilityEnabled: false and no restarts. A failed run commits
+#   nothing (both formats commit at the very end), so run.sh simply reports it;
+#   a silent retry would rewrite the same files again.
+# - The executor is staged on CREATE only, like the writers' (EMR's webhook):
+#   run.sh deletes and re-creates the CR for every pass.
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  namespace: ${NAMESPACE}
+  name: flink-cid-compact-${FMT}
+spec:
+  flinkVersion: v1_20
+  executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
+  image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${IMAGE_TAG}
+  imagePullPolicy: IfNotPresent
+  emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
+
+  flinkConfiguration:
+    fs.s3a.endpoint.region: ${AWS_REGION}
+    # /glue/confs/ in the pods: the Paimon catalog's hive-conf-dir (the Paimon
+    # writer sets the same). Harmless for Iceberg, whose catalog is GlueCatalog.
+    aws.glue.enabled: "true"
+    job.autoscaler.enabled: "false"
+    pipeline.operator-chaining.enabled: "true"
+    pipeline.object-reuse: "true"
+    restart-strategy.type: none
+    heartbeat.timeout: "180s"
+    heartbeat.interval: "20s"
+    taskmanager.numberOfTaskSlots: "4"
+    # Rewriting is Parquet decode + encode on the task heap; nothing uses
+    # managed memory except Paimon's batch sort, which bin-packing does not run.
+    taskmanager.memory.managed.fraction: "0.1"
+    parallelism.default: "${COMPACT_PARALLELISM}"
+    pipeline.max-parallelism: "512"
+    # Iceberg: the groups to rewrite are serialized into the job graph; large
+    # task deployment descriptors go through the blob server.
+    pekko.framesize: "104857600b"
+    kubernetes.transactional-operation.max-retries: "10"
+
+  jobManager:
+    highAvailabilityEnabled: false
+    replicas: 1
+    resource:
+      # Iceberg plans every data file of the table on the JM (77K files
+      # = 14.5 TB on 2026-10-21) before the job starts.
+      memory: 16Gi
+      cpu: 4
+    podTemplate:
+      spec:
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: ${JM_NODEPOOL}
+        containers:
+        - name: flink-main-container
+          env:
+          # The writers' catalog SQL reads these (02-catalog-setup.sql).
+          - name: PAIMON_WAREHOUSE
+            value: "s3://${BUCKET_NAME}/cid-warehouse-paimon${TEST_SUFFIX}/"
+          - name: ICEBERG_WAREHOUSE
+            value: "s3://${BUCKET_NAME}/cid-warehouse-iceberg${TEST_SUFFIX}/"
+          - name: GLUE_DATABASE
+            value: "flink_cid_${FMT}_db${TEST_DB_SUFFIX}"
+          - name: AWS_REGION
+            value: "${AWS_REGION}"
+          # The legacy Hadoop/Hive Glue client reads AWS_DEFAULT_REGION (see
+          # the writers' manifests).
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
+          - name: S3A_MULTIPART_SIZE
+            value: "${S3A_MULTIPART_SIZE}"
+          - name: S3A_MULTIPART_THRESHOLD
+            value: "${S3A_MULTIPART_THRESHOLD}"
+  taskManager:
+    resource:
+      memory: 16Gi
+      cpu: 4
+    podTemplate:
+      metadata:
+        annotations:
+          # As on the writers: Karpenter must not consolidate a node from under
+          # a TaskManager; a lost TM fails the job (no restarts).
+          karpenter.sh/do-not-disrupt: "true"
+      spec:
+        containers:
+        - name: flink-main-container
+          env:
+          - name: AWS_REGION
+            value: "${AWS_REGION}"
+          - name: AWS_DEFAULT_REGION
+            value: "${AWS_REGION}"
+        nodeSelector:
+          karpenter.sh/capacity-type: on-demand
+          karpenter.sh/nodepool: ${TM_NODEPOOL}
+
+  job:
+    jarURI: s3://${BUCKET_NAME}/flink/scripts/flink-cid-compact.py
+    entryClass: org.apache.flink.client.python.PythonDriver
+    args:
+      - "-py"
+      - "/opt/flink/usrlib/flink-cid-compact.py"
+      - "--format"
+      - "${FMT}"
+      - "--catalog-sql"
+      - "s3://${BUCKET_NAME}/flink/cid-compact/${FMT}/02-catalog-setup.sql"
+      - "--parallelism"
+      - "${COMPACT_PARALLELISM}"
+      - "--max-groups"
+      - "${ICEBERG_MAX_GROUPS}"
+      - "--retain"
+      - "${COMPACT_RETAIN}"
+      - "--dry-run"
+      - "${DRY_RUN}"
+      - "--result-uri"
+      - "${RESULT_URI}"
+    parallelism: ${COMPACT_PARALLELISM}
+    upgradeMode: stateless
+    state: running
+
+  monitoringConfiguration:
+    s3MonitoringConfiguration:
+      logUri: s3://${BUCKET_NAME}/flink/logs/cid-compact-${FMT}
+    sideCarResources:
+      limits:
+        cpuLimit: 500m
+        memoryLimit: 250Mi

@@ -1,16 +1,50 @@
 # Flink Throughput Benchmark — Paimon vs Iceberg
 
-Compares the **Flink write path** of Apache Paimon and Apache Iceberg on EMR on
-EKS, then **query speed** on the tables they wrote (StarRocks vs DuckDB).
+This project compares the **Flink write performance** of Apache Paimon and Apache Iceberg on EMR on EKS. It also provides **hot and snapshot query performance** comparisons for the Paimon and Iceberg tables produced by Flink, using two query engines: **StarRocks (4.1.4)** and **DuckDB (1.5.6)**
 
 - Image: `emr-flink-cdc-paimon` (EMR 7.13, Paimon 1.3.2, Iceberg 1.10.0-amzn-1),
   shared with the CDC pipeline. No image build here: build it once with
   `cd ../cdc-pipeline && ./build-deploy-generic.sh build`.
-- Data: gzipped NDJSON files (~4 KiB rows) written to S3 by a generator, and
-  announced to each job through S3 → SNS → SQS.
+- Data: gzipped JSON files (~4 KiB rows) written to S3 by a data generator, and
+  announced the incremental s3 files to each job through S3 → SNS → SQS.
 - Both tables are **append-only**, partitioned by `dt`: no primary key, no
   upsert, no delete files.
-- Results: `bench-results/` (latest: `BENCH-SUMMARY-20261019-r3.md`).
+- Results: `bench-results/BENCH-SUMMARY-<session>.md`; the raw data is in S3.
+
+---
+
+## Easiest start: ask a GenAI MCP client tool
+
+Open a GenAI tool such as Kiro or Claude Code, navigate to the Github project's folder `throughput-benchmark/`
+```bash
+git clone git@github.com:melodyyangaws/emr-eks-flink-autoscaler-demo.git
+cd emr-eks-flink-autoscaler-demo/throughput-benchmark
+# start the GenAI tool
+claude
+```
+then ask:
+> follow the readme of this project to start all the test
+
+Ask the test progress at any time:
+> what's the current progress?
+
+The tool reads this README and runs every step below in order. It checks
+capacity and what is still running, and asks you before anything that changes
+shared state: a new `TEST_SUFFIX`, or purging leftover SQS messages. Create
+`.bench-env.local` first (see [Settings](#settings-bench-env-and-bench-envlocal)).
+
+| # | Step | Command | What it does | Time (measured) |
+|---|---|---|---|---|
+| 0 | Pre-checks | — | capacity, leftover pods, SQS backlog, a fresh `TEST_SUFFIX`, purge queues | ~2 min (a purge takes 60 s) |
+| 1 | Throughput | `./bench.sh throughput` | deploys both Flink writers, waits for RUNNING, starts the source data generator and monitoring | ~8 min |
+| 2 | Fill the tables | — | the writers commit while the tables grow | ~30 min |
+| 2b | Query engines | `kubectl apply -f engine-deploy/gp3-fast-sc.yaml`, then `./engine-deploy/deploy-starrocks.sh install`, `./engine-deploy/deploy-duckdb-warm.sh up` | only if StarRocks or DuckDB long-runner server is missing: the fast gp3 disk classes first, then the engines (see [Query engines](#query-engines-before-a-query-test)); | ~5–10 min (new nodes) |
+| 3 | Hot query test | `./bench.sh hot` | DuckDB up, caches emptied, then 1 warm-up + 3 timed passes while the writers run | ~5 min setup + ~1.5 h test |
+| 4 | Snapshot query test | `./bench.sh snapshot` | waits for the hot test complete, stops the writers, compacts both tables once (`COMPACT_BEFORE_SNAPSHOT=true`, [Compaction](#compaction-before-the-snapshot-test)), empties caches, runs StarRocks (3 arms) then DuckDB (2 arms) | compaction 39 min (parallelism 320, 2026-10-22; ~55 min expected at the default 160) + ~6 min stop/caches + StarRocks 2.6 h + DuckDB 1.8 h = **~5.3 h** (2026-10-23: 10-min S1–S3 / 1-min S4 windows, BEs 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi). With the old 25 / 3-min windows: StarRocks ~10.5 h, DuckDB ~6 h |
+| 5 | Summary | `./bench.sh summary` | pulls the results from S3 into `bench-results/BENCH-SUMMARY-<session>.md` | ~3 min |
+
+A full session takes about 7.5 h, most of it the snapshot test (about 19 h before the 2026-10-23 windows). Steps 3 and 4
+run as Jobs in the cluster, so the laptop and the tool can be closed while they run.
 
 ---
 
@@ -22,9 +56,12 @@ cd throughput-benchmark
 # each session: set TEST_SUFFIX in .bench-env (a new table set, e.g. "-test4")
 # see the following step by step section for more details
 PAIMON_WRITE_ONLY=true PAIMON_WRITE_BUFFER_SPILLABLE=false \
-./bench.sh throughput   # writers -> both RUNNING -> generator -> monitoring
+./bench.sh throughput   # writers -> both RUNNING -> source data generator -> monitoring
+kubectl apply -f engine-deploy/gp3-fast-sc.yaml   # before the engines: the fast gp3 disk classes
+./engine-deploy/deploy-starrocks.sh install   # only if StarRocks is missing (status shows it)
+./engine-deploy/deploy-duckdb-warm.sh up      # only if DuckDB is missing; the tests empty both caches themselves
 ./bench.sh hot          # hot query test while the writers run
-./bench.sh snapshot     # snapshot query test (stops the writers first)
+./bench.sh snapshot     # snapshot query test (stops the writers, compacts both tables once, then queries)
 ./bench.sh summary      # -> bench-results/BENCH-SUMMARY-<session>.md
 ./bench.sh status       # what is running
 ./bench.sh cleanup      # stop everything; deletes no data
@@ -41,6 +78,9 @@ Each folder has one `run.sh <command>`; `bench.sh` only calls them in order.
 | Data generator | `./datagen/run.sh` | `start`, `stop`, `status`, `logs`, `scale N`, `render` |
 | Flink writers | `./flinkwriter/run.sh` | `upload`, `render`, `deploy <paimon\|iceberg\|both>`, `notify`, `cleanup [fmt\|both]` |
 | Monitoring | `./monitoring/run.sh` | `start`, `stop` |
+| Compaction | `./compaction/run.sh` | `run [paimon\|iceberg\|both]`, `status`, `logs <fmt>`, `cleanup` |
+| Query engines | `./engine-deploy/deploy-starrocks.sh` | `install`, `migrate-be-disks`, `status`, `connection`, `down`, `uninstall` |
+| | `./engine-deploy/deploy-duckdb-warm.sh` | `up`, `status`, `clear-cache`, `down` |
 | Query tests | `./querybench/run.sh` | `start` (with `SUITE=hot\|snapshot`), `logs [watch]` |
 | Summary | `./summary/run.sh` | none |
 
@@ -66,13 +106,14 @@ What `.bench-env` sets:
 
 | Variable | `.bench-env` | Script default | Note |
 |---|---|---|---|
-| `TEST_SUFFIX` | `-final` | empty | names the table set; keep it for the whole session |
+| `TEST_SUFFIX` | `-final2` | empty | names the table set; keep it for the whole session |
 | `JOB_PARALLELISM` | `320` | `128` | writer subtasks per job (80 TMs) |
 | `ICEBERG_COMPAT` | `true` | `false` | Paimon also exports Iceberg metadata, so StarRocks/DuckDB can read it as Iceberg |
 | `JSONGZ_REPLICAS` | `7` | required | generator pods, 500K rows/s each at most |
 | `DURATION_SECONDS` | `0` | `1800` | generator run length; `0` means long running until stopped manually |
 | `OUTPUT_URI` | `s3://$BUCKET_NAME/cid-landing-jsongz` | — | the only prefix S3 announces to SQS |
 | `S3A_MULTIPART_SIZE` / `_THRESHOLD` | `32M` | `16M` | Paimon's S3 upload part size |
+| `COMPACT_BEFORE_SNAPSHOT` | `true` | `false` | the snapshot test compacts both tables once first ([Compaction](#compaction-before-the-snapshot-test)) |
 
 `TEST_SUFFIX` sets every name of a table set:
 
@@ -82,6 +123,7 @@ What `.bench-env` sets:
 | Warehouses | `s3://$BUCKET_NAME/cid-warehouse-{paimon,iceberg}-test4/` |
 | Flink state (checkpoints, HA) | `s3://$BUCKET_NAME/flink/cid-{paimon,iceberg}-test4/` |
 | Query results | `s3://$BUCKET_NAME/querybench-results/session-test4/<STAMP>-<suite>/` |
+| Compaction results | `s3://$BUCKET_NAME/querybench-results/session-test4/compaction/<STAMP>-<fmt>-pass<N>.json` |
 
 ---
 
@@ -148,10 +190,55 @@ kubectl port-forward svc/flink-cid-paimon-rest 8081:8081 -n emr-flink   # Flink 
   Throughput comes from the tables' commit history, or from Flink metrics if
   no commit landed in the window.
 - **Collectors:** `collect-metrics.sh`, one per running job (Paimon on port
-  8091, Iceberg on 8092). Output: `bench-results/cid-<fmt>-<stamp>.csv`.
+  8091, Iceberg on 8092). Output: `bench-results/cid-<fmt>-<stamp>.csv`, moved
+  to S3 by the summary.
   Knobs: `COLLECT=0` (skip), `COLLECT_INTERVAL` (30 s), `COLLECT_DURATION` (7200 s).
 
 ### 6. Query tests
+
+#### Query engines: before a query test
+
+Both tests need StarRocks and the warm DuckDB server. Check them first:
+
+```bash
+./engine-deploy/deploy-starrocks.sh status      # FE + 3 BE pods, BE volumes
+./engine-deploy/deploy-duckdb-warm.sh status    # duckdb-warm: {...} or "not running"
+```
+
+- **An engine is missing:** create the fast gp3 disk classes first, then start
+  the engine, then run the test.
+
+  ```bash
+  kubectl apply -f engine-deploy/gp3-fast-sc.yaml   # gp3-fast (DuckDB: 16000 IOPS / 850 MB/s)
+                                                    # gp3-starrocks-be (each BE: 5333 IOPS / 283 MB/s)
+  kubectl get storageclass gp3-fast gp3-starrocks-be \
+    -o custom-columns=NAME:.metadata.name,IOPS:.parameters.iops,MBPS:.parameters.throughput
+  ./engine-deploy/deploy-starrocks.sh install   # ~5 min: operator, FE, 3 BEs (9 cpu / 38 Gi, m5.4xlarge, gp3-starrocks-be)
+  ./engine-deploy/deploy-duckdb-warm.sh up      # ~5-10 min on a new node (27 cpu / 114 Gi, m5.8xlarge, gp3-fast)
+  ```
+
+  `run.sh start` would start a missing DuckDB itself, but not StarRocks. Both
+  deploy scripts apply `gp3-fast-sc.yaml` too; creating the classes first shows
+  a mismatch before any engine is half-deployed.
+
+  A StorageClass's parameters cannot change. After editing a class in
+  `gp3-fast-sc.yaml`, the apply fails with `updates to parameters are
+  forbidden`: delete that class and apply again. Volumes already created keep
+  their speed, so restart DuckDB (`up`) or re-create the BE volumes
+  (`deploy-starrocks.sh uninstall` + `install`) to get the new one.
+
+  ```bash
+  kubectl delete storageclass gp3-fast && kubectl apply -f engine-deploy/gp3-fast-sc.yaml
+  ```
+- **Both are up:** only the caches need emptying, and the test does that itself
+  (step 4 below). By hand, without a test:
+
+  ```bash
+  ./querybench/clear-caches.sh                  # StarRocks datacache (BE by BE) + DuckDB restart
+  ```
+
+Both engines keep the `TEST_SUFFIX` and settings they were started with. After
+changing either, restart DuckDB (`up`) and re-run the StarRocks `install`.
 
 ```bash
 ./bench.sh hot                    # = SUITE=hot ./querybench/run.sh start
@@ -163,15 +250,64 @@ kubectl port-forward svc/flink-cid-paimon-rest 8081:8081 -n emr-flink   # Flink 
 
 1. Waits while an earlier test is still running (`FORCE=1` replaces it).
 2. Snapshot only: stops the generator and the writers, and picks the query windows.
-3. Starts the DuckDB server and checks it is healthy.
+   Then, with `COMPACT_BEFORE_SNAPSHOT=true`, compacts both tables once (below).
+3. Starts StarRocks if its FE or BEs are missing (`engine-deploy/deploy-starrocks.sh install`),
+   then the DuckDB server, and checks it is healthy.
 4. Empties both engines' caches (`querybench/clear-caches.sh`).
 5. Starts the runner Job. When the test ends, the results go to S3 under
    `querybench-results/session<TEST_SUFFIX>/`.
 6. Starts the watcher Job. When the runner ends, it stops the generator,
-   writers, monitor and DuckDB.
+   writers, monitor, DuckDB and StarRocks (`deploy-starrocks.sh down`: FE/BE
+   pods and volumes; `STOP_STARROCKS=0` keeps it). The next test's step 3
+   brings both engines back.
 
 Both Jobs run in the cluster, so closing the laptop does not stop a test.
 Queries, arms, knobs and output: [querybench/README.md](querybench/README.md).
+
+#### Compaction before the snapshot test
+
+The writers leave two files per subtask per 60 s checkpoint: one ~256 MiB and
+one ~118 MiB tail (77K files, 14.5 TB per table on 10-21). `compaction/run.sh`
+merges the tails once, with the same rule on both formats, so the snapshot
+test reads tables laid out the way a maintained table would be.
+
+| | Paimon | Iceberg |
+|---|---|---|
+| Picks | files under 70% of the 256 MiB target (Paimon's own rule) | the same rule, applied in the job |
+| Packs | bins of ≥ 2 × target or ≥ 5 files; output rolls at 256 MiB | groups of ≤ 256 MiB, one output file each |
+| Runs | `CALL sys.compact` (batch, `minor`) | Iceberg's `RowDataRewriter`, then one `RewriteFiles` commit |
+| Passes | 1 | `ICEBERG_MAX_GROUPS` groups each (4000), until none is left |
+
+- Files at or near the target stay as they are, so each file still covers
+  about one minute of `eventTimeDT`. That keeps the window pruning as it was.
+  It is bin-packing, not a sort.
+- Each format is a batch FlinkDeployment, `flink-cid-compact-<fmt>`. Both use
+  the writers' image, catalog SQL and nodepools, at `COMPACT_PARALLELISM`
+  (default 160: 40 TaskManagers each), and run side by side.
+- The snapshot test runs it after the writers stop and the windows are
+  picked, and before the caches are emptied. It runs from the laptop, so keep
+  the laptop on until `run.sh start` has started the runner Job.
+- Iceberg's own Flink `RewriteDataFilesAction` is not used: it splits every
+  file at the target and rewrites any file it had to split, which here means
+  nearly all of them.
+- Paimon's compaction commit expires snapshots. `COMPACT_RETAIN` (7d) keeps
+  the writers' APPEND snapshots for that commit, because the throughput
+  numbers are computed from them.
+- A failed pass commits nothing, and its FlinkDeployment is kept for the
+  logs. `./compaction/run.sh cleanup` deletes it.
+- Each pass writes a JSON to `compaction/` in the session's S3 prefix: before
+  and after files and bytes, and timings. The summary adds a section from it.
+
+```bash
+DRY_RUN=true ./compaction/run.sh run both   # measure and plan only; nothing rewritten (JobManagers only)
+./compaction/run.sh run both                # compact by hand (writers must be stopped)
+./compaction/run.sh status
+./compaction/run.sh logs iceberg
+COMPACT_BEFORE_SNAPSHOT=false ./bench.sh snapshot   # one snapshot test without it
+```
+
+Knobs: `COMPACT_PARALLELISM`, `ICEBERG_MAX_GROUPS`, `COMPACT_MAX_PASSES` (20),
+`COMPACT_TIMEOUT_S` (per pass, 4 h), `COMPACT_RETAIN`, `DRY_RUN`.
 
 ### 7. Summary
 
@@ -179,10 +315,19 @@ Queries, arms, knobs and output: [querybench/README.md](querybench/README.md).
 ./bench.sh summary   # = ./summary/run.sh
 ```
 
-Finds the session's newest hot and snapshot runs in S3 (`HOT_STAMP=` /
-`SNAPSHOT_STAMP=` pick others), reads both tables' commit history, and writes
-`bench-results/BENCH-SUMMARY-<date><TEST_SUFFIX>.md`. The bucket and account ID
-are masked.
+Writes one findings file, `bench-results/BENCH-SUMMARY-<date><TEST_SUFFIX>.md`:
+setup, key findings, throughput, hot and snapshot tables, and like-for-like
+comparisons (reader, writer, engine). The findings are derived from the numbers,
+including incidents such as one writer stopping its commits early.
+
+- **Inputs, all from S3** (`querybench-results/session<TEST_SUFFIX>/`): the
+  newest hot and snapshot runs (`HOT_STAMP=` / `SNAPSHOT_STAMP=` pick others)
+  and `throughput/`, plus both tables' commit history.
+- **The laptop's collector files** (`cid-<fmt>-*.csv`, `collect-*.log`) are
+  uploaded to `throughput/` first, with the commit history.
+- **`bench-results/` keeps Markdown only:** every other file there is deleted
+  at the end, since it is in S3. Re-running rewrites the summary.
+- The bucket and account ID are masked.
 
 ### 8. Teardown
 
@@ -190,7 +335,7 @@ Nothing may be writing when you wipe: a live job recommits into a half-deleted
 warehouse.
 
 ```bash
-./bench.sh cleanup                       # generator, writers, monitor, DuckDB
+./bench.sh cleanup                       # generator, writers, monitor, DuckDB, StarRocks, compaction jobs
 ./flinkwriter/run.sh cleanup both        # delete the FlinkDeployments
 kubectl get pods -n emr-flink | grep cid # must print nothing
 kubectl get cm -n emr-flink | grep -E 'flink-cid-.*config-map'   # leftover HA state: delete it
@@ -291,7 +436,10 @@ Change one side, change the other.
 ### Differences that remain
 
 - **Compaction:** Paimon compacts inside the writer (unless
-  `PAIMON_WRITE_ONLY=true`). Iceberg's Flink sink never compacts. Compare file
+  `PAIMON_WRITE_ONLY=true`). Iceberg's Flink sink never compacts. Before the
+  snapshot test, `compaction/run.sh` compacts both with one rule (see
+  [Compaction](#compaction-before-the-snapshot-test)); the hot test always
+  reads them as written. Compare file
   count and size alongside rows/s.
 - **Commit:** each Iceberg commit also updates Glue. Paimon commits are S3 only.
 - **Snapshot expiry:** Paimon expires snapshots as it commits. For Iceberg the
@@ -379,11 +527,20 @@ throughput-benchmark/
 │   ├── run.sh
 │   ├── collect-metrics.sh           # REST samples -> bench-results/cid-*.csv
 │   ├── entrypoint.py, flink_cid_monitor.py, monitor-deployment.yaml
+├── compaction/
+│   ├── run.sh
+│   ├── flink-cid-compact.py         # one-off bin-pack of one format's table (batch)
+│   └── flink-cid-compact.yaml       # its FlinkDeployment template
 ├── querybench/              # StarRocks + DuckDB query tests: see querybench/README.md
+├── engine-deploy/           # the two query engines' deployments
+│   ├── deploy-starrocks.sh          # StarRocks (Helm), BE disks gp3-starrocks-be: 3 x 283 = ~850 MB/s
+│   ├── deploy-duckdb-warm.sh        # the warm DuckDB server: up | status | clear-cache | down
+│   ├── duckdb-warm.yaml, duckdb_warm_server.py
+│   └── gp3-fast-sc.yaml             # the disk classes: gp3-fast (DuckDB, 850 MB/s), gp3-starrocks-be (283 MB/s x 3)
 ├── summary/
 │   ├── run.sh
 │   └── summarize.py                 # -> bench-results/BENCH-SUMMARY-<session>.md
-└── bench-results/           # CSVs, logs, summaries
+└── bench-results/           # BENCH-SUMMARY-<session>.md only; the data is in S3
 ```
 
 Rendered manifests (`*-deployed.yaml`) hold the bucket and account ID and are

@@ -70,7 +70,14 @@ export DURATION_SECONDS=0
 # Keep it for the whole session: the throughput run and the hot and snapshot
 # tests must all use the same data/table set.
 
-export TEST_SUFFIX="-final"
+export TEST_SUFFIX="-final2"
 
 # Data Generator: 7 replicas ≈ 3.0M rows/s, just under both writers' capacity.
 export JSONGZ_REPLICAS=7
+
+# Compact both tables once before the snapshot query test (compaction/run.sh:
+# files under 70% of the 256 MiB target, bin-packed, the same rule on both
+# formats). querybench/run.sh runs it after stopping the writers, before
+# emptying the caches. The script default is false; sessions before
+# 2026-10-22 ran without it, so their snapshot numbers are on uncompacted tables.
+export COMPACT_BEFORE_SNAPSHOT=true

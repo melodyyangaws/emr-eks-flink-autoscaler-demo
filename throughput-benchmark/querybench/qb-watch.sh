@@ -20,12 +20,15 @@
 #   2. suspends the writers (qb_stop_writers; SUSPEND_WRITERS=0 leaves them);
 #   3. scales the job monitor (flink-cid-monitor) to 0, once the writers have
 #      stopped;
-#   4. takes the warm DuckDB server down (duckdb-warm.sh down);
-#   5. deletes the runner's ConfigMap and Secret (its bundle and .bench-env.local);
+#   4. takes the warm DuckDB server down (engine-deploy/deploy-duckdb-warm.sh down);
+#   5. takes the StarRocks cluster down (engine-deploy/deploy-starrocks.sh down:
+#      FE/BE pods and volumes; the Helm release and operator stay, and
+#      querybench/run.sh start installs it again; STOP_STARROCKS=0 leaves it);
+#   6. deletes the runner's ConfigMap and Secret (its bundle and .bench-env.local);
 #      the finished Jobs delete themselves after a day.
 # The laptop's metric collectors (monitoring/run.sh) are not reachable from
 # here: `./monitoring/run.sh stop` ends them.
-# Knob: WATCH_INTERVAL_S.
+# Knobs: WATCH_INTERVAL_S, STOP_STARROCKS (1).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
@@ -49,7 +52,7 @@ test_over() {
     kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" 2>/dev/null | grep -m1 '^status: runner-exit=' || true
 }
 
-qb_log "qb-watch (${SUITE}): checking ${WATCH_RUNNER} every ${WATCH_INTERVAL_S}s; then stopping ${GEN_JOB}, the writers (${FLINK_JOBS}), the job monitor and ${SERVER}"
+qb_log "qb-watch (${SUITE}): checking ${WATCH_RUNNER} every ${WATCH_INTERVAL_S}s; then stopping ${GEN_JOB}, the writers (${FLINK_JOBS}), the job monitor, ${SERVER} and StarRocks"
 while :; do
     why=$(test_over)
     [[ -n "$why" ]] && break
@@ -83,9 +86,16 @@ if ( qb_stop_writers ); then
 else
     qb_log "WARNING: could not stop the writers (see above); job monitor left running"
 fi
-"${HERE}/duckdb-warm.sh" down >/dev/null \
+"${HERE}/../engine-deploy/deploy-duckdb-warm.sh" down >/dev/null \
     && qb_log "${SERVER} stopped" \
     || qb_log "WARNING: could not stop ${SERVER}"
+if [[ "${STOP_STARROCKS:-1}" == 0 ]]; then
+    qb_log "STOP_STARROCKS=0: StarRocks left running"
+else
+    "${HERE}/../engine-deploy/deploy-starrocks.sh" down >/dev/null \
+        && qb_log "StarRocks stopped (FE/BE and volumes deleted; run.sh start installs it again)" \
+        || qb_log "WARNING: could not stop StarRocks (./engine-deploy/deploy-starrocks.sh down by hand)"
+fi
 kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && qb_log "${WATCH_RUNNER}'s ConfigMap and Secret deleted" \

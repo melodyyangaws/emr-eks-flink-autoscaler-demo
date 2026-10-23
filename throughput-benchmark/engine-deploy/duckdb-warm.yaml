@@ -1,4 +1,4 @@
-# Warm DuckDB server for both suites, rendered by duckdb-warm.sh (envsubst): a
+# Warm DuckDB server for both suites, rendered by deploy-duckdb-warm.sh (envsubst): a
 # long-lived pod holding one DuckDB process (duckdb_warm_server.py), the
 # counterpart of the always-up StarRocks cluster: same total CPU/RAM as its 3 BEs.
 apiVersion: apps/v1
@@ -28,9 +28,9 @@ spec:
             topologyKey: kubernetes.io/hostname
       nodeSelector:
         kubernetes.io/arch: amd64                  # = StarRocks' BEs
-        karpenter.sh/nodepool: driver-nodepool     # = StarRocks (cdc-pipeline/helm/starrocks-eks-values.yaml); never consolidated while busy
+        karpenter.sh/nodepool: ${DUCKDB_NODEPOOL}  # driver-nodepool (= the BEs') up to 8xlarge; executor-memorynodepool beyond. do-not-disrupt above keeps the node
         karpenter.k8s.aws/instance-family: m5      # = StarRocks' BEs: changing CPU family moved timings 20-36%
-        karpenter.k8s.aws/instance-size: 8xlarge   # 32 vcpu / 128Gi, the smallest m5 that holds 18 cpu / 72Gi
+        karpenter.k8s.aws/instance-size: ${DUCKDB_INSTANCE_SIZE}  # DUCKDB_INSTANCE_SIZE: the smallest m5 Karpenter fits ${DUCKDB_CPU} cpu / ${DUCKDB_POD_MEMORY} on
         karpenter.sh/capacity-type: on-demand      # a spot reclaim would drop the warm cache
       containers:
       - name: duckdb
@@ -63,8 +63,8 @@ spec:
         - {name: CACHE_DISK_BYTES,     value: "${CACHE_DISK_BYTES}"}
         - {name: CACHE_MEM_BYTES,      value: "${CACHE_MEM_BYTES}"}
         resources:                          # requests = limits: Guaranteed QoS, no CPU burst over parity
-          requests: {cpu: "18", memory: 72Gi}
-          limits:   {cpu: "18", memory: 72Gi}
+          requests: {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}
+          limits:   {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}
         volumeMounts:
         - {name: bench,   mountPath: /opt/bench}
         - {name: scratch, mountPath: /scratch}
@@ -84,5 +84,5 @@ spec:
           volumeClaimTemplate:
             spec:
               accessModes: ["ReadWriteOnce"]
-              storageClassName: ${CACHE_STORAGE_CLASS}   # gp3-fast: 1000 MB/s, see gp3-fast-sc.yaml
+              storageClassName: ${CACHE_STORAGE_CLASS}   # gp3-fast: 850 MB/s, see gp3-fast-sc.yaml
               resources: {requests: {storage: ${CACHE_VOLUME}}}

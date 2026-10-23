@@ -1,4 +1,4 @@
--- Fat-JSON decode over a SNAPSHOT_S4_MINUTES (3) slice of the closed partition,
+-- Fat-JSON decode over a SNAPSHOT_S4_MINUTES (1) slice of the closed partition,
 -- bench: io-tasks=1
 -- on eventTimeDT: set by the generator, so every arm reads exactly the same rows
 -- in the same time slot (ingestionTime is each writer's own clock: 471M vs 480M).

@@ -1,24 +1,12 @@
 #!/usr/bin/env bash
-# Warm DuckDB, the like-for-like counterpart of the always-up StarRocks cluster.
-# One long-lived server (duckdb_warm_server.py, Deployment duckdb-warm)
-# keeps one DuckDB process, its S3 secret and a block cache sized like
-# StarRocks' datacache, for both suites: StarRocks too has one cluster and one
-# cache for hot and snapshot. (Until 2026-10-20 each suite had its own server.)
+# The DuckDB side of the query tests: runs the suites on the warm DuckDB server
+# (Deployment duckdb-warm, deployed by ../engine-deploy/deploy-duckdb-warm.sh:
+# up / status / clear-cache / down), the counterpart of starrocks.sh.
 #
-#   ./duckdb-warm.sh up                         start (or restart) the server
-#   ./duckdb-warm.sh status                     health, busy flag, cache size
 #   SUITE=hot|snapshot|all ./duckdb-warm.sh run run the suite(s) on the server
-#   ./duckdb-warm.sh clear-cache                empty the block cache (cold start)
 #   ./duckdb-warm.sh pin                        pin both tables' current version (shell exports)
-#   ./duckdb-warm.sh down                       delete the server and its cache
 #
-# Parity with StarRocks (checked on the cluster 2026-10-13, StarRocks 4.1.4):
-#   CPU/RAM   3 BEs x 6 cpu / 24Gi limit = 18 cpu / 72Gi  -> one 18 cpu / 72Gi pod, m5
-#   cache     3 x 150 GiB disk + 3 x ~4.2 GB memory        -> CACHE_DISK_BYTES on disk + CACHE_MEM_BYTES
-#             (both engines' default: cache on). DuckDB's disk is gp3-fast (1000 MB/s,
-#             gp3-fast-sc.yaml): on default gp3 (125 MB/s) cache_httpfs served hits from
-#             disk slower than S3 and, unlike StarRocks' io adaptor, cannot fall back to S3.
-#             CACHE_MODE=in_mem keeps only the memory cache.
+# Parity with StarRocks (sizing: see deploy-duckdb-warm.sh):
 #   process   always up, warm                             -> always up, warm
 #   timing    server-side, audit log, planning included   -> in-process, execute + fetch
 #   arms      serial, one cluster                         -> serial, one process
@@ -36,24 +24,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/../lib/querybench.sh"
 
 FORMAT="${FORMAT:-both}"
-CM="${CM:-duckdb-warm}"
-DUCKDB_VERSION="${DUCKDB_VERSION:-1.5.6}"           # latest stable; 2.0 is dev builds only (2026-10)
-DUCKDB_THREADS="${DUCKDB_THREADS:-18}"               # = the cpu limit
-# 44GB + the 11.7 GB cache memory (not counted by DuckDB) stays under the 72Gi
-# limit with room for httpfs/Arrow buffers, which DuckDB does not count either.
-DUCKDB_MEMORY_LIMIT="${DUCKDB_MEMORY_LIMIT:-44GB}"
-DUCKDB_MAX_TEMP_SIZE="${DUCKDB_MAX_TEMP_SIZE:-180GB}"
-CACHE_DISK_BYTES="${CACHE_DISK_BYTES:-483183820800}" # 3 x 161061273600 = BE block_cache_disk_quota_bytes
-CACHE_MEM_BYTES="${CACHE_MEM_BYTES:-12524124633}"    # 3 x 4174708211 = each BE's datacache memory quota (20% of its 19.44 GiB mem_limit)
-CACHE_MODE="${CACHE_MODE:-on_disk}"                  # on_disk | in_mem, see duckdb_warm_server.py
-CACHE_STORAGE_CLASS="${CACHE_STORAGE_CLASS:-gp3-fast}"  # gp3-fast-sc.yaml; plain gp3 caps the cache at 125 MB/s
-case "$CACHE_MODE" in
-    in_mem)  CACHE_VOLUME="${CACHE_VOLUME:-1Gi}" ;;     # unused, the template still mounts it
-    on_disk) CACHE_VOLUME="${CACHE_VOLUME:-500Gi}" ;;   # 450 GiB cap + filesystem overhead
-    *) qb_die "CACHE_MODE must be in_mem|on_disk, got '${CACHE_MODE}'" ;;
-esac
-PIN_SNAPSHOT="${PIN_SNAPSHOT:-1}"
-READY_GRACE="${READY_GRACE:-1200}"                   # Karpenter launch + pip + extensions
+READY_GRACE="${READY_GRACE:-1200}"                   # a restart: Karpenter launch + pip + extensions
 POLL_S=5
 CSV="${OUT_DIR}/duckdb_warm-${STAMP}.csv"
 LOG="${OUT_DIR}/duckdb_warm-${STAMP}.log"
@@ -61,11 +32,6 @@ QB_DEFER=TABLE        # the server resolves it per arm and query (pinned metadat
 QB_BYTES_FN=STRLEN    # bytes, like StarRocks' LENGTH (DuckDB's LENGTH counts characters)
 NAME=duckdb-warm
 PORT=18181
-# Every placeholder in duckdb-warm.yaml (lib/common.sh's render rejects one left out).
-TPL_VARS="NAME NAMESPACE CM DUCKDB_VERSION AWS_REGION BUCKET_NAME ICEBERG_DB TABLE_NAME PMNICE_TABLE_ROOT
-PIN_SNAPSHOT DUCKDB_MEMORY_LIMIT DUCKDB_THREADS DUCKDB_MAX_TEMP_SIZE CACHE_MODE CACHE_STORAGE_CLASS
-CACHE_DISK_BYTES CACHE_MEM_BYTES CACHE_VOLUME"
-
 case "$FORMAT" in
     iceberg|paimon) ARMS="$FORMAT" ;;
     both)           ARMS="paimon iceberg" ;;            # StarRocks' order: paimon first
@@ -97,48 +63,6 @@ api() {     # $1 GET|POST, $2 path, [$3 json body] -> body on stdout
     return 1
 }
 jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1]); print("" if v is None else v)' "$1"; }
-
-# ── up / down / status ──────────────────────────────────────────────────────
-cmd_up() {
-    local deadline
-    if [[ "$CACHE_MODE" == on_disk ]] && ! kubectl get storageclass "$CACHE_STORAGE_CLASS" >/dev/null 2>&1; then
-        [[ "$CACHE_STORAGE_CLASS" == gp3-fast ]] || qb_die "storageclass ${CACHE_STORAGE_CLASS} not found"
-        kubectl apply -f "${HERE}/gp3-fast-sc.yaml" >/dev/null
-    fi
-    kubectl delete configmap "$CM" -n "$NAMESPACE" --ignore-not-found >/dev/null
-    kubectl create configmap "$CM" -n "$NAMESPACE" --from-file="${HERE}/duckdb_warm_server.py" >/dev/null
-    # shellcheck disable=SC2086
-    render "${HERE}/duckdb-warm.yaml" "${HERE}/duckdb-warm-deployed.yaml" $TPL_VARS || qb_die "could not render duckdb-warm.yaml"
-    kubectl apply -f "${HERE}/duckdb-warm-deployed.yaml" >/dev/null
-    # A changed server.py only reaches a running pod through a restart.
-    kubectl rollout restart -n "$NAMESPACE" "deploy/${NAME}" >/dev/null
-    qb_log "deploy/${NAME} applied (duckdb ${DUCKDB_VERSION}, cache ${CACHE_MODE}: $((CACHE_MEM_BYTES / 1000000000)) GB mem$([[ "$CACHE_MODE" == on_disk ]] && echo " + $((CACHE_DISK_BYTES >> 30)) GiB disk"))"
-    deadline=$(( $(date +%s) + READY_GRACE ))
-    until kubectl rollout status -n "$NAMESPACE" "deploy/${NAME}" --timeout=30s >/dev/null 2>&1; do
-        (( $(date +%s) < deadline )) || qb_die "deploy/${NAME} not ready after ${READY_GRACE}s (kubectl describe pod -l app=duckdb-warm)"
-        qb_log "waiting for deploy/${NAME}..."
-    done
-    pf_up || qb_die "no /health from ${NAME}"
-    qb_log "$(api GET /health)"
-}
-
-cmd_status() {
-    if kubectl get deploy "$NAME" -n "$NAMESPACE" >/dev/null 2>&1 && pf_up; then
-        echo "${NAME}: $(api GET '/health?cache=1')"
-    else
-        echo "${NAME}: not running"
-    fi
-}
-
-cmd_down() {
-    kubectl delete deploy "$NAME" -n "$NAMESPACE" --ignore-not-found --wait=false
-    kubectl delete configmap "$CM" -n "$NAMESPACE" --ignore-not-found
-}
-
-cmd_clear() {
-    pf_up || qb_die "${NAME} is not up"
-    qb_log "cache cleared: $(api POST /clear_cache)"
-}
 
 # ── run ─────────────────────────────────────────────────────────────────────
 # One pass of one query: submit, poll until done, job JSON on stdout. The
@@ -252,7 +176,7 @@ run_suite() {   # $1 suite
     for f in $(qb_query_files "$s"); do
         n=$((n + 1)); qb_render "$f" > "${dir}/$(printf '%02d' "$n").sql" || qb_die "render failed: ${f}"
     done
-    pf_up || qb_die "${NAME} is not up: ./duckdb-warm.sh up"
+    pf_up || qb_die "${NAME} is not up: ./engine-deploy/deploy-duckdb-warm.sh up"
     writers=$(qb_writer_state)
     { echo "# ---- suite=${s} arms=${ARMS} writers: ${writers}"; echo "# server: $(api GET /health)"; } >> "$LOG"
     for arm in $ARMS; do
@@ -279,10 +203,7 @@ cmd_run() {
 }
 
 case "${1:-run}" in
-    up)          cmd_up ;;
-    status)      cmd_status ;;
     run)         cmd_run ;;
-    clear-cache) cmd_clear ;;
     pin)         # Pin both tables' current version for one run; prints shell exports.
                  pf_up || qb_die "${NAME} is not up"
                  api POST /pin "{\"tag\": \"${STAMP}\"}" | python3 -c 'import json, sys
@@ -290,6 +211,7 @@ d = json.load(sys.stdin)
 if "error" in d: sys.exit("pin failed: " + d["error"])
 print("export DUCK_PIN_ICEBERG=%s DUCK_PIN_PAIMON=%s" % (d["iceberg"]["metadata"], d["paimon"]["metadata"]))
 print("export SR_PIN_ICEBERG=%s SR_PIN_PMNICE=%s SR_PIN_PAIMON=%s" % (d["iceberg"]["snapshot_id"], d["paimon"]["snapshot_id"], d["paimon"]["paimon_snapshot_id"] or ""))' ;;
-    down)        cmd_down ;;
-    *)           qb_die "usage: $0 up|status|run|clear-cache|pin|down" ;;
+    up|status|clear-cache|down)
+                 qb_die "moved: ./engine-deploy/deploy-duckdb-warm.sh $1" ;;
+    *)           qb_die "usage: $0 run|pin (the server: ./engine-deploy/deploy-duckdb-warm.sh)" ;;
 esac

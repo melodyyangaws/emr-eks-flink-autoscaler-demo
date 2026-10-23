@@ -84,6 +84,8 @@ suite_names() { local f; for f in $(qb_query_files "$1"); do qb_query_name "$f";
 
 # The arm's whole suite as one script. Markers are SELECTs, not comments: the
 # audit log strips comments from Stmt.
+QB_PLANNER_TIMEOUT_MS="${QB_PLANNER_TIMEOUT_MS:-300000}"   # see build_script
+
 build_script() {   # <arm> <suite> <rendered sql>
     local t pass qi line
     t=$(arm_target "$1")
@@ -91,6 +93,11 @@ build_script() {   # <arm> <suite> <rendered sql>
     echo "USE ${t#* };"
     # Per-suite cap shared with DuckDB, so a timeout means the same on both.
     echo "SET query_timeout = $(qb_query_timeout "$2");"
+    # The planner's own limit (default 3 s): a fresh FE's first plan of a table
+    # loads all of its metadata, 4.5 s for the compacted Paimon table on
+    # 2026-10-22, and failed with "planner use long time". DuckDB's timing
+    # includes planning too.
+    echo "SET new_planner_optimize_timeout = ${QB_PLANNER_TIMEOUT_MS};"
     # Datacache ON (StarRocks' default): warm-vs-warm with duckdb-warm.sh, whose
     # server keeps a block cache sized like it. Both start empty (clear-caches.sh,
     # before every test) and both are filled by the same WARMUP pass, so a cache
@@ -226,7 +233,7 @@ ensure_catalog() {   # <arm>
     esac
     qb_sr "$ddl" >/dev/null
     local t; t=$(arm_target "$1")
-    qb_sr "SELECT uuid FROM ${t% *}.${t#* }.cid_events LIMIT 1" | grep -q . \
+    qb_sr "SET new_planner_optimize_timeout = ${QB_PLANNER_TIMEOUT_MS}; SELECT uuid FROM ${t% *}.${t#* }.cid_events LIMIT 1" | grep -q . \
         || qb_die "cannot read a row from ${t% *}.${t#* }.cid_events (arm ${1})"
 }
 

@@ -19,6 +19,12 @@
 #   2. snapshot only: stop the generator, suspend the writers and wait until
 #      they are down, then resolve SNAPSHOT_DT and the S4 slice from the
 #      tables' commit history (set ones are kept);
+#   2b. snapshot only, when .bench-env sets COMPACT_BEFORE_SNAPSHOT=true:
+#      compact both tables once (compaction/run.sh run both), after the
+#      windows are fixed and before the caches are emptied;
+#   3a. make sure StarRocks is up: installed (engine-deploy/deploy-starrocks.sh
+#      install) if its FE or BEs are missing, e.g. after the previous test's
+#      watcher took it down;
 #   3. make sure duckdb-warm is up (started if not; a ready one is left as is),
 #      then validate it: rollout ready and /health, read inside the pod,
 #      answering busy=false;
@@ -29,7 +35,7 @@
 # watcher started before the runner, or left over while the runner is
 # replaced, would stop everything at once.
 #
-# Steps 1-4 run here, on the laptop: they need envsubst (duckdb-warm.sh up),
+# Steps 1-4 run here, on the laptop: they need envsubst (engine-deploy/deploy-duckdb-warm.sh up),
 # which the pod lacks, and the writers stopped before the windows. The pods
 # get the run's settings from this shell: every PASS_VARS variable that is set
 # here is exported to them (e.g. `SUITE=hot RUNS=1 ./querybench/run.sh start`). The
@@ -47,13 +53,13 @@ TB="$BENCH_DIR"
 # Exported to the pods when set in this shell: the run knobs that the scripts
 # running there (hot-interleave.sh, starrocks.sh, duckdb-warm.sh run, lib/querybench.sh,
 # qb-watch.sh) read. Not here: names derived from TEST_SUFFIX, the pins
-# hot-interleave.sh sets itself, duckdb-warm.sh's server sizing (`up` runs on
-# the laptop), SNAPSHOT_S4_MINUTES (resolved on the laptop) and SUITE, which
+# hot-interleave.sh sets itself, deploy-duckdb-warm.sh's server sizing (`up` runs on
+# the laptop), SNAPSHOT_MINUTES / SNAPSHOT_S4_MINUTES (resolved on the laptop) and SUITE, which
 # each Job's step sets itself.
 PASS_VARS="STAMP TEST_SUFFIX RUNS WARMUP ARMS FORMAT ALLOW_CONCURRENT
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS STABLE_CHECKS WAIT_COMMIT_S
-SNAPSHOT_DT SNAPSHOT_S4_FROM SNAPSHOT_S4_TO
-WATCH_INTERVAL_S SUSPEND_WRITERS"
+SNAPSHOT_DT SNAPSHOT_FROM SNAPSHOT_TO SNAPSHOT_S4_FROM SNAPSHOT_S4_TO
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_STARROCKS"
 # kubectl pinned to the cluster's own version. "stable" moved on 2026-10-18 to a
 # release that segfaults on these nodes, and the runner sat in its first kubectl
 # loop for an hour without a single error line.
@@ -71,7 +77,7 @@ start_job() {   # <name> <step>
       for v in $PASS_VARS; do [[ -n "${!v:-}" ]] && printf 'export %s=%q\n' "$v" "${!v}"; done
       printf '# step: %s\n' "${step%%$'\n'*}"      # what the pod's log shows first
       echo "$step"; } > "${TB}/.qb-runner-cmd.sh"
-    tar -C "$TB" -czf "${d}/bundle.tgz" querybench lib .bench-env .qb-runner-cmd.sh
+    tar -C "$TB" -czf "${d}/bundle.tgz" querybench engine-deploy lib .bench-env .qb-runner-cmd.sh
     rm -f "${TB}/.qb-runner-cmd.sh"
     delete_job "$name"
     # Each kubectl checked: start_job also runs inside `( ... ) ||` (the
@@ -103,11 +109,11 @@ stop_writers() {
 # Writers stopped, so the partition and its commits are final.
 resolve_snapshot() {
     local r
-    r=$(lib eval 'qb_resolve_snapshot >&2; printf "%s\n%s\n%s\n" "$QB_SNAPSHOT_DT" "$QB_S4_FROM" "$QB_S4_TO"') \
+    r=$(lib eval 'qb_resolve_snapshot >&2; printf "%s\n" "$QB_SNAPSHOT_DT" "$QB_SNAP_FROM" "$QB_SNAP_TO" "$QB_S4_FROM" "$QB_S4_TO"') \
         || die "could not resolve the snapshot windows"
-    { read -r SNAPSHOT_DT; read -r SNAPSHOT_S4_FROM; read -r SNAPSHOT_S4_TO; } <<<"$r"
-    export SNAPSHOT_DT SNAPSHOT_S4_FROM SNAPSHOT_S4_TO
-    echo "  snapshot windows: dt=${SNAPSHOT_DT} S4=[${SNAPSHOT_S4_FROM}, ${SNAPSHOT_S4_TO})"
+    { read -r SNAPSHOT_DT; read -r SNAPSHOT_FROM; read -r SNAPSHOT_TO; read -r SNAPSHOT_S4_FROM; read -r SNAPSHOT_S4_TO; } <<<"$r"
+    export SNAPSHOT_DT SNAPSHOT_FROM SNAPSHOT_TO SNAPSHOT_S4_FROM SNAPSHOT_S4_TO
+    echo "  snapshot windows: dt=${SNAPSHOT_DT} S1-S3=[${SNAPSHOT_FROM}, ${SNAPSHOT_TO}) S4=[${SNAPSHOT_S4_FROM}, ${SNAPSHOT_S4_TO})"
 }
 
 # /health read inside the pod (no port-forward); empty if not ready or no answer.
@@ -118,13 +124,32 @@ duckdb_health() {
         2>/dev/null || true
 }
 
+# The FE and all 3 BEs Ready, else a fresh install (Helm, on the laptop).
+starrocks_up() {
+    local fe be
+    fe=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=fe -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
+    be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
+    if (( fe >= 1 && be >= 3 )); then
+        echo "${SUITE}: StarRocks already up (FE ${fe}, BE ${be})"
+    else
+        echo "${SUITE}: starting StarRocks (FE ${fe}, BE ${be} ready)"
+        "${TB}/engine-deploy/deploy-starrocks.sh" install >/dev/null || die "StarRocks did not come up (engine-deploy/deploy-starrocks.sh install)"
+        local i; for (( i = 0; i < 80; i++ )); do
+            be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
+            (( be >= 3 )) && break; sleep 15
+        done
+        (( be >= 3 )) || die "StarRocks BEs not Ready 20 min after install"
+        echo "  StarRocks installed (FE + ${be} BEs)"
+    fi
+}
+
 duckdb_up() {
     local h; h=$(duckdb_health)
     if [[ -n "$h" ]]; then
         echo "${SUITE}: duckdb-warm already up"
     else
         echo "${SUITE}: starting duckdb-warm"
-        "${HERE}/duckdb-warm.sh" up || die "duckdb-warm did not come up"
+        "${TB}/engine-deploy/deploy-duckdb-warm.sh" up || die "duckdb-warm did not come up"
         h=$(duckdb_health)
     fi
     [[ "$h" == *'"busy": false'* ]] || die "duckdb-warm is not ready and idle (/health: ${h:-no answer})"
@@ -167,6 +192,10 @@ cmd_start() {
     wait_for_runner                                                # 0
     delete_job qb-watch                                            # 1
     if [[ "$SUITE" == snapshot ]]; then stop_writers; resolve_snapshot; fi   # 2
+    if [[ "$SUITE" == snapshot && "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]]; then  # 2b
+        "${TB}/compaction/run.sh" run both || die "the compaction before the snapshot test failed"
+    fi
+    starrocks_up                                                   # 3a
     duckdb_up                                                      # 3
     "${HERE}/clear-caches.sh" || die "could not clear the caches"  # 4
     start_job qb-runner "$step"                                    # 5

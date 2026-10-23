@@ -5,11 +5,12 @@
 #
 #   ./bench.sh throughput     flink writers deploy both -> both RUNNING -> datagen start -> monitoring start
 #   ./bench.sh hot            without a wait, start the hot query test (+ its watcher), while writers live
-#   ./bench.sh snapshot       wait until the hot query test is complete, then start the snapshot query test (+ watcher); It auto-stops the writers first
+#   ./bench.sh snapshot       wait until the hot query test is complete, then start the snapshot query test (+ watcher); It auto-stops the writers first,
+#                             then compacts both tables once when COMPACT_BEFORE_SNAPSHOT=true (.bench-env)
 #   ./bench.sh summary        bench-results/BENCH-SUMMARY-<session>.md, from the
 #                             session's (TEST_SUFFIX's) newest hot and snapshot runs
 #   ./bench.sh status         what is running
-#   ./bench.sh cleanup        stop generator, suspend writers, stop monitoring, DuckDB down
+#   ./bench.sh cleanup        stop generator, suspend writers, stop monitoring, DuckDB + StarRocks down, compaction jobs deleted
 #                             (no data is deleted: wiping a table set is README "Teardown")
 #
 # A typical session: edit TEST_SUFFIX in .bench-env, then
@@ -63,7 +64,9 @@ cmd_cleanup() {
     ./datagen/run.sh stop                                    || warn "cleanup: stopping the generator failed; carrying on"
     ( source "${HERE}/lib/querybench.sh"; qb_stop_writers )  || warn "cleanup: suspending the writers failed; carrying on"
     ./monitoring/run.sh stop                                 || warn "cleanup: stopping monitoring failed; carrying on"
-    ./querybench/duckdb-warm.sh down                         || warn "cleanup: taking duckdb-warm down failed"
+    ./engine-deploy/deploy-duckdb-warm.sh down               || warn "cleanup: taking duckdb-warm down failed"
+    ./engine-deploy/deploy-starrocks.sh down                 || warn "cleanup: taking StarRocks down failed"
+    ./compaction/run.sh cleanup                              || warn "cleanup: deleting the compaction jobs failed"
     log "stopped. Data is kept; to wipe the table set see README \"Teardown\"."
 }
 
@@ -74,5 +77,5 @@ case "${1:-}" in
     summary)    ./summary/run.sh ;;
     status)     cmd_status ;;
     cleanup)    cmd_cleanup ;;
-    *)          sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *)          sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

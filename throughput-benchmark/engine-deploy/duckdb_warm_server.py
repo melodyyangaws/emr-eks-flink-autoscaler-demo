@@ -1,5 +1,5 @@
 """Warm DuckDB query server: the DuckDB side of a warm-vs-warm comparison with
-StarRocks. Runs in a long-lived pod (duckdb-warm.yaml), driven by duckdb-warm.sh.
+StarRocks. Runs in a long-lived pod (duckdb-warm.yaml), deployed by deploy-duckdb-warm.sh, driven by querybench/duckdb-warm.sh.
 
 One process and ONE connection for the pod's life, like a StarRocks FE/BE that is
 already up: extensions, the S3 secret, Parquet footers and the cache_httpfs block
@@ -12,9 +12,12 @@ Cache parity with the StarRocks BEs (3 x datacache, checked 2026-10-13); both
 engines run with their cache ON, as both defaults:
   disk    3 x 150 GiB = 450 GiB  ->  CACHE_MODE=on_disk (default): cache_httpfs
                                      on-disk cache, CACHE_DISK_BYTES, LRU, on a
-                                     gp3-fast volume (1000 MB/s)
-  memory  3 x ~4.2 GB  = 12.5 GB ->  its read-through memory cache, CACHE_MEM_BYTES
+                                     gp3-fast volume (850 MB/s)
+  memory  3 x 7.34 GB = 22.03 GB ->  its read-through memory cache, CACHE_MEM_BYTES
+          (12.5 GB = 3 x ~4.2 GB until 2026-10-23)
 CACHE_MODE=in_mem keeps only a CACHE_MEM_BYTES memory cache (every miss reads S3).
+DuckDB's own external file cache is left on (its default): it also keeps file
+data in the buffer pool, within memory_limit, which StarRocks has no match for.
 The cache volume must not be default gp3: at its 125 MB/s baseline cache_httpfs
 served every hit from the disk, never S3, and the snapshot S3 pass ran for hours
 at 130 MB/s and 0.3 cores (2026-10-17). StarRocks' BEs sit on default gp3, but
@@ -111,12 +114,12 @@ def init():
         # StarRocks caches Parquet footers and object metadata too.
         "SET parquet_metadata_cache=true",
         "SET enable_http_metadata_cache=true",
-        # Off: DuckDB's own external file cache (default on since 1.3) keeps
-        # remote file data in the buffer pool, within memory_limit (44 GB),
-        # i.e. a second data cache beside cache_httpfs's CACHE_MEM_BYTES. With
-        # it, DuckDB could hold far more of the data in memory than StarRocks'
-        # 3 x 3.888 GiB datacache (2026-10-20); cache_httpfs is the only one.
-        "SET enable_external_file_cache=false",
+        # enable_external_file_cache is left at DuckDB's default (on since 1.3):
+        # remote file data is also kept in the buffer pool, within memory_limit
+        # (82.08 GiB), a memory cache in front of cache_httpfs's CACHE_MEM_BYTES.
+        # From 2026-10-20 to 2026-10-23 it was off, so that DuckDB held no more
+        # data in memory than StarRocks' datacache memory (then 3 x ~4.2 GB); runs since then
+        # can hold more, and are not comparable with those on that point.
     ]:
         con.execute(sql)
     return info
