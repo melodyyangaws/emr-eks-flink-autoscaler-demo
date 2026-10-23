@@ -389,7 +389,14 @@ class FlinkCIDMonitor:
         ts = TableSnapshot(name=table_name)
         s3, bucket, table_prefix = self._paimon_s3(table_name)
         try:
-            resp = s3.get_object(Bucket=bucket, Key=f"{table_prefix}/snapshot/LATEST")
+            try:
+                resp = s3.get_object(Bucket=bucket, Key=f"{table_prefix}/snapshot/LATEST")
+            except s3.exceptions.NoSuchKey:
+                # A new table before its first commit has no snapshot/LATEST yet
+                # (the first ~minute of a run): not an error. current_snapshot_id
+                # stays None, so the window uses the Flink rate meter.
+                log.info("Paimon %s.%s: no commit yet (no snapshot/LATEST)", self.glue_database, table_name)
+                return ts
             ts.current_snapshot_id = int(resp["Body"].read().decode("utf-8").strip())
             snap = json.loads(s3.get_object(
                 Bucket=bucket, Key=f"{table_prefix}/snapshot/snapshot-{ts.current_snapshot_id}"

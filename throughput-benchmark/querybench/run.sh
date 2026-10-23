@@ -28,7 +28,10 @@
 #   3. make sure duckdb-warm is up (started if not; a ready one is left as is),
 #      then validate it: rollout ready and /health, read inside the pod,
 #      answering busy=false;
-#   4. empty both engines' caches (clear-caches.sh), so the test starts cold;
+#   4. empty both engines' caches (clear-caches.sh), so the test starts cold.
+#      Hot only: skipped when step 3 started BOTH engines just now (a fresh
+#      StarRocks and DuckDB have empty caches already); the snapshot test
+#      always clears;
 #   5. start the runner Job (qb-runner) with the suite's test;
 #   6. start the watcher Job (qb-watch, qb-watch.sh), always, for both suites.
 # The order matters: a missing qb-runner Job counts as a finished test, so a
@@ -125,6 +128,7 @@ duckdb_health() {
 }
 
 # The FE and all 3 BEs Ready, else a fresh install (Helm, on the laptop).
+STARTED_FRESH=""   # the engines step 3 started from scratch (step 4 reads it)
 starrocks_up() {
     local fe be
     fe=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=fe -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
@@ -133,6 +137,7 @@ starrocks_up() {
         echo "${SUITE}: StarRocks already up (FE ${fe}, BE ${be})"
     else
         echo "${SUITE}: starting StarRocks (FE ${fe}, BE ${be} ready)"
+        STARTED_FRESH+=" starrocks"
         "${TB}/engine-deploy/deploy-starrocks.sh" install >/dev/null || die "StarRocks did not come up (engine-deploy/deploy-starrocks.sh install)"
         local i; for (( i = 0; i < 80; i++ )); do
             be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
@@ -149,6 +154,7 @@ duckdb_up() {
         echo "${SUITE}: duckdb-warm already up"
     else
         echo "${SUITE}: starting duckdb-warm"
+        STARTED_FRESH+=" duckdb"
         "${TB}/engine-deploy/deploy-duckdb-warm.sh" up || die "duckdb-warm did not come up"
         h=$(duckdb_health)
     fi
@@ -197,7 +203,11 @@ cmd_start() {
     fi
     starrocks_up                                                   # 3a
     duckdb_up                                                      # 3
-    "${HERE}/clear-caches.sh" || die "could not clear the caches"  # 4
+    if [[ "$SUITE" == hot && "$STARTED_FRESH" == *starrocks* && "$STARTED_FRESH" == *duckdb* ]]; then   # 4
+        echo "hot: both engines started fresh just now, so their caches are empty: not clearing them"
+    else
+        "${HERE}/clear-caches.sh" || die "could not clear the caches"
+    fi
     start_job qb-runner "$step"                                    # 5
     # A runner without its watcher would never stop the generator or the
     # writers (DURATION_SECONDS=0): if the watcher fails to start, the runner goes too.

@@ -61,6 +61,8 @@ Both tests run as Jobs in the cluster, so closing the laptop does not stop them.
 5. **Empties both caches** (`clear-caches.sh`): each StarRocks BE's datacache
    (delete + restart, one BE at a time), then a DuckDB restart. Checks every BE
    reports `DiskUsage: 0B`. It refuses while a `cid_events` query runs.
+   The hot test skips it when step 4 just started both engines from scratch (their caches
+   are empty already); the snapshot test always empties them.
 6. **Starts the runner Job** (`qb-runner`):
    - hot: `hot-interleave.sh`;
    - snapshot: `starrocks.sh`, then `duckdb-warm.sh run`.
