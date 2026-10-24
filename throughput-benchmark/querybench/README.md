@@ -51,7 +51,10 @@ Both tests run as Jobs in the cluster, so closing the laptop does not stop them.
 
 1. **Waits while an earlier runner is still running** (e.g. the hot test).
    `FORCE=1` replaces it.
-2. **Deletes the old watcher Job.**
+2. **Waits for the old watcher Job to finish its shutdown, then deletes it.** It checks
+   the runner only every 10 min, so deleting it right after its runner ended dropped
+   that shutdown (monitor and engines left up). Waits up to `WATCH_INTERVAL_S` + 15 min;
+   `FORCE=1` skips it.
 3. **Snapshot only:** stops the generator, suspends both writers (waits until no
    TaskManager is left), and picks the partition, the S1–S3 window and the S4 slice.
 4. **Starts StarRocks and DuckDB** if they aren't up: StarRocks when its FE or

@@ -15,7 +15,8 @@
 #
 # `start` runs, in this order (any failure stops it before a Job is created):
 #   0. wait while a qb-runner is still running a test (FORCE=1: don't);
-#   1. delete any old watcher Job (qb-watch);
+#   1. wait while the old watcher (qb-watch) is still shutting the last test
+#      down, then delete it (FORCE=1: don't wait);
 #   2. snapshot only: stop the generator, suspend the writers and wait until
 #      they are down, then resolve SNAPSHOT_DT and the S4 slice from the
 #      tables' commit history (set ones are kept);
@@ -179,6 +180,24 @@ wait_for_runner() {
     done
 }
 
+# The previous test's watcher, once its runner has ended, still has its
+# shutdown to do (generator, writers, monitor, DuckDB, StarRocks), and it only
+# looks every WATCH_INTERVAL_S (600 s). Deleting it before then dropped that
+# shutdown (2026-10-21, again 2026-10-23: the monitor and both engines stayed
+# up). So wait for it to finish, up to WATCH_INTERVAL_S + 15 min. The engines it
+# takes down are brought back by step 3.
+wait_for_watcher() {
+    local active deadline=$(( $(date +%s) + ${WATCH_INTERVAL_S:-600} + 900 ))
+    while :; do
+        active=$(kubectl get job qb-watch -n "$NAMESPACE" -o jsonpath='{.status.active}' 2>/dev/null || true)
+        [[ "${active:-0}" == 0 ]] && return 0
+        [[ "${FORCE:-0}" == 1 ]] && { warn "FORCE=1: deleting qb-watch before its shutdown"; return 0; }
+        (( $(date +%s) < deadline )) || { warn "qb-watch still running after $(( ${WATCH_INTERVAL_S:-600} + 900 )) s; deleting it"; return 0; }
+        log "qb-watch is still shutting the last test down; waiting for it (checked every 30 s; FORCE=1 to skip)"
+        sleep 30
+    done
+}
+
 cmd_start() {
     local step results
     : "${BUCKET_NAME:?not set in .bench-env(.local)}" "${EMR_EXECUTION_ROLE_ARN:?not set in .bench-env(.local)}"
@@ -196,7 +215,8 @@ cmd_start() {
     step+=$'\n''rc=$?; aws s3 sync bench-results "s3://${BUCKET_NAME}/'"${results}"'" --only-show-errors \
   && echo "status: results-uploaded '"${results}"'" || echo "status: results-upload-failed"; exit $rc'
     wait_for_runner                                                # 0
-    delete_job qb-watch                                            # 1
+    wait_for_watcher                                               # 1
+    delete_job qb-watch
     if [[ "$SUITE" == snapshot ]]; then stop_writers; resolve_snapshot; fi   # 2
     if [[ "$SUITE" == snapshot && "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]]; then  # 2b
         "${TB}/compaction/run.sh" run both || die "the compaction before the snapshot test failed"

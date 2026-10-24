@@ -254,7 +254,8 @@ changing either, restart DuckDB (`up`) and re-run the StarRocks `install`.
 
 `querybench/run.sh start` does this, and stops if any step fails:
 
-1. Waits while an earlier test is still running (`FORCE=1` replaces it).
+1. Waits while an earlier test is still running, and then while its watcher is still
+   shutting it down (`FORCE=1` skips both waits).
 2. Snapshot only: stops the generator and the writers, and picks the query windows.
    Then, with `COMPACT_BEFORE_SNAPSHOT=true`, compacts both tables once (below).
 3. Starts StarRocks if its FE or BEs are missing (`engine-deploy/deploy-starrocks.sh install`),
