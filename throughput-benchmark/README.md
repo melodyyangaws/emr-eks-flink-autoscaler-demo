@@ -223,7 +223,8 @@ Both tests need StarRocks and the warm DuckDB server. Check them first:
   ./engine-deploy/deploy-duckdb-warm.sh up      # ~5-10 min on a new node (27 cpu / 114 Gi, m5.8xlarge, gp3-fast)
   ```
 
-  `run.sh start` would start a missing DuckDB itself, but not StarRocks. Both
+  `run.sh start` starts either engine itself if it is missing (StarRocks when its FE or a BE
+  is not Ready). Both
   deploy scripts apply `gp3-fast-sc.yaml` too; creating the classes first shows
   a mismatch before any engine is half-deployed.
 
@@ -313,6 +314,8 @@ DRY_RUN=true ./compaction/run.sh run both   # measure and plan only; nothing rew
 ./compaction/run.sh status
 ./compaction/run.sh logs iceberg
 COMPACT_BEFORE_SNAPSHOT=false ./bench.sh snapshot   # one snapshot test without it
+# rerun DuckDB only on the already-compacted tables (same windows; StarRocks untouched)
+ENGINES=duckdb COMPACT_BEFORE_SNAPSHOT=false SUITE=snapshot ./querybench/run.sh start
 ```
 
 Knobs: `COMPACT_PARALLELISM`, `ICEBERG_MAX_GROUPS`, `PAIMON_SMALL_PCT` (1), `COMPACT_MAX_PASSES` (20),

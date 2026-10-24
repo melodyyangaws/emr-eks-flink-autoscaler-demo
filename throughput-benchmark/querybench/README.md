@@ -70,6 +70,12 @@ Both tests run as Jobs in the cluster, so closing the laptop does not stop them.
    - hot: `hot-interleave.sh`;
    - snapshot: `starrocks.sh`, then `duckdb-warm.sh run`.
 
+   `ENGINES=duckdb` (or `starrocks`) makes a snapshot run one engine only: the
+   other is not started, cleared or queried. Use it to rerun one engine against
+   the same tables, e.g. after a DuckDB setting changed (keep the writers stopped
+   and set `COMPACT_BEFORE_SNAPSHOT=false`, so the table version and windows stay
+   the ones the other engine read). The hot test always needs both.
+
    At the end it uploads `bench-results/` to
    `s3://$BUCKET_NAME/querybench-results/session<TEST_SUFFIX>/<STAMP>-<suite>/`.
 7. **Starts the watcher Job** (`qb-watch.sh`). Every 10 min it checks the
@@ -184,8 +190,16 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
   the 15.2 GB it needs, and its cached passes read that back at the cache disk's
   850 MB/s limit (~100 s, 1-1.5 of 27 cores busy). 64 KiB was faster still (24.3 GB
   fetched; cached S1/S2/S3 29/35/34 s instead of 101/135/134 s, 2026-10-25) but finer
-  than StarRocks' blocks, so it is not used. DuckDB results before 2026-10-25 used
-  512 KiB and are not comparable.
+  than StarRocks' blocks, so it is not used. At 256 KiB (partial run 2026-10-24,
+  Paimon arm, same windows and table version), the cached S1/S2/S3/S4 passes took
+  62-69 / 78 / 77 / 234 s, against 101 / 135 / 134 / 245 s at 512 KiB. The cold S4
+  warm-up took longer (908 s vs 425 s), but warm-up passes are not timed. DuckDB
+  results before 2026-10-25 used 512 KiB and are not comparable.
+- **Warm-up is the same on both engines.** `starrocks.sh` and `duckdb-warm.sh`
+  share `WARMUP=1` / `RUNS=3` (`lib/querybench.sh`), start from caches emptied by
+  `clear-caches.sh`, and run each arm pass-major: S1-S4 once as a discarded
+  warm-up, then S1-S4 three times timed (median reported). So both are measured
+  warm, each from a cache it filled itself the same way.
 - **Data scanned** (since 2026-10-24): after an arm's timed passes, each query runs
   once more, untimed, as `EXPLAIN ANALYZE` with the block cache bypassed. Its HTTPFS
   `in:` bytes are what the query reads from S3, the counterpart of StarRocks'
@@ -255,6 +269,7 @@ rendering stops the run. `-- bench:` flags: `allow-zero-rows`,
 | `SUSPEND_WRITERS` | `1` | `0` = never touch the writers |
 | `WATCH_INTERVAL_S` | `600` | watcher check interval |
 | `FORCE` / `ALLOW_CONCURRENT` | off | replace a running runner / skip the one-engine guard |
+| `ENGINES` | `starrocks duckdb` | snapshot only: `duckdb` or `starrocks` runs one engine; the other is neither started, cleared nor queried |
 | `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` | `84049MiB` (82.08 GiB) / `27` | 90% of the 114 Gi pod minus the 22.03 GB cache, the same shares as a BE's `mem_limit` |
 | `DUCKDB_VERSION` | `1.5.6` | DuckDB 2.0 has no stable release yet |
 | `CACHE_MODE` | `on_disk` | `in_mem` = memory cache only |
