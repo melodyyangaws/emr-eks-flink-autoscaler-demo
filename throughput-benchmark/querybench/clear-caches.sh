@@ -13,6 +13,8 @@
 # 3. DuckDB: restart duckdb-warm, if it is up: empty disk and memory caches,
 #    Parquet-footer and HTTP-metadata caches included (/clear_cache misses those).
 # 4. Checks every BE reports DiskUsage 0B.
+# ENGINES (run.sh; default both) without starrocks skips steps 1, 2 and 4,
+# without duckdb step 3.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
@@ -20,7 +22,9 @@ source "${HERE}/../lib/querybench.sh"
 BE_PODS="${BE_PODS:-kube-starrocks-be-0 kube-starrocks-be-1 kube-starrocks-be-2}"
 DATACACHE_DIR="${DATACACHE_DIR:-/opt/starrocks/be/storage/datacache}"
 
-qb_assert_fe_idle
+ENGINES="${ENGINES:-starrocks duckdb}"
+[[ "$ENGINES" == *starrocks* ]] || BE_PODS=""
+[[ -z "$BE_PODS" ]] || qb_assert_fe_idle
 
 for p in $BE_PODS; do
     qb_log "StarRocks ${p}: emptying ${DATACACHE_DIR} and restarting"
@@ -41,7 +45,7 @@ done
 # cache_httpfs only; the Parquet-footer and HTTP-metadata caches (and anything
 # else in the process) survive it, while StarRocks' BEs are restarted above. A
 # new pod also gets a new, empty cache volume (an ephemeral PVC per pod).
-if kubectl get deploy duckdb-warm -n "$NAMESPACE" >/dev/null 2>&1; then
+if [[ "$ENGINES" == *duckdb* ]] && kubectl get deploy duckdb-warm -n "$NAMESPACE" >/dev/null 2>&1; then
     qb_log "duckdb-warm: restarting (empty caches)"
     kubectl rollout restart -n "$NAMESPACE" deploy/duckdb-warm >/dev/null
     kubectl rollout status -n "$NAMESPACE" deploy/duckdb-warm --timeout=1200s >/dev/null \
@@ -56,6 +60,7 @@ fi
 
 # Every BE back, with an empty datacache. The FE can take a moment to see the
 # restarted BEs, so a few tries.
+[[ -n "$BE_PODS" ]] || { qb_log "StarRocks not in ENGINES: not cleared"; echo "status: caches-cleared $(date -u)"; exit 0; }
 for try in 1 2 3 4 5 6; do
     m=$(qb_sr "SHOW BACKENDS" | grep -o 'DiskUsage: [^,]*' || true)
     n=$(grep -c . <<<"$m" || true)

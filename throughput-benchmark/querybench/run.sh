@@ -4,6 +4,8 @@
 #
 #   SUITE=hot      ./querybench/run.sh start   the hot test (hot-interleave.sh)
 #   SUITE=snapshot ./querybench/run.sh start   the snapshot test (starrocks.sh, then duckdb-warm.sh run)
+#   ENGINES=duckdb SUITE=snapshot ...         one engine only (starrocks|duckdb; default both):
+#                                              the other is neither started, cleared nor queried
 #   ./querybench/run.sh logs [watch]           follow the runner's output (watch: the watcher's)
 #
 # Results: when the test ends, the runner uploads its bench-results/ to
@@ -63,7 +65,7 @@ TB="$BENCH_DIR"
 PASS_VARS="STAMP TEST_SUFFIX RUNS WARMUP ARMS FORMAT ALLOW_CONCURRENT
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS STABLE_CHECKS WAIT_COMMIT_S
 SNAPSHOT_DT SNAPSHOT_FROM SNAPSHOT_TO SNAPSHOT_S4_FROM SNAPSHOT_S4_TO
-WATCH_INTERVAL_S SUSPEND_WRITERS STOP_STARROCKS PROFILE_SCAN"
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_STARROCKS PROFILE_SCAN ENGINES"
 # kubectl pinned to the cluster's own version. "stable" moved on 2026-10-18 to a
 # release that segfaults on these nodes, and the runner sat in its first kubectl
 # loop for an hour without a single error line.
@@ -81,7 +83,8 @@ start_job() {   # <name> <step>
       for v in $PASS_VARS; do [[ -n "${!v:-}" ]] && printf 'export %s=%q\n' "$v" "${!v}"; done
       printf '# step: %s\n' "${step%%$'\n'*}"      # what the pod's log shows first
       echo "$step"; } > "${TB}/.qb-runner-cmd.sh"
-    tar -C "$TB" -czf "${d}/bundle.tgz" querybench engine-deploy lib .bench-env .qb-runner-cmd.sh
+    # No macOS xattrs/resource forks: the pod's GNU tar warns on every such header.
+    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$TB" -czf "${d}/bundle.tgz" querybench engine-deploy lib .bench-env .qb-runner-cmd.sh
     rm -f "${TB}/.qb-runner-cmd.sh"
     delete_job "$name"
     # Each kubectl checked: start_job also runs inside `( ... ) ||` (the
@@ -132,8 +135,8 @@ duckdb_health() {
 STARTED_FRESH=""   # the engines step 3 started from scratch (step 4 reads it)
 starrocks_up() {
     local fe be
-    fe=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=fe -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
-    be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
+    fe=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=fe -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | { grep -o True || true; } | wc -l | tr -d ' ')
+    be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | { grep -o True || true; } | wc -l | tr -d ' ')
     if (( fe >= 1 && be >= 3 )); then
         echo "${SUITE}: StarRocks already up (FE ${fe}, BE ${be})"
     else
@@ -141,7 +144,7 @@ starrocks_up() {
         STARTED_FRESH+=" starrocks"
         "${TB}/engine-deploy/deploy-starrocks.sh" install >/dev/null || die "StarRocks did not come up (engine-deploy/deploy-starrocks.sh install)"
         local i; for (( i = 0; i < 80; i++ )); do
-            be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o True | wc -l | tr -d ' ')
+            be=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | { grep -o True || true; } | wc -l | tr -d ' ')
             (( be >= 3 )) && break; sleep 15
         done
         (( be >= 3 )) || die "StarRocks BEs not Ready 20 min after install"
@@ -201,9 +204,15 @@ wait_for_watcher() {
 cmd_start() {
     local step results
     : "${BUCKET_NAME:?not set in .bench-env(.local)}" "${EMR_EXECUTION_ROLE_ARN:?not set in .bench-env(.local)}"
+    export ENGINES="${ENGINES:-starrocks duckdb}"
+    [[ "$ENGINES" =~ ^(starrocks|duckdb)([ ,](starrocks|duckdb))?$ ]] || die "ENGINES must name starrocks and/or duckdb, got '${ENGINES}'"
+    [[ "${SUITE:-}" == hot && "$ENGINES" != *starrocks*duckdb* && "$ENGINES" != *duckdb*starrocks* ]] \
+        && die "the hot test interleaves both engines: ENGINES must be both"
     case "${SUITE:-}" in
         hot)      step='./querybench/hot-interleave.sh' ;;    # sets SUITE=hot itself
-        snapshot) step='export SUITE=snapshot; ./querybench/starrocks.sh; echo "status: starrocks-exit=$?"; ./querybench/duckdb-warm.sh run' ;;
+        snapshot) step='export SUITE=snapshot'
+                  [[ "$ENGINES" == *starrocks* ]] && step+='; ./querybench/starrocks.sh; echo "status: starrocks-exit=$?"'
+                  [[ "$ENGINES" == *duckdb* ]] && step+='; ./querybench/duckdb-warm.sh run' ;;
         *)        die "set SUITE=hot or SUITE=snapshot" ;;
     esac
     # One STAMP for the CSV names and the results prefix.
@@ -221,8 +230,8 @@ cmd_start() {
     if [[ "$SUITE" == snapshot && "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]]; then  # 2b
         "${TB}/compaction/run.sh" run both || die "the compaction before the snapshot test failed"
     fi
-    starrocks_up                                                   # 3a
-    duckdb_up                                                      # 3
+    [[ "$ENGINES" == *starrocks* ]] && starrocks_up                # 3a
+    [[ "$ENGINES" == *duckdb* ]] && duckdb_up                      # 3
     if [[ "$SUITE" == hot && "$STARTED_FRESH" == *starrocks* && "$STARTED_FRESH" == *duckdb* ]]; then   # 4
         echo "hot: both engines started fresh just now, so their caches are empty: not clearing them"
     else

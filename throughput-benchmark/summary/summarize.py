@@ -18,6 +18,7 @@ import glob
 import json
 import math
 import os
+import re
 import statistics as st
 from datetime import datetime, timezone
 
@@ -217,6 +218,44 @@ def ratio(out, A, B):
     return (math.exp(sum(map(math.log, rs)) / len(rs)), len(rs)) if rs else (None, 0)
 
 
+
+def scan_explained(pins, out, qs, sc):
+    """The notes under a scanned table that has DuckDB columns: what was read
+    (window and pinned versions, from the hot test's pins), what each engine's
+    GB and rows count, and the read-vs-window row ratio from this run."""
+    L = []
+    w = re.search(r"window=\[([^,]+), ([^)]+)\) rows=(\d+)", pins or "")
+    pin = lambda k: (re.search(k + r"=(\S+)", pins or "") or [None, "-"])[1]
+    if w:
+        L += ["Both engines read the same window from the same pinned table versions:", "",
+              "| | Value |", "|---|---|",
+              f"| Window | `eventTimeDT` in [{w.group(1)}, {w.group(2)}) |",
+              f"| Rows in the window | {int(w.group(3)):,} (the same on the Paimon and Iceberg tables) |",
+              f"| StarRocks pins | Iceberg snapshot `{pin('SR_PIN_ICEBERG')}`; Paimon snapshot `{pin('SR_PIN_PAIMON')}` "
+              f"(its Iceberg export: `{pin('SR_PIN_PMNICE')}`) |",
+              f"| DuckDB pins | Iceberg `{pin('DUCK_PIN_ICEBERG')}`; Paimon export `{pin('DUCK_PIN_PAIMON')}` |", ""]
+    def med(q, duck):
+        v = [int(out[(*x, q)]["scan_rows"]) for x in sc if (x[0] != "starrocks") == duck
+             and int(out.get((*x, q), {}).get("scan_rows") or 0) > 0]
+        return st.median(v) if v else None
+    L += ["- **GB**, the figure to compare: what each engine's scan read. StarRocks: `ScanBytes` (from S3 or "
+          "its cache). DuckDB: bytes read from S3 in one untimed pass after the timed ones, its cache bypassed."]
+    # Rows in each query's window: the hot pins' count, else DuckDB's scan output
+    # (the queries' filters are the window, apart from extra ones such as H3's uuid).
+    pairs = [(q, med(q, False), int(w.group(3)) if w else med(q, True)) for q in qs]
+    pairs = [(q, a, b) for q, a, b in pairs if a and b]
+    if pairs:
+        wins = sorted({b for _, _, b in pairs})
+        rows_txt = (f"the same {wins[0]:,} rows in the window" if len(wins) == 1 else
+                    "the same rows in each query's window (" + ", ".join(f"{q.split('_')[0]} {b / 1e6:,.0f}M" for q, _, b in pairs) + ")")
+        ratio = st.median([a / b for _, a, b in pairs])
+        L += [f"- **Rows:** both engines compute each query from {rows_txt}. To get them, StarRocks reads "
+              f"~{ratio:.1f}× those rows from storage: every row group that overlaps the window, neighbouring rows "
+              "included, which its filter then drops. DuckDB reads the same row groups (see the GB), but it reports "
+              "rows only after its scan's filter, so no rows-read figure is shown for it."]
+    return L + [""]
+
+
 def query_section(num, title, suite, stamp, results, F):
     out, bad, pins, notes = load(results, stamp)
     if not out:
@@ -224,13 +263,14 @@ def query_section(num, title, suite, stamp, results, F):
     arms = [x for x in ARMS if any(k[:2] == x for k in out)]
     qs = sorted({k[2] for k in out})
     cell = lambda r: f"{secs(r):,.1f}" if secs(r) is not None else (f"**{r['status']}**" if r else "-")
-    L = [f"## {num}. {title}", "", f"Run `{stamp}`. Median seconds over the timed passes; fastest arm in bold.", ""]
+    L = [f"## {num}. {title}", "", f"Run `{stamp}`.", ""]
     if pins:
         L += ["```", pins, "```", ""]
     for n in notes:
         L += [f"- `{n}`"]
     L += [""] if notes else []
-    L += ["| Query | " + " | ".join(label(*x) for x in arms) + " |", "|---" * (len(arms) + 1) + "|"]
+    L += ["**Query time, in seconds** (median over the timed passes; fastest arm in bold):", "",
+          "| Query (seconds) | " + " | ".join(label(*x) for x in arms) + " |", "|---" * (len(arms) + 1) + "|"]
     wins = {}
     for q in qs:
         vals = {x: secs(out.get((*x, q))) for x in arms}
@@ -246,15 +286,15 @@ def query_section(num, title, suite, stamp, results, F):
     sc = [x for x in arms if has(x)]
     if sc:
         duck = any(x[0] != "starrocks" for x in sc)
-        L += [("Scanned GB (rows):" if duck else "StarRocks scanned GB (rows):"), "",
-              "| Query | " + " | ".join(label(*x) for x in sc) + " |", "|---" * (len(sc) + 1) + "|"]
-        rows = lambda r: f" ({int(r['scan_rows']) / 1e6:,.0f}M)" if r.get("scan_rows") else ""
+        # With DuckDB columns, GB only: the two engines count rows at different
+        # points (StarRocks before its filter, DuckDB after), so rows go below.
+        L += [("**Data scanned, in GB:**" if duck else "StarRocks scanned GB (rows):"), "",
+              ("| Query (GB) | " if duck else "| Query | ") + " | ".join(label(*x) for x in sc) + " |", "|---" * (len(sc) + 1) + "|"]
+        rows = lambda r: f" ({int(r['scan_rows']) / 1e6:,.0f}M)" if r.get("scan_rows") and not duck else ""
         gb = lambda r: f"{int(r['scan_bytes']) / 1e9:,.1f}{rows(r)}" if r and r.get("scan_bytes") else "-"
         L += [f"| {q} | " + " | ".join(gb(out.get((*x, q))) for x in sc) + " |" for q in qs] + [""]
         if duck:
-            L += ["GB: bytes read from S3 (StarRocks: `ScanBytes`, cache hits included; DuckDB: one untimed "
-                  "pass with its block cache bypassed). Rows are not the same quantity: StarRocks counts rows read "
-                  "before its filters, DuckDB the rows its scan returns after the filters pushed into it.", ""]
+            L += scan_explained(pins, out, qs, sc)
     if bad:
         L += ["**Passes not OK** (a query not OK on every pass has no median):", ""] + [f"- {b}" for b in bad] + [""]
 
@@ -314,8 +354,15 @@ def compaction(d, F):
         runs.setdefault(stamp, {}).setdefault(fmt, []).append(json.load(open(f)))
     if not runs:
         return []
-    stamp = max(runs)
-    c = {fmt: sorted(p, key=lambda r: r.get("started", "")) for fmt, p in runs[stamp].items()}
+    # Every compaction run of the session, combined per format in time order:
+    # one result, from the first pass's "before" to the last pass's "after".
+    stamps = sorted(runs)
+    stamp = stamps[-1] if len(stamps) == 1 else f"{stamps[0]} .. {stamps[-1]}"
+    c = {}
+    for st_ in stamps:
+        for fmt, p in runs[st_].items():
+            c.setdefault(fmt, []).extend(p)
+    c = {fmt: sorted(p, key=lambda r: r.get("started", "")) for fmt, p in c.items()}
     fmts = [f for f in ("paimon", "iceberg") if f in c]
     th = next((p[0].get("threshold_bytes") for p in c.values() if p[0].get("threshold_bytes")), 0)
     first = lambda f, k: c[f][0].get("before", {}).get(k, 0)
@@ -323,7 +370,8 @@ def compaction(d, F):
     arrow = lambda f, k, conv=lambda v: f"{v:,}": f"{conv(first(f, k))} → {conv(last(f, k))}"
     tb = lambda v: f"{v / 1e12:.2f}"
     ok = lambda f: all(r.get("status") == "OK" for r in c[f]) and not c[f][-1].get("remaining_groups")
-    rows = [("passes", lambda f: f"{len(c[f])}"),
+    rows = [("passes (jobs)", lambda f: f"{len(c[f])}"),
+            ("parallelism per pass", lambda f: " / ".join(str(r.get("parallelism", "?")) for r in c[f])),
             ("status", lambda f: "OK" if ok(f) else "**INCOMPLETE**"),
             ("data files", lambda f: arrow(f, "files")),
             (f"files under {th >> 20} MiB", lambda f: arrow(f, "small_files")),
@@ -331,7 +379,7 @@ def compaction(d, F):
             ("job time, all passes (s)", lambda f: f"{sum(r.get('duration_s', 0) for r in c[f]):,.0f}")]
     L = ["## Compaction before the snapshot test", "",
          f"Run `{stamp}` (`compaction/run.sh`): files under 70% of the 256 MiB target bin-packed, the same rule on both "
-         f"formats, at parallelism {c[fmts[0]][0].get('parallelism', '?')}. The hot test ran before it, on the "
+         f"formats" + (f", each pass's parallelism sized from the data it rewrites (cap {c[fmts[0]][0].get('parallelism_cap')})." if c[fmts[0]][0].get("parallelism_cap") else f", at parallelism {c[fmts[0]][0].get('parallelism', '?')}.") + f" The hot test ran before it, on the "
          "uncompacted tables.", "",
          "| | " + " | ".join(f.capitalize() for f in fmts) + " |", "|---|" + "---|" * len(fmts)]
     L += [f"| {name} | " + " | ".join(fn(f) for f in fmts) + " |" for name, fn in rows] + [""]
@@ -381,7 +429,7 @@ def main():
                "work the Iceberg writer does not do."] if "hive-catalog" in " ".join(a.setting) else []),
             *(["- The snapshot test ran on compacted tables (section above), the hot test on uncompacted ones; "
                "snapshot numbers are not comparable with sessions that did not compact."] if a.compaction else []),
-            "- Query times compare engines on equal CPU and memory (StarRocks 3 BEs × 9 cpu / 38 Gi vs DuckDB 27 cpu / 114 Gi; memory limit 90% of the pod and cache memory 20% of it, on both), "
+            "- Query times compare engines on equal CPU and memory (StarRocks 3 BEs × 9 cpu / 38 Gi vs DuckDB 27 cpu / 114 Gi; memory limit 90% of the pod and cache memory 20% of it, on both); DuckDB's cache_httpfs uses 256 KiB blocks, the same as StarRocks' datacache_block_size (512 KiB before 2026-10-25, when its narrow snapshot reads fetched ~5.7x the bytes they need), "
             "with both caches emptied before each test.", ""]
     open(a.out, "w").write("\n".join(head + body + tail))
     print(a.out)

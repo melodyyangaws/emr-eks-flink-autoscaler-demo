@@ -52,6 +52,7 @@ DUCKDB_NODEPOOL="${DUCKDB_NODEPOOL:-driver-nodepool}"   # = the BEs'; consolidat
 # 8xlarge (32 vcpu / 128 GiB): the smallest m5 that holds 27 cpu / 114Gi + daemonsets.
 # Above ~170 GiB, Karpenter's VM-overhead estimate rules out an m5.12xlarge: use 16xlarge.
 DUCKDB_INSTANCE_SIZE="${DUCKDB_INSTANCE_SIZE:-8xlarge}"
+CACHE_BLOCK_BYTES="${CACHE_BLOCK_BYTES:-262144}"    # cache_httpfs_cache_block_size: 256 KiB = StarRocks' datacache_block_size, not its 512 KiB default (duckdb_warm_server.py BLOCK)
 CACHE_MODE="${CACHE_MODE:-on_disk}"                  # on_disk | in_mem, see duckdb_warm_server.py
 CACHE_STORAGE_CLASS="${CACHE_STORAGE_CLASS:-gp3-fast}"  # gp3-fast-sc.yaml; plain gp3 caps the cache at 125 MB/s
 case "$CACHE_MODE" in
@@ -65,7 +66,7 @@ NAME=duckdb-warm
 # Every placeholder in duckdb-warm.yaml (lib/common.sh's render rejects one left out).
 TPL_VARS="NAME NAMESPACE CM DUCKDB_VERSION AWS_REGION BUCKET_NAME ICEBERG_DB TABLE_NAME PMNICE_TABLE_ROOT
 PIN_SNAPSHOT DUCKDB_MEMORY_LIMIT DUCKDB_THREADS DUCKDB_MAX_TEMP_SIZE CACHE_MODE CACHE_STORAGE_CLASS
-CACHE_DISK_BYTES CACHE_MEM_BYTES CACHE_VOLUME DUCKDB_POD_MEMORY DUCKDB_CPU DUCKDB_NODEPOOL DUCKDB_INSTANCE_SIZE"
+CACHE_DISK_BYTES CACHE_MEM_BYTES CACHE_VOLUME DUCKDB_POD_MEMORY DUCKDB_CPU DUCKDB_NODEPOOL DUCKDB_INSTANCE_SIZE CACHE_BLOCK_BYTES"
 
 # The server's HTTP API, called inside the pod (no port-forward): $1 GET|POST, $2 path.
 server() {

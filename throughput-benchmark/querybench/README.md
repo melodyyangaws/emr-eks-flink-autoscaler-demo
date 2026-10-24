@@ -176,6 +176,16 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
 
 ### DuckDB specifics (`duckdb-warm.sh`; the server: `../engine-deploy/deploy-duckdb-warm.sh`, `duckdb_warm_server.py`)
 
+- **Cache block size: 256 KiB, the same as StarRocks** (`CACHE_BLOCK_BYTES`, since
+  2026-10-25). StarRocks' datacache uses 256 KiB blocks (`datacache_block_size=262144`,
+  its default, read from each BE's `/varz` on 4.1.4), so both engines cache in
+  blocks of one size. With `cache_httpfs`'s own 512 KiB default, the snapshot
+  queries' narrow column reads each pulled a whole block: S1 fetched 87.4 GB for
+  the 15.2 GB it needs, and its cached passes read that back at the cache disk's
+  850 MB/s limit (~100 s, 1-1.5 of 27 cores busy). 64 KiB was faster still (24.3 GB
+  fetched; cached S1/S2/S3 29/35/34 s instead of 101/135/134 s, 2026-10-25) but finer
+  than StarRocks' blocks, so it is not used. DuckDB results before 2026-10-25 used
+  512 KiB and are not comparable.
 - **Data scanned** (since 2026-10-24): after an arm's timed passes, each query runs
   once more, untimed, as `EXPLAIN ANALYZE` with the block cache bypassed. Its HTTPFS
   `in:` bytes are what the query reads from S3, the counterpart of StarRocks'
@@ -248,6 +258,7 @@ rendering stops the run. `-- bench:` flags: `allow-zero-rows`,
 | `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` | `84049MiB` (82.08 GiB) / `27` | 90% of the 114 Gi pod minus the 22.03 GB cache, the same shares as a BE's `mem_limit` |
 | `DUCKDB_VERSION` | `1.5.6` | DuckDB 2.0 has no stable release yet |
 | `CACHE_MODE` | `on_disk` | `in_mem` = memory cache only |
+| `CACHE_BLOCK_BYTES` | `262144` | `cache_httpfs` block size (256 KiB = StarRocks' `datacache_block_size`, not its 512 KiB default; see DuckDB specifics) |
 | `PROFILE_SCAN` | `1` | DuckDB's scan profile: one untimed pass per arm after the timed ones (hot: after the last pass); `0` skips it |
 
 ---

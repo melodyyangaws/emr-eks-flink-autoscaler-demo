@@ -62,6 +62,7 @@ spec:
         - {name: CACHE_DIR,            value: /cache}
         - {name: CACHE_DISK_BYTES,     value: "${CACHE_DISK_BYTES}"}
         - {name: CACHE_MEM_BYTES,      value: "${CACHE_MEM_BYTES}"}
+        - {name: CACHE_BLOCK_BYTES,    value: "${CACHE_BLOCK_BYTES}"}
         resources:                          # requests = limits: Guaranteed QoS, no CPU burst over parity
           requests: {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}
           limits:   {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}

@@ -367,7 +367,8 @@ qb_assert_alone() {   # <self: starrocks|duckdb-warm>
     esac
     [[ -z "$other" ]] || qb_die "another benchmark is running (ALLOW_CONCURRENT=1 to override):
 ${other}"
-    qb_assert_fe_idle
+    # No FE pod (StarRocks taken down, e.g. an ENGINES=duckdb run): nothing can run there.
+    if kubectl get pod "$FE_POD" -n "$NAMESPACE" >/dev/null 2>&1; then qb_assert_fe_idle; fi
     if kubectl get deploy duckdb-warm -n "$NAMESPACE" >/dev/null 2>&1; then
         busy=$(kubectl exec -n "$NAMESPACE" deploy/duckdb-warm -c duckdb -- python3 -c \
             'import json, urllib.request; print(json.load(urllib.request.urlopen("http://localhost:8080/health", timeout=10))["busy"])' 2>/dev/null || echo unreachable)

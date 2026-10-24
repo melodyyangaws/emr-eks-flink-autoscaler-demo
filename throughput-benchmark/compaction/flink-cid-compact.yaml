@@ -120,6 +120,8 @@ spec:
       - "${COMPACT_RETAIN}"
       - "--dry-run"
       - "${DRY_RUN}"
+      - "--target-s"
+      - "${COMPACT_TARGET_S}"
       - "--result-uri"
       - "${RESULT_URI}"
     parallelism: ${COMPACT_PARALLELISM}

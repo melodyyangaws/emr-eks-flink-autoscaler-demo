@@ -65,7 +65,12 @@ CACHE_MODE = ENV.get("CACHE_MODE", "on_disk")
 CACHE_DIR = ENV["CACHE_DIR"]
 CACHE_DISK_BYTES = int(ENV["CACHE_DISK_BYTES"])
 CACHE_MEM_BYTES = int(ENV["CACHE_MEM_BYTES"])
-BLOCK = 524288                              # cache_httpfs_cache_block_size default
+# cache_httpfs_cache_block_size, CACHE_BLOCK_BYTES: 256 KiB since 2026-10-25, the same
+# as StarRocks' datacache_block_size (4.1.4 default, read from the BEs' /varz). Its own
+# default, 512 KiB, made the narrow snapshot queries fetch 5.7x the bytes they need
+# (S1: 87.4 vs 15.2 GB) and read them back at the cache disk's 850 MB/s: S1 100 s cached
+# (29 s at 64 KiB, which was faster still but finer than StarRocks' blocks).
+BLOCK = int(ENV.get("CACHE_BLOCK_BYTES") or 262144)
 SECRET_TTL_S = 20 * 60                      # IRSA sessions last ~1h
 
 con = duckdb.connect()
@@ -82,6 +87,7 @@ def init():
     if CACHE_MODE == "in_mem":
         cache = [
             "SET cache_httpfs_type='in_mem'",
+            "SET cache_httpfs_cache_block_size=%d" % BLOCK,
             "SET cache_httpfs_max_in_mem_cache_block_count=%d" % (CACHE_MEM_BYTES // BLOCK),
             # The default 1 h expiry would drop a warm-up pass's blocks before a
             # long snapshot suite reused them; StarRocks' cache has no TTL.
@@ -96,6 +102,7 @@ def init():
         floor = max(vol - CACHE_DISK_BYTES, 1 << 30)
         cache = [
             "SET cache_httpfs_type='on_disk'",
+            "SET cache_httpfs_cache_block_size=%d" % BLOCK,
             "SET cache_httpfs_cache_directory='%s'" % CACHE_DIR,
             "SET cache_httpfs_min_disk_bytes_for_cache=%d" % floor,
             "SET cache_httpfs_evict_policy='lru_sp'",
@@ -264,7 +271,7 @@ def profile_query(job, q):
     arm's timed passes (duckdb-warm.sh), as EXPLAIN ANALYZE with cache_httpfs
     bypassed (cache_httpfs_type='noop'): the HTTPFS "in:" counter then counts
     every byte the query reads from S3, where through the cache it counts only
-    misses (0 when warm) and in 512 KB blocks. The cache type is restored after,
+    misses (0 when warm) and in whole cache blocks (CACHE_BLOCK_BYTES). The cache type is restored after,
     which keeps the disk cache. DuckDB 1.5.6's JSON profile has no usable
     counter for this: its total_bytes_read and rows_scanned do not count
     Parquet reads, and custom_profiling_settings crashes (2026-10-24).

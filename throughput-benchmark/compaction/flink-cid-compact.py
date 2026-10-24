@@ -51,6 +51,23 @@ import boto3
 TABLE = "cid_events"
 OPEN_FILE_COST = 4 * 1024 * 1024    # both formats' default (source.split.open-file-cost / read.split.open-file-cost)
 LOOKBACK = 10                        # Iceberg's read.split.planning-lookback default
+# Data-sized parallelism (a batch job's counterpart of autoscaling; Flink's own
+# autoscaler is streaming-only). A rewrite subtask is CPU-bound at ~10.5 MB/s
+# (2026-10-23: 3.2 TB in 1,879 s at 160), and work comes in ~512 MiB bins
+# (Paimon: >= 2 x target; Iceberg: 2-file groups of <= 256 MiB), so more
+# subtasks than bins only sit idle. The job requests TaskManagers for the
+# slots it uses, so a smaller pass also starts fewer nodes.
+SUBTASK_BYTES_PER_S = 10.5e6
+BIN_BYTES = 512 * 2**20
+
+
+def sized_parallelism(rewrite_bytes, cap, target_s):
+    """Subtasks for a pass: enough to rewrite `rewrite_bytes` in ~target_s,
+    at most one per bin and at most `cap` (--parallelism), at least 1."""
+    import math
+    by_time = math.ceil(rewrite_bytes / (SUBTASK_BYTES_PER_S * target_s))
+    by_bins = math.ceil(rewrite_bytes / BIN_BYTES)
+    return max(1, min(cap, by_time, by_bins))
 
 
 def now():
@@ -99,7 +116,6 @@ def paimon(a, result):
 
     t_env = TableEnvironment.create(EnvironmentSettings.in_batch_mode())
     cfg = t_env.get_config()
-    cfg.set("parallelism.default", str(a.parallelism))
     cfg.set("table.dml-sync", "true")          # CALL returns once the compaction job has finished
     run_catalog_sql(t_env, a.catalog_sql)
     db = os.environ["GLUE_DATABASE"]
@@ -122,8 +138,14 @@ def paimon(a, result):
     if a.dry_run:
         return
 
-    opts = f"snapshot.time-retained={a.retain}"
-    log(f"CALL sys.compact on {db}.{TABLE} (options {opts}, parallelism {a.parallelism})")
+    par = sized_parallelism(result["before"]["small_bytes"], a.parallelism, a.target_s)
+    cfg.set("parallelism.default", str(par))
+    result.update(parallelism=par, parallelism_cap=a.parallelism)
+    # sink.parallelism: the compaction workers' parallelism, in case the
+    # procedure's environment does not take parallelism.default.
+    opts = f"snapshot.time-retained={a.retain},sink.parallelism={par}"
+    log(f"CALL sys.compact on {db}.{TABLE} (options {opts}; parallelism {par} for "
+        f"{result['before']['small_bytes'] / 1e9:,.1f} GB, cap {a.parallelism})")
     t0 = time.time()
     res = t_env.execute_sql(f"CALL sys.compact(`table` => '{db}.{TABLE}', options => '{opts}')")
     with res.collect() as rows:
@@ -208,11 +230,15 @@ def iceberg(a, result):
     jgroups = J.java.util.ArrayList()
     for g in todo:
         jgroups.add(g)
-    log(f"rewriting {len(todo)} group(s) ({len(rest)} left for another pass), parallelism {min(len(todo), a.parallelism)}")
+    todo_bytes = sum(t.file().fileSizeInBytes() for g in todo for t in g.files())
+    par = min(len(todo), sized_parallelism(todo_bytes, a.parallelism, a.target_s))
+    result.update(parallelism=par, parallelism_cap=a.parallelism, rewrite_bytes=todo_bytes)
+    log(f"rewriting {len(todo)} group(s), {todo_bytes / 1e9:,.1f} GB ({len(rest)} left for another pass), "
+        f"parallelism {par} (cap {a.parallelism})")
     t0 = time.time()
     ds = env._j_stream_execution_environment.fromCollection(jgroups)
     rewriter = J.org.apache.iceberg.flink.source.RowDataRewriter(table, True, table.io(), table.encryption())
-    added = rewriter.rewriteDataForTasks(ds, min(len(todo), a.parallelism))
+    added = rewriter.rewriteDataForTasks(ds, par)
     result["rewrite_s"] = round(time.time() - t0, 1)
     log(f"rewritten: {added.size()} new file(s) in {result['rewrite_s']} s; committing")
 
@@ -243,6 +269,7 @@ def main():
     ap.add_argument("--max-groups", type=int, default=4000, help="Iceberg: groups per pass")
     ap.add_argument("--retain", default="7d", help="Paimon: snapshot.time-retained for the compaction commit")
     ap.add_argument("--dry-run", default="false", help="true: measure and plan only; rewrite and commit nothing")
+    ap.add_argument("--target-s", type=int, default=300, help="data-sized parallelism: aim for ~this many seconds of rewrite")
     a = ap.parse_args()
     a.dry_run = a.dry_run.lower() == "true"
 

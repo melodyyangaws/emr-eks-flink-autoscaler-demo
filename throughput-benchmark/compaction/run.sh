@@ -14,9 +14,10 @@
 # Both formats get the same rule (see flink-cid-compact.py): files under 70% of
 # the 256 MiB target are bin-packed; the rest stay. Each format is one batch
 # FlinkDeployment, flink-cid-compact-<fmt>, on the writers' image and nodepools,
-# at COMPACT_PARALLELISM (default 160): both side by side, as the
+# sized per pass from its data, up to COMPACT_PARALLELISM (320): both side by side, as the
 # writers ran. Iceberg runs in passes of ICEBERG_MAX_GROUPS groups (default
-# 4000) until none is left; Paimon in one.
+# 4000) until none is left; Paimon in passes until its small files are under
+# PAIMON_SMALL_PCT (1%) of all files, or a pass cuts them by under 10%.
 #
 # Each pass writes a JSON (before/after files and bytes, what was rewritten,
 # timings) to s3://$BUCKET_NAME/querybench-results/session<TEST_SUFFIX>/compaction/,
@@ -26,7 +27,7 @@
 # DRY_RUN=true measures both tables and plans the groups (JobManagers only, a
 # few minutes), rewrites and commits nothing; its JSONs go to compaction/dry-run/.
 #
-# Knobs: COMPACT_PARALLELISM, ICEBERG_MAX_GROUPS, COMPACT_MAX_PASSES (20),
+# Knobs: COMPACT_PARALLELISM (cap), COMPACT_TARGET_S (300), ICEBERG_MAX_GROUPS, PAIMON_SMALL_PCT (1), COMPACT_MAX_PASSES (20),
 # COMPACT_TIMEOUT_S (per pass, 14400), COMPACT_RETAIN (Paimon's
 # snapshot.time-retained for the compaction commit, 7d), JM_NODEPOOL, TM_NODEPOOL.
 set -euo pipefail
@@ -40,9 +41,13 @@ export EMR_VERSION=${EMR_VERSION:-7.13.0}
 export IMAGE_TAG=${IMAGE_TAG:-$EMR_VERSION}
 export JM_NODEPOOL=${JM_NODEPOOL:-driver-nodepool}
 export TM_NODEPOOL=${TM_NODEPOOL:-executor-memorynodepool}
-# 160 per format (40 TMs, 320 cpu for both): the 2026-10-22 run at 320 kept its TMs
-# 60-83% busy, so the rewrite is CPU-bound: half the cores, ~same cpu-hours, ~55 min.
-export COMPACT_PARALLELISM=${COMPACT_PARALLELISM:-160}
+# The CAP per pass: each pass sizes itself from the bytes it rewrites
+# (flink-cid-compact.py sized_parallelism: ~COMPACT_TARGET_S of rewrite at
+# ~10.5 MB/s per subtask, at most one subtask per ~512 MiB bin). Only a big
+# first pass reaches it: 3.2 TB at 320 is ~15 min (80 TMs per format); the
+# 5,215-file pass of 2026-10-24 sizes to 62, a final mop-up to 1-2.
+export COMPACT_PARALLELISM=${COMPACT_PARALLELISM:-320}
+export COMPACT_TARGET_S=${COMPACT_TARGET_S:-300}
 export ICEBERG_MAX_GROUPS=${ICEBERG_MAX_GROUPS:-4000}
 export S3A_MULTIPART_SIZE=${S3A_MULTIPART_SIZE:-16M}
 export S3A_MULTIPART_THRESHOLD=${S3A_MULTIPART_THRESHOLD:-16M}
@@ -96,7 +101,7 @@ deploy() {   # <fmt> <result-uri>: a fresh CR (EMR stages the script on CREATE o
     FMT="$fmt" RESULT_URI="$2" render "${HERE}/flink-cid-compact.yaml" "$out" \
         NAMESPACE FMT AWS_REGION AWS_ACCOUNT_ID BUCKET_NAME EMR_EXECUTION_ROLE_ARN EMR_VERSION IMAGE_TAG \
         COMPACT_PARALLELISM ICEBERG_MAX_GROUPS JM_NODEPOOL TM_NODEPOOL TEST_SUFFIX TEST_DB_SUFFIX \
-        S3A_MULTIPART_SIZE S3A_MULTIPART_THRESHOLD COMPACT_RETAIN DRY_RUN RESULT_URI || die "could not render ${out##*/}"
+        S3A_MULTIPART_SIZE S3A_MULTIPART_THRESHOLD COMPACT_RETAIN DRY_RUN COMPACT_TARGET_S RESULT_URI || die "could not render ${out##*/}"
     kubectl delete flinkdeployment "flink-cid-compact-${fmt}" -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=300s >/dev/null
     kubectl create -f "$out" >/dev/null || die "could not create flink-cid-compact-${fmt}"
 }
@@ -134,12 +139,37 @@ print("  {} pass: {} in {} s; before {}; after {}{}".format(
 EOF
 }
 
-# One format, pass after pass until nothing is left (Paimon: one pass).
+# Whether a format needs another pass, from its pass's JSON: prints why (and
+# exits 0), or nothing (exit 1) when it is done.
+#   Iceberg: groups left over (ICEBERG_MAX_GROUPS per pass).
+#   Paimon: one sys.compact leaves about one new small file per bin (a bin of
+#   ~5 tails is written as 256 MiB files plus a remainder; 28,799 -> 5,215 on
+#   2026-10-23), so it runs again while its small files are above
+#   PAIMON_SMALL_PCT of all files and the last pass cut them by >= 10%.
+more_passes() {   # <json>
+    PAIMON_SMALL_PCT="${PAIMON_SMALL_PCT:-1}" python3 - "$1" <<'EOF'
+import json, os, sys
+r = json.loads(sys.argv[1]); b, a = r.get("before", {}), r.get("after", {})
+if r.get("format") == "iceberg":
+    left = r.get("remaining_groups") or 0
+    sys.exit(print(f"{left:,} groups left") if left else 1)
+small, files, was = a.get("small_files", 0), a.get("files", 0) or 1, b.get("small_files", 0)
+pct = float(os.environ["PAIMON_SMALL_PCT"])
+if small <= files * pct / 100:
+    sys.exit(1)                                  # few enough small files
+if small > was * 0.9:
+    print(f"{small:,} small files left, but the last pass cut them by under 10%: stopping", file=sys.stderr)
+    sys.exit(1)
+print(f"{small:,} small files left, {100 * small / files:.1f}% of {files:,}, above {pct:g}%")
+EOF
+}
+
+# One format, pass after pass until nothing is left (more_passes).
 compact_one() {   # <fmt> <stamp>
     local fmt="$1" stamp="$2" pass st uri json left
     for (( pass = 1; pass <= COMPACT_MAX_PASSES; pass++ )); do
         uri="${RESULTS}/${stamp}-${fmt}-pass${pass}.json"
-        log "${fmt}: pass ${pass} (parallelism ${COMPACT_PARALLELISM}) -> ${uri#s3://${BUCKET_NAME}/}"
+        log "${fmt}: pass ${pass} (parallelism sized from its data, cap ${COMPACT_PARALLELISM}) -> ${uri#s3://${BUCKET_NAME}/}"
         deploy "$fmt" "$uri"
         st=$(wait_job "$fmt" "$uri")
         json=$(result "$uri" || true)
@@ -154,10 +184,11 @@ compact_one() {   # <fmt> <stamp>
             return 1
         fi
         kubectl delete flinkdeployment "flink-cid-compact-${fmt}" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null
-        left=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("remaining_groups", 0))' "$json" 2>/dev/null || echo 0)
-        (( left == 0 )) && { log "${fmt}: done"; return 0; }
+        left=$(more_passes "$json") || left=""
+        [[ -z "$left" ]] && { log "${fmt}: done"; return 0; }
+        log "${fmt}: another pass (${left})"
     done
-    warn "${fmt}: groups still left after ${COMPACT_MAX_PASSES} passes (raise COMPACT_MAX_PASSES or ICEBERG_MAX_GROUPS)"
+    warn "${fmt}: still not done after ${COMPACT_MAX_PASSES} passes (raise COMPACT_MAX_PASSES; Iceberg: ICEBERG_MAX_GROUPS)"
     return 1
 }
 
