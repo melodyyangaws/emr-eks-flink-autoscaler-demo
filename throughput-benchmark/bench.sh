@@ -3,6 +3,7 @@
 # run.sh; the session's values (TEST_SUFFIX, JSONGZ_REPLICAS, DURATION_SECONDS)
 # come from .bench-env, through lib/common.sh.
 #
+#   ./bench.sh precheck       the S3 -> SNS -> SQS pipeline: set up if a piece is missing, else its queue backlog
 #   ./bench.sh throughput     flink writers deploy both -> both RUNNING -> datagen start -> monitoring start
 #   ./bench.sh hot            without a wait, start the hot query test (+ its watcher), while writers live
 #   ./bench.sh snapshot       wait until the hot query test is complete, then start the snapshot query test (+ watcher); It auto-stops the writers first,
@@ -14,6 +15,7 @@
 #                             (no data is deleted: wiping a table set is README "Teardown")
 #
 # A typical session: edit TEST_SUFFIX in .bench-env, then
+#   ./bench.sh precheck            # purge the queues first if their backlog is an earlier run's
 #   PAIMON_WRITE_ONLY=true PAIMON_WRITE_BUFFER_SPILLABLE=false ./bench.sh throughput
 #   ./bench.sh hot                 # once both writers are RUNNING; its watcher ends the run
 #   ./bench.sh snapshot            # after the hot test
@@ -71,11 +73,12 @@ cmd_cleanup() {
 }
 
 case "${1:-}" in
+    precheck)   ./flinkwriter/run.sh ensure-sqs ;;
     throughput) cmd_throughput ;;
     hot)        SUITE=hot ./querybench/run.sh start ;;
     snapshot)   SUITE=snapshot ./querybench/run.sh start ;;
     summary)    ./summary/run.sh ;;
     status)     cmd_status ;;
     cleanup)    cmd_cleanup ;;
-    *)          sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *)          sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

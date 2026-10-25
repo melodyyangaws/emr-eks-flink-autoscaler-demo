@@ -41,15 +41,15 @@ shared state: a new `TEST_SUFFIX`, or purging leftover SQS messages. Create
 
 | # | Step | Command | What it does | Time (measured) |
 |---|---|---|---|---|
-| 0 | Pre-checks | — | capacity, leftover pods, SQS backlog, a fresh `TEST_SUFFIX`, purge queues | ~2 min (a purge takes 60 s) |
-| 1 | Throughput | `./bench.sh throughput` | deploys both Flink writers, waits for RUNNING, starts the source data generator and monitoring | ~8 min |
-| 2 | Fill the tables | — | the writers commit while the tables grow, before the hot test | ~15 min |
-| 2b | Query engines | `kubectl apply -f engine-deploy/gp3-fast-sc.yaml`, then `./engine-deploy/deploy-starrocks.sh install`, `./engine-deploy/deploy-duckdb-warm.sh up` | only if StarRocks or DuckDB long-runner server is missing: the fast gp3 disk classes first, then the engines (see [Query engines](#query-engines-before-a-query-test)); | ~5–10 min (new nodes) |
-| 3 | Hot query test | `./bench.sh hot` | DuckDB up, caches emptied, then 1 warm-up + 3 timed passes while the writers run | ~5 min setup + ~1.5 h test |
-| 4 | Snapshot query test | `./bench.sh snapshot` | waits for the hot test complete, stops the writers, compacts both tables once (`COMPACT_BEFORE_SNAPSHOT=true`, [Compaction](#compaction-before-the-snapshot-test)), empties caches, runs StarRocks (3 arms) then DuckDB (2 arms) | **~4.6 h** (run 2026-10-23: compacted tables, 10-min S1–S3 / 1-min S4, BEs 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi): ~6 min stopping writers and emptying caches, StarRocks 2.6 h (`paimon` 38 / `pmn_as_iceberg` 40 / `iceberg` 81 min), DuckDB 1.8 h (`paimon` 56 / `iceberg` 50 min); each arm = 1 warm-up + 3 timed passes. Plus, once, the compaction: 39 min at parallelism 320 (~55 min expected at the default 160). DuckDB's data-scanned figures come from one untimed pass per DuckDB arm after its timed passes, cache bypassed (~40 min per arm, at its cold S3 read rate). Before (uncompacted, 25 / 3-min windows, 2026-10-21): ~16.5 h |
-| 5 | Summary | `./bench.sh summary` | pulls the results from S3 into `bench-results/BENCH-SUMMARY-<session>.md` | ~3 min |
+| 0 | Pre-checks | `./bench.sh precheck` | the S3 → SNS → SQS pipeline: set up if any piece is missing (`setup-sqs`), else left as is with its queue backlog shown; then capacity, leftover pods, a fresh `TEST_SUFFIX`, purge queues | ~2 min (2 purges, 60 s each; run 2026-10-24) |
+| 1 | Throughput | `./bench.sh throughput` | deploys both Flink writers, waits for RUNNING, starts the source data generator and monitoring | ~10 min (2026-10-24: writers created 16:57Z, both RUNNING 17:04Z, generator and monitoring up 17:05Z) |
+| 2 | Fill the tables | — | the writers commit while the tables grow, before the hot test; it can start once the query engines are up (step 2b) | ~10 min (2026-10-24: 17:05–17:15Z) |
+| 2b | Startup query engines | `kubectl apply -f engine-deploy/gp3-fast-sc.yaml`, then `./engine-deploy/deploy-starrocks.sh install`, `./engine-deploy/deploy-duckdb-warm.sh up` | only if StarRocks or DuckDB long-runner server is missing: the fast gp3 disk classes first, then the engines (see [Query engines](#query-engines-before-a-query-test)); | ~8–10 min, alongside step 2 (StarRocks install ~4 min once nodes exist; DuckDB ~5 min on a new node) |
+| 3 | Hot query test | `./bench.sh hot` | DuckDB up, empties caches, then 1 warm-up + 3 timed passes/runs while the writers run | ~4 min setup (cache clear ~3.5 min) + **~1.2 h** test (2026-10-24: runner 74 min; the watcher then needs ≤ 10 min to shut down) |
+| 4 | Snapshot query test | `./bench.sh snapshot` | waits for the hot test complete, stops the writers, compacts both tables once (`COMPACT_BEFORE_SNAPSHOT=true`, [Compaction](#compaction-before-the-snapshot-test)), empties caches, runs StarRocks (3 arms) then DuckDB (2 arms) | **~5.9 h** (run 2026-10-25, `-final`): ~3 min stopping the writers; compaction 37 min (Paimon 2 passes, Iceberg 4, in parallel); StarRocks install 4 min; DuckDB up and both caches cleared 7 min; runner 5.0 h = StarRocks 2.4 h (`paimon` 36 / `pmn_as_iceberg` 35 / `iceberg` 73 min) then DuckDB 2.6 h (each arm 1 warm-up + 3 timed passes, then its untimed scan pass with the cache bypassed). Before (uncompacted): ~16.5 h |
+| 5 | Summary | `./bench.sh summary` | pulls the results from S3 into `bench-results/BENCH-SUMMARY-<session>.md` | ~3 min (2026-10-25: 06:49–06:52Z) |
 
-A full session takes about 7.5 h, most of it the snapshot test (about 19 h before the 2026-10-23 windows). Steps 3 and 4
+A full session takes about 7.6 h of running time (`-final`, 2026-10-24/25), most of it the snapshot test (about 19 h before the 2026-10-23 windows). Steps 3 and 4
 run as Jobs in the cluster, so the laptop and the tool can be closed while they run.
 
 ---
@@ -59,6 +59,7 @@ run as Jobs in the cluster, so the laptop and the tool can be closed while they 
 ```bash
 cd throughput-benchmark
 # once: create .bench-env.local (below)
+./bench.sh precheck     # SQS pipeline: set up if missing, else its backlog (purge if it is an earlier run's)
 # each session: set TEST_SUFFIX in .bench-env (a new table set, e.g. "-test4")
 # see the following step by step section for more details
 PAIMON_WRITE_ONLY=true PAIMON_WRITE_BUFFER_SPILLABLE=false \
@@ -148,6 +149,29 @@ kubectl get nodepool executor-memorynodepool -o jsonpath='{.status.resources.cpu
 ```
 
 Stay under ~80% of the limit, or TMs evict each other and the jobs restart.
+
+**The S3 → SNS → SQS pipeline: `./bench.sh precheck`** (`./flinkwriter/run.sh ensure-sqs`).
+It checks the topic, both queues and their DLQs, the subscriptions and the bucket's
+notification. If all are there, it changes nothing and shows each queue's backlog.
+If any is missing (a new account or region), it runs `setup-sqs`.
+`bench.sh throughput` does not check it; `deploy` stops with "Cannot read SQS queue"
+if a queue is missing.
+
+```bash
+./bench.sh precheck              # set up only what is missing; else the backlog
+./flinkwriter/run.sh setup-sqs   # force the setup; writers stopped; safe to rerun
+```
+
+`setup-sqs` creates whatever is missing:
+- the SNS topic `cid-landing-jsongz-events`, which only `$BUCKET_NAME` may publish to;
+- per format, the queue `cid-landing-jsongz-<fmt>` (visibility 900 s, 14-day retention,
+  SQS-managed encryption, writable by the topic only), with a `-dlq` after 10 receives;
+- the subscriptions, with raw message delivery.
+
+Existing queues keep their attributes; only their access policy and redrive are set.
+It then runs `notify`, which sets the bucket's S3 event notification and checks a
+test file reaches both queues. That step is skipped, with a warning, while a writer
+is RUNNING.
 
 ### 2. Upload (done by `deploy`)
 
@@ -401,8 +425,9 @@ s3://$BUCKET_NAME/cid-landing-jsongz/*.json.gz   (ObjectCreated)
   names. Nothing lists the bucket.
 - Each job has its own queue, so the two never compete for messages.
 - **Only new files under `cid-landing-jsongz/` are announced.** The S3
-  notification is set on the bucket, not in this repo. After changing
-  `OUTPUT_URI`, run `./flinkwriter/run.sh notify` (writers stopped).
+  notification is set on the bucket by `./flinkwriter/run.sh setup-sqs` (once,
+  [step 1](#1-check-capacity)) or `notify`. After changing `OUTPUT_URI`, run
+  `./flinkwriter/run.sh notify` (writers stopped).
 - **The queue is the state.** Leftover messages are read first by the next
   run. `deploy` warns about a backlog but never purges. Purge with everything
   stopped:

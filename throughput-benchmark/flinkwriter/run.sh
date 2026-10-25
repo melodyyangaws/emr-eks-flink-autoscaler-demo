@@ -27,6 +27,8 @@
 #   cd ../cdc-pipeline && ./build-deploy-generic.sh build
 #
 # USAGE (from throughput-benchmark/; it sources .bench-env itself, through lib/common.sh):
+#   ./flinkwriter/run.sh ensure-sqs            # pre-check (./bench.sh precheck): setup-sqs only if a piece is missing
+#   ./flinkwriter/run.sh setup-sqs             # once per account: SNS topic, SQS queues (+ DLQs), subscriptions, then notify
 #   ./flinkwriter/run.sh upload                # optional pre-check: Glue DBs + executor/SQL to S3, verified; no kubectl
 #   ./flinkwriter/run.sh deploy paimon         # runs upload first, always; one writer — the only way to get a quotable rows/s
 #   ./flinkwriter/run.sh deploy iceberg
@@ -492,6 +494,108 @@ print(int(hit))' "$key" "$url" "$AWS_REGION" 2>/dev/null || echo 0)
     log "✓ Test file removed. Files under ${prefix} now reach both queues."
 }
 
+# ── SNS topic + SQS queues (the pipeline notify points the bucket at) ────────
+# Creates what is missing, the same shape as the account's original setup
+# (2026-10): topic SNS_TOPIC_NAME, publishable by S3 from BUCKET_NAME only; per
+# format a queue <SQS_QUEUE_PREFIX>-<fmt> (visibility 900 s, 14-day retention,
+# SQS-managed SSE, sendable by the topic only) with a <queue>-dlq after 10
+# receives; each subscribed with raw delivery (the connector also parses an SNS
+# envelope, but raw is what runs). Existing queues keep their own attributes;
+# only their policy and redrive are (re)set, to the values above. Then notify,
+# unless a writer is RUNNING (it would read notify's test file): run it later.
+cmd_setup_sqs() {
+    local topic fmt q url arn dlq_url dlq_arn sub
+    topic=$(aws sns create-topic --region "$AWS_REGION" --name "$SNS_TOPIC_NAME" \
+              --query TopicArn --output text) || error "Cannot create SNS topic ${SNS_TOPIC_NAME}"
+    aws sns set-topic-attributes --region "$AWS_REGION" --topic-arn "$topic" --attribute-name Policy \
+        --attribute-value "$(python3 -c 'import json, sys
+topic, acct, bucket = sys.argv[1:4]
+print(json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Sid": "OwnerDefault", "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::%s:root" % acct},
+     "Action": ["SNS:GetTopicAttributes", "SNS:SetTopicAttributes", "SNS:AddPermission", "SNS:RemovePermission",
+                "SNS:DeleteTopic", "SNS:Subscribe", "SNS:ListSubscriptionsByTopic", "SNS:Publish"],
+     "Resource": topic},
+    {"Sid": "AllowS3Publish", "Effect": "Allow", "Principal": {"Service": "s3.amazonaws.com"},
+     "Action": "SNS:Publish", "Resource": topic,
+     "Condition": {"StringEquals": {"aws:SourceAccount": acct}, "ArnLike": {"aws:SourceArn": "arn:aws:s3:::%s" % bucket}}}]}))' \
+        "$topic" "$AWS_ACCOUNT_ID" "$(landing_bucket)")" || error "Cannot set the policy of ${SNS_TOPIC_NAME}"
+    log "✓ SNS ${SNS_TOPIC_NAME} (S3 bucket $(landing_bucket) may publish)"
+    for fmt in $DEPLOY_TARGETS; do
+        q="${SQS_QUEUE_PREFIX}-${fmt}"
+        dlq_url=$(aws sqs get-queue-url --region "$AWS_REGION" --queue-name "${q}-dlq" --query QueueUrl --output text 2>/dev/null) \
+          || dlq_url=$(aws sqs create-queue --region "$AWS_REGION" --queue-name "${q}-dlq" \
+                         --attributes MessageRetentionPeriod=1209600,SqsManagedSseEnabled=true \
+                         --query QueueUrl --output text) || error "Cannot create SQS queue ${q}-dlq"
+        dlq_arn="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${q}-dlq"
+        url=$(aws sqs get-queue-url --region "$AWS_REGION" --queue-name "$q" --query QueueUrl --output text 2>/dev/null) \
+          || url=$(aws sqs create-queue --region "$AWS_REGION" --queue-name "$q" \
+                     --attributes VisibilityTimeout=900,MessageRetentionPeriod=1209600,SqsManagedSseEnabled=true \
+                     --query QueueUrl --output text) || error "Cannot create SQS queue ${q}"
+        arn="arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${q}"
+        aws sqs set-queue-attributes --region "$AWS_REGION" --queue-url "$url" --attributes "$(python3 -c 'import json, sys
+arn, topic, dlq = sys.argv[1:4]
+print(json.dumps({
+    "Policy": json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Sid": "AllowSNS", "Effect": "Allow", "Principal": {"Service": "sns.amazonaws.com"},
+         "Action": "sqs:SendMessage", "Resource": arn, "Condition": {"ArnEquals": {"aws:SourceArn": topic}}}]}),
+    "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq, "maxReceiveCount": 10})}))' "$arn" "$topic" "$dlq_arn")" \
+          || error "Cannot set the policy of ${q}"
+        # subscribe is idempotent for the same topic, endpoint and attributes.
+        sub=$(aws sns subscribe --region "$AWS_REGION" --topic-arn "$topic" --protocol sqs --notification-endpoint "$arn" \
+                --attributes RawMessageDelivery=true --return-subscription-arn --query SubscriptionArn --output text) \
+          || error "Cannot subscribe ${q} to ${SNS_TOPIC_NAME}"
+        log "✓ SQS ${q} (+ ${q}-dlq) subscribed, raw delivery (${sub##*:})"
+    done
+    if kubectl get flinkdeployment -n "$NAMESPACE" -o jsonpath='{.items[*].status.jobStatus.state}' 2>/dev/null | grep -q RUNNING; then
+        warn "A Flink writer is RUNNING: S3 -> SNS not set or tested now. With both suspended, run: $0 notify"
+    else
+        cmd_notify
+    fi
+}
+
+# The pipeline pieces that are missing, one per line (none: all in place): the
+# topic, each queue and its DLQ, each queue's subscription to the topic, and
+# the bucket's notification to the topic. Read-only.
+sqs_missing() {
+    local topic fmt subs
+    topic=$(sns_topic_arn)
+    if ! aws sns get-topic-attributes --region "$AWS_REGION" --topic-arn "$topic" >/dev/null 2>&1; then
+        echo "SNS topic ${SNS_TOPIC_NAME}"
+        subs=""
+    else
+        subs=$(aws sns list-subscriptions-by-topic --region "$AWS_REGION" --topic-arn "$topic" \
+                 --query 'Subscriptions[].Endpoint' --output text 2>/dev/null || true)
+    fi
+    for fmt in $DEPLOY_TARGETS; do
+        aws sqs get-queue-url --region "$AWS_REGION" --queue-name "${SQS_QUEUE_PREFIX}-${fmt}" >/dev/null 2>&1 \
+            || echo "SQS queue ${SQS_QUEUE_PREFIX}-${fmt}"
+        aws sqs get-queue-url --region "$AWS_REGION" --queue-name "${SQS_QUEUE_PREFIX}-${fmt}-dlq" >/dev/null 2>&1 \
+            || echo "SQS queue ${SQS_QUEUE_PREFIX}-${fmt}-dlq"
+        [[ " ${subs//$'\t'/ } " == *" arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_PREFIX}-${fmt} "* ]] \
+            || echo "subscription ${SNS_TOPIC_NAME} -> ${SQS_QUEUE_PREFIX}-${fmt}"
+    done
+    aws s3api get-bucket-notification-configuration --bucket "$(landing_bucket)" --region "$AWS_REGION" \
+        --query "TopicConfigurations[?TopicArn=='${topic}'].Id" --output text 2>/dev/null | grep -q . \
+        || echo "S3 notification $(landing_bucket)/$(landing_prefix) -> ${SNS_TOPIC_NAME}"
+}
+
+# Pre-check: set the pipeline up only if a piece is missing (cmd_setup_sqs);
+# otherwise change nothing and report each queue's backlog, as deploy does.
+cmd_ensure_sqs() {
+    local missing
+    missing=$(sqs_missing)
+    if [[ -z "$missing" ]]; then
+        log "✓ S3 -> SNS ${SNS_TOPIC_NAME} -> SQS ${SQS_QUEUE_PREFIX}-{$(tr ' ' ',' <<<"$DEPLOY_TARGETS")} in place"
+        log "SQS backlog (read-only; the jobs read these first):"
+        check_sqs_backlog $DEPLOY_TARGETS
+    else
+        warn "SQS pipeline incomplete, missing:
+$(sed 's/^/         /' <<<"$missing")
+       setting it up (setup-sqs)"
+        cmd_setup_sqs
+    fi
+}
+
 upload_scripts() {
     log "Uploading executor and SQL scripts to S3..."
     # This IS what the job runs. spec.job.jarURI points at this key; EMR on
@@ -712,6 +816,18 @@ main() {
             check_env_vars
             cmd_notify
             ;;
+        setup-sqs)
+            # Create the SNS topic, both queues (+ DLQs) and subscriptions if
+            # missing, then notify (see cmd_setup_sqs). Once per account/region.
+            check_env_vars
+            cmd_setup_sqs
+            ;;
+        ensure-sqs)
+            # Pre-check (./bench.sh precheck): setup-sqs only if a piece is
+            # missing, else just the backlog (see cmd_ensure_sqs).
+            check_env_vars
+            cmd_ensure_sqs
+            ;;
         cleanup)
             local fmt=${2:-both}
             warn "Deleting flink-cid deployment(s): ${fmt}"
@@ -731,6 +847,10 @@ main() {
             echo "  upload             Create Glue DBs, upload + verify executor and SQL in S3 (no kubectl)"
             echo "  render             Render all manifests, upload scripts, prep Glue/ConfigMap"
             echo "  deploy paimon|iceberg|both"
+            echo "  setup-sqs                   Create the SNS topic, both SQS queues (+ DLQs) and their"
+            echo "                              subscriptions if missing, then notify (once per account)"
+            echo "  ensure-sqs                  setup-sqs only if a piece is missing; else report the"
+            echo "                              queues' backlog (./bench.sh precheck)"
             echo "  notify                      Point the bucket's S3 event notification at"
             echo "                              OUTPUT_URI's prefix and test it through both queues"
             echo "                              (deploy does not check it: run notify after changing OUTPUT_URI)"

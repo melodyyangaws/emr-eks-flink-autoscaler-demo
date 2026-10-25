@@ -182,32 +182,28 @@ SUITE=snapshot ./querybench/duckdb-warm.sh run
 
 ### DuckDB specifics (`duckdb-warm.sh`; the server: `../engine-deploy/deploy-duckdb-warm.sh`, `duckdb_warm_server.py`)
 
-- **Cache block size: 256 KiB, the same as StarRocks** (`CACHE_BLOCK_BYTES`, since
-  2026-10-25). StarRocks' datacache uses 256 KiB blocks (`datacache_block_size=262144`,
+- **Cache block size: 256 KiB, the same as StarRocks** (`CACHE_BLOCK_BYTES`). StarRocks' datacache uses 256 KiB blocks (`datacache_block_size=262144`,
   its default, read from each BE's `/varz` on 4.1.4), so both engines cache in
-  blocks of one size. With `cache_httpfs`'s own 512 KiB default, the snapshot
+  blocks of one size. Previously, with CACHE_BLOCK_BYTES(`cache_httpfs`)'s own 512 KiB default, the snapshot
   queries' narrow column reads each pulled a whole block: S1 fetched 87.4 GB for
   the 15.2 GB it needs, and its cached passes read that back at the cache disk's
   850 MB/s limit (~100 s, 1-1.5 of 27 cores busy). 64 KiB was faster still (24.3 GB
-  fetched; cached S1/S2/S3 29/35/34 s instead of 101/135/134 s, 2026-10-25) but finer
-  than StarRocks' blocks, so it is not used. At 256 KiB (partial run 2026-10-24,
-  Paimon arm, same windows and table version), the cached S1/S2/S3/S4 passes took
+  fetched; cached S1/S2/S3 29/35/34 s instead of 101/135/134 s). To be fair for StarRocks, 64KiB was not used. At 256 KiB Paimon arm, the cached S1/S2/S3/S4 passes took
   62-69 / 78 / 77 / 234 s, against 101 / 135 / 134 / 245 s at 512 KiB. The cold S4
   warm-up took longer (908 s vs 425 s), but warm-up passes are not timed. DuckDB
-  results before 2026-10-25 used 512 KiB and are not comparable.
+  results based on previous 512 KiB was not comparable.
 - **Warm-up is the same on both engines.** `starrocks.sh` and `duckdb-warm.sh`
   share `WARMUP=1` / `RUNS=3` (`lib/querybench.sh`), start from caches emptied by
   `clear-caches.sh`, and run each arm pass-major: S1-S4 once as a discarded
   warm-up, then S1-S4 three times timed (median reported). So both are measured
   warm, each from a cache it filled itself the same way.
-- **Data scanned** (since 2026-10-24): after an arm's timed passes, each query runs
+- **Data scanned**: after an arm's timed passes, each query runs
   once more, untimed, as `EXPLAIN ANALYZE` with the block cache bypassed. Its HTTPFS
   `in:` bytes are what the query reads from S3, the counterpart of StarRocks'
   `ScanBytes`, and go to the CSV's `scan_bytes`. `scan_rows` is the rows the scan
   returns after the filters pushed into it, not StarRocks' rows-read-before-filters.
   DuckDB 1.5.6's JSON profile can't give either (its byte/row counters miss Parquet
-  reads, and `custom_profiling_settings` crashes). Runs before 2026-10-24 have no
-  DuckDB scan figures.
+  reads, and `custom_profiling_settings` crashes).
 
 - One DuckDB connection for the pod's life; one query at a time.
 - **Pinned metadata (`PIN_SNAPSHOT=1`):** each query reads a copy of the
@@ -310,51 +306,47 @@ The DuckDB log can contain the bucket name; mask it in anything you commit.
 
 ## How long it takes
 
-**Hot** (`RUNS=3 WARMUP=1`, 2026-10-18): ~45 min.
+Measured on the `-final` session (hot 2026-10-24, snapshot 2026-10-25), StarRocks 3 BEs × 9 cpu /
+38 Gi, DuckDB 27 cpu / 114 Gi with 256 KiB cache blocks.
 
-| Arm | Time |
-|---|---|
-| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | ~5.5 / ~6.5 / ~15.5 min |
-| DuckDB `paimon` / `iceberg` | ~9 / ~9 min |
-
-H5 dominates (75–95 s per pass); the rest takes seconds once warm.
-
-**Snapshot** (`RUNS=3 WARMUP=1`, run `20261023T003027Z`): **~4.5 h** of queries
-after ~6 min of stopping writers and emptying caches. Compacted `-final2` tables,
-S1–S3 over 10 min of `eventTimeDT` (1.80B rows), S4 over 1 min (181M rows);
-StarRocks 3 BEs × 9 cpu / 38 Gi, DuckDB 27 cpu / 114 Gi.
+**Hot** (`RUNS=3 WARMUP=1`): **~74 min** of runner time, after ~4 min of setup
+(emptying caches ~3.5 min), on a 30 s window of 90.8M rows.
 
 | Arm | Time (warm-up + 3 timed passes) |
 |---|---|
-| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | 38 / 40 / 81 min (2,288 / 2,379 / 4,849 s) |
-| DuckDB `paimon` / `iceberg` | 56 / 50 min (3,389 / 3,006 s) |
+| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | ~6 / ~6 / ~6.5 min (~90 s per pass) |
+| DuckDB `paimon` / `iceberg` | ~37 / ~39 min, plus one untimed scan pass each |
+
+H5 dominates: 64 s per pass on StarRocks, 139 s on DuckDB, and DuckDB's cold
+warm-up H5 took 541 s. The rest takes seconds once warm.
+
+**Snapshot** (`RUNS=3 WARMUP=1`): **~5.0 h** of queries, after ~3 min of stopping
+the writers, the compaction (37 min), engine start-up and emptying caches (~11 min);
+S1–S3 over 10 min of `eventTimeDT` (1.81B rows), S4 over 1 min (181M rows).
+
+| Arm | Time (warm-up + 3 timed passes) |
+|---|---|
+| StarRocks `paimon` / `pmn_as_iceberg` / `iceberg` | 36 / 35 / 73 min (2,138 / 2,077 / 4,395 s) |
+| DuckDB `paimon` / `iceberg` | 58 / 55 min (3,497 / 3,303 s), plus one untimed scan pass each (~20 min) |
 
 Median of the timed passes, seconds:
 
 | Query | SR `paimon` | SR `pmn_as_iceberg` | SR `iceberg` | DuckDB `paimon` | DuckDB `iceberg` |
 |---|---|---|---|---|---|
-| S1 | 36.0 | 15.5 | 41.9 | 106.5 | 90.2 |
-| S2 | 11.5 | 31.1 | 52.6 | 139.7 | 121.0 |
-| S3 | 14.0 | 46.6 | 49.5 | 139.2 | 120.2 |
-| S4 | 280.1 | 244.5 | 314.2 | 245.6 | 219.5 |
+| S1 | 52.2 | 30.8 | 36.4 | 64.0 | 57.8 |
+| S2 | 24.4 | 25.1 | 36.3 | 79.1 | 70.1 |
+| S3 | 16.8 | 41.8 | 42.2 | 78.4 | 69.2 |
+| S4 | 273.1 | 247.9 | 300.4 | 234.8 | 220.8 |
 
-Data scanned per query, StarRocks (GB; DuckDB recorded none until 2026-10-24, see DuckDB specifics):
-
-| Query | SR `paimon` | SR `pmn_as_iceberg` | SR `iceberg` |
-|---|---|---|---|
-| S1 | 8.8 | 15.6 | 63.6 |
-| S2 | 9.0 | 20.5 | 74.8 |
-| S3 | 8.8 | 20.1 | 68.9 |
-| S4 | 121.7 | 126.1 | 156.2 |
-| one pass (S1–S4) | ~148 | ~182 | ~364 |
-
-A pass now fits each engine's 450 GiB disk cache, so the timed passes are cache
-hits; the warm-up pass, from S3, is the slowest (e.g. StarRocks `iceberg` S2:
-1,661 s cold, 44 s warm). StarRocks reads 2.8× more bytes from the Iceberg table
-than from Paimon's export (geometric mean).
+A pass fits each engine's 450 GiB disk cache, so the timed passes are cache
+hits; the warm-up pass, from S3, is the slowest (DuckDB's S4 warm-up: 836 / 899 s).
+StarRocks reads 4.0× more bytes from the Iceberg table than from Paimon's export
+(geometric mean). The 2026-10-23 run (`-round1`, DuckDB on 512 KiB blocks) took
+~4.5 h of queries: StarRocks 38 / 40 / 81 min, DuckDB 56 / 50 min, with DuckDB's
+cached S1–S3 at 90–140 s.
 
 Before (25-min S1–S3, 3-min S4, uncompacted, BEs 6 cpu / 24 Gi, DuckDB 18 cpu /
-72 Gi, 2026-10-21): StarRocks ~10.5 h (171 / 190 / ~190 min per arm), DuckDB ~6 h;
+72 Gi): StarRocks ~10.5 h (171 / 190 / ~190 min per arm), DuckDB ~6 h;
 a pass read ~450 GB per arm, about the whole 450 GiB cache.
 
 ---
@@ -364,6 +356,6 @@ a pass read ~450 GB per arm, about the whole 450 GiB cache.
 - **H1 shows rows,** and the `.pins` file says the generator was `live` before
   and after (hot).
 - **S1 and S4 counts match** across arms (the summary checks this).
-- **No pass hit S3 503 (SlowDown).** On 2026-10-18, with 8 generator pods, S3
+- **No pass hit S3 503 (SlowDown).**, S3
   throttled the Iceberg writer and it restarted. Don't time queries across a
   writer restart.

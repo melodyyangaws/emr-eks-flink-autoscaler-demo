@@ -430,7 +430,10 @@ def main():
             *(["- The snapshot test ran on compacted tables (section above), the hot test on uncompacted ones; "
                "snapshot numbers are not comparable with sessions that did not compact."] if a.compaction else []),
             "- Query times compare engines on equal CPU and memory (StarRocks 3 BEs × 9 cpu / 38 Gi vs DuckDB 27 cpu / 114 Gi; memory limit 90% of the pod and cache memory 20% of it, on both); DuckDB's cache_httpfs uses 256 KiB blocks, the same as StarRocks' datacache_block_size (512 KiB before 2026-10-25, when its narrow snapshot reads fetched ~5.7x the bytes they need), "
-            "with both caches emptied before each test.", ""]
+            "with both caches emptied before each test.",
+            "- Linux page cache sits outside both engines' cache settings and is not equal: on 2026-10-25 a StarRocks BE held "
+            "~26 GiB of page cache over its datacache files (9 GiB of its own memory), DuckDB only ~3-4.5 GiB, so StarRocks' "
+            "cached passes could re-read from RAM where DuckDB's read its cache disk.", ""]
     open(a.out, "w").write("\n".join(head + body + tail))
     print(a.out)
 

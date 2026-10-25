@@ -70,7 +70,7 @@ export DURATION_SECONDS=0
 # Keep it for the whole session: the throughput run and the hot and snapshot
 # tests must all use the same data/table set.
 
-export TEST_SUFFIX="-round1"
+export TEST_SUFFIX="-final"
 
 # Data Generator: 7 replicas ≈ 3.0M rows/s, just under both writers' capacity.
 export JSONGZ_REPLICAS=7
