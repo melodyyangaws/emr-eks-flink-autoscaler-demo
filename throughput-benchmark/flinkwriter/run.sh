@@ -28,7 +28,7 @@
 #
 # USAGE (from throughput-benchmark/; it sources .bench-env itself, through lib/common.sh):
 #   ./flinkwriter/run.sh ensure-sqs            # pre-check (./bench.sh precheck): setup-sqs only if a piece is missing
-#   ./flinkwriter/run.sh setup-sqs             # once per account: SNS topic, SQS queues (+ DLQs), subscriptions, then notify
+#   ./flinkwriter/run.sh setup-sqs             # once per account: SNS topic, SQS queues (+ DLQs), subscriptions, job role policy, then notify
 #   ./flinkwriter/run.sh upload                # optional pre-check: Glue DBs + executor/SQL to S3, verified; no kubectl
 #   ./flinkwriter/run.sh deploy paimon         # runs upload first, always; one writer — the only way to get a quotable rows/s
 #   ./flinkwriter/run.sh deploy iceberg
@@ -39,7 +39,7 @@
 # Suspend without deleting:
 #   kubectl patch flinkdeployment flink-cid-<fmt> -n emr-flink --type=merge \
 #     -p '{"spec":{"job":{"state":"suspended"}}}'
-# Knobs (env, defaults below): SQS_QUEUE_PREFIX, SQS_POLL_THREADS,
+# Knobs (env, defaults below): SQS_QUEUE_PREFIX, SQS_ROLE_POLICY_NAME, SQS_POLL_THREADS,
 #   SQS_MAX_PENDING, SQS_VISIBILITY_TIMEOUT, SQS_SOURCE_JAR, JOB_PARALLELISM,
 #   PAIMON_BUCKETS (-1 = unaware), ICEBERG_COMPAT, WRITE_BUFFER, JM_NODEPOOL,
 #   TM_NODEPOOL.
@@ -494,6 +494,43 @@ print(int(hit))' "$key" "$url" "$AWS_REGION" 2>/dev/null || echo 0)
     log "✓ Test file removed. Files under ${prefix} now reach both queues."
 }
 
+# ── The job role's read access to the queues ─────────────────────────────────
+# The writers' source reads its queue as EMR_EXECUTION_ROLE_ARN, through the
+# role's inline policy SQS_ROLE_POLICY_NAME; without it the source fails with
+# AccessDenied. The policy names each <SQS_QUEUE_PREFIX>-<fmt> queue by ARN,
+# so a new prefix needs it rewritten too.
+export SQS_ROLE_POLICY_NAME=${SQS_ROLE_POLICY_NAME:-FlinkLandingQueueConsume}
+SQS_CONSUME_ACTIONS="sqs:ReceiveMessage sqs:DeleteMessage sqs:GetQueueAttributes sqs:ChangeMessageVisibility sqs:GetQueueUrl"
+sqs_role_name() { echo "${EMR_EXECUTION_ROLE_ARN##*/}"; }
+sqs_queue_arns() {
+    local fmt
+    for fmt in $DEPLOY_TARGETS; do echo "arn:aws:sqs:${AWS_REGION}:${AWS_ACCOUNT_ID}:${SQS_QUEUE_PREFIX}-${fmt}"; done
+}
+sqs_role_policy_doc() {
+    python3 -c 'import json, sys
+sid, actions, arns = sys.argv[1], sys.argv[2].split(), sys.argv[3].split()
+print(json.dumps({"Version": "2012-10-17", "Statement": [
+    {"Sid": sid, "Effect": "Allow", "Action": actions, "Resource": arns}]}))' \
+        "$SQS_ROLE_POLICY_NAME" "$SQS_CONSUME_ACTIONS" "$(sqs_queue_arns | tr '\n' ' ')"
+}
+# Succeeds when the role's inline policy allows every consume action on every
+# queue (exact ARN or "*"). Read-only.
+sqs_role_policy_ok() {
+    aws iam get-role-policy --role-name "$(sqs_role_name)" --policy-name "$SQS_ROLE_POLICY_NAME" \
+        --query PolicyDocument --output json 2>/dev/null \
+      | python3 -c 'import json, sys
+actions, arns = sys.argv[1].split(), sys.argv[2].split()
+as_list = lambda v: v if isinstance(v, list) else [v]
+allowed = set()
+for s in as_list(json.load(sys.stdin).get("Statement", [])):
+    if s.get("Effect") == "Allow":
+        for a in as_list(s.get("Action", [])):
+            for r in as_list(s.get("Resource", [])):
+                allowed.add((a.lower(), r))
+ok = lambda a, r: any((x, y) in allowed for x in (a.lower(), "sqs:*", "*") for y in (r, "*"))
+sys.exit(0 if all(ok(a, r) for a in actions for r in arns) else 1)' "$SQS_CONSUME_ACTIONS" "$(sqs_queue_arns | tr '\n' ' ')"
+}
+
 # ── SNS topic + SQS queues (the pipeline notify points the bucket at) ────────
 # Creates what is missing, the same shape as the account's original setup
 # (2026-10): topic SNS_TOPIC_NAME, publishable by S3 from BUCKET_NAME only; per
@@ -501,8 +538,10 @@ print(int(hit))' "$key" "$url" "$AWS_REGION" 2>/dev/null || echo 0)
 # SQS-managed SSE, sendable by the topic only) with a <queue>-dlq after 10
 # receives; each subscribed with raw delivery (the connector also parses an SNS
 # envelope, but raw is what runs). Existing queues keep their own attributes;
-# only their policy and redrive are (re)set, to the values above. Then notify,
-# unless a writer is RUNNING (it would read notify's test file): run it later.
+# only their policy and redrive are (re)set, to the values above. The job
+# role gets its inline policy SQS_ROLE_POLICY_NAME on both queues, if it does
+# not already allow them. Then notify, unless a writer is RUNNING (it would
+# read notify's test file): run it later.
 cmd_setup_sqs() {
     local topic fmt q url arn dlq_url dlq_arn sub
     topic=$(aws sns create-topic --region "$AWS_REGION" --name "$SNS_TOPIC_NAME" \
@@ -546,6 +585,15 @@ print(json.dumps({
           || error "Cannot subscribe ${q} to ${SNS_TOPIC_NAME}"
         log "✓ SQS ${q} (+ ${q}-dlq) subscribed, raw delivery (${sub##*:})"
     done
+    # put-role-policy replaces the inline policy as a whole: always both queues.
+    if sqs_role_policy_ok; then
+        log "✓ IAM role $(sqs_role_name): ${SQS_ROLE_POLICY_NAME} already allows reading both queues"
+    else
+        aws iam put-role-policy --role-name "$(sqs_role_name)" --policy-name "$SQS_ROLE_POLICY_NAME" \
+            --policy-document "$(sqs_role_policy_doc)" \
+          || error "Cannot put inline policy ${SQS_ROLE_POLICY_NAME} on role $(sqs_role_name)"
+        log "✓ IAM role $(sqs_role_name): ${SQS_ROLE_POLICY_NAME} set (consume ${SQS_QUEUE_PREFIX}-{$(tr ' ' ',' <<<"$DEPLOY_TARGETS")})"
+    fi
     if kubectl get flinkdeployment -n "$NAMESPACE" -o jsonpath='{.items[*].status.jobStatus.state}' 2>/dev/null | grep -q RUNNING; then
         warn "A Flink writer is RUNNING: S3 -> SNS not set or tested now. With both suspended, run: $0 notify"
     else
@@ -555,7 +603,8 @@ print(json.dumps({
 
 # The pipeline pieces that are missing, one per line (none: all in place): the
 # topic, each queue and its DLQ, each queue's subscription to the topic, and
-# the bucket's notification to the topic. Read-only.
+# the bucket's notification to the topic, and the job role's policy on the
+# queues. Read-only.
 sqs_missing() {
     local topic fmt subs
     topic=$(sns_topic_arn)
@@ -577,6 +626,8 @@ sqs_missing() {
     aws s3api get-bucket-notification-configuration --bucket "$(landing_bucket)" --region "$AWS_REGION" \
         --query "TopicConfigurations[?TopicArn=='${topic}'].Id" --output text 2>/dev/null | grep -q . \
         || echo "S3 notification $(landing_bucket)/$(landing_prefix) -> ${SNS_TOPIC_NAME}"
+    sqs_role_policy_ok \
+        || echo "IAM inline policy ${SQS_ROLE_POLICY_NAME} on role $(sqs_role_name) (consume ${SQS_QUEUE_PREFIX}-{$(tr ' ' ',' <<<"$DEPLOY_TARGETS")})"
 }
 
 # Pre-check: set the pipeline up only if a piece is missing (cmd_setup_sqs);
@@ -848,7 +899,8 @@ main() {
             echo "  render             Render all manifests, upload scripts, prep Glue/ConfigMap"
             echo "  deploy paimon|iceberg|both"
             echo "  setup-sqs                   Create the SNS topic, both SQS queues (+ DLQs) and their"
-            echo "                              subscriptions if missing, then notify (once per account)"
+            echo "                              subscriptions and the job role's ${SQS_ROLE_POLICY_NAME}"
+            echo "                              if missing, then notify (once per account)"
             echo "  ensure-sqs                  setup-sqs only if a piece is missing; else report the"
             echo "                              queues' backlog (./bench.sh precheck)"
             echo "  notify                      Point the bucket's S3 event notification at"

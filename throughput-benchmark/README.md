@@ -13,19 +13,34 @@ This project compares the **Flink write performance** of Apache Paimon and Apach
 
 ---
 
+## Prerequisites
+
+| # | What | Check |
+|---|---|---|
+| 1 | **Image** `emr-flink-cdc-paimon:<EMR_VERSION>` containing Aapche Paimon in ECR, built once from the CDC pipeline: `cd ../cdc-pipeline && ./build-deploy-generic.sh build` | `aws ecr describe-images --repository-name emr-flink-cdc-paimon --image-ids imageTag=7.13.0` |
+| 2 | **`.bench-env.local`** with the account values: region, account ID, bucket, EMR execution role ARN. See [Settings](#settings-bench-env-and-bench-envlocal).| `ls .bench-env.local` |
+| 3 | **`.bench-env`** edited for the test: a new `TEST_SUFFIX` per session ("-final" as default), and other variables if needed. See [Settings](#settings-bench-env-and-bench-envlocal). | `./bench.sh status` prints the session values |
+| 4 | **EKS cluster** with a namespace for EMR on EKS (eg.`emr-flink`) and the EMR on EKS Flink operator installed in it, with an EMR execution IAM role for service accounts | `kubectl get pods -n emr-flink`, `kubectl describe sa -n emr-flink`, `kubectl get crd flinkdeployments.flink.apache.org` |
+| 5 | **Karpenter nodepools** `driver-nodepool` (JobManagers) and `executor-memorynodepool` (TaskManagers), defined in `.bench-env`  | `kubectl get nodepool` |
+| 6 | **EBS CSI driver** installed, for the gp3 disks of DuckDB and the StarRocks BEs | `kubectl get csidriver ebs.csi.aws.com` |
+
+
+---
+
 ## Easiest start: ask a GenAI MCP client tool
 
 Open a GenAI tool such as Kiro or Claude Code, navigate to the Github project's folder `throughput-benchmark/`
+
 ```bash
 git clone git@github.com:melodyyangaws/emr-eks-flink-autoscaler-demo.git
 cd emr-eks-flink-autoscaler-demo/throughput-benchmark
 # start the GenAI tool
 claude
 ```
-- Ask to start the test from end to end (Flink writer throughput + Query/read performance):
-> follow the readme of this project to start all the test
+- Ask to start the test from end to end (write throughput + Query performance for Paimon & Iceberg):
+> follow readme to run a full test
 
-- Only benchmark Flink's writer throughput
+- Only benchmark writer's throughput
 > test Flink throughput to write Iceberg vs Paimon tables, monitor and summarize the result
 
 - Hot query performance against Iceberg vs Paimon
@@ -111,9 +126,9 @@ EOF
 
 What `.bench-env` sets:
 
-| Variable | `.bench-env` | Script default | Note |
+| Variable | `.bench-env` | Default | Note |
 |---|---|---|---|
-| `TEST_SUFFIX` | `-final2` | empty | names the table set; keep it for the whole session |
+| `TEST_SUFFIX` | `-final` | empty | names the table set; keep it for the whole session |
 | `JOB_PARALLELISM` | `320` | `128` | writer subtasks per job (80 TMs) |
 | `ICEBERG_COMPAT` | `true` | `false` | Paimon also exports Iceberg metadata, so StarRocks/DuckDB can read it as Iceberg |
 | `JSONGZ_REPLICAS` | `7` | required | generator pods, 500K rows/s each at most |
@@ -121,16 +136,20 @@ What `.bench-env` sets:
 | `OUTPUT_URI` | `s3://$BUCKET_NAME/cid-landing-jsongz` | — | the only prefix S3 announces to SQS |
 | `S3A_MULTIPART_SIZE` / `_THRESHOLD` | `32M` | `16M` | Paimon's S3 upload part size |
 | `COMPACT_BEFORE_SNAPSHOT` | `true` | `false` | the snapshot test compacts both tables once first ([Compaction](#compaction-before-the-snapshot-test)) |
+| `EMR_VERSION` | `7.13.0` | `7.13.0` | the writer and compaction image tag (`IMAGE_TAG` defaults to it); must exist in ECR |
+| `NAMESPACE` | `emr-flink` | `emr-flink` | the EMR on EKS namespace for every job and pod |
+| `JM_NODEPOOL` | `driver-nodepool` | `driver-nodepool` | Karpenter nodepool for the JobManagers |
+| `TM_NODEPOOL` | `executor-memorynodepool` | `executor-memorynodepool` | Karpenter nodepool for the TaskManagers |
 
-`TEST_SUFFIX` sets every name of a table set:
+`TEST_SUFFIX` sets every name of a table set. For example:
 
-| | Name (`TEST_SUFFIX=-test4`) |
+| | Name (`TEST_SUFFIX=-test1`) |
 |---|---|
-| Glue databases | `flink_cid_paimon_db_test4`, `flink_cid_iceberg_db_test4` |
-| Warehouses | `s3://$BUCKET_NAME/cid-warehouse-{paimon,iceberg}-test4/` |
-| Flink state (checkpoints, HA) | `s3://$BUCKET_NAME/flink/cid-{paimon,iceberg}-test4/` |
-| Query results | `s3://$BUCKET_NAME/querybench-results/session-test4/<STAMP>-<suite>/` |
-| Compaction results | `s3://$BUCKET_NAME/querybench-results/session-test4/compaction/<STAMP>-<fmt>-pass<N>.json` |
+| Glue databases | `flink_cid_paimon_db_test1`, `flink_cid_iceberg_db_test1` |
+| Warehouses | `s3://$BUCKET_NAME/cid-warehouse-{paimon,iceberg}-test1/` |
+| Flink state (checkpoints, HA) | `s3://$BUCKET_NAME/flink/cid-{paimon,iceberg}-test1/` |
+| Query results | `s3://$BUCKET_NAME/querybench-results/session-test1/<STAMP>-<suite>/` |
+| Compaction results | `s3://$BUCKET_NAME/querybench-results/session-test1/compaction/<STAMP>-<fmt>-pass<N>.json` |
 
 ---
 
@@ -151,8 +170,8 @@ kubectl get nodepool executor-memorynodepool -o jsonpath='{.status.resources.cpu
 Stay under ~80% of the limit, or TMs evict each other and the jobs restart.
 
 **The S3 → SNS → SQS pipeline: `./bench.sh precheck`** (`./flinkwriter/run.sh ensure-sqs`).
-It checks the topic, both queues and their DLQs, the subscriptions and the bucket's
-notification. If all are there, it changes nothing and shows each queue's backlog.
+It checks the topic, both queues and their DLQs, the subscriptions, the bucket's
+notification and the job role's read access to the queues. If all are there, it changes nothing and shows each queue's backlog.
 If any is missing (a new account or region), it runs `setup-sqs`.
 `bench.sh throughput` does not check it; `deploy` stops with "Cannot read SQS queue"
 if a queue is missing.
@@ -166,7 +185,11 @@ if a queue is missing.
 - the SNS topic `cid-landing-jsongz-events`, which only `$BUCKET_NAME` may publish to;
 - per format, the queue `cid-landing-jsongz-<fmt>` (visibility 900 s, 14-day retention,
   SQS-managed encryption, writable by the topic only), with a `-dlq` after 10 receives;
-- the subscriptions, with raw message delivery.
+- the subscriptions, with raw message delivery;
+- on the role in `EMR_EXECUTION_ROLE_ARN`, the inline policy `FlinkLandingQueueConsume`
+  (`SQS_ROLE_POLICY_NAME`): `ReceiveMessage`, `DeleteMessage`, `GetQueueAttributes`,
+  `ChangeMessageVisibility` and `GetQueueUrl` on both queues. It is rewritten only if it
+  does not already allow them, e.g. after changing `SQS_QUEUE_PREFIX`.
 
 Existing queues keep their attributes; only their access policy and redrive are set.
 It then runs `notify`, which sets the bucket's S3 event notification and checks a
@@ -440,11 +463,12 @@ s3://$BUCKET_NAME/cid-landing-jsongz/*.json.gz   (ObjectCreated)
   ```
 
 - An `AccessDenied` from the source means the job role lacks the
-  `FlinkLandingQueueConsume` policy.
+  `FlinkLandingQueueConsume` policy: `./bench.sh precheck` adds it.
 
 | Knob | Default | Meaning |
 |---|---|---|
 | `SQS_QUEUE_PREFIX` | `cid-landing-jsongz` | queue = `<prefix>-<fmt>` |
+| `SQS_ROLE_POLICY_NAME` | `FlinkLandingQueueConsume` | the job role's inline policy on the queues |
 | `SQS_POLL_THREADS` | `8` | parallel `ReceiveMessage` loops |
 | `SQS_MAX_PENDING` | connector default | cap on received, unassigned files |
 | `SQS_VISIBILITY_TIMEOUT` | `15min` | must outlast a checkpoint, or a file is read twice |
