@@ -17,7 +17,7 @@ This project compares the **Flink write performance** of Apache Paimon and Apach
 
 | # | What | Check |
 |---|---|---|
-| 1 | **Image** `emr-flink-cdc-paimon:<EMR_VERSION>` containing Aapche Paimon in ECR, built once from the CDC pipeline: `cd ../cdc-pipeline && ./build-deploy-generic.sh build` | `aws ecr describe-images --repository-name emr-flink-cdc-paimon --image-ids imageTag=7.13.0` |
+| 1 | **Image** `emr-flink-cdc-paimon:<EMR_VERSION>` containing Apache Paimon in ECR, built once from the CDC pipeline: `cd ../cdc-pipeline && ./build-deploy-generic.sh build` | `aws ecr describe-images --repository-name emr-flink-cdc-paimon --image-ids imageTag=7.13.0` |
 | 2 | **`.bench-env.local`** with the account values: region, account ID, bucket, EMR execution role ARN. See [Settings](#settings-bench-env-and-bench-envlocal).| `ls .bench-env.local` |
 | 3 | **`.bench-env`** edited for the test: a new `TEST_SUFFIX` per session ("-final" as default), and other variables if needed. See [Settings](#settings-bench-env-and-bench-envlocal). | `./bench.sh status` prints the session values |
 | 4 | **EKS cluster** with a namespace for EMR on EKS (eg.`emr-flink`) and the EMR on EKS Flink operator installed in it, with an EMR execution IAM role for service accounts | `kubectl get pods -n emr-flink`, `kubectl describe sa -n emr-flink`, `kubectl get crd flinkdeployments.flink.apache.org` |
