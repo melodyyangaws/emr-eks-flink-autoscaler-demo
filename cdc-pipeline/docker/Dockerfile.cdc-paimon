@@ -1,35 +1,26 @@
 ###############################################################################
-# Paimon CDC Action — MySQL to Paimon on EMR on EKS 7.13
+# Flink CDC image — MySQL to Paimon / Iceberg on EMR on EKS 7.14
 #
 # This image includes:
-# - Flink 1.20.x (from EMR 7.13 — 1.20.0-amzn-7)
-# - Paimon CDC Action for automatic MySQL-to-Paimon database sync
-# - MySQL CDC Connector for full snapshot + incremental sync
-# - Apache Paimon for S3-based lakehouse storage
-# - AWS Glue Data Catalog native integration (paimon-aws-glue)
-# - AWS S3 dependencies
-#
-# Optimizations:
-# - Multi-stage build to reduce final image size
-# - Cleanup of temporary files and caches
+# - Flink 1.20 from EMR 7.14 (1.20.0-amzn-8), Amazon Corretto 17
+# - Flink CDC MySQL connector for full snapshot + incremental binlog sync
+# - Apache Paimon 2.1 (Flink bundle, S3 filesystem, Hive/Glue catalog)
+# - Apache Iceberg 1.12 Flink runtime (replaces EMR's bundled 1.10.1-amzn-1)
+# - AWS Glue Data Catalog integration (EMR's Glue Hive client for Paimon,
+#   Iceberg's GlueCatalog for Iceberg)
 ###############################################################################
-ARG EMR_VERSION=7.13.0
+ARG EMR_VERSION=7.14.0
+ARG ICEBERG_VERSION=1.12.0
 
 # ============================================================================
 # Stage 1: Download Flink connector JARs
 # ============================================================================
 FROM public.ecr.aws/amazonlinux/amazonlinux:2023 AS downloader
-# PAIMON_VERSION stays on the 1.3.x line deliberately. 1.4.x publishes the Flink
-# modules used here but dropped every paimon-spark bundle from Maven Central
-# (paimon-spark-3.5 and -4.0 are both 404 at 1.4.1), and EMR 7.13 ships Spark
-# 3.5.6 — so moving to 1.4.x would keep Flink writes working while silently
-# removing the Spark reader that the Athena notebook path depends on. 1.3.2 is
-# the newest release that has both. Being a patch bump it also leaves the table
-# format and deletion-vector metadata unchanged, so existing warehouse data is
-# readable without a rewrite and earlier benchmark numbers stay comparable.
+ARG ICEBERG_VERSION
 ENV FLINK_VERSION=1.20 \
-    PAIMON_VERSION=1.3.2 \
-    MYSQL_CDC_VERSION=3.5.0 \
+    PAIMON_VERSION=2.1.0 \
+    MYSQL_CDC_VERSION=3.7.0-1.20 \
+    ICEBERG_VERSION=${ICEBERG_VERSION} \
     SCALA_VERSION=2.12
 
 RUN dnf swap -y curl-minimal curl && \
@@ -46,23 +37,19 @@ RUN dnf swap -y curl-minimal curl && \
         https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-catalog/${PAIMON_VERSION}/paimon-hive-catalog-${PAIMON_VERSION}.jar && \
     curl -fsSL -o /tmp/jars/paimon-hive-connector-${PAIMON_VERSION}.jar \
         https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-connector-3.1/${PAIMON_VERSION}/paimon-hive-connector-3.1-${PAIMON_VERSION}.jar && \
+    curl -fsSL -o /tmp/jars/iceberg-flink-runtime-${FLINK_VERSION}-${ICEBERG_VERSION}.jar \
+        https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-${FLINK_VERSION}/${ICEBERG_VERSION}/iceberg-flink-runtime-${FLINK_VERSION}-${ICEBERG_VERSION}.jar && \
     curl -fsSL -o /tmp/jars/mysql-connector-j-8.4.0.jar \
         https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar && \
-    # curl -fsSL -o /tmp/jars/iceberg-flink-1.20-1.10.0.jar \
-    #     https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-1.20/1.10.0/iceberg-flink-1.20-1.10.0.jar && \
     dnf clean all && \
     ls -lh /tmp/jars/ && \
     echo "All JARs downloaded successfully ($(du -sh /tmp/jars | cut -f1))"
 
 # ============================================================================
-# Stage 2: Get an OSS Glue Data Catalog Client
-# ============================================================================
-# FROM sdaberdaku/spark-with-glue-builder:v3.5.1 AS glue-builder
-
-# ============================================================================
-# Stage 3: Final image
+# Stage 2: Final image
 # ============================================================================
 FROM public.ecr.aws/emr-on-eks/flink/emr-${EMR_VERSION}-flink:latest
+ARG ICEBERG_VERSION
 USER root
 
 # ${FLINK_LIB_DIR} is on both FLINK_CLASSPATH and HADOOP_CLASSPATH below, so the
@@ -73,22 +60,32 @@ USER root
 COPY --from=downloader --chown=hadoop:hadoop /tmp/jars/*.jar ${FLINK_LIB_DIR}
 # COPY --from=glue-builder --chown=hadoop:hadoop /opt/glue/aws-glue-datacatalog-hive3-client/target/aws-glue-datacatalog-hive3-client-*.jar ${FLINK_LIB_DIR}
 
-# The base EMR image intentionally sets none of these three variables. We add
-# them because the PyFlink entry point (opt/flink-python), the Glue Data Catalog
-# Hive client (opt/aws-glue-datacatalog-hive3-client) and the Hive/Glue metastore
-# jars (glue/) must all be visible to the JVM. Putting opt/ on the classpath also
-# exposes jars that stock Flink deliberately keeps off it, so the conflicting ones
-# are deleted below — see the "prune opt/" RUN step.
 ENV FLINK_CLASSPATH="/usr/lib/flink/bin/*:/usr/lib/flink/lib/*:/usr/lib/flink/opt/*:/usr/lib/flink/glue/*"
 ENV FLINK_ENV_JAVA_OPTS="${FLINK_ENV_JAVA_OPTS} -Djava.class.path=${FLINK_CLASSPATH}"
 ENV HADOOP_CLASSPATH="${FLINK_CLASSPATH}:/usr/share/aws/emr/emrfs/lib/*:/usr/lib/hadoop-lzo/lib/*:/usr/share/aws/aws-java-sdk/*:/usr/share/aws/aws-java-sdk-v2/*:/usr/share/aws/emr/emrfs/conf:/usr/share/aws/emr/emrfs/auxlib/*:/usr/share/aws/emr/ddb/lib/emr-ddb-hadoop.jar:/usr/share/aws/emr/goodies/lib/emr-hadoop-goodies.jar:/usr/share/aws/emr/cloudwatch-sink/lib/*:/usr/share/aws/emr/security/conf:/usr/share/aws/emr/security/lib/*"
 
-RUN cp /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar ${FLINK_LIB_DIR} && \
-    chown -R hadoop:hadoop ${FLINK_LIB_DIR}/iceberg-flink-runtime.jar && \
+# ---------------------------------------------------------------------------
+# Iceberg: OSS 1.12.0 runtime instead of EMR's 1.10.1-amzn-1
+# ---------------------------------------------------------------------------
+# Why: on a format-version v3 table, EMR Iceberg 1.10's Flink sink fails the commit
+# when the same key is updated twice inside one checkpoint. 1.12 writes
+# deletion vectors on v3 tables. v2 tables behave as before, so one image serves
+# both ICEBERG_FORMAT_VERSION=2 and =3 runs.
+#
+# AWS SDK: iceberg-flink-runtime-1.20-1.12.0 contains GlueCatalog and S3FileIO
+# (org.apache.iceberg.aws.*) but NOT the AWS SDK v2 they call — same as EMR's
+# runtime, which got the SDK from EMR's /usr/share/aws/aws-java-sdk-v2 (2.44.5
+# in 7.14, on HADOOP_CLASSPATH). The default is to keep using that SDK rather
+# than add iceberg-aws-bundle-1.12.0: the bundle is an UNRELOCATED SDK 2.54.17
+# plus unrelocated Apache httpclient5, and from lib/ it would sit ahead of EMR's
+# SDK and shadow it for every EMR component in the JVM — two SDK v2 copies of
+# different versions on one classpath. Every SDK class Iceberg 1.12's aws
+# package references (s3, glue, kms, sts, dynamodb, lakeformation, core, auth,
+# apache5/url-connection clients) exists in SDK 2.44.5 (checked by class name)
+RUN rm -f /usr/share/aws/iceberg/lib/iceberg-flink-runtime*.jar && \
     rm -rf ${FLINK_HOME}/examples && \
-    rm /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar && \
     rm -rf /tmp/* /var/tmp/* && \
-    dnf clean all 2>/dev/null || true
+    (dnf clean all 2>/dev/null || true)
 
 # ---------------------------------------------------------------------------
 # Prune opt/ — remove the jars that break the job once opt/ is on the classpath
@@ -99,12 +96,6 @@ RUN cp /usr/share/aws/iceberg/lib/iceberg-flink-runtime.jar ${FLINK_LIB_DIR} && 
 # org.apache.flink.table.delegation.ExecutorFactory" (DefaultExecutorFactory vs
 # DelegateExecutorFactory). Stock Flink keeps exactly one of the two on the
 # classpath; we keep the loader.
-#
-# flink-gs-fs-hadoop (Google Cloud Storage) bundles a protobuf/gRPC version that
-# collides with the Hadoop/AWS one, so FileSystem.initialize() dies before the
-# job even starts with "java.lang.VerifyError: Bad type on operand stack" in
-# com.google.api.ClientProto.registerAllExtensions. This pipeline only ever
-# touches s3://, so GCS (and the equally unused Azure/OSS filesystems) can go.
 RUN rm -f ${FLINK_OPT_DIR}/flink-table-planner_2.12-*.jar \
            ${FLINK_OPT_DIR}/flink-gs-fs-hadoop-*.jar \
            ${FLINK_OPT_DIR}/flink-azure-fs-hadoop-*.jar \
@@ -112,7 +103,33 @@ RUN rm -f ${FLINK_OPT_DIR}/flink-table-planner_2.12-*.jar \
     echo "Pruned conflicting jars from ${FLINK_OPT_DIR}:" && \
     ls ${FLINK_OPT_DIR}
 
+# ---------------------------------------------------------------------------
+# Classpath guard — fail the build rather than the job
+# ---------------------------------------------------------------------------
+# 1. Java >= 17 (Iceberg 1.12 is compiled for 17).
+# 2. Exactly one jar on the classpath carries Iceberg core classes, and it is
+#    the 1.12 runtime.
+# 3. Some jar on the classpath provides the AWS SDK v2 Glue and S3 clients the
+#    Iceberg runtime needs; the providers are printed for the build log.
+RUN set -eu; \
+    spec=$(java -XshowSettings:properties -version 2>&1 | awk -F'= ' '/java.specification.version/ {print $2}'); \
+    echo "Java specification version: ${spec}"; \
+    [ "${spec%%.*}" -ge 17 ] || { echo "ERROR: Iceberg 1.12 needs Java 17+, image has ${spec}"; exit 1; }; \
+    cp_dirs="/usr/lib/flink/bin /usr/lib/flink/lib /usr/lib/flink/opt /usr/lib/flink/glue \
+             /usr/share/aws/emr/emrfs/lib /usr/share/aws/emr/emrfs/auxlib /usr/lib/hadoop-lzo/lib \
+             /usr/share/aws/aws-java-sdk /usr/share/aws/aws-java-sdk-v2 \
+             /usr/share/aws/emr/cloudwatch-sink/lib /usr/share/aws/emr/security/lib"; \
+    jars=$(for d in $cp_dirs; do [ -d "$d" ] && find "$d" -maxdepth 1 -name '*.jar'; done; true); \
+    ice=$(printf '%s\n' $jars | xargs -r env LC_ALL=C grep -l -a -E '(^|[^/])org/apache/iceberg/BaseTable\.class' || true); \
+    echo "Jars with Iceberg core classes:"; printf '  %s\n' $ice; \
+    [ "$ice" = "${FLINK_LIB_DIR}/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar" ] || \
+        { echo "ERROR: expected exactly one Iceberg (lib/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar) on the classpath"; exit 1; }; \
+    for cls in software/amazon/awssdk/services/glue/GlueClient software/amazon/awssdk/services/s3/S3Client; do \
+        prov=$(printf '%s\n' $jars | xargs -r env LC_ALL=C grep -l -a -E "(^|[^/])${cls}\.class" || true); \
+        echo "Providers of ${cls}:"; printf '  %s\n' $prov; \
+        [ -n "$prov" ] || { echo "ERROR: no AWS SDK v2 ${cls} on the classpath; add iceberg-aws-bundle to the jar downloads"; exit 1; }; \
+    done
+
 USER hadoop:hadoop
-# enable flink-sql-client
 RUN mkdir -p /mnt/tmp
 WORKDIR $FLINK_HOME

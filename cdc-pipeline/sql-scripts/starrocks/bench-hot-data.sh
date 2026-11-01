@@ -19,37 +19,42 @@ set -uo pipefail
 # Alongside the timings we capture the file/delete/snapshot counts that explain
 # them, so a "Paimon is faster" line is never left unattributed.
 #
+# This is one of the older ad-hoc StarRocks tools. The maintained CDC query
+# benchmark is cdc-pipeline/querybench/ (server-side timing, pinned snapshots,
+# DuckDB arms); prefer it, and bench-server-side.sh over this script.
+#
 # Usage:
-#   ./bench-hot-data.sh                 # snapshot + hot, both catalogs
+#   ./bench-hot-data.sh                 # snapshot + hot, both catalogs, v3 set
 #   SUITE=hot ./bench-hot-data.sh       # hot only
 #   RUNS=5 WARMUP=2 ./bench-hot-data.sh
+#   ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./bench-hot-data.sh   # the v2 set
+#   SR_V3_ARMS=1 ./bench-hot-data.sh    # v3: run the Iceberg arm to record its error
+#   DRY_RUN=1 ./bench-hot-data.sh       # print each arm's session SQL, run nothing
 #   ICEBERG_MAINTENANCE=1 ./bench-hot-data.sh   # also re-run hot suite after
 #                                               # rewrite_data_files + expire_snapshots
+#
+# Table set, Iceberg v3 rules (JNI Paimon reader, Iceberg arm skipped unless
+# SR_V3_ARMS=1) and the result labels: bench-lib.sh.
 
-NAMESPACE="${NAMESPACE:-emr-flink}"
-FE_POD="${FE_POD:-kube-starrocks-fe-0}"
-PAIMON_CATALOG="${PAIMON_CATALOG:-paimon_catalog}"
-PAIMON_DB="${PAIMON_DB:-flink_paimon_db}"
-ICEBERG_CATALOG="${ICEBERG_CATALOG:-iceberg_catalog}"
-ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db}"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bench-lib.sh"
 SUITE="${SUITE:-all}"          # all | snapshot | hot
 RUNS="${RUNS:-3}"              # timed runs per query
 WARMUP="${WARMUP:-1}"          # untimed runs first (StarRocks caches file lists)
 ICEBERG_MAINTENANCE="${ICEBERG_MAINTENANCE:-0}"
 
 OUT_DIR="${OUT_DIR:-./bench-results}"
-mkdir -p "$OUT_DIR"
+[[ "$DRY_RUN" == 1 ]] || mkdir -p "$OUT_DIR"
 # No date/timestamp from the shell's clock beyond this one stamp, so a rerun
 # never overwrites a previous result set.
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 CSV="${OUT_DIR}/starrocks-bench-${STAMP}.csv"
+# The error text of every failed timed run (created only if one fails).
+ERR_LOG="${OUT_DIR}/starrocks-bench-${STAMP}.errors.log"
 
 # Run SQL in the FE pod. StarRocks' MySQL protocol port is 9030 and the root
 # user has no password in this deployment.
-sr() {
-    kubectl exec -n "$NAMESPACE" "$FE_POD" -- \
-        mysql -h127.0.0.1 -P9030 -uroot -N -B -e "$1" 2>/dev/null
-}
+sr() { bl_sr "$1"; }
 
 # ── Queries ─────────────────────────────────────────────────────────────────
 # Kept inline rather than parsed out of the .sql files: the files are written for
@@ -125,8 +130,9 @@ median() {
 
 # Echo the median wall-clock ms for one query, or FAIL if every run errored.
 time_query() {
-    local catalog=$1 db=$2 sql=$3
-    local prelude="SET CATALOG ${catalog}; USE ${db};"
+    local arm=$1 catalog=$2 db=$3 sql=$4
+    local prelude
+    prelude=$(bl_prelude "$arm" "$catalog" "$db")
     local i start end out
     local -a times=()
 
@@ -141,7 +147,9 @@ time_query() {
         # window it measures is supposed to be quiet.
         # An empty result is legitimate (a hot window can genuinely be empty),
         # so only a non-zero exit counts as a failure.
-        if ! out=$(sr "${prelude} ${sql}"); then
+        # stderr is kept so a failed run's error text can be recorded.
+        if ! out=$(bl_sr_err "${prelude} ${sql}"); then
+            echo "${STAMP} ${arm} ${catalog}.${db} run ${i}: $(bl_oneline <<<"$out") :: $(bl_oneline <<<"$sql")" >> "$ERR_LOG"
             continue
         fi
         end=$(date +%s%N)
@@ -157,8 +165,11 @@ time_query() {
 
 # Rows returned, so a suspiciously fast query can be spotted as "returned 0 rows".
 row_count() {
-    local catalog=$1 db=$2 sql=$3
-    sr "SET CATALOG ${catalog}; USE ${db}; ${sql}" | grep -c . || echo 0
+    local arm=$1 catalog=$2 db=$3 sql=$4 n
+    # grep -c prints 0 AND exits 1 on no rows: `|| echo 0` printed "0\n0" and
+    # split the CSV row whenever a query failed or returned nothing.
+    n=$(sr "$(bl_prelude "$arm" "$catalog" "$db") ${sql}" | grep -c .)
+    echo "${n:-0}"
 }
 
 run_suite() {
@@ -174,6 +185,7 @@ run_suite() {
 
     printf '\n%s\n' "────────────────────────────────────────────────────────────────────"
     printf '  %s suite  (state: %s, runs: %s, warmup: %s)\n' "$suite_label" "$state" "$RUNS" "$WARMUP"
+    printf '  %s\n' "$RUN_LABEL"
     printf '%s\n' "────────────────────────────────────────────────────────────────────"
     printf '%-20s %12s %12s %10s %8s %8s\n' QUERY PAIMON_ms ICEBERG_ms RATIO P_rows I_rows
 
@@ -185,12 +197,16 @@ run_suite() {
         part_p=${sql//\$\{PART\}/order_date_str}
         part_i=${sql//\$\{PART\}/order_dt}
 
-        p_ms=$(time_query "$PAIMON_CATALOG"  "$PAIMON_DB"  "$part_p")
-        i_ms=$(time_query "$ICEBERG_CATALOG" "$ICEBERG_DB" "$part_i")
-        p_rows=$(row_count "$PAIMON_CATALOG"  "$PAIMON_DB"  "$part_p")
-        i_rows=$(row_count "$ICEBERG_CATALOG" "$ICEBERG_DB" "$part_i")
+        p_ms=$(time_query paimon "$PAIMON_CATALOG" "$PAIMON_DB" "$part_p")
+        p_rows=$(row_count paimon "$PAIMON_CATALOG" "$PAIMON_DB" "$part_p")
+        if [[ "$ICEBERG_ARM" == skipped ]]; then
+            i_ms=SKIPPED; i_rows=-
+        else
+            i_ms=$(time_query iceberg "$ICEBERG_CATALOG" "$ICEBERG_DB" "$part_i")
+            i_rows=$(row_count iceberg "$ICEBERG_CATALOG" "$ICEBERG_DB" "$part_i")
+        fi
 
-        if [[ "$p_ms" == FAIL || "$i_ms" == FAIL ]]; then
+        if [[ "$p_ms" == FAIL || "$i_ms" == FAIL || "$i_ms" == SKIPPED ]]; then
             ratio="n/a"
         else
             ratio=$(awk -v a="$i_ms" -v b="$p_ms" 'BEGIN{ if (b>0) printf "%.2fx", a/b; else print "n/a" }')
@@ -198,7 +214,7 @@ run_suite() {
 
         printf '%-20s %12s %12s %10s %8s %8s\n' \
             "$name" "$p_ms" "$i_ms" "$ratio" "$p_rows" "$i_rows"
-        echo "${STAMP},${suite_label},${state},${name},${p_ms},${i_ms},${ratio},${p_rows},${i_rows}" >> "$CSV"
+        echo "${STAMP},${suite_label},${state},${name},${p_ms},${i_ms},${ratio},${p_rows},${i_rows},${CSV_META}" >> "$CSV"
     done
 }
 
@@ -207,21 +223,48 @@ capture_state() {
     local label=$1
     printf '\n%s\n' "── Table state (${label}) ──────────────────────────────────────────"
 
-    printf '\nIceberg — data / delete files and snapshots per table:\n'
-    for t in customers products orders order_items; do
-        # $files$ and $snapshots$ are StarRocks' Iceberg metadata tables.
-        local files snaps
-        files=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.\`${t}\$files\`;" | head -1)
-        snaps=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.\`${t}\$snapshots\`;" | head -1)
-        printf '  %-14s files=%-8s snapshots=%-8s\n' "$t" "${files:-?}" "${snaps:-?}"
-    done
+    if [[ "$ICEBERG_ARM" == skipped ]]; then
+        printf '\nIceberg — skipped (v3 set; SR_V3_ARMS=1 to run it)\n'
+    else
+        printf '\nIceberg — data / delete files and snapshots per table:\n'
+        for t in customers products orders order_items; do
+            # $files$ and $snapshots$ are StarRocks' Iceberg metadata tables.
+            local files snaps
+            files=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.\`${t}\$files\`;" | head -1)
+            snaps=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.\`${t}\$snapshots\`;" | head -1)
+            printf '  %-14s files=%-8s snapshots=%-8s\n' "$t" "${files:-?}" "${snaps:-?}"
+        done
+    fi
 
     printf '\nRow counts (both catalogs):\n'
     for t in customers products orders order_items; do
         local pc ic
-        pc=$(sr "SELECT COUNT(*) FROM ${PAIMON_CATALOG}.${PAIMON_DB}.${t};" | head -1)
-        ic=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.${t};" | head -1)
+        pc=$(sr "$(bl_paimon_sets) SELECT COUNT(*) FROM ${PAIMON_CATALOG}.${PAIMON_DB}.${t};" | head -1)
+        if [[ "$ICEBERG_ARM" == skipped ]]; then ic=skipped
+        else ic=$(sr "SELECT COUNT(*) FROM ${ICEBERG_CATALOG}.${ICEBERG_DB}.${t};" | head -1); fi
         printf '  %-14s paimon=%-12s iceberg=%-12s\n' "$t" "${pc:-?}" "${ic:-?}"
+    done
+}
+
+# DRY_RUN=1: the statements each arm's session would send, nothing else.
+dry_run() {
+    local arm cat db i names_var sqls_var
+    local -a names sqls
+    for arm in paimon iceberg; do
+        if [[ "$arm" == paimon ]]; then cat=$PAIMON_CATALOG db=$PAIMON_DB
+        else cat=$ICEBERG_CATALOG db=$ICEBERG_DB; fi
+        if [[ "$arm" == iceberg && "$ICEBERG_ARM" == skipped ]]; then
+            printf '\n-- [%s] skipped (Iceberg v3; SR_V3_ARMS=1 runs it)\n' "$arm"; continue
+        fi
+        printf '\n-- [%s] %s.%s (each query: one mysql -e, WARMUP=%s + RUNS=%s times)\n' "$arm" "$cat" "$db" "$WARMUP" "$RUNS"
+        for names_var in SNAPSHOT HOT; do
+            [[ "$SUITE" == all || "$SUITE" == "$(tr '[:upper:]' '[:lower:]' <<<"$names_var")" ]] || continue
+            eval "names=(\"\${${names_var}_NAMES[@]}\")"
+            eval "sqls=(\"\${${names_var}_SQL[@]}\")"
+            for i in "${!names[@]}"; do
+                printf -- '-- %s\n%s %s\n' "${names[$i]}" "$(bl_prelude "$arm" "$cat" "$db")" "$(tr -s '\n ' '  ' <<<"${sqls[$i]}")"
+            done
+        done
     done
 }
 
@@ -233,12 +276,18 @@ echo "  FE pod   : ${FE_POD} (ns ${NAMESPACE})"
 echo "  Paimon   : ${PAIMON_CATALOG}.${PAIMON_DB}"
 echo "  Iceberg  : ${ICEBERG_CATALOG}.${ICEBERG_DB}"
 echo "  Suite    : ${SUITE}"
+bl_print_arms
 echo "  Results  : ${CSV}"
 echo "═══════════════════════════════════════════════════════════════════"
 
-sr "SELECT 1;" >/dev/null || { echo "ERROR: cannot reach StarRocks FE in ${FE_POD}" >&2; exit 1; }
+if [[ "$DRY_RUN" == 1 ]]; then dry_run; exit 0; fi
 
-echo "stamp,suite,state,query,paimon_ms,iceberg_ms,ratio_iceberg_over_paimon,paimon_rows,iceberg_rows" > "$CSV"
+sr "SELECT 1;" >/dev/null || { echo "ERROR: cannot reach StarRocks FE in ${FE_POD}" >&2; exit 1; }
+bl_check_jni
+bl_probe_iceberg
+[[ -z "$ICEBERG_PROBE_ERR" ]] || echo "${STAMP} iceberg probe (SR_V3_ARMS=1): ${ICEBERG_PROBE_ERR}" >> "$ERR_LOG"
+
+echo "stamp,suite,state,query,paimon_ms,iceberg_ms,ratio_iceberg_over_paimon,paimon_rows,iceberg_rows,${CSV_META_COLS}" > "$CSV"
 
 capture_state "before"
 
@@ -262,5 +311,6 @@ fi
 
 printf '\n%s\n' "═══════════════════════════════════════════════════════════════════"
 echo "  ✓ Done. CSV: ${CSV}"
+[[ -f "$ERR_LOG" ]] && echo "  Errors  : ${ERR_LOG}"
 echo "  RATIO > 1.00x means Iceberg took longer than Paimon."
 echo "═══════════════════════════════════════════════════════════════════"

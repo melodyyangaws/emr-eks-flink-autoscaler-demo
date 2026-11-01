@@ -6,7 +6,8 @@
 -- Prerequisites:
 --   - Iceberg tables created by Flink CDC
 --   - StarRocks cluster running on EKS with AWS IAM role
---   - AWS Glue database: flink_iceberg_db
+--   - AWS Glue database: flink_iceberg_db_v3 (v3 set, the branch default) or
+--     flink_iceberg_db (v2 set: ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=)
 -- ============================================================================
 
 -- Connect to StarRocks
@@ -34,8 +35,16 @@ SET CATALOG iceberg_catalog;
 -- Show databases
 SHOW DATABASES;
 
--- Use Glue database
-USE flink_iceberg_db;
+-- Use Glue database. The branch default is the Iceberg v3 table set (.bench-env:
+-- ICEBERG_FORMAT_VERSION=3, CDC_DB_SUFFIX=_v3), i.e. flink_iceberg_db_v3.
+-- StarRocks 4.1.x refuses any Iceberg v3 scan that touches a deletion vector
+-- ("Iceberg V3 Deletion Vectors are not supported"), and the Flink sink writes
+-- them under v3: on the v3 set expect SHOW TABLES / DESC to work and every
+-- query below to fail. Piped through mysql, the first such error stops the file
+-- (add --force to keep going). bench-*.sh skip this arm on v3 (SR_V3_ARMS=1 runs
+-- it to record the error). For the v2 set swap the two USE lines.
+USE flink_iceberg_db_v3;
+-- USE flink_iceberg_db;    -- v2 set
 
 -- Show tables
 SHOW TABLES;

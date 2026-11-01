@@ -9,7 +9,18 @@
 # Bump deliberately and re-test; pyiceberg constrains pyarrow, so move those two
 # together.
 boto3==1.40.0
-pyiceberg[glue,s3fs]==0.9.1
-pyarrow==19.0.1
+# 0.12.0 (2026-09-01), not 0.9.1, for Iceberg v3 tables (ICEBERG_FORMAT_VERSION=3):
+# 0.9.1 already parses format-version 3 metadata (TableMetadataV3), but its v3
+# model predates the final spec (row-lineage field, removed in 0.10; snapshot
+# first-row-id / added-rows in 0.11) and it has no deletion-vector support
+# (0.10+; DV blob framing fixed in 0.12). The monitor reads only metadata and
+# snapshot summaries, which both versions load (checked on python 3.11 with v2
+# and v3 sample metadata, 2026-11-02). pyarrow moved with it (pyiceberg 0.12:
+# pyarrow>=18); resolves in one pass with boto3 1.40.0 (uv pip compile, py3.11).
+pyiceberg[glue,s3fs]==0.12.0
+pyarrow==21.0.0
 requests==2.32.3
 tabulate==0.9.0
+# Paimon manifests are Avro with zstd: fastavro reads them, zstandard is the codec.
+fastavro==1.10.0
+zstandard==0.23.0

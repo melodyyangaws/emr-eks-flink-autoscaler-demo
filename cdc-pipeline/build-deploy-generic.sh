@@ -47,19 +47,48 @@ ACTION=${1:-help}
 export AWS_REGION=${AWS_REGION:-us-west-2}
 export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
 
+# EMR on EKS release of the base image AND the emrReleaseLabel. 7.14.0 is the
+# newest release with Flink (EMR 8.x is Spark-only): Flink 1.20.0-amzn-8, Java 17.
+export EMR_VERSION=${EMR_VERSION:-7.14.0}
+
+# Table set selection. On this branch the DEFAULT is the Iceberg v3 set:
+#   (defaults)                                -> format v3, *_v3 databases + state
+#   ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=    -> the original v2 set
+#
+# ICEBERG_FORMAT_VERSION: Iceberg table format version written by the sink DDL
+# (2 or 3). Rendered into both JobManagers; the executor substitutes it into
+# sql-scripts/iceberg/*.sql. An existing table cannot change format, so v3 and
+# v2 runs need different CDC_DB_SUFFIX values (fresh Glue DBs and Flink state).
+export ICEBERG_FORMAT_VERSION=${ICEBERG_FORMAT_VERSION:-3}
+
+# CDC_DB_SUFFIX: appended to both Glue database names
+# (flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}) and to the
+# Flink checkpoint / savepoint / HA / log paths (flink/cdc-paimon${CDC_DB_SUFFIX}/
+# ...), so one table set never touches, or restores state from, another.
+# Defaults to _v3 only when UNSET (note the '-', not ':-'): an explicit
+# CDC_DB_SUFFIX= selects the unsuffixed v2 set.
+export CDC_DB_SUFFIX=${CDC_DB_SUFFIX-_v3}
+
+# PAIMON_DV_BITMAP64: Paimon 'deletion-vectors.bitmap64', derived from the
+# format version and not a setting of its own. The v3 export needs 64-bit DVs;
+# StarRocks' native Paimon reader cannot decode them, so v2 gets false.
+if [[ "$ICEBERG_FORMAT_VERSION" == "3" ]]; then PAIMON_DV_BITMAP64=true; else PAIMON_DV_BITMAP64=false; fi
+export PAIMON_DV_BITMAP64
+
 # Check required environment variables
-check_env_vars() {
+check_env_vars() {   # [build]
     log "Checking required environment variables..."
 
+    # MYSQL_PASSWORD is never needed here: the manifests read it from the
+    # ${MYSQL_ENV_SECRET_NAME} Secret at pod start. `build` (image + S3 upload)
+    # needs no MySQL values at all.
     local required_vars=(
         "AWS_REGION"
         "AWS_ACCOUNT_ID"
         "BUCKET_NAME"
         "EMR_EXECUTION_ROLE_ARN"
-        "MYSQL_HOST"
-        "MYSQL_USER"
-        "MYSQL_PASSWORD"
     )
+    [[ "${1:-}" == build ]] || required_vars+=("MYSQL_HOST" "MYSQL_USER")
 
     local missing_vars=()
     for var in "${required_vars[@]}"; do
@@ -68,13 +97,22 @@ check_env_vars() {
         fi
     done
 
-    # Check lakehouse-specific vars
-    if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
-        if [[ -z "${GLUE_DATABASE}" ]]; then
-            warn "GLUE_DATABASE not set, using default: flink_iceberg_db"
-            export GLUE_DATABASE="flink_iceberg_db"
-        fi
+    # Both values end up inside S3 paths, Glue database names and SQL
+    # identifiers, so reject anything that is not a plain identifier fragment.
+    [[ "$ICEBERG_FORMAT_VERSION" =~ ^[23]$ ]] || \
+        error "ICEBERG_FORMAT_VERSION must be 2 or 3 (got '${ICEBERG_FORMAT_VERSION}')"
+    # Same rule as lib/common.sh and monitoring/deploy-monitor.sh: empty or _<x>.
+    [[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || \
+        error "CDC_DB_SUFFIX must be empty or like _v3 (got '${CDC_DB_SUFFIX}')"
+    if [[ "$ICEBERG_FORMAT_VERSION" == "3" && -z "$CDC_DB_SUFFIX" ]]; then
+        warn "ICEBERG_FORMAT_VERSION=3 with an empty CDC_DB_SUFFIX: existing v2 tables in"
+        warn "flink_iceberg_db keep format 2 (CREATE TABLE IF NOT EXISTS), and the job"
+        warn "restores the v2 run's state. Unset CDC_DB_SUFFIX (default _v3) for v3."
+    elif [[ "$ICEBERG_FORMAT_VERSION" == "2" && "$CDC_DB_SUFFIX" == "_v3" ]]; then
+        warn "ICEBERG_FORMAT_VERSION=2 with CDC_DB_SUFFIX=_v3: the _v3 databases would get"
+        warn "v2 tables. For the original v2 set use ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX="
     fi
+
 
     if [[ ${#missing_vars[@]} -gt 0 ]]; then
         error "Missing required environment variables: ${missing_vars[*]}"
@@ -91,16 +129,20 @@ display_config() {
     echo "  S3 Bucket:        $BUCKET_NAME"
     echo "  MySQL Host:       $MYSQL_HOST"
     echo "  Namespace:        ${NAMESPACE:-emr-flink}"
-    echo "  EMR Version:      ${EMR_VERSION:-7.13.0}"
+    echo "  EMR Version:      ${EMR_VERSION}"
     echo "  Lakehouse Format: ${LAKEHOUSE_FORMAT}"
+    echo "  DB/state suffix:  ${CDC_DB_SUFFIX:-(none)}"
 
     if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
         echo "  Paimon Warehouse: s3://${BUCKET_NAME}/paimon-warehouse/"
+        echo "  Paimon Database:  flink_paimon_db${CDC_DB_SUFFIX}"
+        echo "  Paimon DV 64-bit: ${PAIMON_DV_BITMAP64}"
     fi
 
     if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
         echo "  Iceberg Warehouse: s3://${BUCKET_NAME}/iceberg-warehouse/"
-        echo "  Glue Database:     ${GLUE_DATABASE}"
+        echo "  Glue Databases:    flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}"
+        echo "  Iceberg format:    v${ICEBERG_FORMAT_VERSION}"
     fi
 }
 
@@ -128,7 +170,7 @@ create_ecr_repo() {
 # architecture. Requires ServiceAccount image-builder-sa in $NAMESPACE (IRSA ->
 # a role allowed to push to ECR and read the build context from S3).
 build_and_push_image() {
-    local emr_version=${EMR_VERSION:-7.13.0}
+    local emr_version=${EMR_VERSION}
     local repo_name="emr-flink-cdc-paimon"
     # Tag must match the image reference in flink-cdc-*-sql.yaml (:${IMAGE_TAG})
     local image_tag=${IMAGE_TAG:-$emr_version}
@@ -490,7 +532,7 @@ upload_scripts_to_s3() {
 
 # Create AWS Glue database for Iceberg
 create_glue_database() {
-    local glue_db=${GLUE_DATABASE:-flink_iceberg_db}
+    local glue_db="flink_iceberg_db${CDC_DB_SUFFIX}"
 
     log "Creating AWS Glue database: $glue_db"
 
@@ -594,9 +636,11 @@ generate_flink_deployment() {
         -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
         -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
         -e "s|\${EMR_EXECUTION_ROLE_ARN}|${EMR_EXECUTION_ROLE_ARN}|g" \
-        -e "s|\${EMR_VERSION}|${EMR_VERSION:-7.13.0}|g" \
-        -e "s|\${IMAGE_TAG}|${IMAGE_TAG:-${EMR_VERSION:-7.13.0}}|g" \
-        -e "s|\${GLUE_DATABASE}|${GLUE_DATABASE:-flink_iceberg_db}|g" \
+        -e "s|\${EMR_VERSION}|${EMR_VERSION}|g" \
+        -e "s|\${IMAGE_TAG}|${IMAGE_TAG:-${EMR_VERSION}}|g" \
+        -e "s|\${ICEBERG_FORMAT_VERSION}|${ICEBERG_FORMAT_VERSION}|g" \
+        -e "s|\${CDC_DB_SUFFIX}|${CDC_DB_SUFFIX}|g" \
+        -e "s|\${PAIMON_DV_BITMAP64}|${PAIMON_DV_BITMAP64}|g" \
         -e "s|\${MYSQL_HOST}|${MYSQL_HOST}|g" \
         -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
         -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
@@ -697,7 +741,7 @@ main() {
 
     case $action in
         build)
-            check_env_vars
+            check_env_vars build
             display_config
             build_and_push_image
             upload_scripts_to_s3
@@ -827,10 +871,13 @@ main() {
             echo ""
             echo "Required environment variables:"
             echo "  AWS_REGION, AWS_ACCOUNT_ID, BUCKET_NAME,"
-            echo "  EMR_EXECUTION_ROLE_ARN, MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD"
+            echo "  EMR_EXECUTION_ROLE_ARN, MYSQL_HOST, MYSQL_USER (not for build; MYSQL_PASSWORD comes from the Secret)"
             echo ""
-            echo "Optional for Iceberg:"
-            echo "  GLUE_DATABASE (default: flink_iceberg_db)"
+            echo "Optional:"
+            echo "  EMR_VERSION            (default: 7.14.0; image tag and emrReleaseLabel)"
+            echo "  ICEBERG_FORMAT_VERSION (default: 3; 2 or 3)"
+            echo "  CDC_DB_SUFFIX          (default when unset: _v3; set empty for the v2 set)"
+            echo "  -> ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= selects the original v2 tables"
             echo ""
             echo "Examples:"
             echo "  # Deploy Paimon only"

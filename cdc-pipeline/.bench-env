@@ -1,0 +1,52 @@
+# Account-specific values live in .bench-env.local (git-ignored), sourced below
+# so it overrides these placeholders. Create it with your actual values:
+#   export AWS_REGION=us-west-2
+#   export AWS_ACCOUNT_ID=<12 digits>
+#   export BUCKET_NAME=emr-on-eks-test-<account>-<region>
+#   export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::<account>:role/emr-on-eks-test-execution-role
+
+_cdc_env_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
+if [ -f "$_cdc_env_dir/.bench-env.local" ]; then
+    source "$_cdc_env_dir/.bench-env.local"
+elif [ -f "$_cdc_env_dir/../throughput-benchmark/.bench-env.local" ]; then
+    source "$_cdc_env_dir/../throughput-benchmark/.bench-env.local"
+fi
+unset _cdc_env_dir
+
+export NAMESPACE=emr-flink
+
+export ICEBERG_FORMAT_VERSION=3
+export CDC_DB_SUFFIX=_v3
+
+# SESSION_SUFFIX names one round of query results: they go to
+# s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
+# and the summary to bench-results/QUERYBENCH-SUMMARY-<date><set tag><SESSION_SUFFIX>.md,
+# where <set tag> is CDC_DB_SUFFIX with - for _ (-v3; empty for the v2 set).
+# Empty or suffix represent the test round like -r2. 
+export SESSION_SUFFIX=""
+
+# The CDC tables, as flink-cdc-{paimon,iceberg}-sql.yaml write them. 
+export PAIMON_WAREHOUSE="s3://${BUCKET_NAME}/paimon-warehouse"
+export ICEBERG_WAREHOUSE="s3://${BUCKET_NAME}/iceberg-warehouse"
+export FLINK_JOBS="flink-cdc-paimon flink-cdc-iceberg"
+
+# Starrocks Engine versions
+export SR_IMAGE_TAG=4.1.7
+export SR_CHART_VERSION=1.11.8
+
+# DuckDB: the image of the warm server (engine-deploy/deploy-duckdb-cdc.sh),
+# by default the DuckDB 2.0.0 built from source and pushed to this account's
+# ECR by duckdb-image/build-duckdb-image.sh (iceberg/httpfs/aws/avro
+# statically linked, cache_httpfs preinstalled; GCC 14, no LTO). Empty
+# (DUCKDB_IMAGE=) = python:3.12-slim + pip duckdb==2.0.0 (PyPI, clang +
+# ThinLTO) at every start: a different build, so a different timing baseline.
+export DUCKDB_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/duckdb-cdc-server:2.0.0"
+
+# The MySQL load generator(s) the hot test needs running and the snapshot test
+# stops (scaled to 0; whichever of them exists). deploy-data-generator.sh brings
+# them back.
+export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen deployment/mysql-data-generator"
+
+# ICEBERG_REQUIRE_COMPACTION=0 (one run) measures the Iceberg tables as they are.
+export COMPACT_BEFORE_SNAPSHOT=true
+export COMPACT_TABLES="customers products orders order_items"

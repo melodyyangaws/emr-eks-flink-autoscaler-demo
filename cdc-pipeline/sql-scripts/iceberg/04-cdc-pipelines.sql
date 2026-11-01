@@ -3,6 +3,11 @@
 -- ============================================================================
 -- Reads from MySQL CDC sources and writes to Iceberg tables.
 -- Explicit DATE STRING partition columns computed via DATE_FORMAT().
+--
+-- Environment variables:
+--   GLUE_DATABASE: target Iceberg database (default: flink_iceberg_db; the
+--     manifest sets flink_iceberg_db + CDC_DB_SUFFIX)
+--   MYSQL_DATABASE: source database (default: ecommerce)
 -- ============================================================================
 
 -- ============================================================================

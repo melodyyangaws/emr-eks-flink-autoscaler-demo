@@ -16,6 +16,16 @@ export NAMESPACE="${NAMESPACE:-emr-flink}"
 export EMR_EXECUTION_ROLE_ARN="${EMR_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role}"
 # Must already be annotated with an IRSA role that can read Glue + S3.
 export MONITOR_SERVICE_ACCOUNT="${MONITOR_SERVICE_ACCOUNT:-starrocks-sa}"
+# The table set: flink_{paimon,iceberg}_db${CDC_DB_SUFFIX}. Default _v3 (this
+# branch's Iceberg v3 set), i.e. the value in cdc-pipeline/.bench-env, which the
+# Flink jobs and the query benchmark use, read from there when that file sets
+# it; CDC_DB_SUFFIX= (set, empty) monitors the v2 set.
+if [[ -z "${CDC_DB_SUFFIX+set}" ]]; then
+  CDC_DB_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${CDC_DB_SUFFIX+set}" ]] || exit 1; printf %s "$CDC_DB_SUFFIX"' \
+                    _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
+fi
+export CDC_DB_SUFFIX
+[[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || { echo "CDC_DB_SUFFIX must be empty or like _v3, got '${CDC_DB_SUFFIX}'" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOYMENT_TEMPLATE="${SCRIPT_DIR}/monitor-deployment.yaml"
@@ -29,6 +39,7 @@ echo "  Account:   ${AWS_ACCOUNT_ID}"
 echo "  Bucket:    ${BUCKET_NAME}"
 echo "  Namespace: ${NAMESPACE}"
 echo "  SA:        ${MONITOR_SERVICE_ACCOUNT}"
+echo "  Glue DBs:  flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── IRSA ─────────────────────────────────────────────────────────────────────
@@ -56,8 +67,11 @@ kubectl create configmap flink-cdc-monitor-code -n "${NAMESPACE}" \
 
 # ── Resolve variables in deployment manifest and apply ───────────────────────
 echo "Resolving variables in monitor-deployment.yaml..."
-envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT}' \
+envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${CDC_DB_SUFFIX}' \
   < "${DEPLOYMENT_TEMPLATE}" > "${DEPLOYED_MANIFEST}"
+if grep -nE '^[^#]*\$\{[A-Z][A-Z0-9_]*\}' "${DEPLOYED_MANIFEST}" >&2; then
+  echo "unrendered placeholder(s) above in ${DEPLOYED_MANIFEST}" >&2; exit 1
+fi
 
 echo "Applying ${DEPLOYED_MANIFEST}..."
 kubectl apply -f "${DEPLOYED_MANIFEST}"

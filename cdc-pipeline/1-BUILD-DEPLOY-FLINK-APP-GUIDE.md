@@ -96,17 +96,70 @@ cdc-pipeline/
 
 ## Quick Start
 ### 0. Install EMR on EKS Flink Operator if needed
+The jobs run EMR 7.14.0 (`emrReleaseLabel: emr-7.14.0-flink-latest`), so install
+the 7.14.0 operator chart (operator 1.13.0-amzn-1, image
+`flink-k8s-operator/emr-7.14.0-flink`):
+
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.12.0/cert-manager.yaml
 
-export VERSION=7.13.0
+export VERSION=7.14.0 # The Amazon EMR release version
 export NAMESPACE=emr-flink
 
 helm install flink-kubernetes-operator \
 oci://public.ecr.aws/emr-on-eks/flink-kubernetes-operator \
 --version $VERSION \
---namespace $NAMESPACE
+--namespace $NAMESPACE \
+--set emrContainers.awsRegion=${AWS_REGION:-us-west-2}
+
+kubectl wait deployment flink-kubernetes-operator --namespace $NAMESPACE \
+  --for condition=Available=True --timeout=120s
+helm list --namespace $NAMESPACE   # CHART flink-kubernetes-operator-7.14.0
 ```
+
+`emrContainers.awsRegion` picks the ECR registry the operator image is pulled from
+(`<account>.dkr.ecr.<awsRegion>.amazonaws.com/flink-k8s-operator/emr-7.14.0-flink`).
+The chart defaults it to `us-east-1`, which is why the current operator pod pulls
+from a us-east-1 registry; setting it to the cluster's region is optional but
+avoids the cross-region pull.
+
+#### 0a. Upgrade an existing operator (7.12.0 → 7.14.0) — prerequisite for 7.14 jobs
+
+The cluster currently runs chart **7.12.0** (operator 1.10.0-amzn-6). Upgrade it
+before deploying the 7.14.0 jobs. The AWS procedure
+([Upgrade the Kubernetes operator](https://docs.aws.amazon.com/emr/latest/EMR-on-EKS-DevelopmentGuide/jobruns-flink-kubernetes-operator-getting-started.html))
+is uninstall → delete CRDs → reinstall, because `helm upgrade` never updates the
+CRDs a chart ships:
+
+```bash
+export NAMESPACE=emr-flink
+helm list --namespace $NAMESPACE        # confirm what is installed now
+
+# Deleting the CRDs DELETES EVERY FlinkDeployment / FlinkSessionJob in the
+# cluster (the CRs go with their CRD). Stop the CDC jobs deliberately first;
+# checkpoints and data in S3 are untouched, but HA ConfigMaps should be cleared
+# per "Change CDC Configuration" before the jobs are re-applied.
+kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n $NAMESPACE --ignore-not-found
+
+# 1. Uninstall the old operator
+helm uninstall flink-kubernetes-operator -n $NAMESPACE
+# 2. Delete the CRDs (helm does not remove or upgrade them)
+kubectl delete crd flinkdeployments.flink.apache.org flinksessionjobs.flink.apache.org
+# 3. Re-install with the newer version (same command as step 0)
+helm install flink-kubernetes-operator \
+oci://public.ecr.aws/emr-on-eks/flink-kubernetes-operator \
+--version 7.14.0 \
+--namespace $NAMESPACE \
+--set emrContainers.awsRegion=${AWS_REGION:-us-west-2}
+kubectl wait deployment flink-kubernetes-operator --namespace $NAMESPACE \
+  --for condition=Available=True --timeout=120s
+```
+
+Both charts also ship `flinkstatesnapshots.flink.apache.org`; that CRD is
+byte-identical between 7.12.0 and 7.14.0 (only `flinkdeployments` changed), so
+the two-CRD delete above is enough — `helm install` keeps the existing one. An in-place `helm upgrade` (after `kubectl replace
+-f` of the chart's `crds/`) is the upstream Apache operator's alternative that
+keeps existing CRs, but it is not the AWS-documented path for the EMR chart.
 
 ### 1. Set Environment Variables
 Now that MySQL is set up, you can proceed to deploy Flink CDC.
@@ -291,9 +344,12 @@ exactly these placeholders, and nothing else:
 | `${AWS_ACCOUNT_ID}` | required |
 | `${BUCKET_NAME}` | required |
 | `${EMR_EXECUTION_ROLE_ARN}` | required |
-| `${EMR_VERSION}` | `7.13.0` |
-| `${IMAGE_TAG}` | `$IMAGE_TAG`, else `$EMR_VERSION`, else `7.13.0` |
-| `${GLUE_DATABASE}` | `flink_iceberg_db` |
+| `${EMR_VERSION}` | `$EMR_VERSION`, else `7.14.0` (base image release and `emrReleaseLabel`) |
+| `${IMAGE_TAG}` | `$IMAGE_TAG`, else `$EMR_VERSION`, else `7.14.0` |
+| `${GLUE_DATABASE}` | `$GLUE_DATABASE`, else `flink_iceberg_db${CDC_DB_SUFFIX}` (the DB the script pre-creates; the manifests hardcode `flink_{paimon,iceberg}_db${CDC_DB_SUFFIX}`) |
+| `${ICEBERG_FORMAT_VERSION}` | `$ICEBERG_FORMAT_VERSION`, else **`3`** on this branch (`2` or `3`). Both JobManagers; Iceberg sink `format-version` and Paimon `metadata.iceberg.format-version`. Never empty |
+| `${CDC_DB_SUFFIX}` | `$CDC_DB_SUFFIX`, else **`_v3`** when unset (empty or like `_v3`). Appended to both Glue DB names and the checkpoint / savepoint / HA / log paths. An explicit `CDC_DB_SUFFIX=` selects the unsuffixed v2 set |
+| `${PAIMON_DV_BITMAP64}` | Derived, not a setting: `true` iff `ICEBERG_FORMAT_VERSION=3` (StarRocks' native Paimon reader cannot decode 64-bit DVs, so v2 gets `false`). Both JobManagers |
 | `${MYSQL_HOST}` / `${MYSQL_USER}` | required |
 | `${MYSQL_ENV_SECRET_NAME}` | `flink-cdc-mysql-env` |
 | `${JM_NODEPOOL}` | `driver-nodepool` |
@@ -317,7 +373,19 @@ Empty env value(s) rendered into flink-cdc-<format>-deployed.yaml: ...
 
 The second guard matters more than it looks: an empty `AWS_REGION` renders as a
 blank value that Kubernetes accepts, and the job then dies minutes later with an
-error naming a heartbeat timeout rather than the missing variable.
+error naming a heartbeat timeout rather than the missing variable. An empty
+`CDC_DB_SUFFIX` never trips it (it only appears inside non-empty values).
+
+**Table sets.** On this branch the defaults render the Iceberg **v3** set —
+`flink_{paimon,iceberg}_db_v3`, format 3, `PAIMON_DV_BITMAP64=true`, state under
+`flink/cdc-<format>_v3/`. The original v2 set is:
+
+```bash
+ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./build-deploy-generic.sh render
+```
+
+The two sets never share tables or Flink state, so switching between them never
+restores one set's checkpoint against the other's tables.
 
 > The two templates are **not** symmetric on region. Iceberg uses
 > `fs.s3a.endpoint.region: ${AWS_REGION}`; Paimon hardcodes `aws.region: us-west-2`
@@ -338,7 +406,7 @@ From the templates (both jobs, kept in lockstep as fair-comparison variables):
 | Task graph | 808 tasks (Paimon) / 520 tasks (Iceberg) |
 | `taskmanager.memory.managed.fraction` | 0.2 — at 32 Gi process size this leaves ~21 Gi of task heap (~5.3 Gi/slot). At the default 0.4 the CDC deserializer OOMed inside `RowDataDebeziumDeserializeSchema`, killing TaskManagers |
 | Checkpointing | 60s interval, 600s timeout, 30s min-pause, `tolerable-failed-checkpoints: 10` |
-| State | RocksDB + changelog (`state.changelog.enabled: true`), S3 checkpoints, EBS local recovery (`ebs-sc`) |
+| State | `hashmap`, S3 checkpoints (RocksDB + changelog + EBS local recovery on `ebs-sc` before 2026-11-02) |
 | Failover | `jobmanager.execution.failover-strategy: full`, `restart-strategy.type: exponential-delay`, `jobmanager.scheduler: default` |
 | Autoscaler | off (`job.autoscaler.enabled: false`, `job.autoscaler.scaling.enabled: false`) |
 | `server-id` ranges | Paimon 5401–5432 / 5441–5472 / 5481–5512 / 5521–5552; Iceberg 6401–6432 / 6441–6472 / 6481–6512 / 6521–6552 |
@@ -440,7 +508,27 @@ step 2 of Quick Start. Neither uploads `flink-cdc-executor.py` either; that is
 manifests each action touches. Required environment variables: `AWS_REGION`
 (defaulted to `us-west-2`), `AWS_ACCOUNT_ID`, `BUCKET_NAME`,
 `EMR_EXECUTION_ROLE_ARN`, `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`.
-`GLUE_DATABASE` is optional and defaults to `flink_iceberg_db`.
+Optional: `EMR_VERSION` (default `7.14.0`; the base image is its `:latest` tag),
+`ICEBERG_FORMAT_VERSION` (default `3`) and `CDC_DB_SUFFIX` (default `_v3` when
+unset). Everything else is derived from these.
+
+### What the image contains
+
+`docker/Dockerfile.cdc-paimon` builds on
+`public.ecr.aws/emr-on-eks/flink/emr-7.14.0-flink` (Flink 1.20.0-amzn-8, Corretto
+17) and adds Paimon 2.1.0 (`paimon-flink-1.20`, `-flink-action`, `-s3`,
+`-hive-catalog`, `-hive-connector-3.1`), `flink-sql-connector-mysql-cdc`
+3.7.0-1.20, `mysql-connector-j` 8.4.0 and the OSS
+`iceberg-flink-runtime-1.20-1.12.0.jar`. The last one **replaces** EMR's bundled
+Iceberg 1.10.1-amzn-1 runtime (whose copy is deleted from
+`/usr/share/aws/iceberg/lib`): 1.10 fails v3 commits when a key is updated twice
+within a checkpoint, 1.12 writes deletion vectors on v3 tables. The Iceberg
+runtime has no AWS SDK of its own; GlueCatalog / S3FileIO use EMR's SDK v2
+(2.44.5, `/usr/share/aws/aws-java-sdk-v2`). A build-time guard fails the image if
+Java is below 17, if any other jar on the classpath carries Iceberg classes, or if
+no SDK v2 Glue/S3 client is on the classpath. If a job ever fails with
+`NoSuchMethodError` / `NoClassDefFoundError` under `software.amazon.awssdk`, add
+`iceberg-aws-bundle-1.12.0.jar` (SDK 2.54.17) to the Dockerfile's jar downloads.
 
 ### Stopping the pipelines
 
@@ -631,9 +719,10 @@ Both manifests do still set `AWS_DEFAULT_REGION` — for the v1 SDK's
 ---
 
 **Status**: ✅ Production Ready
-**Last Updated**: 2026-09-27
-**EMR Version**: 7.13.0
-**Flink Version**: 1.20
-**Paimon Version**: 1.3.2 (newest release still publishing `paimon-spark-3.5`; 1.4.x dropped it)
-**Iceberg Version**: 1.10.0-amzn-1
+**Last Updated**: 2026-11-02
+**EMR Version**: 7.14.0 (Flink operator chart 7.14.0 — see step 0a)
+**Flink Version**: 1.20.0-amzn-8 (Java 17)
+**Paimon Version**: 2.1.0 (Spark 3.5 bundle is `paimon-spark-3.5_2.12` from 1.4 on)
+**Iceberg Version**: 1.12.0 OSS runtime (replaces EMR's 1.10.1-amzn-1); format v3 by default on this branch
+**Flink CDC MySQL connector**: 3.7.0-1.20
 **mySQL Version**: 8.0.45

@@ -26,8 +26,13 @@
 --       (b) after rewrite_data_files : merged data, deletes applied
 --       (c) after expire_snapshots : metadata trimmed too
 --
--- Run this file with bench-hot-data.sh, which times each query against both
--- catalogs and records the file/snapshot counts that explain the timings.
+-- Run this file with bench-server-side.sh (server-side audit-log timing) or
+-- bench-hot-data.sh (client-side), which run these queries against both catalogs
+-- and record the file/snapshot counts that explain the timings. Both are older
+-- ad-hoc tools; the maintained harness is cdc-pipeline/querybench/. On the v3
+-- set (the default) run the USE / SET lines of 01-starrocks-paimon-catalog.sql
+-- first (paimon_force_jni_reader); the Iceberg catalog cannot read v3 tables with
+-- deletion vectors on StarRocks 4.1.x.
 -- Queries are written to be valid in both catalogs; the only per-format
 -- difference is the partition column name, noted at Q9.
 

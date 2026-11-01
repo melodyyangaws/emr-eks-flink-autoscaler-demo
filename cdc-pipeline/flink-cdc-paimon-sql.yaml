@@ -11,11 +11,17 @@ spec:
   emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
 
   flinkConfiguration:
-    aws.glue.enabled: "true"    
-    aws.region: us-west-2
+    # Paimon only: EMR's Glue integration provides /glue/confs/{hive,hadoop}/conf
+    # for paimon_catalog's 'metastore' = 'hive' (sql-scripts/paimon/01-catalog-
+    # setup.sql). The Iceberg job talks to Glue through Iceberg's own GlueCatalog
+    # and does not set it — the one intended flinkConfiguration difference.
+    aws.glue.enabled: "true"
+    # Region from the AWS_REGION placeholder, never hardcoded: the Paimon
+    # manifest used to pin us-west-2 here while the Iceberg one was templated.
+    aws.region: ${AWS_REGION}
     # table.catalog-store.kind: glue
     # S3 Configuration
-    fs.s3a.endpoint.region: us-west-2
+    fs.s3a.endpoint.region: ${AWS_REGION}
     # # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
     # job.autoscaler.scale-down.interval: "0"
     # # restart with local-recovery is still needed
@@ -32,9 +38,16 @@ spec:
     # job.autoscaler.restart.time: "2m"
     # job.autoscaler.catch-up.duration: "5m"
     # job.autoscaler.vertex.exclude.ids: ""
-    pipeline.operator-chaining.enabled: "false"
+    # ON (it was "false"), with object reuse, as in the throughput-benchmark
+    # writers. Off, every row was serialized and copied across each Source ->
+    # DropUpdateBefore -> Calc -> ConstraintEnforcer edge; object-reuse-off
+    # copies alone were 27% of task CPU in the throughput profile (2026-10-09).
+    # The UI and REST then show one vertex per chain, so per-operator record
+    # counts come from operator-scoped metrics (monitoring/flink_cdc_monitor.py).
+    # Fair-comparison variables: keep identical across both formats.
+    pipeline.operator-chaining.enabled: "true"
+    pipeline.object-reuse: "true"
     pipeline.auto-watermark-interval: "1s"
-    # local-recovery
     execution.checkpointing.interval: "60s"
     execution.checkpointing.timeout: "600s"
     execution.checkpointing.min-pause: "30s"
@@ -45,26 +58,25 @@ spec:
     # default is 0, meaning the very first failed checkpoint kills the job. Interval
     # itself stays at 60s — it is a fair-comparison variable and must match Iceberg.
     execution.checkpointing.tolerable-failed-checkpoints: "10"
-    state.backend.local-recovery: "true"
-    # ebs local-recovery
-    task.local-recovery.ebs.enable: "true"
-    kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit: 10Gi
     execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
-    # log-based incremental checkpoint
-    state.backend.incremental: "true"
-    state.changelog.enabled: "true"
-    state.backend.changelog.storage: filesystem
-    dstl.dfs.base-path: s3://${BUCKET_NAME}/flink/cdc-paimon/changelog/
-    dstl.dfs.upload.timeout: 5s
-    state.backend.type: rocksdb
-    state.backend.rocksdb.localdir: /tmp/rocksdb/
+    # hashmap, not RocksDB + changelog + EBS local recovery (2026-11-02). The
+    # graph has no keyed operator: its state is the CDC sources' split
+    # assignments and the writers' pending commits, small enough for the heap.
+    # This drops the per-record changelog uploads to S3 and the per-TM EBS
+    # volumes local recovery created (40 orphaned PVCs were found 2026-09-27).
+    # Watch heap during the initial snapshot, when the sources hold the most
+    # split state. Fair-comparison variable: keep identical across both formats.
+    state.backend.type: hashmap
     # increase from default 50s to 3min to tolerate GC pauses during heavy commits
     heartbeat.timeout: "180s"
     heartbeat.interval: "20s"
     heartbeat.rpc-failure-threshold: "10"
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon/checkpoints/
-    state.savepoints.dir: s3://${BUCKET_NAME}/flink/cdc-paimon/savepoints/
-
+    # Every state path carries the CDC_DB_SUFFIX placeholder (_v3 by default),
+    # as do the Glue database names below, so each table set (the v3 default,
+    # or the unsuffixed v2 set) starts from its own state and never restores a
+    # checkpoint, savepoint or HA pointer written against the other's tables.
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/savepoints/
     # Restart Strategy
     # 'full', not 'region'. region restarts only the failed pipelined region, and
     # on this graph each of the 16 source subtasks is its own region — so when
@@ -140,7 +152,9 @@ spec:
     # Cutting the managed fraction to 0.2 keeps RocksDB at roughly its old absolute
     # allocation (6.1Gi at 32Gi process vs 5.9Gi at 16Gi) while redirecting the whole
     # size increase into task heap: ~21Gi, about 3x, or ~5.3Gi per slot.
-    taskmanager.memory.managed.fraction: "0.2"
+    # 0.1, not 0.2 (2026-11-02): managed memory was RocksDB's, and the state
+    # backend is now hashmap, so it only moves ~3Gi more into task heap.
+    taskmanager.memory.managed.fraction: "0.1"
     # Parallelism
     parallelism.default: "4"
     pipeline.max-parallelism: "128"
@@ -153,7 +167,7 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon/ha/
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/ha/
     replicas: 1
     resource:
       memory: 8Gi
@@ -202,8 +216,25 @@ spec:
           # (e.g. a hive-site/core-site property the Glue factory reads), not here.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
+          # CDC_DB_SUFFIX keeps a v3 (or any other) run in its own database:
+          # an existing table cannot change format version.
           - name: GLUE_DATABASE
-            value: "flink_paimon_db"
+            value: "flink_paimon_db${CDC_DB_SUFFIX}"
+          # Table-format knobs, rendered by build-deploy-generic.sh and
+          # substituted into the sink DDL by the executor. All are set on both
+          # JobManagers so the manifests stay in lockstep; each SQL reads only
+          # the ones it needs. ICEBERG_FORMAT_VERSION and PAIMON_DV_BITMAP64
+          # must never render empty: the executor treats "" as set, and an
+          # empty value becomes = '' in CREATE TABLE.
+          #  - ICEBERG_FORMAT_VERSION (2|3): Iceberg sink format-version, and
+          #    Paimon's metadata.iceberg.format-version.
+          #  - PAIMON_DV_BITMAP64 (true|false): derived from the format version
+          #    (true iff 3); StarRocks' native Paimon reader cannot decode
+          #    64-bit deletion vectors, so a v2 run gets false.
+          - name: ICEBERG_FORMAT_VERSION
+            value: "${ICEBERG_FORMAT_VERSION}"
+          - name: PAIMON_DV_BITMAP64
+            value: "${PAIMON_DV_BITMAP64}"
           # Binlog client id ranges for the four mysql-cdc sources. These are
           # substituted into 02-cdc-sources.sql, which the JobManager parses, and
           # they must not overlap the Iceberg job's 64xx ranges — both pipelines
@@ -227,6 +258,14 @@ spec:
       memory: 32Gi
       cpu: 8
     podTemplate:
+      metadata:
+        annotations:
+          # Karpenter must not consolidate a node away from under a TaskManager:
+          # with failover-strategy full each evicted TM restarts the whole job
+          # (see the Karpenter row in README.md's troubleshooting table). The
+          # fix belongs on the pods, not the shared nodepool. Same as the
+          # throughput-benchmark writers.
+          karpenter.sh/do-not-disrupt: "true"
       spec:
         containers:
         - name: flink-main-container
@@ -257,7 +296,7 @@ spec:
 
   monitoringConfiguration:
     s3MonitoringConfiguration:
-      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon${CDC_DB_SUFFIX}
     sideCarResources:
       limits:
         cpuLimit: 500m
@@ -265,4 +304,3 @@ spec:
     containerLogRotationConfiguration:
         rotationSize: 2GB
         maxFilesToKeep: "10"
-                 

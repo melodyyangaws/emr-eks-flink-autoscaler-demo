@@ -5,9 +5,9 @@
 #   - Chart 1.11.x nests component specs under the `starrocks:` key. Earlier
 #     charts (<= 1.8) used top-level starrocksFESpec/starrocksBeSpec.
 #   - Image tags are left empty HERE and pinned by the deploy script instead:
-#     starrocks/deploy-starrocks.sh passes --set starrocks.starrocks{FE,Be}Spec.image.tag
-#     from $IMAGE_TAG (default 4.1.4). An empty tag falls back to the chart
-#     appVersion, which on chart 1.11.7 is the floating `4.1-latest` tag — mutable,
+#     engine-deploy/deploy-starrocks.sh passes --set starrocks.starrocks{FE,Be}Spec.image.tag
+#     from $IMAGE_TAG (default 4.1.7). An empty tag falls back to the chart
+#     appVersion, which on chart 1.11.8 is the floating `4.1-latest` tag — mutable,
 #     so the engine version drifts whenever a pod restarts. Pinning is required
 #     before capturing benchmark numbers you intend to compare across runs.
 #     The sink tables are Iceberg format-version 2 and Paimon 1.3 with deletion
@@ -49,7 +49,7 @@ starrocks:
       # Empty = chart appVersion = mutable `4.1-latest`; the deploy script --sets
       # this from $IMAGE_TAG. Pin it before capturing comparable benchmark numbers.
       tag: ""
-      # tag: "4.1.4"
+      # tag: "4.1.7"
     serviceAccount: starrocks-sa
     # No OpenTelemetry auto-instrumentation. The cluster's CloudWatch
     # Observability add-on auto-annotates workloads and injects its Java agent
@@ -100,7 +100,7 @@ starrocks:
       # Empty = chart appVersion = mutable `4.1-latest`; the deploy script --sets
       # this from $IMAGE_TAG. Pin it before capturing comparable benchmark numbers.
       tag: ""
-      # tag: "4.1.4"
+      # tag: "4.1.7"
     serviceAccount: starrocks-sa
     # No OpenTelemetry auto-instrumentation. The cluster's CloudWatch
     # Observability add-on auto-annotates workloads and injects its Java agent

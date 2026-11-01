@@ -1,22 +1,29 @@
 
 -- ============================================================================
--- Iceberg V2 Catalog Setup with AWS Glue
+-- Iceberg Catalog Setup with AWS Glue (Iceberg Flink runtime 1.12.0)
 -- ============================================================================
 -- Creates an Apache Iceberg catalog using AWS Glue as metadata service.
 --
--- Required environment variables:
+-- Environment variables:
 --   ICEBERG_WAREHOUSE: S3 path for Iceberg warehouse (e.g., s3://bucket/iceberg/)
---   GLUE_DATABASE: AWS Glue database name (e.g., flink_iceberg_db)
+--   GLUE_DATABASE: AWS Glue database name (default: flink_iceberg_db; the
+--     manifest sets flink_iceberg_db + CDC_DB_SUFFIX, e.g. flink_iceberg_db_v3)
 --   AWS_REGION: AWS region
+--   ICEBERG_FORMAT_VERSION: 3 (default on this branch) or 2
 --
--- Iceberg V2 features used by this pipeline:
---   - Row-level deletes via positional delete files (merge-on-read)
---   - Equality deletes and sequence numbers for CDC upserts
+-- Iceberg features used by this pipeline:
+--   - Upserts via equality deletes + sequence numbers (both v2 and v3)
+--   - Deletes of rows written earlier in the same checkpoint: positional delete
+--     files on v2, deletion vectors (Puffin) on v3
 --   - Min/max column statistics for predicate pushdown
 --
--- Keep format-version at 2 here and in 03-iceberg-sinks.sql; the bundled
--- iceberg-flink-runtime.jar sink writes positional-delete files, which is what
--- V2 expects. Raising it stops the sink from committing.
+-- The 'format-version' that matters is the per-table one in
+-- 03-iceberg-sinks.sql. Iceberg catalogs take table defaults only from
+-- 'table-default.*' catalog properties (CatalogProperties.TABLE_DEFAULT_PREFIX),
+-- so a bare catalog-level 'format-version' does not set the tables' version.
+-- It is kept here only so the two files visibly agree, driven by the same
+-- ICEBERG_FORMAT_VERSION. See 03-iceberg-sinks.sql for what v3 changes and
+-- which readers can handle it.
 -- ============================================================================
 
 CREATE CATALOG iceberg_catalog WITH (
@@ -27,7 +34,7 @@ CREATE CATALOG iceberg_catalog WITH (
     'catalog-name' = 'iceberg_glue_catalog',
     'catalog-database' = '${GLUE_DATABASE:flink_iceberg_db}',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
-    'format-version' = '2'
+    'format-version' = '${ICEBERG_FORMAT_VERSION:3}'
 );
 
 -- Switch to Iceberg catalog

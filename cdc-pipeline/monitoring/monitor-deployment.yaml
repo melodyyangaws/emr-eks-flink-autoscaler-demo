@@ -18,16 +18,19 @@ data:
   PAIMON_FLINK_URL: "http://flink-cdc-paimon-rest:8081"
   ICEBERG_FLINK_URL: "http://flink-cdc-iceberg-rest:8081"
   AWS_REGION: "${AWS_REGION}"
-  PAIMON_GLUE_DB: "flink_paimon_db"
-  ICEBERG_GLUE_DB: "flink_iceberg_db"
+  # CDC_DB_SUFFIX (cdc-pipeline/.bench-env; empty, or e.g. _v3 for the Iceberg
+  # v3 table set): the Glue databases the Flink jobs write, and so the Paimon
+  # warehouse path <db>.db/ the monitor scans.
+  PAIMON_GLUE_DB: "flink_paimon_db${CDC_DB_SUFFIX}"
+  ICEBERG_GLUE_DB: "flink_iceberg_db${CDC_DB_SUFFIX}"
   # Paimon native warehouse root — S3 scan reads <db>.db/<table>/snapshot/ and bucket-N/
   PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimon-warehouse"
   ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/iceberg-warehouse/"
   CDC_TABLES: "customers,products,orders,order_items"
   # Sampling window per pipeline, reported as "Duration (s)" in the comparison
-  # table. Throughput is (last records_out - first records_out) / elapsed across
-  # this window, so it must stay a multiple of POLL_INTERVAL: at 120s/20s the loop
-  # takes samples at 0/20/.../120 and the delta spans two full minutes.
+  # table. Headline throughput is rows committed / time between commits, from
+  # the tables' history, so the window must span at least one 60s checkpoint;
+  # keep it a multiple of POLL_INTERVAL for the counter and rate-meter fallbacks.
   MONITOR_DURATION: "120"
   POLL_INTERVAL: "20"
   REPEAT_INTERVAL: "60"

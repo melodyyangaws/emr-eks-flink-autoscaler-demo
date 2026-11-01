@@ -5,6 +5,8 @@
 --
 -- Required environment variables:
 --   MYSQL_DATABASE: Database name (default: ecommerce)
+--   GLUE_DATABASE: target Paimon database (default: flink_paimon_db; the
+--     manifest sets flink_paimon_db + CDC_DB_SUFFIX)
 --
 -- Note: These are long-running streaming INSERT statements
 -- ============================================================================

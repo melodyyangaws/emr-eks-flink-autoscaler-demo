@@ -15,7 +15,9 @@
 -- Create Paimon catalog
 --
 -- The Flink pipeline writes to s3://${BUCKET_NAME}/paimon-warehouse/ and
--- registers tables in the Glue database flink_paimon_db (metastore = hive/Glue).
+-- registers tables in the Glue database flink_paimon_db_v3 (v3 set, the default;
+-- flink_paimon_db for the v2 set; metastore = hive/Glue). Both sets share the
+-- warehouse, so this one catalog serves both.
 -- The filesystem catalog type reads the Paimon metadata directly from S3, so the
 -- warehouse path must match the pipeline exactly.
 --
@@ -38,8 +40,19 @@ SET CATALOG paimon_catalog;
 -- Show databases
 SHOW DATABASES;
 
--- Use the Paimon lakehouse database written by the Flink CDC pipeline
-USE flink_paimon_db;
+-- Use the Paimon lakehouse database written by the Flink CDC pipeline.
+-- The branch default is the Iceberg v3 table set (.bench-env:
+-- ICEBERG_FORMAT_VERSION=3, CDC_DB_SUFFIX=_v3), i.e. flink_paimon_db_v3.
+-- Its Paimon tables use 64-bit deletion vectors
+-- ('deletion-vectors.bitmap64' = 'true', ../paimon/03-paimon-sinks.sql), which
+-- StarRocks 4.1.x's native (C++) Paimon reader cannot decode: force the JNI
+-- (Java) reader for this session first. It is slower, so v3 timings are not
+-- comparable with v2 native-reader timings.
+-- For the v2 set (ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=), swap the two USE
+-- lines and drop the SET (the native reader handles 32-bit DVs).
+SET paimon_force_jni_reader = true;
+USE flink_paimon_db_v3;
+-- USE flink_paimon_db;    -- v2 set
 
 -- Show tables
 SHOW TABLES;

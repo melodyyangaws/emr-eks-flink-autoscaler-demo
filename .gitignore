@@ -37,5 +37,7 @@ venv/
 .pytest_cache/
 # throughput-benchmark/querybench/run.sh writes this while bundling a Job, then deletes it
 throughput-benchmark/.qb-runner-cmd.sh
+# cdc-pipeline/querybench/run.sh writes this while bundling a Job, then deletes it
+cdc-pipeline/.qb-runner-cmd.sh
 # GenAI tool
 *claude

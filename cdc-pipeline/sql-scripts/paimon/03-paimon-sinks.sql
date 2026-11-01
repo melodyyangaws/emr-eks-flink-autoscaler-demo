@@ -1,5 +1,5 @@
 -- ============================================================================
--- Paimon Sink Tables — Streaming CDC Optimized
+-- Paimon Sink Tables — Streaming CDC Optimized (Paimon 2.1.0)
 -- ============================================================================
 -- Creates Apache Paimon sink tables optimized for low-latency CDC:
 --   - Deletion vectors: bitmap-based row deletes without rewriting data files
@@ -9,9 +9,11 @@
 --     has no zstd-jni on its Iceberg reader classpath — see the
 --     metadata.iceberg.manifest-compression note on `customers` below
 --   - Tuned compaction, write buffers, and snapshot retention for 60s checkpoints
---   - Iceberg compatibility: IcebergHadoopMetadataCommitter writes read-only
---     Iceberg V2 metadata to S3 for Athena/Spark queries
---   - Input changelog producer for downstream CDC consumers
+--   - Iceberg compatibility: Paimon writes read-only Iceberg metadata (format
+--     version ICEBERG_FORMAT_VERSION, 3 by default on this branch) for Iceberg
+--     readers, and
+--     registers it in Glue (metadata.iceberg.storage = hive-catalog)
+--   - Lookup changelog producer for downstream CDC consumers
 --
 -- Streaming best practices applied:
 --   1. Spillable write buffers to prevent backpressure during burst writes
@@ -20,13 +22,68 @@
 --   4. Manifest merging to keep read planning fast
 --   5. Async snapshot expiration to avoid checkpoint latency spikes
 --
--- Valid metadata.iceberg.* options (Paimon 1.3.0):
---   storage, uri, hive-conf-dir, hadoop-conf-dir, format-version,
+-- ----------------------------------------------------------------------------
+-- Iceberg format version of the exported metadata: v3 (default) vs v2
+-- ----------------------------------------------------------------------------
+-- ICEBERG_FORMAT_VERSION drives 'metadata.iceberg.format-version' here AND
+-- 'format-version' on the native Iceberg tables (../iceberg/03-iceberg-sinks.sql),
+-- so the Paimon export and the native Iceberg table are always the same version.
+-- v3 is the default on this branch, and its default table set is a fresh
+-- CDC_DB_SUFFIX=_v3 database, so nothing here has to migrate an existing table.
+-- ICEBERG_FORMAT_VERSION=2 (+ PAIMON_DV_BITMAP64=false) gives the v2 setup.
+--
+--   v2: an Iceberg v2 reader cannot see Paimon deletion vectors, so for a
+--       primary-key table the export lists ONLY files at the max LSM level
+--       (IcebergCommitCallback.shouldAddFileToIceberg: level == num-levels - 1).
+--       Rows still in lower levels are invisible to Iceberg readers until a full
+--       compaction pushes them down; the native Paimon reader is unaffected.
+--   v3: the export lists every file at level > 0 plus the deletion vectors as
+--       Iceberg v3 DVs (Puffin). Paimon does this only when ALL THREE hold
+--       (IcebergCommitCallback.needAddDvToIceberg):
+--         'deletion-vectors.enabled'        = 'true'
+--         'deletion-vectors.bitmap64'       = 'true'
+--         'metadata.iceberg.format-version' = '3'
+--       With DVs on, lookup-compact = radical (the default) compacts level 0
+--       up at every checkpoint, so the v3 export trails the table by about one
+--       checkpoint without any forced full compaction.
+--
+-- deletion-vectors.enabled is 'true' on every table regardless of version.
+-- deletion-vectors.bitmap64 is PAIMON_DV_BITMAP64 (default 'true', matching the
+-- v3 default), NOT hard-wired, because it is wrong for the v2 setup:
+--   - It must be set at CREATE TABLE time (existing 32-bit DV index files are
+--     not rewritten), so it cannot be flipped on later for the v3 case.
+--   - It is NOT harmless for v2. StarRocks 4.1.x reads Paimon DVs in
+--     its native C++ reader (PaimonScanNode passes the DeletionFile of every
+--     raw-convertible split to BE), and BE's PaimonDeleteFileBuilder
+--     (be/src/exec/paimon/paimon_delete_file_builder.cpp, branch-4.1) only knows
+--     the 32-bit layout: big-endian magic 1581511376 + a 32-bit roaring bitmap.
+--     The 64-bit layout (Bitmap64DeletionVector: little-endian magic
+--     1681511377 + roaring64 + CRC) is not decoded there. The JNI reader
+--     (Paimon 1.3.1 Java, DeletionVector.read) does handle both magics, so on
+--     v3 tables StarRocks' paimon_catalog needs SET paimon_force_jni_reader =
+--     true (untested). DuckDB and Iceberg readers of the v3 export need 64-bit.
+--   So: PAIMON_DV_BITMAP64 = 'true' (the default) exactly when
+--   ICEBERG_FORMAT_VERSION = 3 (the default); set it to 'false' whenever
+--   ICEBERG_FORMAT_VERSION = 2. The SQL substitution cannot derive one from the
+--   other, so the manifest/build script sets both together.
+--
+-- Valid metadata.iceberg.* options used here (Paimon 2.1.0 IcebergOptions):
+--   storage, hive-client-class, hive-conf-dir, format-version (2 or 3),
 --   manifest-compression
 --
+-- Table options are applied at CREATE TABLE only (CREATE TABLE IF NOT EXISTS
+-- is a no-op for an existing table). The live flink_paimon_db tables have
+-- drifted from this file (they are 'bucket' = '-1', and several sizes differ);
+-- this DDL is deliberately NOT changed to match them. New tables — e.g. a
+-- fresh CDC_DB_SUFFIX database — get exactly what is written here.
+--
 -- Required: 'aws.glue.enabled: "true"' in flinkConfiguration
--- Required environment variables:
---   GLUE_DATABASE: Glue database name (default: flink_paimon_db)
+-- Environment variables:
+--   GLUE_DATABASE: Glue database name (default: flink_paimon_db; the manifest
+--     sets flink_paimon_db + CDC_DB_SUFFIX)
+--   ICEBERG_FORMAT_VERSION: 3 (default) or 2 — Iceberg export format version
+--   PAIMON_DV_BITMAP64: true or false, derived by build-deploy-generic.sh from
+--     the version (true iff 3); not a setting of its own
 -- ============================================================================
 
 -- Switch to Paimon catalog
@@ -56,6 +113,10 @@ CREATE TABLE IF NOT EXISTS customers (
     'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
+    -- 64-bit DV index format (default on, for the v3 default) — required for the
+    -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
+    -- See the header. CREATE-time only.
+    'deletion-vectors.bitmap64' = '${PAIMON_DV_BITMAP64:true}',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
@@ -71,7 +132,10 @@ CREATE TABLE IF NOT EXISTS customers (
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'compaction.max.file-num' = '8',
+    -- 'compaction.max.file-num' was removed from all four tables: no such option
+    -- exists in Paimon 1.3.x or 2.1.0 CoreOptions (only compaction.min.file-num,
+    -- for append tables), so Paimon stored it and ignored it. Dropping it changes
+    -- no behaviour; it only stops implying a cap that never applied.
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
@@ -83,10 +147,13 @@ CREATE TABLE IF NOT EXISTS customers (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- '2', not '3'. This is the format version of the Iceberg-compatible
-    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
-    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
-    'metadata.iceberg.format-version' = '2',
+    -- ICEBERG_FORMAT_VERSION (3 default on this branch, 2 opt-out) — the format
+    -- version of the Iceberg-compatible metadata Paimon exports; always equal to
+    -- the native Iceberg tables' 'format-version'. 3 exports DVs only together
+    -- with PAIMON_DV_BITMAP64 = true (its default) — see the header. 2 is for
+    -- Iceberg-v2-only readers (Athena engine v3) and needs PAIMON_DV_BITMAP64 =
+    -- false.
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- 'snappy', not 'zstd'. This compresses the Avro MANIFEST files of the
     -- Iceberg-compatible metadata Paimon exports under <table>/iceberg/, and it
     -- has to be a codec the READER has on its classpath, not just the best
@@ -129,6 +196,10 @@ CREATE TABLE IF NOT EXISTS products (
     'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
+    -- 64-bit DV index format (default on, for the v3 default) — required for the
+    -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
+    -- See the header. CREATE-time only.
+    'deletion-vectors.bitmap64' = '${PAIMON_DV_BITMAP64:true}',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
@@ -144,7 +215,6 @@ CREATE TABLE IF NOT EXISTS products (
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'compaction.max.file-num' = '8',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
@@ -155,10 +225,8 @@ CREATE TABLE IF NOT EXISTS products (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- '2', not '3'. This is the format version of the Iceberg-compatible
-    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
-    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
-    'metadata.iceberg.format-version' = '2',
+    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
@@ -185,6 +253,10 @@ CREATE TABLE IF NOT EXISTS orders (
     'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
+    -- 64-bit DV index format (default on, for the v3 default) — required for the
+    -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
+    -- See the header. CREATE-time only.
+    'deletion-vectors.bitmap64' = '${PAIMON_DV_BITMAP64:true}',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
@@ -195,7 +267,6 @@ CREATE TABLE IF NOT EXISTS orders (
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'compaction.max.file-num' = '10',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
@@ -206,10 +277,8 @@ CREATE TABLE IF NOT EXISTS orders (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- '2', not '3'. This is the format version of the Iceberg-compatible
-    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
-    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
-    'metadata.iceberg.format-version' = '2',
+    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'
@@ -234,6 +303,10 @@ CREATE TABLE IF NOT EXISTS order_items (
     'bucket' = '32',
     'changelog-producer' = 'lookup',
     'deletion-vectors.enabled' = 'true',
+    -- 64-bit DV index format (default on, for the v3 default) — required for the
+    -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
+    -- See the header. CREATE-time only.
+    'deletion-vectors.bitmap64' = '${PAIMON_DV_BITMAP64:true}',
     'file.format' = 'parquet',
     'file.compression' = 'zstd',
     'file.compression.zstd-level' = '1',
@@ -244,7 +317,6 @@ CREATE TABLE IF NOT EXISTS order_items (
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'compaction.max.file-num' = '10',
     'snapshot.time-retained' = '1h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '10',
@@ -255,10 +327,8 @@ CREATE TABLE IF NOT EXISTS order_items (
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- '2', not '3'. This is the format version of the Iceberg-compatible
-    -- metadata Paimon exports under <table>/iceberg/, and Athena engine v3 only
-    -- reads Iceberg V2 — see README "Paimon Tables" and 4-STARROCKS-OLAP-ENGINE.md
-    'metadata.iceberg.format-version' = '2',
+    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
     'sink.writer-coordinator.enabled' = 'true'

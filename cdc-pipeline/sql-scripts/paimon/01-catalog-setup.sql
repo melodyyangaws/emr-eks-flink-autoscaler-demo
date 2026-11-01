@@ -10,7 +10,9 @@
 -- Required environment variables:
 --   PAIMON_WAREHOUSE: S3 path for Paimon warehouse (e.g., s3://bucket/paimon/)
 --   AWS_REGION: AWS region (e.g., us-west-2)
---   GLUE_DATABASE: Glue database name (default: flink_paimon_db)
+--   GLUE_DATABASE: Glue database name (default: flink_paimon_db). The manifest
+--     sets flink_paimon_db + CDC_DB_SUFFIX (e.g. flink_paimon_db_v3), so a
+--     suffixed run creates and writes a separate, fresh set of tables.
 -- ============================================================================
 
 CREATE CATALOG paimon_catalog WITH (

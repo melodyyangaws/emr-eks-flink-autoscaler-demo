@@ -1,0 +1,240 @@
+# Spark Iceberg compaction job: rewrite_data_files on one Iceberg CDC table
+# (ICEBERG_DB.ICEBERG_TABLE), so its delete files stop making it unreadable.
+# Written for flink_iceberg_db.order_items (v2: 365 M equality deletes); the
+# sizing below is that table's. A TEMPLATE: submit it with run-compaction.sh,
+# never `kubectl apply` it directly. run-compaction.sh renders every ${...}
+# placeholder in the env values and the image from cdc-pipeline/.bench-env
+# (+ .bench-env.local) through lib/common.sh, and refuses to submit if one is
+# left:
+#   ICEBERG_DB         flink_iceberg_db<CDC_DB_SUFFIX>: flink_iceberg_db_v3 on the
+#                      default v3 set (CDC_DB_SUFFIX unset -> _v3), flink_iceberg_db
+#                      with an explicit CDC_DB_SUFFIX= (v2). querybench/run.sh
+#                      passes its own ICEBERG_DB and each of COMPACT_TABLES.
+#   ICEBERG_WAREHOUSE  s3://<BUCKET_NAME>/iceberg-warehouse (.bench-env)
+#   AWS_REGION / AWS_DEFAULT_REGION  .bench-env.local's AWS_REGION
+#   image              SPARK_IMAGE, default the us-west-2 EMR 7.14.0 Spark image
+# `./run-compaction.sh render` prints the rendered Job without touching the cluster.
+#
+# WHY A BARE JOB AND NOT AN OPERATOR / EMR VIRTUAL CLUSTER
+# This cluster has no Spark operator installed (only the Flink one), and every
+# EMR virtual cluster in RUNNING state belongs to another team's workload or a
+# different EKS cluster. Borrowing one would put load on someone else's
+# namespace. A single self-contained Job needs neither.
+#
+# LOCAL MODE, ONE BIG DRIVER — this is a deliberate choice, not laziness.
+# rewrite_data_files distributes fine, but the work here is ~7.4 GB of data
+# against a 365 M-entry equality-delete set. Executors would each need their own
+# copy of the delete set, so distributing multiplies the memory problem instead of
+# dividing it. local[*] in one 100g heap keeps exactly one copy.
+#
+# SIZING: m5.12xlarge (48 vcpu / 192Gi) requesting 24 cpu / 150Gi.
+# The memory is the point. DuckDB died at 72Gi and StarRocks at 16Gi/query, so
+# this needs to be comfortably past both to be worth attempting at all; 150Gi
+# container / 100g heap gives ~3x DuckDB's failed budget. m5 is NOT for
+# benchmark parity here (nothing is being timed against StarRocks) — it is
+# because the delete set must live in one amd64 JVM heap and m5.12xlarge is the
+# smallest permitted shape that holds it. executor-memorynodepool already allows
+# {4,8,12,16}xlarge / category m,r / generation > 4, so this selects into the
+# nodepool WITHOUT any edit to the shared nodepool spec.
+#
+# spark-submit --driver-memory is load-bearing: in PySpark the JVM is already
+# running by the time SparkSession.builder executes, so spark.driver.memory set
+# in Python is silently ignored and the driver would come up on the default ~1g
+# heap and OOM immediately. The heap MUST be passed on the submit command line.
+#
+# backoffLimit: 0 — a partially-applied rewrite must be looked at, not silently
+# retried. rewrite_data_files commits atomically (the table is never left
+# half-rewritten), but an automatic retry after an OOM just burns another hour.
+#
+# serviceAccountName: starrocks-sa is reused rather than creating a new role: it
+# is already annotated with emr-on-eks-test-execution-role, which has the
+# glue:GetTable / glue:UpdateTable / s3:GetObject / s3:PutObject / s3:DeleteObject
+# this commit needs (verified with SimulatePrincipalPolicy), and the execution
+# role trusts system:serviceaccount:emr-flink:*.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-compact-order-items
+  namespace: emr-flink
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: starrocks-sa
+      # The EMR Spark image runs as uid 999 (hadoop) / gid 1000, but a freshly
+      # provisioned gp3 volume mounts owned by root:root with mode 0755, so Spark
+      # cannot create its local dirs there: it fails with "Failed to create a temp
+      # directory (under /tmp/spark-local) after 10 attempts" and then "Failed to
+      # create any local dir", killing the driver during SparkEnv init. fsGroup
+      # makes the CSI driver chgrp the volume to 1000 and set the setgid bit, which
+      # is what makes the mount writable to the hadoop user.
+      securityContext:
+        fsGroup: 1000
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        karpenter.sh/nodepool: executor-memorynodepool
+        karpenter.k8s.aws/instance-family: m5
+        karpenter.k8s.aws/instance-size: 12xlarge
+        # on-demand, not spot: a reclaimed node mid-rewrite loses the entire pass.
+        karpenter.sh/capacity-type: on-demand
+      containers:
+      - name: spark
+        # EMR on EKS 7.14.0 Spark 3.5.8-amzn-0, the same release as the Flink
+        # jobs. Chosen because the image already ships Iceberg 1.10.1-amzn-1
+        # (iceberg-spark-runtime-3.5_2.12) and the AWS SDK for Java v2 bundle
+        # (2.44.5 in 7.14.0) on spark.{driver,executor}.extraClassPath, so
+        # GlueCatalog and S3FileIO work with no --packages resolution and no jar
+        # staging. The us-west-2 EMR ECR account is 895885662937; other regions
+        # use other accounts, so run-compaction.sh requires SPARK_IMAGE there.
+        # spark/emr-7.14.0:latest resolved on 2026-11-02 (ecr BatchGetImage,
+        # sha256:81acb12c19f36260be789849936cf61e3253882ca3300031c492a27f22d42124);
+        # the Iceberg / SDK versions above were not re-checked inside the image
+        # (no pull here). (Was emr-7.13.0 with Iceberg 1.10.0-amzn-1 /
+        # SDK 2.42.12 before 2026-11-02.)
+        #
+        # FORMAT v3 (the default table set, flink_iceberg_db_v3): UNTESTED. The
+        # v3 tables are written by the Iceberg 1.12.0 Flink runtime: data files,
+        # equality deletes for upserts of keys from earlier checkpoints, and
+        # deletion vectors (Puffin) for keys rewritten within one checkpoint. On
+        # paper, Iceberg 1.10 Spark can compact v3 tables: 1.10.0 finalized the
+        # v3 spec and added "Spark 3.5: preserving row lineage on compaction"
+        # (apache/iceberg #13637, backport of #13555); Spark has read and written
+        # deletion vectors since 1.8 (#11561); rewrite_position_delete_files is
+        # disabled for v3 (#12048), but the script calls only rewrite_data_files,
+        # which is unaffected. AWS lists EMR Spark 7.12+ as V3-capable (S3 user
+        # guide, "Working with Apache Iceberg V3"). What nobody has checked is
+        # whether this OLDER reader (1.10.1) accepts metadata written by the NEWER
+        # 1.12.0 writer; there is no v3 compaction log in bench-results/ yet.
+        #   1. Run DRY_RUN=true first. It reads the data_files / delete_files
+        #      metadata tables, so it shows whether 1.10.1 can load the table and
+        #      its manifests. It does not exercise the rewrite or the commit.
+        #   2. If 1.10.1 rejects the metadata (an unknown format version, field or
+        #      manifest content type), the fallback is a newer runtime,
+        #      iceberg-spark-runtime-3.5_2.12-1.12.0.jar (Maven Central,
+        #      org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.12.0), staged
+        #      by hand; there is no knob for it here. Plain --jars or
+        #      spark.jars.packages is not enough on its own: in client mode the
+        #      EMR jar on spark.driver.extraClassPath is on the JVM classpath and
+        #      wins over --jars (spark.driver.userClassPathFirst is cluster-mode
+        #      only). Put the 1.12.0 jar on spark.driver.extraClassPath AHEAD of
+        #      EMR's entries, or drop EMR's Iceberg jar from that value (it comes
+        #      from the image's spark-defaults.conf; read it in the pod first).
+        #      Note it with the result: the compaction is then not the EMR build.
+        # Flink's own rewrite action refuses v3 tables (#13646, 1.10), so compact
+        # v3 with this Spark Job, not a Flink compaction.
+        #
+        # FORMAT v2 (CDC_DB_SUFFIX=, flink_iceberg_db): the setup this Job was
+        # written and run against (bench-results/iceberg-compact-order_items-
+        # 20260930T*.log, on emr-7.13.0).
+        image: ${SPARK_IMAGE}
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          # local[N], NOT local[*]: local[*] takes the HOST's core count (48 on an
+          # m5.12xlarge) and ignores the 24-cpu cgroup limit entirely. N is set low
+          # on purpose — see SPARK_LOCAL_THREADS below.
+          #
+          # spark.memory.fraction is kept LOW (0.2) deliberately. Iceberg's
+          # executor cache is a Caffeine cache of plain JVM objects, so it lives in
+          # USER memory — the (1 - fraction) slice Spark does not manage — not in
+          # the unified execution/storage pool. A low fraction therefore leaves MORE
+          # room for the delete sets, which are what decide whether this job
+          # survives; raising it would starve them to benefit execution memory this
+          # job barely uses.
+          #
+          # -Xlog:gc and ExitOnOutOfMemoryError exist because this image ships a JRE
+          # with NO jstack/jstat/jcmd. The 60-minute full-GC spiral had to be
+          # diagnosed by diffing per-thread CPU in /proc/1/task/*/stat to discover
+          # that only GC threads were running. GC logging makes that visible in
+          # `kubectl logs`, and ExitOnOutOfMemoryError makes the JVM die instead of
+          # thrashing indefinitely under a soft memory ceiling.
+          #
+          # NOTE: no '#' comments between the continuation lines below — a comment
+          # inside a backslash-continued command breaks the line join.
+          exec /usr/bin/spark-submit \
+            --master "local[${SPARK_LOCAL_THREADS}]" \
+            --deploy-mode client \
+            --driver-memory "${DRIVER_MEMORY}" \
+            --conf spark.driver.maxResultSize=4g \
+            --conf spark.local.dir=/tmp/spark-local \
+            --conf spark.ui.enabled=false \
+            --conf spark.memory.fraction=0.2 \
+            --conf spark.sql.shuffle.partitions=8 \
+            --conf spark.sql.adaptive.enabled=true \
+            --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
+            --conf "spark.driver.extraJavaOptions=-Xlog:gc:stdout:time,uptime -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError" \
+            /opt/compact/compact-order-items.py
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        # Heap for the single local driver. Sits well below the 150Gi container
+        # limit: Spark accounts for its own heap but not for off-heap/Netty/Arrow
+        # buffers or the Python process, and exceeding the container limit gets
+        # SIGKILLed by the kubelet (exit 137, no traceback) instead of raising a
+        # catchable Java OOM. That is exactly how the DuckDB attempts died.
+        - name: DRIVER_MEMORY
+          value: "100g"
+        # DELIBERATELY FAR BELOW the 24-cpu limit. This is the parallelism half of
+        # the GC-death fix described in compact-order-items.py: each concurrent task
+        # rewriting a data file needs the equality-delete keys, so N tasks means up
+        # to N delete sets resident at once. At 24 the JVM spent an hour in
+        # continuous full GC and made no progress. 4 tasks sharing one cached set
+        # fits; the job is memory-bound, not CPU-bound, so idle cores are the
+        # correct trade.
+        - name: SPARK_LOCAL_THREADS
+          value: "4"
+        # Placeholders: run-compaction.sh always sets these five (see the header).
+        - name: AWS_REGION
+          value: "${AWS_REGION}"
+        - name: AWS_DEFAULT_REGION
+          value: "${AWS_REGION}"
+        - name: ICEBERG_DB
+          value: "${ICEBERG_DB}"
+        - name: ICEBERG_TABLE
+          value: "${ICEBERG_TABLE}"
+        - name: ICEBERG_WAREHOUSE
+          value: "${ICEBERG_WAREHOUSE}"
+        # 256 MiB, deliberately 4x the table's own write.target-file-size-bytes
+        # (64 MiB). The Flink writer wants small files to keep commit latency low;
+        # a read-optimised table wants fewer, larger ones. 137 files of ~54 MB
+        # should land as ~30 files.
+        - name: TARGET_FILE_SIZE_BYTES
+          value: "268435456"
+        # DRY_RUN=true reports the before-state and exits without committing (on
+        # v3: the first check that Iceberg 1.10.1 reads the 1.12.0 metadata).
+        - name: DRY_RUN
+          value: "false"
+        resources:
+          requests:
+            cpu: "24"
+            memory: 150Gi
+          limits:
+            cpu: "24"
+            memory: 150Gi
+        volumeMounts:
+        - name: script
+          mountPath: /opt/compact
+        - name: scratch
+          mountPath: /tmp/spark-local
+      volumes:
+      - name: script
+        configMap:
+          name: iceberg-compact-py
+      # A real EBS volume, not an emptyDir: the node root disk has only ~44Gi
+      # allocatable ephemeral-storage, and shuffle/spill over a 365 M-row delete
+      # set will exceed that — overrunning it evicts the pod for ephemeral-storage
+      # pressure rather than spilling. Generic ephemeral so it is deleted with the
+      # pod; this namespace already carries 16 orphaned PVCs and needs no more.
+      - name: scratch
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: gp3
+              resources:
+                requests:
+                  storage: 300Gi

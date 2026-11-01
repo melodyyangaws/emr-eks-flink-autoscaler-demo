@@ -9,7 +9,7 @@
 #
 #   * The chart has exactly two top-level values keys, `operator:` and
 #     `starrocks:` (verify: helm show values starrocks/kube-starrocks
-#     --version 1.11.7 | grep '^[a-zA-Z]'). There is no top-level
+#     --version 1.11.8 | grep '^[a-zA-Z]'). There is no top-level
 #     `starrocksCluster` key and no `operator.enabled` key — the real switches
 #     are `operator.starrocksOperator.enabled` and `starrocks.starrocksCluster.*`.
 #     `--set operator.enabled=…` / `--set starrocksCluster.enabled=…` are
@@ -28,7 +28,7 @@
 #       "starrocks-operator"
 #     So this script installs operator + cluster as ONE release ($RELEASE_NAME).
 #
-#   * The chart appVersion for 1.11.7 is the MUTABLE tag `4.1-latest`. Both the
+#   * The chart appVersion for 1.11.8 is the MUTABLE tag `4.1-latest`. Both the
 #     chart version and the FE/BE image tags are therefore pinned here
 #     (CHART_VERSION / IMAGE_TAG) so a reinstall lands on the same engine build.
 ###############################################################################
@@ -70,15 +70,15 @@ info() {
 NAMESPACE=${NAMESPACE:-emr-flink}
 RELEASE_NAME=${RELEASE_NAME:-starrocks}
 # Pin the chart. Without --version, helm takes whatever the repo's latest is.
-CHART_VERSION=${CHART_VERSION:-1.11.7}
+CHART_VERSION=${CHART_VERSION:-1.11.8}
 # Pin the FE/BE image tags. The values file leaves image.tag empty, which falls
-# back to the chart appVersion — `4.1-latest` on chart 1.11.7, a mutable tag that
+# back to the chart appVersion — `4.1-latest` on chart 1.11.8, a mutable tag that
 # drifts on every pod restart. Keep it pinned for anything you intend to compare
 # across runs.
 # `${IMAGE_TAG-…}` (no colon) on purpose: an explicitly exported IMAGE_TAG="" must
 # survive as empty so `IMAGE_TAG= ./deploy-starrocks.sh install` really does opt
 # back into the floating tag. With `:-` an empty value would be replaced too.
-IMAGE_TAG=${IMAGE_TAG-4.1.4}
+IMAGE_TAG=${IMAGE_TAG-4.1.7}
 
 # Paths are resolved from the script's own location, so the script works from any
 # cwd (the values file and the catalog SQL live one level up, in cdc-pipeline/).
@@ -497,8 +497,8 @@ main() {
             echo "  NAMESPACE      - Kubernetes namespace (default: emr-flink — the only"
             echo "                   namespace the execution role's trust policy covers)"
             echo "  RELEASE_NAME   - Helm release name (default: starrocks)"
-            echo "  CHART_VERSION  - kube-starrocks chart version (default: 1.11.7)"
-            echo "  IMAGE_TAG      - FE/BE image tag (default: 4.1.4; empty = chart"
+            echo "  CHART_VERSION  - kube-starrocks chart version (default: 1.11.8)"
+            echo "  IMAGE_TAG      - FE/BE image tag (default: 4.1.7; empty = chart"
             echo "                   appVersion, i.e. the mutable '4.1-latest' tag)"
             echo "  VALUES_FILE    - Helm values file (default: ../helm/starrocks-eks-values.yaml)"
             echo "  BUCKET_NAME    - S3 bucket for lakehouse data"

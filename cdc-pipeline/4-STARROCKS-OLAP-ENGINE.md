@@ -244,8 +244,8 @@ export EKS_CLUSTER_NAME=loadtest-mcp
 
 # Install IRSA + operator + cluster.
 # Defaults, all overridable: NAMESPACE=emr-flink, RELEASE_NAME=starrocks,
-# CHART_VERSION=1.11.7, IMAGE_TAG=4.1.4.
-./starrocks/deploy-starrocks.sh install-iam
+# CHART_VERSION=1.11.8, IMAGE_TAG=4.1.7.
+./engine-deploy/deploy-starrocks.sh install-iam
 ```
 
 This creates:
@@ -263,17 +263,17 @@ runs — note the single release and the two pins:
 helm repo add starrocks https://starrocks.github.io/starrocks-kubernetes-operator
 helm repo update
 helm upgrade --install starrocks starrocks/kube-starrocks \
-  --version 1.11.7 \
+  --version 1.11.8 \
   --namespace emr-flink \
   --values helm/starrocks-eks-values.yaml \
-  --set starrocks.starrocksFESpec.image.tag=4.1.4 \
-  --set starrocks.starrocksBeSpec.image.tag=4.1.4 \
+  --set starrocks.starrocksFESpec.image.tag=4.1.7 \
+  --set starrocks.starrocksBeSpec.image.tag=4.1.7 \
   --wait --timeout 15m
 ```
 
 > **The operator and the cluster cannot be split into two Helm releases.** Chart
 > 1.11.x has exactly two top-level values keys — verify with
-> `helm show values starrocks/kube-starrocks --version 1.11.7 | grep '^[a-zA-Z]'`,
+> `helm show values starrocks/kube-starrocks --version 1.11.8 | grep '^[a-zA-Z]'`,
 > which prints only `operator:` and `starrocks:`. There is no `starrocksCluster`
 > top-level key and no `operator.enabled`; the real switches are nested
 > (`operator.starrocksOperator.enabled`, `starrocks.starrocksCluster.*`). So
@@ -301,17 +301,40 @@ helm upgrade --install starrocks starrocks/kube-starrocks \
 > header comments of `helm/starrocks-eks-values.yaml`. Note the side effect: this is
 > a *shared* namespace, so `uninstall` no longer deletes it (see 3.6).
 >
-> **Both the chart and the images are pinned.** Chart 1.11.7's appVersion is
+> **Both the chart and the images are pinned.** Chart 1.11.8's appVersion is
 > `4.1-latest` — a **mutable** tag, so with `image.tag: ""` the engine version
-> drifts on every pod restart. The script pins `CHART_VERSION=1.11.7` and
-> `IMAGE_TAG=4.1.4`, passing the tag as
+> drifts on every pod restart. The script pins `CHART_VERSION=1.11.8` and
+> `IMAGE_TAG=4.1.7`, passing the tag as
 > `--set starrocks.starrocks{FE,Be}Spec.image.tag`. The values file leaves
-> `image.tag: ""` with a commented-out `tag: "4.1.4"` alongside if you prefer to pin
+> `image.tag: ""` with a commented-out `tag: "4.1.7"` alongside if you prefer to pin
 > there instead; in that case run with `IMAGE_TAG=` so the two do not fight.
-> Verified on the running cluster: `starrocks/fe-ubuntu:4.1.4` and
+> Verified on the running cluster (when the pin was 4.1.4): `starrocks/fe-ubuntu:4.1.4` and
 > `starrocks/be-ubuntu:4.1.4`, while `helm list -n emr-flink` still reports the
 > release's APP VERSION as `4.1-latest` (that column is the chart's appVersion, not
 > the image actually pulled — do not read the engine version off it).
+>
+> **4.1.7 / chart 1.11.8 (2026-11-02).** The pins moved from 4.1.4 / 1.11.7 to
+> the newest 4.1 patch and chart (operator v1.11.8, 2026-10-22: no values-layout
+> change, appVersion still `4.1-latest`; `starrocks/{fe,be}-ubuntu:4.1.7` exist on
+> Docker Hub). **Iceberg v3:** 4.1.x (4.1.7 included, also branch-4.2 and main as
+> of 2026-11-02) refuses any Iceberg v3 table scan that has a deletion vector
+> (`Iceberg V3 Deletion Vectors are not supported`,
+> IcebergConnectorScanRangeSource.buildScanRanges; StarRocks PR #76228 is open).
+> The `iceberg_catalog` and the Iceberg reader on Paimon's export therefore fail
+> on an `ICEBERG_FORMAT_VERSION=3` table set. The native Paimon catalog still
+> reads it, but only through the JNI reader: the v3 tables use 64-bit Paimon
+> deletion vectors, which the native (C++) reader cannot decode, so run
+> `SET paimon_force_jni_reader = true;` first. The CDC query benchmark skips the
+> Iceberg arms and sets that variable on v3 (querybench/README.md).
+>
+> **The query benchmark does not use this script.** `querybench/run.sh start`
+> installs StarRocks with `throughput-benchmark/engine-deploy/deploy-starrocks.sh
+> install` (one StarRocks cluster, shared by both benchmarks), passing
+> `SR_IMAGE_TAG` / `SR_CHART_VERSION` from `cdc-pipeline/.bench-env` (4.1.7 /
+> 1.11.8) as that script's `SR_IMAGE_TAG` / `CHART_VERSION`. That script's own
+> defaults are left alone, so switching the version from the CDC side changes the
+> cluster the throughput benchmark then runs on (and `install` is a `helm upgrade`:
+> it rolls an existing cluster to the new tag).
 
 ### 3.2 Connect to StarRocks
 
@@ -321,7 +344,7 @@ There is no external endpoint. `helm/starrocks-eks-values.yaml` sets
 
 ```bash
 # Print the FE service/pod and every working access path
-./starrocks/deploy-starrocks.sh connection
+./engine-deploy/deploy-starrocks.sh connection
 
 # Path 1 — exec into the FE pod. This is what the bench scripts do.
 kubectl exec -it -n emr-flink kube-starrocks-fe-0 -- mysql -h127.0.0.1 -P9030 -uroot
@@ -367,6 +390,18 @@ for f in 01-starrocks-paimon-catalog.sql 02-starrocks-iceberg-catalog.sql; do
 done
 ```
 
+> **The files default to the Iceberg v3 table set** (`USE flink_paimon_db_v3` /
+> `USE flink_iceberg_db_v3`, matching `.bench-env`'s `ICEBERG_FORMAT_VERSION=3`
+> `CDC_DB_SUFFIX=_v3`); the v2 `USE flink_*_db` line is commented next to each. Both
+> sets live in the same warehouses, so the catalogs (`paimon_catalog`,
+> `iceberg_catalog`) are the same for both. On v3, `01-` runs
+> `SET paimon_force_jni_reader = true;` before its queries: the v3 Paimon tables use
+> 64-bit deletion vectors (`'deletion-vectors.bitmap64' = 'true'`), which StarRocks
+> 4.1.x's native C++ Paimon reader cannot decode (drop the SET for v2). `02-` on v3
+> creates the catalog and lists the tables, but its queries fail with `Iceberg V3
+> Deletion Vectors are not supported` (3.1), and a piped `mysql` stops at the first
+> error: add `--force` to see them all, or switch to the v2 lines.
+>
 > **`SOURCE` will not work here.** It is a client-side mysql command that reads a
 > path on the machine running the client, and the client is running inside the FE
 > pod — which has no copy of this repo (`ls /` in `kube-starrocks-fe-0` shows a bare
@@ -376,17 +411,19 @@ done
 ### 3.4 Query Both Formats
 
 ```sql
--- Query Paimon tables
+-- Query Paimon tables (v3 set, the branch default; v2: flink_paimon_db, no SET)
+SET paimon_force_jni_reader = true;   -- v3 only: 64-bit deletion vectors
 SET CATALOG paimon_catalog;
-USE flink_paimon_db;
+USE flink_paimon_db_v3;
 SELECT * FROM customers LIMIT 10;
 
--- Query Iceberg tables
+-- Query Iceberg tables: v2 set only. On v3 StarRocks 4.1.x refuses any scan
+-- that touches a deletion vector (see 3.1).
 SET CATALOG iceberg_catalog;
 USE flink_iceberg_db;
 SELECT * FROM customers LIMIT 10;
 
--- Cross-catalog comparison
+-- Cross-catalog comparison (v2 set)
 SELECT
     'paimon' as source, COUNT(*) as cnt
 FROM paimon_catalog.flink_paimon_db.customers
@@ -400,7 +437,7 @@ FROM iceberg_catalog.flink_iceberg_db.customers;
 
 ```bash
 # Release, StarRocksCluster CR, and the StarRocks pods/services/PVCs only
-./starrocks/deploy-starrocks.sh monitor
+./engine-deploy/deploy-starrocks.sh monitor
 
 # Or directly. Filter by label — emr-flink also holds the Flink operator and the
 # CDC TaskManagers, so an unfiltered get buries the 5 StarRocks pods.
@@ -441,7 +478,7 @@ works for a quick pause, but the operator will reconcile it back to the CR's
 Tear down with:
 
 ```bash
-./starrocks/deploy-starrocks.sh uninstall
+./engine-deploy/deploy-starrocks.sh uninstall
 ```
 
 > **The uninstall does not delete the namespace, deliberately.** `emr-flink` is
@@ -488,6 +525,12 @@ Tear down with:
 ---
 
 ## Performance Comparison
+
+> **The maintained benchmark is [`querybench/`](querybench/README.md)** (`querybench/run.sh`:
+> server-side timing, pinned snapshots, the Paimon-as-Iceberg arm, DuckDB, the v2/v3
+> table sets). The `sql-scripts/starrocks/bench-server-side.sh` and `bench-hot-data.sh`
+> used below are the **older ad-hoc tools** that produced this 2026-09-22 run; they
+> are kept for spot checks and to reproduce it, and are not extended further.
 
 Results below are from the 40k/s upsert run of **2026-09-22** (`bench-results/starrocks-audit-20260922T160312Z.csv`).
 Every timing is the median of 3 server-side `Time=` values from the FE audit log, taken
@@ -585,9 +628,15 @@ volume, while Paimon's LSM has already merged them away.
 # Flink-side: records written, throughput, checkpoint success/duration
 ./monitoring/capture-flink-metrics.sh
 
-# StarRocks-side: server-side Time/ScanRows/ScanBytes per query
-./sql-scripts/starrocks/bench-server-side.sh            # snapshot + hot suites
-SUITE=hot RUNS=5 ./sql-scripts/starrocks/bench-server-side.sh
+# StarRocks-side: server-side Time/ScanRows/ScanBytes per query (older ad-hoc
+# tool; querybench/ is the maintained harness). The 2026-09-22 numbers above are
+# from the v2 table set:
+ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./sql-scripts/starrocks/bench-server-side.sh
+ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= SUITE=hot RUNS=5 ./sql-scripts/starrocks/bench-server-side.sh
+# The branch default (v3 set, flink_*_db_v3): Paimon arm only, JNI reader
+./sql-scripts/starrocks/bench-server-side.sh
+SR_V3_ARMS=1 ./sql-scripts/starrocks/bench-server-side.sh   # also run Iceberg, to record its error
+DRY_RUN=1 ./sql-scripts/starrocks/bench-server-side.sh      # print the session SQL, run nothing
 
 # Upsert load (8 pods). This is a StatefulSet, not a Deployment:
 # each pod derives its own disjoint slice of the hot-key window from its ordinal,
@@ -603,14 +652,35 @@ kubectl apply -f mysql-data-generator/mysql-upsert-loadgen.yaml
 ./mysql-data-generator/deploy-data-generator.sh stop upsert
 ```
 
+**Table set and Iceberg v3 in the two scripts** (`sql-scripts/starrocks/bench-lib.sh`,
+mirroring `lib/querybench.sh`). Both source `lib/common.sh`, so `.bench-env` decides the
+set: `CDC_DB_SUFFIX` unset means `_v3`, an explicit `CDC_DB_SUFFIX=` means the v2
+`flink_*_db`, and `ICEBERG_FORMAT_VERSION` (default 3) decides the rules. On v3:
+
+- every Paimon-catalog session starts with `SET paimon_force_jni_reader = true;`
+  (`SR_PAIMON_JNI=0` opts out, at the risk the native reader crashes or returns wrong
+  rows on 64-bit deletion vectors); the scripts stop if the FE lacks the variable.
+  The JNI reader is slower, so v3 Paimon times are **not** comparable with v2 ones;
+- the Iceberg arm is **skipped** (logged in the banner and per suite, `SKIPPED` in the
+  CSV), because StarRocks 4.1.x refuses Iceberg v3 scans with deletion vectors.
+  `SR_V3_ARMS=1` runs it anyway: a one-row probe per table records the error (an
+  `error,iceberg_probe` CSV row / `*.errors.log`), and its queries come out as
+  `ERR`/`FAIL`. With the arm skipped, the storage preflight asserts the Paimon side only;
+- every CSV row ends with `iceberg_format_version,cdc_db_suffix,paimon_force_jni_reader,iceberg_arm`,
+  and the suite headers print the same labels.
+
+There is no Paimon-as-Iceberg arm in these scripts (querybench has one; it is also
+skipped on v3).
+
 Note the StarRocks catalogs must exist and point at the *current* warehouses — this cluster
-still carries stale `paimon_catalogv3` / `icebergv3_catalog` entries from an earlier run,
+still carries stale `paimon_catalogv3` / `icebergv3_catalog` entries from an earlier run
+(not this branch's v3 set, which is `flink_*_db_v3` in `paimon_catalog` / `iceberg_catalog`),
 and the first benchmark attempt returned all-zero timings purely because `paimon_catalog`
 did not exist yet. All-zero `ScanRows` means the queries errored, not that they were fast.
 
 ### Measurement notes — read before trusting any number
 
-- **Use `bench-server-side.sh`, not `bench-hot-data.sh`.** Timings must come from the
+- **Use `querybench/`, or at least `bench-server-side.sh`, not `bench-hot-data.sh`.** Timings must come from the
   StarRocks FE audit log (`/opt/starrocks/fe/log/fe.audit.log` — the `Time=`, `ScanRows=`
   and `ScanBytes=` fields), never from a stopwatch around a client call. A
   `kubectl exec ... mysql -e` wrapper costs ~5.5 s on this cluster, which swamped every
@@ -705,6 +775,6 @@ Start: Need OLAP Query Layer
 
 **Status**: ✅ Production Ready
 **Last Updated**: 2026-09-27
-**Technologies**: Flink 1.20, Paimon 1.3.2, Iceberg 1.10.0-amzn-1, StarRocks 4.1.4
+**Technologies**: Flink 1.20, Paimon 1.3.2, Iceberg 1.10.0-amzn-1, StarRocks 4.1.7
 (benchmark numbers above were captured on Paimon 1.3.0 — see the note in
 [Performance Comparison](#performance-comparison))

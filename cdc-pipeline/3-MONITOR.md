@@ -44,8 +44,15 @@ export EKS_CLUSTER_NAME=loadtest-mcp   # only needed for the IRSA step below
 
 ```bash
 cd cdc-pipeline
-bash ./monitoring/deploy-monitor.sh
+bash ./monitoring/deploy-monitor.sh                       # the v3 set (default): flink_*_db_v3
+CDC_DB_SUFFIX= bash ./monitoring/deploy-monitor.sh        # the v2 set: flink_paimon_db, flink_iceberg_db
 ```
+
+`CDC_DB_SUFFIX` picks the table set the monitor reads (`PAIMON_GLUE_DB` /
+`ICEBERG_GLUE_DB` = `flink_paimon_db<suffix>` / `flink_iceberg_db<suffix>`,
+rendered into the ConfigMap with envsubst). Unset, it is the value in
+`cdc-pipeline/.bench-env` (`_v3` on this branch, the Iceberg v3 set), else
+`_v3`; set but empty, the v2 set. Match it to the Flink jobs being monitored.
 
 There is **no image to build**. The monitor runs stock `python:3.11-slim`: the
 script pushes `flink_cdc_monitor.py`, `entrypoint.py`, and `requirements.txt`
@@ -105,13 +112,23 @@ affect them, and `./build-deploy-generic.sh cleanup` does not stop it. The relat
 |--------|--------|-------------|
 | **Job Status** | Flink REST `/jobs` | RUNNING, FAILING, RESTARTING, etc. |
 | **Parallelism** | Flink REST `/jobs/:id` | Current task parallelism |
-| **Throughput** | Flink REST `/jobs/:id/vertices` | Records in/out per operator |
+| **Throughput (rows/s)** | The tables' commit history | Rows each commit added / time between commits, per table and summed (`commits`). Falls back to the sources' `numRecordsOutPerSecond` (`rate meter`), then the source `numRecordsOut` delta (`counter`) when no commit landed in the window |
+| **Records Processed (counter)** | Flink REST `/vertices/:vid/subtasks/metrics` | Operator-scoped: the sources' `numRecordsOut` and the writers' `numRecordsIn`, restart-aware |
+| **Committed bytes** | Iceberg: `committedDataFilesByteCount`; Paimon: APPEND commits' delta manifests | Parquet bytes the window committed; compaction rewrites excluded |
 | **Checkpoint Status** | Flink REST `/jobs/:id/checkpoints` | Latest checkpoint size, duration, alignment |
-| **Checkpoint failures** | Flink REST `/jobs/:id/checkpoints` → `counts.failed` | **Cumulative since job start — see the caveat below** |
-| **Table Row Count** | pyiceberg / Glue API | Total records per sink table |
-| **Table File Count** | pyiceberg / Glue API | Data files per table |
-| **Table Size** | pyiceberg / Glue API | Total bytes on S3 |
-| **Snapshot Count** | pyiceberg / Glue API | Number of snapshots retained |
+| **Checkpoint failures** | Flink REST `/jobs/:id/checkpoints` → `counts.failed` | Reported as the **delta over the window**; the raw counter is cumulative — see the caveat below |
+| **Table Row Count** | Iceberg snapshot summary / Paimon snapshot | Total records per sink table |
+| **Table File Count** | Iceberg snapshot summary / Paimon manifests | Live data files per table (Paimon compaction nets out) |
+| **Table Size** | Iceberg snapshot summary (`total-files-size`) | Total bytes on S3 |
+| **Snapshot Count** | Iceberg metadata / Paimon `snapshot/` | Number of snapshots retained |
+
+The monitor is a port of `throughput-benchmark/monitoring/flink_cid_monitor.py`,
+extended to the four CDC tables. Throughput figures from the previous version
+(before 2026-11-01, including `bench-results/JOB-MONITOR-2026092*.md`) are **not
+comparable**: it summed `numRecordsOut` over every vertex, and with operator
+chaining off that counts each row once per hop — 6× on the Paimon graph (Source,
+DropUpdateBefore, Calc, ConstraintEnforcer, Map, bucket assigner), 3× on Iceberg
+(Source, Calc, ConstraintEnforcer).
 
 ### Checkpoint failure counts are cumulative, not current
 
@@ -129,9 +146,10 @@ since still reports the same non-zero `counts.failed` forever. A byte-identical
 `cp_fail` across two captures therefore tells you nothing about current health —
 it is the *expected* reading for a healthy job.
 
-Only the `history` array in the same response is authoritative for "is it
-checkpointing right now". Neither `capture-flink-metrics.sh` nor
-`flink_cdc_monitor.py::get_checkpoint_stats()` reads `history`, so check it by
+The monitor's "Failed Checkpoints (Δ)" row is the change in that counter over
+its window, so a stale lifetime value no longer shows there. Only the `history`
+array in the same response is authoritative for "is it checkpointing right now",
+and neither `capture-flink-metrics.sh` nor the monitor reads it, so check it by
 hand:
 
 ```bash
@@ -156,8 +174,8 @@ healthy regardless of what `counts.failed` says. Use the **delta** row
 
 | Table Type | How Stats Are Read |
 |------------|-------------------|
-| **Iceberg** | `pyiceberg` loads Glue catalog → reads snapshot summary from S3 metadata |
-| **Paimon** | pyiceberg fails (`table_type = PAIMON`) → falls back to `boto3 glue.get_table()` → reads `numRows`, `numFiles`, `totalSize` from Glue parameters |
+| **Iceberg** | `pyiceberg` loads Glue catalog → reads snapshot summary from S3 metadata. On an Iceberg v3 table the summaries also carry deletion-vector counts per commit (`added-dvs`, `removed-dvs`; Iceberg 1.12's SnapshotSummary has no running DV total, and `total-delete-files` / `added-delete-files` count the DVs too): the report sums them over the commits new in the window and shows a "Deletion Vectors (added / removed)" row and `total_new_dvs` / `total_removed_dvs` (per table `dvs_added_in_window`, ...) in the JSON. A v2 table has no such keys, and its report is unchanged |
+| **Paimon** | Its own metadata on S3: `snapshot/LATEST` → `snapshot-N` (`totalRecordCount`, commit kind and time), the manifest lists for live files, and APPEND commits' delta manifests for added bytes. Not the Glue parameters, which a Flink-written table never fills |
 
 ---
 
@@ -170,12 +188,12 @@ monitoring/
 ├── deploy-monitor.sh           ← Code ConfigMap + envsubst + kubectl apply (no image build)
 ├── flink_cdc_monitor.py        ← FlinkCDCMonitor class
 │   ├── Flink REST API client   → job status, throughput, checkpoints
-│   ├── pyiceberg table reader  → Iceberg snapshot stats
-│   └── Glue API fallback       → Paimon table stats via boto3
+│   ├── pyiceberg table reader  → Iceberg snapshot stats and commit history
+│   └── Paimon metadata reader  → snapshots + Avro manifests on S3 (fastavro)
 ├── entrypoint.py               ← Main loop: build monitors → run → sleep → repeat
 ├── monitor-deployment.yaml     ← Template: Deployment (python:3.11-slim) + ConfigMap
 ├── monitor-deployment-deployed.yaml ← Rendered output of the template (gitignored)
-└── requirements.txt            ← boto3, pyiceberg[glue,s3fs], pyarrow, requests, tabulate
+└── requirements.txt            ← boto3, pyiceberg[glue,s3fs] 0.12.0 (v3 metadata + DVs; was 0.9.1), pyarrow 21.0.0, requests, tabulate, fastavro, zstandard
 ```
 
 ### Key Configuration (ConfigMap)
@@ -184,8 +202,8 @@ monitoring/
 |---------|---------|-------------|
 | `PAIMON_FLINK_URL` | `http://flink-cdc-paimon-rest:8081` | Paimon Flink REST endpoint |
 | `ICEBERG_FLINK_URL` | `http://flink-cdc-iceberg-rest:8081` | Iceberg Flink REST endpoint |
-| `PAIMON_GLUE_DB` | `flink_paimon_db` | Paimon Glue database name |
-| `ICEBERG_GLUE_DB` | `flink_iceberg_db` | Iceberg Glue database name |
+| `PAIMON_GLUE_DB` | `flink_paimon_db${CDC_DB_SUFFIX}` | Paimon Glue database name (`flink_paimon_db_v3` by default on this branch) |
+| `ICEBERG_GLUE_DB` | `flink_iceberg_db${CDC_DB_SUFFIX}` | Iceberg Glue database name (`flink_iceberg_db_v3` by default on this branch) |
 | `PAIMON_WAREHOUSE` | `s3://<BUCKET>/paimon-warehouse/` | Paimon S3 warehouse path |
 | `ICEBERG_WAREHOUSE` | `s3://<BUCKET>/iceberg-warehouse/` | Iceberg S3 warehouse path |
 | `CDC_TABLES` | `customers,products,orders,order_items` | Tables to monitor |
