@@ -91,7 +91,10 @@ TRINO_WORKER_DEPLOY="${TRINO_WORKER_DEPLOY:-trino-worker}"
 TRINO_WORKERS="${TRINO_WORKERS:-3}"
 TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
 TRINO_USER="${TRINO_USER:-cdcbench}"
-TRINO_PORT="${TRINO_PORT:-8080}"
+# Not TRINO_PORT: Kubernetes service links set TRINO_PORT=tcp://<ip>:8080 in every pod
+# of the namespace (Service "trino"), and the runner then called
+# http://localhost:tcp://... ("Catalog name is empty"), failing every pin (2026-11-02).
+QB_TRINO_PORT="${QB_TRINO_PORT:-8080}"
 # The coordinator's REST API from the runner pod, for /v1/query/<id> (CPU and
 # input bytes; system.runtime.queries has neither).
 TRINO_URL="${TRINO_URL:-http://trino.${NAMESPACE}.svc.cluster.local:8080}"
@@ -409,7 +412,7 @@ qb_trino_cli() {   # <sql> [cli flags...]
     local sql="$1"; shift
     kubectl exec -i -n "$NAMESPACE" "$TRINO_COORDINATOR" -c "$TRINO_CONTAINER" -- \
         env JAVA_TOOL_OPTIONS="$TRINO_CLI_JAVA_OPTS" \
-        trino --server "http://localhost:${TRINO_PORT}" --user "$TRINO_USER" --catalog "$TRINO_CATALOG" \
+        trino --server "http://localhost:${QB_TRINO_PORT}" --user "$TRINO_USER" --catalog "$TRINO_CATALOG" \
               --schema "$ICEBERG_DB" "$@" --execute "$sql"
 }
 # TSV rows (NULL for null), stderr noise (JAVA_TOOL_OPTIONS banner) dropped.

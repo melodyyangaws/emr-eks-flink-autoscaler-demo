@@ -79,7 +79,7 @@ MAXR = int(E.get("MAX_RESULT_ROWS") or 10000)
 def cli(sql, extra, timeout):
     cmd = ["kubectl", "exec", "-i", "-n", E["NAMESPACE"], E["TRINO_COORDINATOR"], "-c", E["TRINO_CONTAINER"], "--",
            "env", "JAVA_TOOL_OPTIONS=" + E["TRINO_CLI_JAVA_OPTS"],
-           "trino", "--server", "http://localhost:" + E["TRINO_PORT"], "--user", E["TRINO_USER"],
+           "trino", "--server", "http://localhost:" + E["QB_TRINO_PORT"], "--user", E["TRINO_USER"],
            "--catalog", E["TRINO_CATALOG"], "--schema", E["ICEBERG_DB"]] + extra + ["--execute", sql]
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
@@ -127,7 +127,7 @@ def query_stats(qid):
         try:
             body = subprocess.run(["kubectl", "exec", "-n", E["NAMESPACE"], E["TRINO_COORDINATOR"], "-c", E["TRINO_CONTAINER"],
                                    "--", "curl", "-sf", "-H", "X-Trino-User: " + E["TRINO_USER"],
-                                   "http://localhost:%s/v1/query/%s" % (E["TRINO_PORT"], qid)],
+                                   "http://localhost:%s/v1/query/%s" % (E["QB_TRINO_PORT"], qid)],
                                   capture_output=True, timeout=60, check=True).stdout
         except Exception:
             return {}
@@ -216,7 +216,7 @@ jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1
 run_pass() {   # suite query-file rendered-sql-file tag
     local f="$2"
     NAMESPACE="$NAMESPACE" TRINO_COORDINATOR="$TRINO_COORDINATOR" TRINO_CONTAINER="$TRINO_CONTAINER" \
-    TRINO_CLI_JAVA_OPTS="$TRINO_CLI_JAVA_OPTS" TRINO_PORT="$TRINO_PORT" TRINO_USER="$TRINO_USER" \
+    TRINO_CLI_JAVA_OPTS="$TRINO_CLI_JAVA_OPTS" QB_TRINO_PORT="$QB_TRINO_PORT" TRINO_USER="$TRINO_USER" \
     TRINO_CATALOG="$TRINO_CATALOG" ICEBERG_DB="$ICEBERG_DB" TRINO_URL="$TRINO_URL" MAX_RESULT_ROWS="$MAX_RESULT_ROWS" \
     python3 "$PY" "$3" "$4" "$1" "$(qb_query_name "$f")" "$(qb_query_timeout "$1")" \
         "$(qb_query_flag "$f" allow-zero-rows && echo 1 || echo 0)" \

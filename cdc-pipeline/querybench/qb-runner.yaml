@@ -69,6 +69,9 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: ${NAME}
+      # No Docker-link env vars (TRINO_PORT=tcp://..., DUCKDB_WARM_CDC_PORT=...): they
+      # collide with harness settings; Services are reached by DNS name anyway.
+      enableServiceLinks: false
       nodeSelector:
         karpenter.sh/nodepool: driver-nodepool
         karpenter.sh/capacity-type: on-demand
