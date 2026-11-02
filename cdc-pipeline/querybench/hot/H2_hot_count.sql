@@ -11,8 +11,9 @@
 -- (same rows, one column, nothing returned) and H7 (same rows, key + values).
 -- order_items has no change timestamp: hot-key updates to older rows land in
 -- the partition of their creation date and are invisible to this window.
+-- Runs unchanged on DuckDB and Trino (TIMESTAMP literals: see H1).
 SELECT COUNT(*) AS rows_in_window
 FROM ${ORDER_ITEMS} AS oi
 WHERE oi.${ORDER_ITEMS_PART} = '${HOT_DT}'
-  AND oi.created_at >= '${HOT_FROM}'
-  AND oi.created_at <  '${HOT_TO}';
+  AND oi.created_at >= TIMESTAMP '${HOT_FROM}'
+  AND oi.created_at <  TIMESTAMP '${HOT_TO}';

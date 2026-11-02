@@ -47,7 +47,9 @@
 # A uniformly-random key stream would spread writes so thinly across 14M keys
 # that neither effect shows up, and the benchmark would measure raw ingest only.
 # So HOT_KEY_RATIO of the upserts land in a sliding window of the most recent
-# HOT_KEY_WINDOW keys, and the rest spread over the full range.
+# HOT_KEY_WINDOW keys, and the rest spread over the live range [MIN(pk), MAX(pk)]
+# (not [1, MAX]: after the tables are shrunk to their newest ~10% of ids, a cold
+# draw below MIN would INSERT at a deleted id and regrow the table).
 #
 # The skew is also the single biggest throughput lever, for a reason unrelated to
 # the format comparison: the non-hot remainder is uniform over ~100GB and misses
@@ -181,14 +183,23 @@ data:
         order_items carry FOREIGN KEYs to them — an id that was deleted would
         abort the whole multi-row statement, so inserts must use ids known to
         exist rather than a random number below MAX.
+
+        MIN(pk) is read too, for the same price (the other end of the same
+        index). The tables are periodically shrunk to their newest ~10% of ids,
+        so [1, MAX] is mostly holes: a cold "upsert" drawn below MIN finds no
+        row, takes the INSERT path at that old id, and the table regrows. Each
+        range is therefore (MIN, MAX); an empty table reads as (1, 1).
         """
         conn = connect()
         cur = conn.cursor()
         ranges = {}
         for table, pk in (('customers', 'customer_id'), ('products', 'product_id'),
                           ('orders', 'order_id'), ('order_items', 'order_item_id')):
-            cur.execute(f"SELECT MAX({pk}) FROM {table}")
-            ranges[table] = cur.fetchone()[0] or 1
+            cur.execute(f"SELECT MIN({pk}), MAX({pk}) FROM {table}")
+            lo, hi = cur.fetchone()
+            hi = hi or 1
+            lo = min(lo or 1, hi)
+            ranges[table] = (lo, hi)
 
         # FK parents: a bounded sample, taken off the primary key in id order so
         # it is an index range scan and not a sort.
@@ -205,15 +216,18 @@ data:
               flush=True)
         return ranges, cust, prod, ordr
 
-    def pick_key(max_id, rnd):
+    def pick_key(id_range, rnd):
         """Choose an existing primary key, skewed towards recent (hot) keys.
+
+        id_range is (MIN(pk), MAX(pk)) from sample_ids(). Every draw stays inside
+        it, so an "upsert" never lands on an id below MIN that no longer exists.
 
         When SHARD_HOT_KEYS is on, this pod's hot draws are confined to its own
         slice of the window so pods do not fight for the same rows — see the
         "Hot-window sharding" note above for the measurements behind that.
 
         The cold tail (1 - HOT_KEY_RATIO) stays deliberately unsharded and spans
-        the full key range: it is what keeps writes landing across every data
+        the full LIVE key range [MIN, MAX]: it is what keeps writes landing across every data
         file rather than only in the newest one, and it is uniform over millions
         of keys, so it contributes almost no lock contention anyway.
 
@@ -224,8 +238,9 @@ data:
         43% of the instance's entire 12,000-IOPS budget spent fetching pages the
         benchmark does not care about. Keep the tail small.
         """
+        min_id, max_id = id_range
         if rnd.random() < HOT_KEY_RATIO:
-            window_lo = max(1, max_id - HOT_WINDOW)
+            window_lo = max(min_id, max_id - HOT_WINDOW)
             if not SHARD_HOT:
                 return rnd.randint(window_lo, max_id)
             lo = window_lo + POD_ORDINAL * HOT_SLICE
@@ -236,9 +251,9 @@ data:
             if lo > max_id:
                 return rnd.randint(window_lo, max_id)
             return rnd.randint(lo, min(hi, max_id))
-        return rnd.randint(1, max_id)
+        return rnd.randint(min_id, max_id)
 
-    def plan_keys(max_id, n, rnd):
+    def plan_keys(id_range, n, rnd):
         """Plan a batch's primary keys: existing ids ASCENDING, then inserts.
 
         The ordering is not cosmetic, it is the deadlock fix. InnoDB takes a row
@@ -254,7 +269,7 @@ data:
         values above every existing key, so placing them at the end keeps the
         statement monotonic in key order too.
         """
-        keys = sorted(pick_key(max_id, rnd) for _ in range(n)
+        keys = sorted(pick_key(id_range, rnd) for _ in range(n)
                       if rnd.random() < UPSERT_RATIO)
         return keys, n - len(keys)
 

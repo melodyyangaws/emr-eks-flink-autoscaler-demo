@@ -13,11 +13,12 @@
 --     version ICEBERG_FORMAT_VERSION, 3 by default on this branch) for Iceberg
 --     readers, and
 --     registers it in Glue (metadata.iceberg.storage = hive-catalog)
---   - Lookup changelog producer for downstream CDC consumers
+--   - No changelog producer (changelog-producer = none): nothing reads one, and
+--     Iceberg writes none, so it would be a Paimon-only write cost
 --
 -- Streaming best practices applied:
 --   1. Spillable write buffers to prevent backpressure during burst writes
---   2. Smaller target file sizes (32-64MB) to match checkpoint-driven writes
+--   2. Target data files: 64 MB on customers/products, 128 MB on orders/order_items (same as Iceberg)
 --   3. Tuned compaction triggers to balance write amp vs read performance
 --   4. Manifest merging to keep read planning fast
 --   5. Async snapshot expiration to avoid checkpoint latency spikes
@@ -94,8 +95,8 @@ USE ${GLUE_DATABASE:flink_paimon_db};
 -- Table: customers (Dimension Table — unpartitioned)
 -- ============================================================================
 -- Low cardinality, frequent updates (address/phone changes).
--- Fewer buckets (2) since total data volume is small.
--- Smaller file target (32MB) and write buffer to save memory.
+-- 32 buckets, like every table here. Smaller write buffer (128mb) than the fact
+-- tables to save memory.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
     customer_name VARCHAR,
@@ -111,7 +112,10 @@ CREATE TABLE IF NOT EXISTS customers (
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
     'bucket' = '32',
-    'changelog-producer' = 'lookup',
+    -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
+    -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
+    -- still use lookup compaction (lookup-compact), independent of this option.
+    'changelog-producer' = 'none',
     'deletion-vectors.enabled' = 'true',
     -- 64-bit DV index format (default on, for the v3 default) — required for the
     -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
@@ -122,13 +126,15 @@ CREATE TABLE IF NOT EXISTS customers (
     'file.compression.zstd-level' = '1',
     -- Matches Iceberg's 'write.parquet.row-group-size-bytes' = '8388608'. Without
     -- this Paimon inherits parquet-mr's 128MB default block size and emits ONE row
-    -- group for a whole 32MB file (measured: 1 x 84MB row group, vs Iceberg's
+    -- group for a whole data file (measured on a 32MB file: 1 x 84MB row group, vs Iceberg's
     -- 5 x 16MB). Row group is the unit of predicate pushdown and scan splitting, so
     -- a single one means the reader can neither skip within the file nor parallelize
     -- across it — that penalizes Paimon on the read benchmark for a reason that has
     -- nothing to do with the LSM-vs-merge-on-read question being measured.
     'parquet.block.size' = '8388608',
-    'target-file-size' = '32mb',
+    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
+    -- Iceberg's write.target-file-size-bytes.
+    'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
@@ -136,9 +142,14 @@ CREATE TABLE IF NOT EXISTS customers (
     -- exists in Paimon 1.3.x or 2.1.0 CoreOptions (only compaction.min.file-num,
     -- for append tables), so Paimon stored it and ignored it. Dropping it changes
     -- no behaviour; it only stops implying a cap that never applied.
-    'snapshot.time-retained' = '1h',
+    -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
+    -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
+    -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
+    'snapshot.time-retained' = '12h',
     'snapshot.num-retained.min' = '5',
-    'snapshot.num-retained.max' = '10',
+    'snapshot.num-retained.max' = '1000',
+    -- Explicit Paimon default; pairs with Iceberg's write.metadata.metrics.default.
+    'metadata.stats-mode' = 'truncate(16)',
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
@@ -174,6 +185,15 @@ CREATE TABLE IF NOT EXISTS customers (
     -- the reader already supports is the fix that survives a pod restart.
     -- Costs a little manifest size; manifests are tiny next to the data files.
     'metadata.iceberg.manifest-compression' = 'snappy',
+    -- Export metadata retention, paired with the Iceberg tables'
+    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
+    -- default (0) deleted the previous metadata.json on every commit, so a path
+    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
+    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -194,7 +214,10 @@ CREATE TABLE IF NOT EXISTS products (
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
     'bucket' = '32',
-    'changelog-producer' = 'lookup',
+    -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
+    -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
+    -- still use lookup compaction (lookup-compact), independent of this option.
+    'changelog-producer' = 'none',
     'deletion-vectors.enabled' = 'true',
     -- 64-bit DV index format (default on, for the v3 default) — required for the
     -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
@@ -205,19 +228,26 @@ CREATE TABLE IF NOT EXISTS products (
     'file.compression.zstd-level' = '1',
     -- Matches Iceberg's 'write.parquet.row-group-size-bytes' = '8388608'. Without
     -- this Paimon inherits parquet-mr's 128MB default block size and emits ONE row
-    -- group for a whole 32MB file (measured: 1 x 84MB row group, vs Iceberg's
+    -- group for a whole data file (measured on a 32MB file: 1 x 84MB row group, vs Iceberg's
     -- 5 x 16MB). Row group is the unit of predicate pushdown and scan splitting, so
     -- a single one means the reader can neither skip within the file nor parallelize
     -- across it — that penalizes Paimon on the read benchmark for a reason that has
     -- nothing to do with the LSM-vs-merge-on-read question being measured.
     'parquet.block.size' = '8388608',
-    'target-file-size' = '32mb',
+    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
+    -- Iceberg's write.target-file-size-bytes.
+    'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'snapshot.time-retained' = '1h',
+    -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
+    -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
+    -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
+    'snapshot.time-retained' = '12h',
     'snapshot.num-retained.min' = '5',
-    'snapshot.num-retained.max' = '10',
+    'snapshot.num-retained.max' = '1000',
+    -- Explicit Paimon default; pairs with Iceberg's write.metadata.metrics.default.
+    'metadata.stats-mode' = 'truncate(16)',
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
@@ -229,6 +259,15 @@ CREATE TABLE IF NOT EXISTS products (
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
+    -- Export metadata retention, paired with the Iceberg tables'
+    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
+    -- default (0) deleted the previous metadata.json on every commit, so a path
+    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
+    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -236,8 +275,8 @@ CREATE TABLE IF NOT EXISTS products (
 -- Table: orders (Fact Table — partitioned by date)
 -- ============================================================================
 -- High write volume, mostly inserts + status updates.
--- 4 buckets to handle higher throughput per partition.
--- Larger file target (64MB) and write buffer for sustained throughput.
+-- 32 buckets, like every table here. Larger write buffer (256mb) for sustained
+-- throughput.
 CREATE TABLE IF NOT EXISTS orders (
     order_id INT,
     customer_id INT,
@@ -251,7 +290,10 @@ CREATE TABLE IF NOT EXISTS orders (
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
     'bucket' = '32',
-    'changelog-producer' = 'lookup',
+    -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
+    -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
+    -- still use lookup compaction (lookup-compact), independent of this option.
+    'changelog-producer' = 'none',
     'deletion-vectors.enabled' = 'true',
     -- 64-bit DV index format (default on, for the v3 default) — required for the
     -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
@@ -263,13 +305,20 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 16MB to match Iceberg's row-group-size on the fact tables — see the
     -- parquet.block.size note on `customers`.
     'parquet.block.size' = '16777216',
-    'target-file-size' = '64mb',
+    -- 128 MB on the fact tables (64 MB on customers/products), paired with
+    -- Iceberg's write.target-file-size-bytes.
+    'target-file-size' = '128mb',
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'snapshot.time-retained' = '1h',
+    -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
+    -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
+    -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
+    'snapshot.time-retained' = '12h',
     'snapshot.num-retained.min' = '5',
-    'snapshot.num-retained.max' = '10',
+    'snapshot.num-retained.max' = '1000',
+    -- Explicit Paimon default; pairs with Iceberg's write.metadata.metrics.default.
+    'metadata.stats-mode' = 'truncate(16)',
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
@@ -281,6 +330,15 @@ CREATE TABLE IF NOT EXISTS orders (
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
+    -- Export metadata retention, paired with the Iceberg tables'
+    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
+    -- default (0) deleted the previous metadata.json on every commit, so a path
+    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
+    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -301,7 +359,10 @@ CREATE TABLE IF NOT EXISTS order_items (
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
     'bucket' = '32',
-    'changelog-producer' = 'lookup',
+    -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
+    -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
+    -- still use lookup compaction (lookup-compact), independent of this option.
+    'changelog-producer' = 'none',
     'deletion-vectors.enabled' = 'true',
     -- 64-bit DV index format (default on, for the v3 default) — required for the
     -- v3 DV export, breaks StarRocks' native Paimon DV reader; 'false' for v2.
@@ -313,13 +374,20 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- 16MB to match Iceberg's row-group-size on the fact tables — see the
     -- parquet.block.size note on `customers`.
     'parquet.block.size' = '16777216',
-    'target-file-size' = '64mb',
+    -- 128 MB on the fact tables (64 MB on customers/products), paired with
+    -- Iceberg's write.target-file-size-bytes.
+    'target-file-size' = '128mb',
     'write-buffer-size' = '256mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
-    'snapshot.time-retained' = '1h',
+    -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
+    -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
+    -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
+    'snapshot.time-retained' = '12h',
     'snapshot.num-retained.min' = '5',
-    'snapshot.num-retained.max' = '10',
+    'snapshot.num-retained.max' = '1000',
+    -- Explicit Paimon default; pairs with Iceberg's write.metadata.metrics.default.
+    'metadata.stats-mode' = 'truncate(16)',
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
@@ -331,5 +399,14 @@ CREATE TABLE IF NOT EXISTS order_items (
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
+    -- Export metadata retention, paired with the Iceberg tables'
+    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
+    -- default (0) deleted the previous metadata.json on every commit, so a path
+    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
+    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50',
     'sink.writer-coordinator.enabled' = 'true'
 );

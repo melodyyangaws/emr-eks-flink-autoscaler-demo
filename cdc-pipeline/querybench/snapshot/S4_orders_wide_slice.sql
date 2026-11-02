@@ -9,22 +9,26 @@
 -- TIMESTAMP is whole seconds, so Paimon's TIMESTAMP(6) and Iceberg's
 -- TIMESTAMP(3) hold the same values and a seconds-aligned bound cuts both alike.
 -- The slice prunes by min/max order_date: Iceberg writes 'full' metrics for
--- every column, Paimon's own stats and its Iceberg export carry bounds too,
--- so pruning on this timestamp is comparable. It is NOT comparable on long
--- strings (Iceberg 'full' keeps whole bounds, Paimon truncates), which is why
--- the slice is on a timestamp. How well it prunes still depends on file layout,
--- which compaction changes (a bin-packed file spans the whole day): record the
--- compaction state with the result.
-SELECT COUNT(*)                         AS n,
-       SUM(${BYTES_FN}(shipping_address)
-         + ${BYTES_FN}(payment_method)
-         + ${BYTES_FN}(order_status)
-         + ${BYTES_FN}(${ORDERS_PART}))  AS string_bytes,
-       SUM(total_amount)                AS revenue,
-       SUM(customer_id)                 AS customer_id_sum,
-       SUM(order_id)                    AS order_id_sum,
-       COUNT(updated_at)                AS updated_at_n
+-- every column, so pruning on this timestamp is comparable across readers. It
+-- is NOT comparable on long strings (Iceberg 'full' keeps whole bounds, Paimon
+-- truncates), which is why the slice is on a timestamp. How well it prunes
+-- still depends on file layout, which compaction changes (a bin-packed file
+-- spans the whole day): record the compaction state with the result.
+-- Runs unchanged on DuckDB and Trino. The bounds are TIMESTAMP literals (Trino
+-- has no implicit VARCHAR -> TIMESTAMP coercion in a comparison). string_bytes
+-- is UTF-8 bytes via the BYTE_LEN_OPEN / BYTE_LEN_CLOSE dialect pair (DuckDB
+-- STRLEN, Trino LENGTH of TO_UTF8); integer sums are cast to BIGINT and the
+-- decimal sum to DECIMAL(38,2) so both engines print the same text.
+SELECT COUNT(*)                                        AS n,
+       CAST(SUM(${BYTE_LEN_OPEN}shipping_address${BYTE_LEN_CLOSE}
+              + ${BYTE_LEN_OPEN}payment_method${BYTE_LEN_CLOSE}
+              + ${BYTE_LEN_OPEN}order_status${BYTE_LEN_CLOSE}
+              + ${BYTE_LEN_OPEN}${ORDERS_PART}${BYTE_LEN_CLOSE}) AS BIGINT) AS string_bytes,
+       CAST(SUM(total_amount) AS DECIMAL(38,2))        AS revenue,
+       CAST(SUM(customer_id) AS BIGINT)                AS customer_id_sum,
+       CAST(SUM(order_id) AS BIGINT)                   AS order_id_sum,
+       COUNT(updated_at)                               AS updated_at_n
 FROM ${ORDERS}
 WHERE ${ORDERS_PART} = '${SNAPSHOT_DT}'
-  AND order_date >= '${S_FROM}'
-  AND order_date <  '${S_TO}';
+  AND order_date >= TIMESTAMP '${S_FROM}'
+  AND order_date <  TIMESTAMP '${S_TO}';

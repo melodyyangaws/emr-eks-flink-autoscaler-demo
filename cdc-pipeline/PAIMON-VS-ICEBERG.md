@@ -522,8 +522,10 @@ kubectl apply -f mysql-data-generator/mysql-upsert-loadgen.yaml
 # Flink-side: records written, throughput, checkpoint success/duration, state size
 ./monitoring/capture-flink-metrics.sh            # WINDOW=300 by default
 
-# StarRocks-side: server-side Time/ScanRows/ScanBytes per query, both catalogs
-./sql-scripts/starrocks/bench-server-side.sh
+# Query side: the numbers above came from sql-scripts/starrocks/bench-server-side.sh
+# (StarRocks FE audit log), since removed with StarRocks (git history has it).
+# The maintained harness is querybench/ (DuckDB vs Trino, server-side times):
+SUITE=hot ./querybench/run.sh start
 ```
 
 ### Running a comparison that means something
@@ -535,11 +537,11 @@ kubectl apply -f mysql-data-generator/mysql-upsert-loadgen.yaml
    sink committers: `/jobs` shows no error while the table silently stops advancing. Check
    per-vertex task states and `/jobs/<id>/checkpoints`, and confirm freshness on each side
    (`MAX(updated_at)` vs `UTC_TIMESTAMP()`) before trusting any query timing.
-3. **Take query timings server-side.** Use `bench-server-side.sh`, which reads `Time=`,
-   `ScanRows=` and `ScanBytes=` from the StarRocks FE audit log.
-   `bench-hot-data.sh` times client-side around `kubectl exec`, which costs ~5.5 s per
-   call on this cluster — enough that a bare `SELECT 1;` and a four-table join came back
-   within a few hundred ms of each other. Its absolute numbers are not quotable.
+3. **Take query timings server-side.** The 2026-09 numbers came from the StarRocks FE
+   audit log (`Time=`, `ScanRows=`, `ScanBytes=`); `querybench/` now takes them from the
+   DuckDB server's own timer and Trino's `system.runtime.queries`. Timing client-side
+   around `kubectl exec` costs ~5.5 s per call on this cluster — enough that a bare
+   `SELECT 1;` and a four-table join came back within a few hundred ms of each other.
 4. **Report `ScanRows` beside every timing.** It distinguishes "answered faster" from
    "matched nothing", which a wall-clock figure alone cannot.
 5. **Use `UTC_TIMESTAMP()` in hot-window predicates, never `NOW()`.** The FE session

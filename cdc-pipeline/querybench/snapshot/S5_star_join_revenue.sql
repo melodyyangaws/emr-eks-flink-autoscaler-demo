@@ -13,14 +13,16 @@
 -- On uncompacted Iceberg this needs the order_items delete set (S1) AND one per
 -- dimension table, held at once beside three join hash tables: expect it to be
 -- the first to fail. On Paimon each side is a DV-filtered scan.
--- Group keys are strings and the sums exact decimals, so results compare as
--- text across engines (no AVG, no float, no timestamp formatting).
-SELECT o.${ORDERS_PART}  AS order_day,
+-- Runs unchanged on DuckDB and Trino. Group keys are strings, units is cast
+-- to BIGINT and revenue to DECIMAL(38,2), and the ORDER BY is the full group
+-- key (NULLs last on both engines), so results compare as text (no AVG, no
+-- float, no timestamp).
+SELECT o.${ORDERS_PART}                         AS order_day,
        p.category,
        c.state,
-       COUNT(*)          AS items,
-       SUM(oi.quantity)  AS units,
-       SUM(oi.subtotal)  AS revenue
+       COUNT(*)                                 AS items,
+       CAST(SUM(oi.quantity) AS BIGINT)         AS units,
+       CAST(SUM(oi.subtotal) AS DECIMAL(38,2))  AS revenue
 FROM ${ORDER_ITEMS} oi
 JOIN ${ORDERS}    o ON o.order_id    = oi.order_id
 JOIN ${PRODUCTS}  p ON p.product_id  = oi.product_id

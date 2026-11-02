@@ -7,7 +7,9 @@ spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
   image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/emr-flink-cdc-paimon:${IMAGE_TAG}
-  imagePullPolicy: IfNotPresent
+  # Always: the tag (7.14.0) is rebuilt in place, so a node could otherwise run
+  # a stale copy. Layers already on the node are not re-downloaded.
+  imagePullPolicy: Always
   emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
 
   flinkConfiguration:

@@ -34,6 +34,12 @@ CREATE CATALOG iceberg_catalog WITH (
     'catalog-name' = 'iceberg_glue_catalog',
     'catalog-database' = '${GLUE_DATABASE:flink_iceberg_db}',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
+    -- urlconnection, not Iceberg 1.12's default 'apache': that type builds the
+    -- SDK's Apache5HttpClient, whose relocated httpcore5 classes are not in
+    -- EMR 7.14's AWS SDK v2 bundle (2.44.5), and GlueCatalog.initialize then
+    -- fails with NoClassDefFoundError ...thirdparty/org/apache/hc/core5/http/
+    -- ClassicHttpRequest (first v3 deploy, 2026-11-02).
+    'http-client.type' = 'urlconnection',
     'format-version' = '${ICEBERG_FORMAT_VERSION:3}'
 );
 

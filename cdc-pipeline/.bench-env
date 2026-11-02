@@ -16,7 +16,7 @@ unset _cdc_env_dir
 export NAMESPACE=emr-flink
 
 export ICEBERG_FORMAT_VERSION=3
-export CDC_DB_SUFFIX=_v3
+export CDC_DB_SUFFIX=_v3r1
 
 # SESSION_SUFFIX names one round of query results: they go to
 # s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
@@ -25,14 +25,18 @@ export CDC_DB_SUFFIX=_v3
 # Empty or suffix represent the test round like -r2. 
 export SESSION_SUFFIX=""
 
-# The CDC tables, as flink-cdc-{paimon,iceberg}-sql.yaml write them. 
+# The CDC tables, as flink-cdc-{paimon,iceberg}-sql.yaml write them. The query
+# benchmark reads the Iceberg tables only (querybench/README.md); FLINK_JOBS is
+# what it stops for the snapshot test.
 export PAIMON_WAREHOUSE="s3://${BUCKET_NAME}/paimon-warehouse"
 export ICEBERG_WAREHOUSE="s3://${BUCKET_NAME}/iceberg-warehouse"
 export FLINK_JOBS="flink-cdc-paimon flink-cdc-iceberg"
 
-# Starrocks Engine versions
-export SR_IMAGE_TAG=4.1.7
-export SR_CHART_VERSION=1.11.8
+# Trino: the version engine-deploy/deploy-trino.sh installs (chart
+# TRINO_CHART_VERSION, 1.45.0 = Trino 484), and the one querybench/run.sh
+# start requires on a Trino that is already up (TRINO_VERSION_CHECK=0 skips).
+export TRINO_VERSION=484
+export TRINO_CHART_VERSION=1.45.0
 
 # DuckDB: the image of the warm server (engine-deploy/deploy-duckdb-cdc.sh),
 # by default the DuckDB 2.0.0 built from source and pushed to this account's
@@ -47,6 +51,7 @@ export DUCKDB_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/duckd
 # them back.
 export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen deployment/mysql-data-generator"
 
-# ICEBERG_REQUIRE_COMPACTION=0 (one run) measures the Iceberg tables as they are.
+# The snapshot test submits these Iceberg compaction Jobs and measures the
+# compacted tables; ICEBERG_REQUIRE_COMPACTION=0 (one run) measures them as they are.
 export COMPACT_BEFORE_SNAPSHOT=true
 export COMPACT_TABLES="customers products orders order_items"

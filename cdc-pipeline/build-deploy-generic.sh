@@ -65,9 +65,14 @@ export ICEBERG_FORMAT_VERSION=${ICEBERG_FORMAT_VERSION:-3}
 # (flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}) and to the
 # Flink checkpoint / savepoint / HA / log paths (flink/cdc-paimon${CDC_DB_SUFFIX}/
 # ...), so one table set never touches, or restores state from, another.
-# Defaults to _v3 only when UNSET (note the '-', not ':-'): an explicit
-# CDC_DB_SUFFIX= selects the unsuffixed v2 set.
-export CDC_DB_SUFFIX=${CDC_DB_SUFFIX-_v3}
+# When UNSET, taken from cdc-pipeline/.bench-env (the value the query benchmark
+# and the monitor use), else _v3. An explicit CDC_DB_SUFFIX= (set, empty) selects
+# the unsuffixed v2 set.
+if [[ -z "${CDC_DB_SUFFIX+set}" ]]; then
+    CDC_DB_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${CDC_DB_SUFFIX+set}" ]] || exit 1; printf %s "$CDC_DB_SUFFIX"' \
+                      _ "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
+fi
+export CDC_DB_SUFFIX
 
 # PAIMON_DV_BITMAP64: Paimon 'deletion-vectors.bitmap64', derived from the
 # format version and not a setting of its own. The v3 export needs 64-bit DVs;

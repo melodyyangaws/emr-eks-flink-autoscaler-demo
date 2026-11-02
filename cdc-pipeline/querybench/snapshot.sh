@@ -1,103 +1,93 @@
 #!/usr/bin/env bash
-# Snapshot suite over the STOPPED CDC tables, in two independent phases, one
-# per format, each from a cold start (run.sh's runner step):
+# Snapshot suite over the STOPPED CDC tables, warm DuckDB vs Trino on the
+# compacted Iceberg tables and on Paimon's Iceberg export (ENGINES x FORMATS),
+# from a cold start, every arm of a format on the same pinned snapshot per
+# table (run.sh's runner step). One phase for both formats: the Paimon tables
+# do not change while the writers are stopped, so pinning them after the
+# Iceberg compaction gate costs nothing.
 #
-#   SNAPSHOT_FORMAT=paimon   the Paimon phase: StarRocks paimon + pmn_as_iceberg, DuckDB paimon
-#   SNAPSHOT_FORMAT=iceberg  the Iceberg phase: StarRocks iceberg, DuckDB iceberg
-#   (Iceberg v3 set, ICEBERG_FORMAT_VERSION=3: StarRocks pmn_as_iceberg and
-#   iceberg are skipped, see lib/querybench.sh, so the Paimon phase runs
-#   StarRocks paimon (JNI reader) + DuckDB paimon and the Iceberg phase DuckDB
-#   iceberg alone; SR_V3_ARMS=1 runs the skipped arms to record their errors)
-#   SNAPSHOT_FORMAT=both     (default) the Paimon phase now, then the Iceberg
-#                            phase as soon as its gate passes (this Job waits)
+#   1. gate: the CDC writers stopped (suspended here if not already); with
+#      iceberg in FORMATS, the Iceberg compaction completed (qb_compaction_gate: every COMPACT_TABLES
+#      Job iceberg-compact-<t> SUCCEEDED and the table's current snapshot is its
+#      replace commit; waits for it when run.sh submitted it,
+#      COMPACT_BEFORE_SNAPSHOT=true, else refuses at once;
+#      ICEBERG_REQUIRE_COMPACTION=0 skips it); every engine in ENGINES up
+#      (qb_engines_gate: duckdb-warm-cdc busy=false, Trino with TRINO_WORKERS
+#      active workers);
+#   2. pin: the four tables of every format, AFTER the gate, so the compacted
+#      Iceberg snapshot is pinned; Trino checked to read every pin (a paimon
+#      table it cannot read is a WARNING, its queries record the error);
+#   3. the S4 slice [S_FROM, S_TO) on the pinned tables, unless set (untimed,
+#      on qb_setup_engine, before the cold start);
+#   4. cold start: clear-caches.sh (DuckDB server restarted,
+#      deploy-trino.sh clear-cache);
+#   5. each engine in ENGINES order (default duckdb, then trino): warm-up +
+#      timed passes;
+#   6. uploads bench-results/ (QB_RESULTS_PREFIX_RUN, set by run.sh).
+# SNAPSHOT_DT comes from run.sh (exported). By hand, set it, or it is resolved.
 #
-# Each phase:
-#   1. gate. Both phases: the writers stopped (suspended here if not already)
-#      and the engines up (qb_engines_gate: FE + all BEs Ready, duckdb-warm-cdc
-#      busy=false). The Iceberg phase also needs its compaction finished
-#      (qb_compaction_gate: every COMPACT_TABLES Job iceberg-compact-<t>
-#      SUCCEEDED and the table's current snapshot is its replace commit). The
-#      Paimon phase never waits for compaction: Paimon compacts in its writer.
-#   2. pin: this format's four tables only, AFTER the gate (so the Iceberg
-#      phase pins the compacted snapshot);
-#   3. cold start: clear-caches.sh (StarRocks datacache wiped + BEs restarted,
-#      DuckDB server restarted);
-#   4. StarRocks (the phase's arms), then DuckDB (the phase's arm): warm-up +
-#      timed passes as usual;
-#   5. uploads bench-results/ so far (QB_RESULTS_PREFIX_RUN, set by run.sh).
-# SNAPSHOT_DT / S_FROM / S_TO come from run.sh (exported), the same for both
-# phases. By hand, set them, or qb_start_suite resolves them.
-#
-# Output: as starrocks.sh / duckdb-warm.sh (both phases append to the same
-# CSVs), tables-<STAMP>.tsv, and snapshot-<STAMP>-<format>.pins per phase
-# (gate times, cache-clear time, pinned snapshot ids, windows, writer state).
+# Output: as duckdb-warm.sh / trino.sh, tables-<STAMP>.tsv, and
+# snapshot-<STAMP>.pins (gate times, cache-clear time, pinned snapshot ids,
+# windows, writer state).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SUITE=snapshot
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
 export STAMP
-export ENGINES="${ENGINES:-starrocks duckdb}"
-SNAPSHOT_FORMAT="${SNAPSHOT_FORMAT:-both}"
-case "$SNAPSHOT_FORMAT" in paimon|iceberg|both) ;; *) qb_die "SNAPSHOT_FORMAT must be paimon|iceberg|both, got '${SNAPSHOT_FORMAT}'" ;; esac
+ENGINE_LIST=$(qb_engines)
+export ENGINES="$ENGINE_LIST"
 mkdir -p "$OUT_DIR"
 now() { date -u '+%Y-%m-%d %H:%M:%SZ'; }
+PINS="${OUT_DIR}/snapshot-${STAMP}.pins"
 
 upload() {
     [[ -n "${QB_RESULTS_PREFIX_RUN:-}" ]] || return 0
     aws s3 sync "$OUT_DIR" "s3://${BUCKET_NAME}/${QB_RESULTS_PREFIX_RUN}" --only-show-errors \
-        && echo "status: results-uploaded-${1} ${QB_RESULTS_PREFIX_RUN}" || echo "status: results-upload-failed-${1}"
+        && echo "status: results-uploaded-snapshot ${QB_RESULTS_PREFIX_RUN}" || echo "status: results-upload-failed-snapshot"
 }
 
-phase() {   # <paimon|iceberg>
-    local fmt="$1" pins="${OUT_DIR}/snapshot-${STAMP}-$1.pins" g p rc=0 r sr_arms duck_fmt
-    local engines="$ENGINES"
-    case "$fmt" in
-        paimon)  sr_arms="paimon pmn_as_iceberg"; duck_fmt=paimon ;;
-        iceberg) sr_arms="iceberg";               duck_fmt=iceberg ;;
-    esac
-    sr_arms=$(qb_sr_arms_filter "$sr_arms")
-    # No StarRocks arm left in this phase (v3 Iceberg phase): StarRocks is not
-    # cleared or run here; it stays up for the gate only.
-    [[ -z "$sr_arms" ]] && engines="${engines//starrocks/}"
-    qb_log "=== ${fmt} phase: StarRocks ${sr_arms:-none}, DuckDB ${duck_fmt} ==="
-    { echo "stamp=${STAMP} suite=snapshot phase=${fmt} dt=${QB_SNAPSHOT_DT} slice=[${QB_S_FROM}, ${QB_S_TO}) engines=${ENGINES} sr_arms=${sr_arms:-none}"
-      qb_run_meta
-      echo "phase_started_at=$(now)"; } > "$pins"
-    # 1. gate
-    qb_stop_writers || qb_die "the writers could not be stopped"
-    echo "gate_writers_stopped_at=$(now) writers=$(qb_writer_state) generator=$(qb_generator_state)" >> "$pins"
-    if [[ "$fmt" == iceberg ]]; then
-        g=$(qb_compaction_gate "$([[ "$SNAPSHOT_FORMAT" == both ]] && echo 1 || echo 0)") || exit 1
-        echo "$g" >> "$pins"
-    fi
-    g=$(qb_engines_gate) || exit 1
-    echo "$g" >> "$pins"
-    # 2. pin, after the gate
-    p=$(QB_PIN_FORMATS="$fmt" ARMS="$sr_arms" "${HERE}/pin.sh" "${STAMP}-${fmt}") || qb_die "pinning (${fmt}) failed"
-    eval "$p"
-    # shellcheck disable=SC2046
-    export $(compgen -v | grep -E '^(QB_PIN_|SR_PIN_FORM$)') 2>/dev/null || true
-    { qb_pins_dump | grep -E "^QB_PIN_(SNAP|META|COMMIT_MS|FORMAT_VERSION)_($( [[ $fmt == paimon ]] && echo 'PAIMON|PMNICE' || echo ICEBERG ))_"
-      echo "SR_PIN_FORM=${SR_PIN_FORM:-clause}"; echo "pinned_at=$(now)"; } >> "$pins"
-    # 3. cold start, right before the warm-up pass
-    ENGINES="$engines" "${HERE}/clear-caches.sh" || qb_die "${fmt} phase: could not clear the caches"
-    echo "caches_cleared_at=$(now)" >> "$pins"
-    # 4. the passes
-    if [[ "$engines" == *starrocks* ]]; then
-        ARMS="$sr_arms" "${HERE}/starrocks.sh"; r=$?; echo "status: starrocks-${fmt}-exit=${r}"; (( r == 0 )) || rc=$r
-    fi
-    if [[ "$engines" == *duckdb* ]]; then
-        FORMAT="$duck_fmt" "${HERE}/duckdb-warm.sh" run; r=$?; echo "status: duckdb-${fmt}-exit=${r}"; (( r == 0 )) || rc=$r
-    fi
-    echo "phase_finished_at=$(now) rc=${rc}" >> "$pins"
-    upload "$fmt"
-    return $rc
-}
-
-qb_start_suite snapshot
-export SNAPSHOT_DT="$QB_SNAPSHOT_DT" S_FROM="$QB_S_FROM" S_TO="$QB_S_TO"
 rc=0
-if [[ "$SNAPSHOT_FORMAT" != iceberg ]]; then phase paimon || rc=$?; fi
-if [[ "$SNAPSHOT_FORMAT" != paimon ]];  then phase iceberg || rc=$?; fi
+qb_resolve_snapshot_dt
+qb_log "=== snapshot: dt=${QB_SNAPSHOT_DT}, engines ${ENGINE_LIST}, formats $(qb_formats) ==="
+{ echo "stamp=${STAMP} suite=snapshot dt=${QB_SNAPSHOT_DT} engines=${ENGINE_LIST// /,} formats=$(qb_formats | tr ' ' ',')"
+  qb_run_meta
+  echo "started_at=$(now)"; } > "$PINS"
+# 1. gate
+qb_stop_writers || qb_die "the writers could not be stopped"
+echo "gate_writers_stopped_at=$(now) writers=$(qb_writer_state "$FLINK_JOBS") generator=$(qb_generator_state)" >> "$PINS"
+if qb_has_format iceberg; then
+    g=$(qb_compaction_gate "$([[ "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]] && echo 1 || echo 0)") || exit 1
+    echo "$g" >> "$PINS"
+else
+    echo "compaction_gate=not needed (FORMATS=paimon: Paimon compacts in its writer)" >> "$PINS"
+fi
+g=$(qb_engines_gate) || exit 1
+echo "$g" >> "$PINS"
+# 2. pin, after the gate
+p=$("${HERE}/pin.sh" "${STAMP}") || qb_die "pinning failed"
+eval "$p"
+# shellcheck disable=SC2046
+export $(compgen -v | grep -E '^QB_PIN_') 2>/dev/null || true
+{ qb_pins_dump; echo "pinned_at=$(now)"; } >> "$PINS"
+# 3. the slice, on the pinned tables
+qb_resolve_snapshot_slice
+export SNAPSHOT_DT="$QB_SNAPSHOT_DT" S_FROM="$QB_S_FROM" S_TO="$QB_S_TO"
+echo "slice=[${QB_S_FROM}, ${QB_S_TO}) (${QB_S_HOW})" >> "$PINS"
+qb_log "snapshot slice (S4, orders.order_date): [${S_FROM}, ${S_TO}) (${QB_S_HOW})"
+# 4. cold start, right before the first warm-up pass
+"${HERE}/clear-caches.sh" || qb_die "could not clear the caches"
+echo "caches_cleared_at=$(now)" >> "$PINS"
+# 5. the passes. The second engine starts cold too: neither shares a cache
+# with the other, and clear-caches.sh emptied both.
+for e in $ENGINE_LIST; do
+    case "$e" in
+        duckdb) "${HERE}/duckdb-warm.sh" run; r=$? ;;
+        trino)  "${HERE}/trino.sh" run; r=$? ;;
+    esac
+    echo "status: ${e}-snapshot-exit=${r}"; echo "${e}_finished_at=$(now) rc=${r}" >> "$PINS"
+    (( r == 0 )) || rc=$r
+done
+echo "finished_at=$(now) rc=${rc}" >> "$PINS"
+upload
 exit $rc

@@ -12,29 +12,25 @@
 --   order_items: created_at, its only timestamp. Upserts change quantity /
 --     unit_price but not created_at, so the window holds the rows INSERTED in
 --     it; created_at fixes the partition, so the partition filter only prunes.
--- Paimon's Iceberg export (pmn_as_iceberg, DuckDB paimon) does not list every
--- file the native reader sees, so its counts here can be LOWER than the native
--- reader's at the same snapshot:
---   v3 set (default, Paimon 2.1, metadata.iceberg.format-version 3 with
---     bitmap64 deletion vectors): the export lists every file above LSM level 0
---     and exports the deletion vectors, so it trails by the rows still in level
---     0, about one checkpoint; that is the newest data, i.e. this window.
---   v2 set (ICEBERG_FORMAT_VERSION=2, CDC_DB_SUFFIX empty): only the top LSM
---     level is listed and no deletion vectors are exported, so rows not yet
---     fully compacted are missing.
+-- Runs unchanged on DuckDB and Trino. Window bounds are TIMESTAMP literals:
+-- Trino has no implicit VARCHAR -> TIMESTAMP coercion in a comparison. The
+-- newest values print as 'YYYY-MM-DD HH:MM:SS' text (first 19 characters of
+-- the VARCHAR cast): DuckDB drops a zero fraction, Trino prints timestamp(6)
+-- with six digits, so the raw values would not compare as text. The source
+-- (MySQL TIMESTAMP) is whole seconds, so nothing is lost.
 -- Compare this row across arms before trusting any hot number.
-SELECT LEAST(o.rows_in_window, i.rows_in_window) AS min_rows_in_window,
-       o.rows_in_window                          AS orders_changed,
-       i.rows_in_window                          AS items_created,
-       o.newest                                  AS orders_newest_change,
-       i.newest                                  AS items_newest_insert
+SELECT LEAST(o.rows_in_window, i.rows_in_window)      AS min_rows_in_window,
+       o.rows_in_window                               AS orders_changed,
+       i.rows_in_window                               AS items_created,
+       SUBSTR(CAST(o.newest AS VARCHAR), 1, 19)       AS orders_newest_change,
+       SUBSTR(CAST(i.newest AS VARCHAR), 1, 19)       AS items_newest_insert
 FROM (SELECT COUNT(*) AS rows_in_window, MAX(t.updated_at) AS newest
       FROM ${ORDERS} AS t
-      WHERE t.updated_at >= '${HOT_FROM}'
-        AND t.updated_at <  '${HOT_TO}') AS o
+      WHERE t.updated_at >= TIMESTAMP '${HOT_FROM}'
+        AND t.updated_at <  TIMESTAMP '${HOT_TO}') AS o
 CROSS JOIN
      (SELECT COUNT(*) AS rows_in_window, MAX(t.created_at) AS newest
       FROM ${ORDER_ITEMS} AS t
       WHERE t.${ORDER_ITEMS_PART} = '${HOT_DT}'
-        AND t.created_at >= '${HOT_FROM}'
-        AND t.created_at <  '${HOT_TO}') AS i;
+        AND t.created_at >= TIMESTAMP '${HOT_FROM}'
+        AND t.created_at <  TIMESTAMP '${HOT_TO}') AS i;

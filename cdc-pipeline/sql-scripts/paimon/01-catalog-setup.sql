@@ -20,6 +20,13 @@ CREATE CATALOG paimon_catalog WITH (
     'lock.enabled' = 'false',
     'metastore' = 'hive',
     's3.region' = '${AWS_REGION}',
+    -- Paimon 2.1 opens s3:// through its paimon-s3 plugin (PluginFileIO ->
+    -- HadoopCompliantFileIO), an isolated S3A that takes only these s3.*
+    -- options, never hadoop-conf-dir. Without this it uses Hadoop's default
+    -- chain, which has no IRSA provider: NoAuthWithAWSException on the warehouse
+    -- (first v3 deploy, 2026-11-02). The plugin bundles the STS module the
+    -- web-identity provider needs.
+    's3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider',
     'hive-conf-dir' = '/glue/confs/hive/conf',
     'hadoop-conf-dir' = '/glue/confs/hadoop/conf',
     'warehouse' = '${PAIMON_WAREHOUSE}',

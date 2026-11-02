@@ -1,46 +1,64 @@
 #!/usr/bin/env bash
-# Shared by the CDC query benchmark's drivers (querybench/starrocks.sh,
-# duckdb-warm.sh, hot-interleave.sh, pin.sh, run.sh, qb-watch.sh). Sourced,
-# never run. Adapted from throughput-benchmark/lib/querybench.sh: one copy of
-# everything both engines must agree on (the query files and how they render,
-# the windows, the pins, the timeout, the median, the writer stop and the
-# results format).
+# Shared by the CDC query benchmark's drivers (querybench/duckdb-warm.sh,
+# trino.sh, hot-interleave.sh, snapshot.sh, pin.sh, run.sh, qb-watch.sh,
+# clear-caches.sh) and engine-deploy/deploy-duckdb-cdc.sh. Sourced, never run.
+# One copy of everything both engines must agree on: the query files and how
+# they render, the windows, the pins, the timeout, the median, the writer stop
+# and the results format.
 #
-# What differs from throughput: four tables instead of one (customers,
-# products, orders, order_items), each with its OWN pinned version, and the
-# partition column names differ between the formats.
+# Two engines x two storage formats = four arms (ENGINES x FORMATS), every arm
+# on a pinned version of each table. Flink writes both formats (the two CDC
+# jobs); DuckDB and Trino only query:
+#   duckdb:iceberg   the warm DuckDB server (engine-deploy/deploy-duckdb-cdc.sh),
+#                    iceberg_scan() of a COPY of the Iceberg table's pinned metadata.json
+#   trino:iceberg    Trino (engine-deploy/deploy-trino.sh), catalog `iceberg`
+#                    (Glue), <ICEBERG_DB>.<t> FOR VERSION AS OF the pinned snapshot id
+#   duckdb:paimon    iceberg_scan() of a COPY of Paimon's Iceberg export
+#                    metadata.json (vN.metadata.json, version-hint.text), with
+#                    iceberg_unsafe_skip_puffin_verification on (the server's
+#                    SKIP_PUFFIN_VERIFICATION_ARMS, default paimon on v3)
+#   trino:paimon     the same Iceberg connector over Paimon's export: its
+#                    hive-catalog export registers each table in the Paimon Glue
+#                    DB as table_type=ICEBERG, so <PAIMON_DB>.<t> FOR VERSION AS OF
+#                    the export's snapshot id (no native Paimon connector exists
+#                    for Trino 484)
+# One pin.sh call pins both formats; both engines of a format read the same
+# snapshot (DuckDB the copied metadata.json, Trino its snapshot id). The two
+# formats are pinned at the same moment, not at the same binlog point: the
+# export lags native Paimon by about a checkpoint, so iceberg vs paimon rows
+# are a pipeline gap, not a failure (summarize.py). An arm that cannot read a
+# table (duckdb:paimon on the v3 set: "Manifest ... missing required Avro
+# key-value metadata field 'schema'", a Paimon 2.1 export bug) records ERROR
+# per query and the run goes on.
 #
 # Placeholders in querybench/hot/*.sql and querybench/snapshot/*.sql
 # (qb_render; any other ${...} left after rendering stops the run):
 #   ${CUSTOMERS} ${PRODUCTS} ${ORDERS} ${ORDER_ITEMS}
-#       the table, per engine and arm, at its pinned version:
-#         StarRocks  <catalog>.<db>.<table> FOR VERSION AS OF CAST(<id> AS BIGINT)
-#         DuckDB     iceberg_scan('<copied metadata.json>')
-#       An alias may follow (`FROM ${ORDERS} o`, `${ORDERS} AS o`): StarRocks'
-#       grammar takes it after the version clause (relationPrimary #tableAtom:
-#       qualifiedName queryPeriod? ... (AS? alias)?, StarRocks.g4 on main,
-#       checked 2026-11-02). SR_PIN_FORM=subquery renders
-#       (SELECT * FROM <table> FOR VERSION AS OF ...) instead, adding
-#       `AS <table>` where no alias follows; pin.sh switches to it by itself if
-#       the clause form does not parse on the running FE.
+#       the table at its pinned version, per engine and arm (qb_table_expr):
+#         duckdb  iceberg_scan('<copied metadata.json of that format>')
+#         trino   <TRINO_CATALOG>.<ICEBERG_DB|PAIMON_DB>.<table> FOR VERSION AS OF <snapshot id>
+#       An alias may follow (`FROM ${ORDERS} o`, `${ORDERS} AS o`): Trino's
+#       grammar (aliasedRelation: relationPrimary (AS? identifier)?, with
+#       relationPrimary: qualifiedName queryPeriod?) takes it after the
+#       version clause.
 #   ${ORDERS_PART} ${ORDER_ITEMS_PART}
-#       the partition column: Paimon order_date_str / created_date_str (also
-#       for pmn_as_iceberg and DuckDB's paimon arm: the export keeps Paimon's
-#       names), Iceberg order_dt / created_dt (flink_iceberg_db, confirmed from
-#       the tables' partition-specs 2026-11-02)
-#   ${BYTES_FN}        LENGTH (StarRocks) / STRLEN (DuckDB): both count bytes
+#       the partition column (STRING, 'YYYY-MM-DD'), per arm: iceberg
+#       order_dt / created_dt (sql-scripts/iceberg/03-iceberg-sinks.sql),
+#       paimon order_date_str / created_date_str (the export keeps Paimon's names)
 #   ${HOT_DT} ${HOT_FROM} ${HOT_TO}            hot window (UTC, 'YYYY-MM-DD HH:MM:SS')
 #   ${SNAPSHOT_DT} ${S_FROM} ${S_TO}           snapshot partition and the slice inside it
 #                                              (S_FROM/S_TO: bounds on orders.order_date)
 #   ${LOOKUP_ORDER_ID} ${LOOKUP_ORDER_DT}      hot H8's key: an order updated in the
 #                                              window, picked once per run (qb_resolve_lookup)
-# Every value is a literal resolved once per run (per pass for the hot tables),
-# never a clock function in the SQL: the StarRocks FE session timezone is +08:00
-# and the data is UTC.
+#   dialect keys    every KEY=VALUE line of querybench/dialect-<engine>.env
+#                   (BYTE_LEN_OPEN / BYTE_LEN_CLOSE), written with the SQL; a key may not
+#                   shadow one of the placeholders above. The file must exist.
+# Every value is a literal resolved once per run (per pass for the hot pins),
+# never a clock function in the SQL.
 #
 # File name = query name, lexical order = run order. A `-- bench: <flag>` line
-# sets a per-query flag: allow-zero-rows, leading-col-is-label (DuckDB's
-# ZERO_SCAN guard), io-tasks=1 (StarRocks: one connector io task per scan).
+# sets a per-query flag: allow-zero-rows, leading-col-is-label (the ZERO_SCAN
+# guard, the same on every arm).
 
 [[ -n "${_CDC_QUERYBENCH_LIB:-}" ]] && return 0
 _CDC_QUERYBENCH_LIB=1
@@ -48,8 +66,8 @@ _CDC_QUERYBENCH_LIB=1
 # shellcheck source=common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 QB_DIR="${CDC_DIR}/querybench"
+QB_DIALECT_DIR="${QB_DIALECT_DIR:-${QB_DIR}}"
 
-FE_POD="${FE_POD:-kube-starrocks-fe-0}"
 : "${BUCKET_NAME:?BUCKET_NAME is not set (.bench-env / .bench-env.local)}"
 QB_TABLES="customers products orders order_items"
 PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE:-s3://${BUCKET_NAME}/paimon-warehouse}"; PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE%/}"
@@ -59,20 +77,26 @@ PAIMON_DB="${PAIMON_DB:-flink_paimon_db${CDC_DB_SUFFIX:-}}"
 ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${CDC_DB_SUFFIX:-}}"
 # Paimon's Iceberg export ('metadata.iceberg.storage' = 'hive-catalog' in
 # 03-paimon-sinks.sql): <warehouse>/iceberg/<db>/<table>/metadata/vN.metadata.json
-# plus version-hint.text, the hadoop-catalog layout. N is Paimon's own snapshot
-# id (LATEST=118 <-> v118, current-snapshot-id 118 on orders, 2026-11-02). Glue
-# also points at it (metadata_location on the Paimon table), but the Glue entry
-# carries PaimonStorageHandler, which StarRocks' Glue Iceberg catalog cannot load.
+# plus version-hint.text. N is Paimon's own snapshot id.
 PMNICE_ROOT="${PMNICE_ROOT:-${PAIMON_WAREHOUSE}/iceberg/${PAIMON_DB}}"
 FLINK_JOBS="${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}"
 GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen deployment/mysql-data-generator}"
-# StarRocks catalogs of this harness: own names, so they never collide with the
-# throughput benchmark's (cid_*) or the CDC guide's (paimon_catalog, iceberg_catalog),
-# and suffixed with CDC_DB_SUFFIX, so the v2 and v3 table sets get their own
-# (cdc_paimon_catalog_v3, ...; an existing catalog is never re-created).
-SR_PAIMON_CATALOG="${SR_PAIMON_CATALOG:-cdc_paimon_catalog${CDC_DB_SUFFIX:-}}"
-SR_ICEBERG_CATALOG="${SR_ICEBERG_CATALOG:-cdc_iceberg_catalog${CDC_DB_SUFFIX:-}}"
-SR_PMNICE_CATALOG="${SR_PMNICE_CATALOG:-cdc_pmn_as_ice${CDC_DB_SUFFIX:-}}"
+DUCKDB_NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
+# Trino (engine-deploy/deploy-trino.sh: the trino Helm chart, release `trino`).
+# The CLI ships in the coordinator image (/usr/bin/trino, same version as the
+# server, its own JDK), so trino.sh runs it there through kubectl exec.
+TRINO_COORDINATOR="${TRINO_COORDINATOR:-deploy/trino-coordinator}"
+TRINO_CONTAINER="${TRINO_CONTAINER:-trino-coordinator}"
+TRINO_WORKER_DEPLOY="${TRINO_WORKER_DEPLOY:-trino-worker}"
+TRINO_WORKERS="${TRINO_WORKERS:-3}"
+TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
+TRINO_USER="${TRINO_USER:-cdcbench}"
+TRINO_PORT="${TRINO_PORT:-8080}"
+# The coordinator's REST API from the runner pod, for /v1/query/<id> (CPU and
+# input bytes; system.runtime.queries has neither).
+TRINO_URL="${TRINO_URL:-http://trino.${NAMESPACE}.svc.cluster.local:8080}"
+# Heap of the CLI's own JVM in the coordinator container (it only streams results).
+TRINO_CLI_JAVA_OPTS="${TRINO_CLI_JAVA_OPTS:--Xmx512m -XX:TieredStopAtLevel=1}"
 # Copies of the pinned metadata.json files (one key per run and table).
 QB_PIN_PREFIX="${QB_PIN_PREFIX:-querybench-pins/cdc-session${CDC_SET_TAG:-}${SESSION_SUFFIX}}"
 SUITE="${SUITE:-all}"
@@ -88,137 +112,111 @@ case "$SUITE" in all|hot|snapshot) ;; *) qb_die "SUITE must be all|hot|snapshot,
 qb_suites() { case "$SUITE" in all) echo "hot snapshot" ;; *) echo "$SUITE" ;; esac; }
 qb_upper() { tr '[:lower:]' '[:upper:]' <<<"$1"; }
 
-# The StarRocks FE's MySQL port; root has no password in this deployment.
-qb_sr() {
-    kubectl exec -n "$NAMESPACE" "$FE_POD" -- \
-        mysql -h127.0.0.1 -P9030 -uroot -N -B -e "$1" 2>/dev/null
+# ── Formats (arms) ──────────────────────────────────────────────────────────
+# FORMATS=iceberg|paimon|both (default both) -> "iceberg paimon" or one.
+qb_formats() {
+    case "${FORMATS:-both}" in
+        both|"iceberg paimon"|"paimon iceberg"|iceberg,paimon|paimon,iceberg) echo "iceberg paimon" ;;
+        iceberg|paimon) echo "$FORMATS" ;;
+        *) qb_die "FORMATS must be iceberg|paimon|both, got '${FORMATS}'" ;;
+    esac
 }
+qb_has_format() { [[ " $(qb_formats) " == *" $1 "* ]]; }
+# The writer(s) whose tables are queried (one per format in FORMATS): the hot
+# test needs them RUNNING and a suite is void if their state changes under it.
+# FLINK_JOBS (both) is what the snapshot test and the watcher suspend.
+QB_QUERY_WRITERS="${QB_QUERY_WRITERS:-$(for _f in $(qb_formats); do printf 'flink-cdc-%s ' "$_f"; done)}"
+QB_QUERY_WRITERS="${QB_QUERY_WRITERS% }"
 
-# ── Dates (BSD date first, GNU second: run.sh runs on macOS, the rest in a pod) ──
-qb_utc_minus_sec() {   # "<YYYY-MM-DD HH:MM:SS>" <seconds>
-    date -u -j -v-"$2"S -f '%Y-%m-%d %H:%M:%S' "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-      || date -u -d "@$(( $(date -u -d "$1" +%s) - $2 ))" '+%Y-%m-%d %H:%M:%S'
-}
-
-# ── Arms, tables, partition columns ─────────────────────────────────────────
-# StarRocks arms: paimon (Paimon reader), pmn_as_iceberg (Iceberg reader on
-# Paimon's export), iceberg (Iceberg reader on the Iceberg table).
-# DuckDB arms: paimon (iceberg_scan on Paimon's export), iceberg.
-SR_ARMS_ALL="paimon pmn_as_iceberg iceberg"
-DUCK_ARMS_ALL="paimon iceberg"
-# Iceberg v3 (ICEBERG_FORMAT_VERSION=3): StarRocks 4.1.x (4.1.7, branch-4.2
-# and main as of 2026-11-02) fails ANY scan of an Iceberg v3 table that has a
-# deletion vector ("Iceberg V3 Deletion Vectors are not supported",
-# IcebergConnectorScanRangeSource.buildScanRanges; PR #76228 open), and both
-# StarRocks Iceberg-reader arms read v3 metadata with DVs. They are skipped:
-# SR_ARMS_ALL is then the native Paimon arm alone, whose reader does not go
-# through the Iceberg metadata. SR_V3_ARMS=1 keeps them, to record the failure
-# (their catalog check and pin check then warn instead of stopping the run, and
-# their queries come out as ERROR). DuckDB keeps both arms.
-QB_SR_V3_SKIP="pmn_as_iceberg iceberg"
-QB_SR_SKIPPED=""
-if [[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 && "${SR_V3_ARMS:-0}" != 1 ]]; then
-    SR_ARMS_ALL="paimon"; QB_SR_SKIPPED="$QB_SR_V3_SKIP"
-fi
-# 0 if <arm> is a StarRocks Iceberg-reader arm run on v3 only to record its failure.
-qb_sr_v3_forced() { [[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 && " ${QB_SR_V3_SKIP} " == *" $1 "* ]]; }
-# <arms> without the skipped ones (logged once per call when one is dropped).
-qb_sr_arms_filter() {   # <arms...>
-    local a out="" drop=""
-    for a in $*; do
-        if [[ " ${QB_SR_SKIPPED} " == *" ${a} "* ]]; then drop+=" ${a}"; else out+=" ${a}"; fi
+# ── Engines ─────────────────────────────────────────────────────────────────
+QB_ENGINES_ALL="duckdb trino"
+# ENGINES (default both) normalised: space-separated, validated, in the
+# order given (= the order hot passes and the snapshot suite run them).
+qb_engines() {
+    local e out="" raw="${ENGINES:-$QB_ENGINES_ALL}"
+    for e in ${raw//,/ }; do
+        case "$e" in duckdb|trino) [[ " $out " == *" $e "* ]] || out+=" $e" ;;
+                     *) qb_die "ENGINES must name duckdb and/or trino, got '${raw}'" ;; esac
     done
-    [[ -z "$drop" ]] || qb_log "Iceberg v3: StarRocks arm(s)${drop} skipped (deletion vectors unsupported on 4.1.x; SR_V3_ARMS=1 runs them)"
+    [[ -n "$out" ]] || qb_die "ENGINES is empty"
     echo "${out# }"
 }
-# Iceberg v3 set: Paimon writes 64-bit deletion vectors
-# ('deletion-vectors.bitmap64' = 'true'), which StarRocks 4.1.x's native C++
-# Paimon reader does not decode (be/src/exec/paimon/paimon_delete_file_builder.cpp
-# handles 32-bit DVs; its magic check is only a DCHECK: a crash or wrong rows).
-# Its JNI reader (Paimon's Java reader) reads both, so on v3 every StarRocks
-# session that reads the paimon arm first runs SET paimon_force_jni_reader =
-# true (SR_PAIMON_JNI=0 opts out). The JNI reader is slower: v3 "SR paimon"
-# times are NOT the native-reader numbers of a v2 run (the pins and the summary
-# say so). Unset on v2.
-qb_sr_jni() { [[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 && "${SR_PAIMON_JNI:-1}" == 1 ]]; }
-qb_sr_sets() {   # <arm> -> the session SETs that arm needs before its reads ("" if none)
-    [[ "$1" == paimon ]] && qb_sr_jni && echo "SET paimon_force_jni_reader = true; "
-    return 0
+qb_has_engine() { [[ " $(qb_engines) " == *" $1 "* ]]; }
+# The engine for the untimed setup reads (S4 slice span, H8 key): Trino when it
+# runs (no cache of its own unless one is configured), else DuckDB.
+qb_setup_engine() {
+    if [[ -n "${QB_SETUP_ENGINE:-}" ]]; then echo "$QB_SETUP_ENGINE"
+    elif qb_has_engine trino; then echo trino
+    else echo duckdb; fi
 }
-# The table set and engine settings of this run, one key=value per line, for
+# The CSV `engine` value of each engine.
+qb_engine_label() { case "$1" in duckdb) echo duckdb_warm ;; *) echo "$1" ;; esac; }
+
+# The table set and engine settings of this run, one key=value line each, for
 # every .pins file (and through them the summary's header).
 qb_run_meta() {
     echo "iceberg_format_version=${ICEBERG_FORMAT_VERSION:-3}"
-    echo "cdc_db_suffix=${CDC_DB_SUFFIX:-} paimon_db=${PAIMON_DB} iceberg_db=${ICEBERG_DB}"
-    echo "sr_catalogs=${SR_PAIMON_CATALOG},${SR_PMNICE_CATALOG},${SR_ICEBERG_CATALOG} sr_arms=${SR_ARMS_ALL// /,} sr_skipped_arms=${QB_SR_SKIPPED// /,} sr_v3_arms=${SR_V3_ARMS:-0}"
-    echo "sr_image_tag=${SR_IMAGE_TAG:-} sr_chart_version=${SR_CHART_VERSION:-} sr_paimon_force_jni_reader=$(qb_sr_jni && echo true || echo false)"
+    echo "cdc_db_suffix=${CDC_DB_SUFFIX:-} iceberg_db=${ICEBERG_DB} paimon_db=${PAIMON_DB} engines=$(qb_engines | tr ' ' ',') formats=$(qb_formats | tr ' ' ',')"
     local sp="${SKIP_PUFFIN_VERIFICATION_ARMS-$([[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 ]] && echo paimon)}"
-    echo "duckdb_image=${DUCKDB_IMAGE:-pip duckdb==${DUCKDB_VERSION:-2.0.0}} duckdb_skip_puffin_verification_arms=${sp// /,}"
+    echo "duckdb_image=${DUCKDB_IMAGE:-pip duckdb==${DUCKDB_VERSION:-2.0.0}} duckdb_cpu=${DUCKDB_CPU:-27} duckdb_pod_memory=${DUCKDB_POD_MEMORY:-114Gi} duckdb_skip_puffin_verification_arms=${sp// /,}"
+    echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_workers=${TRINO_WORKERS}"
 }
 
-# The partition column of <table> in the files <arm> reads. Paimon names for
-# every arm that reads Paimon's files (the export keeps them); overridable.
-qb_part_col() {   # <arm> <table>
+# The partition column of <table> in the files <arm> reads (overridable).
+qb_part_col() {   # <iceberg|paimon> <table>
     case "$1:$2" in
         iceberg:orders)       echo "${ICEBERG_ORDERS_PART:-order_dt}" ;;
         iceberg:order_items)  echo "${ICEBERG_ORDER_ITEMS_PART:-created_dt}" ;;
-        *:orders)             echo "${PAIMON_ORDERS_PART:-order_date_str}" ;;
-        *:order_items)        echo "${PAIMON_ORDER_ITEMS_PART:-created_date_str}" ;;
+        paimon:orders)        echo "${PAIMON_ORDERS_PART:-order_date_str}" ;;
+        paimon:order_items)   echo "${PAIMON_ORDER_ITEMS_PART:-created_date_str}" ;;
         *)                    return 1 ;;
-    esac
-}
-
-qb_sr_target() {   # <arm> -> "catalog db pin-key"
-    case "$1" in
-        paimon)         echo "$SR_PAIMON_CATALOG $PAIMON_DB PAIMON" ;;
-        pmn_as_iceberg) echo "$SR_PMNICE_CATALOG $PAIMON_DB PMNICE" ;;
-        iceberg)        echo "$SR_ICEBERG_CATALOG $ICEBERG_DB ICEBERG" ;;
-        *) return 1 ;;
     esac
 }
 
 # The table expression for one engine, arm and table, at its pin. Pins are
 # the QB_PIN_* variables pin.sh prints (eval'd by the caller):
-#   QB_PIN_SNAP_<PAIMON|PMNICE|ICEBERG>_<TABLE>   StarRocks: snapshot id
-#   QB_PIN_META_<PAIMON|ICEBERG>_<TABLE>          DuckDB: the copied metadata.json
-# StarRocks without a pin reads the current version (a native Paimon arm whose
-# FOR VERSION AS OF failed is unset by hot-interleave.sh / pin.sh and logged).
-# DuckDB without a pin is an error: the live metadata.json is deleted within
-# minutes by the writers, mid-scan (memory note: pinned metadata on every arm).
-qb_table_expr() {   # <starrocks|duckdb> <arm> <table>
-    local e="$1" arm="$2" t="$3" T v tgt
-    T=$(qb_upper "$t")
+#   QB_PIN_META_<ICEBERG|PAIMON>_<TABLE>   the copied metadata.json (DuckDB)
+#   QB_PIN_SNAP_<ICEBERG|PAIMON>_<TABLE>   its snapshot id (Trino)
+# Without a pin both are an error: DuckDB's live metadata.json is deleted by
+# the writer mid-scan (memory note: pinned metadata on every arm), and an
+# unpinned Trino read is a different version from DuckDB's.
+qb_table_expr() {   # <duckdb|trino> <iceberg|paimon> <table>
+    local e="$1" arm="$2" t="$3" T v A db
+    T=$(qb_upper "$t"); A=$(qb_upper "$arm")
+    case "$arm" in iceberg) db="$ICEBERG_DB" ;; paimon) db="$PAIMON_DB" ;; *) return 1 ;; esac
     case "$e" in
-        starrocks)
-            tgt=$(qb_sr_target "$arm") || return 1
-            set -- $tgt
-            v="QB_PIN_SNAP_${3}_${T}"
-            # CAST: StarRocks types a small literal (the export's ids are Paimon
-            # snapshot numbers, e.g. 118) as TINYINT and rejects it as a version.
-            if [[ -z "${!v:-}" ]]; then echo "${1}.${2}.${t}"
-            elif [[ "${SR_PIN_FORM:-clause}" == subquery ]]; then echo "(SELECT * FROM ${1}.${2}.${t} FOR VERSION AS OF CAST(${!v} AS BIGINT))"
-            else echo "${1}.${2}.${t} FOR VERSION AS OF CAST(${!v} AS BIGINT)"; fi ;;
         duckdb)
-            case "$arm" in paimon) v="QB_PIN_META_PAIMON_${T}" ;; iceberg) v="QB_PIN_META_ICEBERG_${T}" ;; *) return 1 ;; esac
+            v="QB_PIN_META_${A}_${T}"
             [[ -n "${!v:-}" ]] || { qb_log "no ${v}: DuckDB reads only pinned metadata (run pin.sh first)"; return 1; }
             echo "iceberg_scan('${!v}')" ;;
+        trino)
+            v="QB_PIN_SNAP_${A}_${T}"
+            [[ "${!v:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${v}: Trino reads only the pinned snapshot (run pin.sh first)"; return 1; }
+            echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF ${!v}" ;;
         *) return 1 ;;
     esac
 }
 
 # ── Pins ────────────────────────────────────────────────────────────────────
-# Pin every table of both formats (QB_PIN_FORMATS: "iceberg paimon", or one) at its CURRENT version: copy each current
-# metadata.json to a key this run owns (s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/),
-# and read its current snapshot id. Prints shell exports (QB_PIN_*, above) plus
-# QB_PIN_COMMIT_MS_<FMT>_<TABLE> (the pinned snapshot's commit time, for the
-# record and the hot test's committed-past-the-window check). Read-only on the
-# tables; needs aws CLI and s3:PutObject on the bucket (the runner's role).
+# Pin every table of each format in QB_PIN_FORMATS (default: FORMATS) at its
+# CURRENT version: copy the current metadata.json to a key this run owns
+# (s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/<format>/<table>/), and read its
+# snapshot id:
+#   iceberg  Glue metadata_location; the id = its current-snapshot-id
+#   paimon   the export's version-hint.text -> vN.metadata.json; the id = N
+#            (Paimon's snapshot id, which the export reuses) when N is in that
+#            metadata's `snapshots`, else its current-snapshot-id (logged)
+# Prints shell exports: QB_PIN_META_<FMT>_<T>, QB_PIN_SNAP_<FMT>_<T>,
+# QB_PIN_COMMIT_MS_<FMT>_<T> (the pinned snapshot's commit time),
+# QB_PIN_FORMAT_VERSION_<FMT>_<T>, and for paimon QB_PIN_PAIMON_VERSION_<T> (N).
+# Read-only on the tables; needs the aws CLI and s3:PutObject on the bucket.
 # With QB_TABLE_STATE_OUT set, appends one TSV line per format and table: the
-# pinned snapshot's id, commit time and summary counts (records, data files,
+# pinned snapshot's id, commit time and summary totals (records, data files,
 # delete files, equality / position deletes, bytes; for Paimon native: its
 # snapshot's totalRecordCount and commitKind), the state the times depend on.
 qb_pin_tables() {   # <tag>
-    ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}" QB_PIN_FORMATS="${QB_PIN_FORMATS:-iceberg paimon}" QB_TABLES="$QB_TABLES" PMNICE_ROOT="$PMNICE_ROOT" QB_PIN_PREFIX="$QB_PIN_PREFIX" PAIMON_WAREHOUSE="$PAIMON_WAREHOUSE" \
+    ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}" QB_PIN_FORMATS="${QB_PIN_FORMATS:-$(qb_formats)}" QB_TABLES="$QB_TABLES" \
+    PMNICE_ROOT="$PMNICE_ROOT" QB_PIN_PREFIX="$QB_PIN_PREFIX" PAIMON_WAREHOUSE="$PAIMON_WAREHOUSE" \
     PAIMON_DB="$PAIMON_DB" ICEBERG_DB="$ICEBERG_DB" python3 - "$1" <<'EOF'
 import json, os, subprocess, sys, time
 E = os.environ
@@ -226,54 +224,61 @@ tag, bucket, region = sys.argv[1], E["BUCKET_NAME"], E["AWS_REGION"]
 pmn_root, prefix = E["PMNICE_ROOT"].rstrip("/"), E["QB_PIN_PREFIX"].strip("/")
 def aws(*a):
     return subprocess.run(["aws", "--region", region, *a], check=True, capture_output=True, text=True).stdout
-def pin(fmt, t, loc):
-    key = "%s/%s/%s/%s/%s" % (prefix, tag, fmt, t, loc.rsplit("/", 1)[1])
-    aws("s3", "cp", "--only-show-errors", loc, "s3://%s/%s" % (bucket, key))
-    meta = json.loads(aws("s3", "cp", "s3://%s/%s" % (bucket, key), "-"))
-    sid = meta.get("current-snapshot-id")
-    snap = next((s for s in meta.get("snapshots", []) if s.get("snapshot-id") == sid), {})
-    ts, sm = snap.get("timestamp-ms", ""), snap.get("summary", {})
-    fv = meta.get("format-version")
-    state.append([fmt, t, sid, ts] + [sm.get(k, "") for k in STATE_KEYS] + ["format-version=%s" % fv])
-    if str(fv) != E.get("ICEBERG_FORMAT_VERSION", "3"):
-        print("  [querybench] WARNING: %s %s metadata is format-version %s, not ICEBERG_FORMAT_VERSION=%s (%s)"
-              % (fmt, t, fv, E.get("ICEBERG_FORMAT_VERSION", "3"), loc), file=sys.stderr)
-    out.append("QB_PIN_FORMAT_VERSION_%s_%s=%s" % (fmt.upper(), t.upper(), fv))
-    return "s3://%s/%s" % (bucket, key), sid, ts
 STATE_KEYS = ("total-records", "total-data-files", "total-delete-files", "total-equality-deletes",
               "total-position-deletes", "total-files-size")
 out, state = [], []
-FORMATS = (E.get("QB_PIN_FORMATS") or "iceberg paimon").split()
+def pin(fmt, t, loc, want_sid=None):
+    """Copy <loc>; returns (pinned s3 uri, snapshot id, commit ms)."""
+    key = "%s/%s/%s/%s/%s" % (prefix, tag, fmt, t, loc.rsplit("/", 1)[1])
+    aws("s3", "cp", "--only-show-errors", loc, "s3://%s/%s" % (bucket, key))
+    meta = json.loads(aws("s3", "cp", "s3://%s/%s" % (bucket, key), "-"))
+    ids = {s.get("snapshot-id") for s in meta.get("snapshots", [])}
+    sid, note = meta.get("current-snapshot-id"), ""
+    if want_sid is not None:
+        if want_sid in ids:
+            sid = want_sid
+        else:
+            note = " export snapshot id %s not in its snapshots: current-snapshot-id %s used" % (want_sid, sid)
+            print("  [querybench] WARNING: paimon %s:%s" % (t, note), file=sys.stderr)
+    if sid in (None, -1):
+        sys.exit("%s %s has no current snapshot (%s)" % (fmt, t, loc))
+    snap = next((s for s in meta.get("snapshots", []) if s.get("snapshot-id") == sid), {})
+    ts, sm, fv = snap.get("timestamp-ms", ""), snap.get("summary", {}), meta.get("format-version")
+    if str(fv) != E.get("ICEBERG_FORMAT_VERSION", "3"):
+        print("  [querybench] WARNING: %s %s metadata is format-version %s, not ICEBERG_FORMAT_VERSION=%s (%s)"
+              % (fmt, t, fv, E.get("ICEBERG_FORMAT_VERSION", "3"), loc), file=sys.stderr)
+    state.append([fmt, t, sid, ts] + [sm.get(k, "") for k in STATE_KEYS]
+                 + ["format-version=%s operation=%s%s" % (fv, sm.get("operation", "?"), note.replace(" ", "_"))])
+    F, T = fmt.upper(), t.upper()
+    out.extend(["QB_PIN_META_%s_%s=s3://%s/%s" % (F, T, bucket, key), "QB_PIN_SNAP_%s_%s=%s" % (F, T, sid),
+                "QB_PIN_COMMIT_MS_%s_%s=%s" % (F, T, ts), "QB_PIN_FORMAT_VERSION_%s_%s=%s" % (F, T, fv)])
+FORMATS = E["QB_PIN_FORMATS"].split()
 for t in E["QB_TABLES"].split():
-    T = t.upper()
     for attempt in range(3):   # a writer may delete the file between the lookup and the copy
+        mark = (len(out), len(state))
         try:
-          if "iceberg" in FORMATS:
-            loc = aws("glue", "get-table", "--database-name", E["ICEBERG_DB"], "--name", t,
-                      "--query", "Table.Parameters.metadata_location", "--output", "text").strip()
-            if not loc or loc == "None":
-                sys.exit("no metadata_location on %s.%s" % (E["ICEBERG_DB"], t))
-            m, sid, ts = pin("iceberg", t, loc)
-            out += ["QB_PIN_META_ICEBERG_%s=%s" % (T, m), "QB_PIN_SNAP_ICEBERG_%s=%s" % (T, sid),
-                    "QB_PIN_COMMIT_MS_ICEBERG_%s=%s" % (T, ts)]
-          if "paimon" in FORMATS:
-            v = aws("s3", "cp", "%s/%s/metadata/version-hint.text" % (pmn_root, t), "-").strip()
-            if not v.isdigit():
-                sys.exit("no version-hint.text under %s/%s/metadata (metadata.iceberg.storage unset?)" % (pmn_root, t))
-            m, sid, ts = pin("paimon", t, "%s/%s/metadata/v%s.metadata.json" % (pmn_root, t, v))
-            # The export's snapshot id IS Paimon's snapshot id (vN <-> snapshot-N),
-            # which the native Paimon arm pins to.
-            out += ["QB_PIN_META_PAIMON_%s=%s" % (T, m), "QB_PIN_SNAP_PMNICE_%s=%s" % (T, sid),
-                    "QB_PIN_SNAP_PAIMON_%s=%s" % (T, v), "QB_PIN_COMMIT_MS_PAIMON_%s=%s" % (T, ts)]
-            try:   # the native snapshot the paimon arm pins to (record only)
-                ps = json.loads(aws("s3", "cp", "%s/%s.db/%s/snapshot/snapshot-%s" % (
-                    E["PAIMON_WAREHOUSE"].rstrip("/"), E["PAIMON_DB"], t, v), "-"))
-                state.append(["paimon_native", t, v, ps.get("timeMillis", ""), ps.get("totalRecordCount", ""),
-                              "", "", "", "", "", ps.get("commitKind", "")])
-            except subprocess.CalledProcessError:
-                state.append(["paimon_native", t, v, "", "", "", "", "", "", "", "snapshot file gone"])
-          break
+            if "iceberg" in FORMATS:
+                loc = aws("glue", "get-table", "--database-name", E["ICEBERG_DB"], "--name", t,
+                          "--query", "Table.Parameters.metadata_location", "--output", "text").strip()
+                if not loc or loc == "None":
+                    sys.exit("no metadata_location on %s.%s" % (E["ICEBERG_DB"], t))
+                pin("iceberg", t, loc)
+            if "paimon" in FORMATS:
+                v = aws("s3", "cp", "%s/%s/metadata/version-hint.text" % (pmn_root, t), "-").strip()
+                if not v.isdigit():
+                    sys.exit("no version-hint.text under %s/%s/metadata (metadata.iceberg.storage unset?)" % (pmn_root, t))
+                pin("paimon", t, "%s/%s/metadata/v%s.metadata.json" % (pmn_root, t, v), int(v))
+                out.append("QB_PIN_PAIMON_VERSION_%s=%s" % (t.upper(), v))
+                try:   # the native Paimon snapshot N (record only)
+                    ps = json.loads(aws("s3", "cp", "%s/%s.db/%s/snapshot/snapshot-%s" % (
+                        E["PAIMON_WAREHOUSE"].rstrip("/"), E["PAIMON_DB"], t, v), "-"))
+                    state.append(["paimon_native", t, v, ps.get("timeMillis", ""), ps.get("totalRecordCount", ""),
+                                  "", "", "", "", "", ps.get("commitKind", "")])
+                except subprocess.CalledProcessError:
+                    state.append(["paimon_native", t, v, "", "", "", "", "", "", "", "snapshot file gone"])
+            break
         except subprocess.CalledProcessError as e:
+            del out[mark[0]:], state[mark[1]:]
             if attempt == 2:
                 sys.exit("pin %s failed: %s" % (t, (e.stderr or "").strip()[:300]))
             time.sleep(5)
@@ -288,17 +293,24 @@ print("export " + " ".join(out))
 EOF
 }
 
+# "<operation> <commit ms>" of the Iceberg table's current snapshot (Glue).
+qb_iceberg_current() {   # <table>
+    local loc
+    loc=$(aws glue get-table --region "$AWS_REGION" --database-name "$ICEBERG_DB" --name "$1" \
+            --query 'Table.Parameters.metadata_location' --output text 2>/dev/null) || return 1
+    aws s3 cp --region "$AWS_REGION" "$loc" - 2>/dev/null | python3 -c '
+import json, sys
+m = json.load(sys.stdin); sid = m.get("current-snapshot-id")
+s = next((s for s in m.get("snapshots", []) if s.get("snapshot-id") == sid), {})
+print(s.get("summary", {}).get("operation", "?"), s.get("timestamp-ms", 0))'
+}
+
 # The newest commit time (ms) of <table> in <iceberg|paimon> (read-only: the
 # Iceberg metadata via Glue, Paimon's latest snapshot file).
 qb_commit_ms() {   # <iceberg|paimon> <table>
     if [[ "$1" == iceberg ]]; then
-        local loc
-        loc=$(aws glue get-table --region "$AWS_REGION" --database-name "$ICEBERG_DB" --name "$2" \
-                --query 'Table.Parameters.metadata_location' --output text 2>/dev/null) || return 1
-        aws s3 cp --region "$AWS_REGION" "$loc" - 2>/dev/null | python3 -c '
-import json, sys
-m = json.load(sys.stdin); sid = m.get("current-snapshot-id")
-print(next((s["timestamp-ms"] for s in m.get("snapshots", []) if s.get("snapshot-id") == sid), ""))'
+        local c; c=$(qb_iceberg_current "$2") || return 1
+        echo "${c##* }"
     else
         local root="${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/$2/snapshot" n
         n=$(aws s3 cp --region "$AWS_REGION" "${root}/LATEST" - 2>/dev/null | tr -dc 0-9) && [[ -n "$n" ]] || return 1
@@ -310,10 +322,12 @@ print(next((s["timestamp-ms"] for s in m.get("snapshots", []) if s.get("snapshot
 # ── Windows ─────────────────────────────────────────────────────────────────
 # Hot: HOT_WINDOW_SECONDS (300) ending HOT_LAG_SECONDS (300) before now, on
 # whole minutes, inside one day (moved back to end at midnight if it would
-# cross it). Each bound can be pinned with the same-named variable. 5 min, not
-# throughput's 30 s: the CDC load is ~40k rows/s (mysql-upsert-loadgen), not
-# ~3M, so 30 s would be a handful of files. ESTIMATE, not measured: size it
-# from the first run's H* row counts.
+# cross it). Each bound can be pinned with the same-named variable. ESTIMATE,
+# not measured: size it from the first run's H* row counts.
+qb_utc_minus_sec() {   # "<YYYY-MM-DD HH:MM:SS>" <seconds> (BSD date first, GNU second)
+    date -u -j -v-"$2"S -f '%Y-%m-%d %H:%M:%S' "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+      || date -u -d "@$(( $(date -u -d "$1" +%s) - $2 ))" '+%Y-%m-%d %H:%M:%S'
+}
 qb_resolve_hot() {
     local w="${HOT_WINDOW_SECONDS:-300}" lag="${HOT_LAG_SECONDS:-300}" to
     [[ "$w" =~ ^[1-9][0-9]*$ && "$lag" =~ ^[0-9]+$ ]] || qb_die "HOT_WINDOW_SECONDS / HOT_LAG_SECONDS must be whole seconds"
@@ -337,38 +351,109 @@ _qb_parts_under() {   # <s3 prefix> <col>
 }
 
 # Snapshot partition: SNAPSHOT_DT, or the NEWEST date before today (UTC) that
-# both fact tables hold in both formats (SNAPSHOT_DT_PICK=oldest: the oldest).
+# both fact tables hold in every format of FORMATS (SNAPSHOT_DT_PICK=oldest:
+# the oldest).
 # "Closed" here = not today; the writers are stopped before the test anyway.
 qb_resolve_snapshot_dt() {
     if [[ -z "${SNAPSHOT_DT:-}" ]]; then
-        local d today all
+        local d today all n=0
         d=$(mktemp -d); today=$(date -u +%Y-%m-%d)
-        _qb_parts_under "${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/orders"        "$(qb_part_col paimon orders)"       > "$d/1"
-        _qb_parts_under "${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/order_items"   "$(qb_part_col paimon order_items)"  > "$d/2"
-        _qb_parts_under "${ICEBERG_WAREHOUSE}/${ICEBERG_DB}.db/orders/data"      "$(qb_part_col iceberg orders)"      > "$d/3"
-        _qb_parts_under "${ICEBERG_WAREHOUSE}/${ICEBERG_DB}.db/order_items/data" "$(qb_part_col iceberg order_items)" > "$d/4"
-        all=$(cat "$d/1" "$d/2" "$d/3" "$d/4" | sort | uniq -c | awk '$1 == 4 {print $2}' | awk -v t="$today" '$1 < t')
+        if qb_has_format iceberg; then
+            _qb_parts_under "${ICEBERG_WAREHOUSE}/${ICEBERG_DB}.db/orders/data"      "$(qb_part_col iceberg orders)"      > "$d/1"
+            _qb_parts_under "${ICEBERG_WAREHOUSE}/${ICEBERG_DB}.db/order_items/data" "$(qb_part_col iceberg order_items)" > "$d/2"
+            n=$((n + 2))
+        fi
+        if qb_has_format paimon; then
+            _qb_parts_under "${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/orders"      "$(qb_part_col paimon orders)"      > "$d/3"
+            _qb_parts_under "${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/order_items" "$(qb_part_col paimon order_items)" > "$d/4"
+            n=$((n + 2))
+        fi
+        all=$(cat "$d"/* | sort | uniq -c | awk -v n="$n" '$1 == n {print $2}' | awk -v t="$today" '$1 < t')
         rm -rf "$d"
-        [[ -n "$all" ]] || qb_die "no date before ${today} in both formats' orders and order_items partitions; set SNAPSHOT_DT"
+        [[ -n "$all" ]] || qb_die "no date before ${today} in the orders and order_items partitions of every format ($(qb_formats)); set SNAPSHOT_DT"
         if [[ "${SNAPSHOT_DT_PICK:-newest}" == oldest ]]; then SNAPSHOT_DT=$(head -1 <<<"$all"); else SNAPSHOT_DT=$(tail -1 <<<"$all"); fi
     fi
     [[ "$SNAPSHOT_DT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || qb_die "SNAPSHOT_DT='${SNAPSHOT_DT}' is not YYYY-MM-DD"
     QB_SNAPSHOT_DT="$SNAPSHOT_DT"
 }
 
+# ── Untimed setup reads (slice span, H8 key) on one engine ─────────────────
+# Rows of one small statement, fields tab-separated, NULL as NULL. Both engines
+# accept the SQL below (TIMESTAMP '...' literals, no dialect keys).
+qb_duck_query() {   # <sql> [timeout s]
+    kubectl exec -i -n "$NAMESPACE" "deploy/${DUCKDB_NAME}" -c duckdb -- python3 -c '
+import json, sys, time, urllib.request
+sql, to = sys.stdin.read(), int(sys.argv[1])
+def call(path, body=None):
+    req = urllib.request.Request("http://localhost:8080" + path, method="GET" if body is None else "POST",
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=60))
+jid = call("/query", {"sql": sql, "suite": "setup", "arm": "iceberg", "name": "setup", "runs": 1, "warmup": 0,
+                      "timeout_s": to, "allow_zero_rows": True, "leading_col_is_label": True})["id"]
+deadline = time.time() + to + 120
+while time.time() < deadline:
+    time.sleep(2)
+    j = call("/job/" + jid)
+    if j.get("state") == "done":
+        if j.get("status") != "OK":
+            sys.exit("duckdb: %s %s" % (j.get("status"), j.get("error", "")))
+        for r in j.get("rows") or []:
+            print(r.replace("|", "\t"))
+        sys.exit(0)
+sys.exit("duckdb: no result in %ds" % (to + 120))' "${2:-1800}" <<<"$1"
+}
+
+# The trino CLI in the coordinator container. Extra CLI flags may follow the SQL.
+qb_trino_cli() {   # <sql> [cli flags...]
+    local sql="$1"; shift
+    kubectl exec -i -n "$NAMESPACE" "$TRINO_COORDINATOR" -c "$TRINO_CONTAINER" -- \
+        env JAVA_TOOL_OPTIONS="$TRINO_CLI_JAVA_OPTS" \
+        trino --server "http://localhost:${TRINO_PORT}" --user "$TRINO_USER" --catalog "$TRINO_CATALOG" \
+              --schema "$ICEBERG_DB" "$@" --execute "$sql"
+}
+# TSV rows (NULL for null), stderr noise (JAVA_TOOL_OPTIONS banner) dropped.
+qb_trino() {   # <sql> [timeout s]
+    qb_trino_cli "$1" --output-format TSV --session "query_max_run_time=${2:-1800}s" --source querybench-setup 2>/dev/null
+}
+# qb_trino with the error kept: "<rc><TAB><last output or error line>".
+qb_trino_try() {   # <sql>
+    local out rc
+    out=$(qb_trino_cli "$1" --output-format TSV --source querybench-setup 2>&1); rc=$?
+    out=$(grep -v '^Picked up JAVA_TOOL_OPTIONS' <<<"$out" || true)
+    printf '%s\t%s\n' "$rc" "$(tail -1 <<<"$out" | tr '\t' ' ')"
+}
+
+qb_setup_query() {   # <engine> <arm> <sql with ${ORDERS}-style table placeholders> [timeout s]
+    local e="$1" arm="$2" sql="$3" t T x
+    for t in $QB_TABLES; do
+        T=$(qb_upper "$t")
+        [[ "$sql" == *"\${${T}}"* ]] || continue
+        x=$(qb_table_expr "$e" "$arm" "$t") || return 1
+        sql="${sql//\$\{${T}\}/${x}}"
+    done
+    case "$e" in
+        duckdb) qb_duck_query "$sql" "${4:-1800}" ;;
+        trino)  qb_trino "$sql" "${4:-1800}" ;;
+        *)      return 1 ;;
+    esac
+}
+
 # Snapshot slice [S_FROM, S_TO): SNAPSHOT_SLICE_MINUTES (10) on whole minutes,
 # bounds on orders.order_date (S4, the one sliced query), centred in the span
-# where BOTH formats hold rows in SNAPSHOT_DT (MIN/MAX(order_date) per format:
-# the data was bulk-loaded by the CDC snapshot phase, so the commit history
-# says nothing about event times), SNAPSHOT_SLICE_MARGIN_S (120) clear of each
+# the PINNED orders of every format hold in SNAPSHOT_DT (MIN/MAX(order_date): the data
+# was bulk-loaded by the CDC snapshot phase, so the commit history says
+# nothing about event times), SNAPSHOT_SLICE_MARGIN_S (120) clear of each
 # end. SNAPSHOT_SLICE_COLUMNS ("orders:order_date") lists the table:column
 # spans intersected. 0 = the whole partition. Pin with S_FROM and S_TO.
-# Needs the StarRocks FE (MIN/MAX per table, datacache off): run.sh resolves it
-# once StarRocks is up and before the caches are emptied. ESTIMATE: 10 min is a
-# guess at "short"; size it from the first run's S* row counts.
+# Read on qb_setup_engine, untimed. snapshot.sh resolves it after its gate and
+# pin, before the cold start, so it reads the (compacted) pinned snapshots the
+# arms then measure. Without pins in the shell, the tables are pinned for it
+# (tag <STAMP>-slice, not in tables-<STAMP>.tsv). ESTIMATE: 10 min is a guess
+# at "short"; size it from the first run's S4 row counts.
 qb_resolve_snapshot_slice() {
     local ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$'
-    local M="${SNAPSHOT_SLICE_MINUTES:-10}" margin="${SNAPSHOT_SLICE_MARGIN_S:-120}" spans="" arm t col tc r
+    local M="${SNAPSHOT_SLICE_MINUTES:-10}" margin="${SNAPSHOT_SLICE_MARGIN_S:-120}" spans="" t col tc r e arm used=""
     [[ -n "${QB_SNAPSHOT_DT:-}" ]] || qb_resolve_snapshot_dt
     if [[ -n "${S_FROM:-}${S_TO:-}" ]]; then
         [[ "${S_FROM:-}" =~ $ts_re && "${S_TO:-}" =~ $ts_re ]] || qb_die "S_FROM and S_TO must both be set, as 'YYYY-MM-DD HH:MM:SS'"
@@ -380,38 +465,39 @@ qb_resolve_snapshot_slice() {
         QB_S_TO="$(python3 -c 'import datetime, sys; print(datetime.date.fromisoformat(sys.argv[1]) + datetime.timedelta(days=1))' "$QB_SNAPSHOT_DT") 00:00:00"
         QB_S_HOW="the whole partition (SNAPSHOT_SLICE_MINUTES=0)"; return 0
     fi
-    kubectl get pod "$FE_POD" -n "$NAMESPACE" >/dev/null 2>&1 \
-        || qb_die "deriving S_FROM/S_TO needs the StarRocks FE (${FE_POD}); set S_FROM and S_TO (e.g. from the StarRocks run's .pins) or SNAPSHOT_SLICE_MINUTES=0"
-    # Both formats' spans, each on its own reader. On v3 the StarRocks Iceberg
-    # reader cannot read the Iceberg tables (deletion vectors): the span is the
-    # native Paimon arm's alone (both CDC jobs replicate the same MySQL rows; the
-    # summary's row checks catch a slice one format does not hold).
-    # Keyed on the format version, not QB_SR_SKIPPED: with SR_V3_ARMS=1 the
-    # Iceberg arm still runs (to record its failure) but must not feed setup.
-    local slice_arms="paimon iceberg"
-    [[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 ]] && slice_arms="paimon"
-    for arm in $slice_arms; do
+    if [[ -z "${QB_PIN_SNAP_ICEBERG_ORDERS:-}${QB_PIN_SNAP_PAIMON_ORDERS:-}" ]]; then
+        r=$(QB_TABLE_STATE_OUT="" qb_pin_tables "${STAMP}-slice") || qb_die "pinning for the snapshot slice failed"
+        eval "$r"
+    fi
+    # Every format's span, intersected (both CDC jobs replicate the same rows).
+    # Read on qb_setup_engine, else on the other engine; a format no engine can
+    # read (duckdb:paimon on v3, and no Trino) is left out, and logged.
+    for arm in $(qb_formats); do
         for tc in ${SNAPSHOT_SLICE_COLUMNS:-orders:order_date}; do
-            t="${tc%%:*}" col="${tc#*:}"
-            set -- $(qb_sr_target "$arm")
-            r=$(qb_sr "$(qb_sr_sets "$arm")SET enable_scan_datacache = false; SET populate_datacache_mode = 'never'; SET query_timeout = 1800;
-                       SELECT MIN(${col}), MAX(${col}) FROM ${1}.${2}.${t} WHERE $(qb_part_col "$arm" "$t") = '${QB_SNAPSHOT_DT}'" | tail -1)
-            [[ "$r" == *$'\t'* && "$r" != *NULL* ]] || qb_die "no ${t}.${col} span for ${QB_SNAPSHOT_DT} on the ${arm} arm (got '${r}')"
+            t="${tc%%:*}" col="${tc#*:}" r=""
+            for e in $( { qb_setup_engine; qb_engines | tr ' ' '\n'; } | awk '!seen[$0]++'); do
+                r=$(qb_setup_query "$e" "$arm" "SELECT MIN(${col}), MAX(${col}) FROM \${$(qb_upper "$t")} AS q WHERE q.$(qb_part_col "$arm" "$t") = '${QB_SNAPSHOT_DT}'" | tail -1) || r=""
+                [[ "$r" == *$'\t'* && "${r%%$'\t'*}" =~ ^[0-9]{4}- && "${r#*$'\t'}" =~ ^[0-9]{4}- ]] && break
+                qb_log "snapshot span ${arm} ${t}.${col}: not readable on ${e} (got '${r}')"; r=""
+            done
+            [[ -n "$r" ]] || { qb_log "WARNING: no engine reads the ${arm} ${t}.${col} span; the slice leaves ${arm} out"; continue 2; }
             spans+="${r}"$'\n'
-            qb_log "snapshot span ${arm} ${t}.${col}: ${r/$'\t'/ .. }"
+            qb_log "snapshot span ${arm} ${t}.${col} (${e}, pinned): ${r/$'\t'/ .. }"
         done
+        used+=" ${arm}"
     done
+    [[ -n "$spans" ]] || qb_die "no snapshot slice span on any format; set S_FROM/S_TO, or SNAPSHOT_SLICE_MINUTES=0"
     r=$(python3 - "$QB_SNAPSHOT_DT" "$M" "$margin" "$spans" <<'EOF'
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 dt, M, margin = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-p = lambda s: datetime.strptime(s.strip()[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+p = lambda s: datetime.strptime(s.strip()[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
 f = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 spans = [tuple(p(x) for x in l.split("\t")) for l in sys.argv[4].splitlines() if l.strip()]
 day0 = datetime.strptime(dt, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp()
 lo = max(max(a for a, _ in spans), day0) + margin
 hi = min(min(b for _, b in spans), day0 + 86400) - margin
-span = "rows in both formats (SNAPSHOT_SLICE_COLUMNS), less %ds each end: [%s, %s)" % (margin, f(lo), f(hi))
+span = "rows in every pinned format read (SNAPSHOT_SLICE_COLUMNS), less %ds each end: [%s, %s)" % (margin, f(lo), f(hi))
 if hi - lo < M * 60:
     print("ERR %s is %.1f min, under the %d-min slice" % (span, max(hi - lo, 0) / 60, M)); sys.exit()
 st = max(int((lo + hi) / 2 - M * 30) // 60 * 60, int(lo + 59) // 60 * 60)
@@ -420,71 +506,94 @@ EOF
 )
     [[ "$r" == OK\|* ]] || qb_die "snapshot slice: ${r#ERR }; lower SNAPSHOT_SLICE_MINUTES or set S_FROM/S_TO"
     IFS='|' read -r _ QB_S_FROM QB_S_TO QB_S_HOW <<<"$r"
-    [[ "$slice_arms" == paimon ]] && QB_S_HOW+="; Paimon span only (Iceberg v3: StarRocks cannot read the Iceberg tables)"
+    QB_S_HOW+="; formats:${used}"
     return 0
+}
+
+# H8's key: an order UPDATED in the hot window (updated_at in [HOT_FROM, HOT_TO),
+# created before it), picked on the pinned orders of the first format in
+# FORMATS (iceberg when it runs) on qb_setup_engine. Not confirmed on the other
+# arms: the summary compares their rows. Sets QB_LOOKUP_ORDER_ID / QB_LOOKUP_ORDER_DT
+# (LOOKUP_ORDER_ID / LOOKUP_ORDER_DT pin them) and QB_LOOKUP_NOTE. The
+# selection reads updated_at over the whole table (no partition filter, like
+# H4), untimed, before the warm-up pass.
+qb_resolve_lookup() {
+    if [[ -n "${LOOKUP_ORDER_ID:-}" ]]; then
+        [[ "$LOOKUP_ORDER_ID" =~ ^[0-9]+$ && "${LOOKUP_ORDER_DT:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || qb_die "LOOKUP_ORDER_ID must be an integer and LOOKUP_ORDER_DT a YYYY-MM-DD"
+        QB_LOOKUP_ORDER_ID="$LOOKUP_ORDER_ID"; QB_LOOKUP_ORDER_DT="$LOOKUP_ORDER_DT"; QB_LOOKUP_NOTE="pinned by hand"
+    else
+        local e r arm
+        e=$(qb_setup_engine); arm=$(qb_formats); arm="${arm%% *}"   # iceberg when it is in FORMATS
+        r=$(qb_setup_query "$e" "$arm" "SELECT o.order_id, o.$(qb_part_col "$arm" orders) FROM \${ORDERS} AS o
+                 WHERE o.updated_at >= TIMESTAMP '${QB_HOT_FROM}' AND o.updated_at < TIMESTAMP '${QB_HOT_TO}'
+                   AND o.order_date < TIMESTAMP '${QB_HOT_FROM}'
+                 ORDER BY o.updated_at DESC, o.order_id LIMIT 1" | tail -1) || true
+        [[ "$r" =~ ^[0-9]+$'\t'[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+            || qb_die "no H8 candidate on ${e}:${arm} (got '${r}'): no update of an older order in the window? Set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
+        QB_LOOKUP_ORDER_ID="${r%%$'\t'*}" QB_LOOKUP_ORDER_DT="${r#*$'\t'}"
+        QB_LOOKUP_NOTE="picked on ${e}:${arm} (pinned orders), not confirmed on the other arms (the summary compares their rows)"
+    fi
+    if [[ "$QB_LOOKUP_ORDER_DT" == "${QB_HOT_DT:-}" ]]; then QB_LOOKUP_NOTE+="; partition = HOT_DT"
+    else QB_LOOKUP_NOTE+="; partition older than HOT_DT (more equality deletes)"; fi
+    qb_log "H8 key: order_id=${QB_LOOKUP_ORDER_ID} ${QB_LOOKUP_ORDER_DT} (${QB_LOOKUP_NOTE})"
 }
 
 # ── Queries ─────────────────────────────────────────────────────────────────
 qb_query_files() { ls "${QB_DIR}/$1"/*.sql 2>/dev/null || qb_die "no .sql files in ${QB_DIR}/$1"; }
 qb_query_name()  { basename "$1" .sql; }
 qb_query_flag()  { grep -qE "^-- bench:.*(^|[^A-Za-z0-9_-])$2([^A-Za-z0-9_=-]|\$)" "$1"; }
+qb_dialect_file() { echo "${QB_DIALECT_DIR}/dialect-$1.env"; }
 
-# Render one file for one engine and arm: every placeholder above, from the
-# QB_* windows and the pins. ANY ${...} left is fatal and named: it is not a
-# syntax error on either engine (it binds as an identifier or string and
-# returns a wrong answer), and it is how a placeholder the SQL authors added
-# shows up here first. In Python, so a value's characters are never
-# interpreted (bash 5.2's patsub_replacement treats & in a replacement).
-qb_render() {   # <file> <starrocks|duckdb> <arm>
-    local f="$1" e="$2" arm="$3" t T x args=()
+# Render one file for one engine: every placeholder above, from the QB_*
+# windows, the pins and the engine's dialect file. ANY ${...} left is fatal and
+# named: it is not a syntax error on either engine (it binds as an identifier
+# or string and returns a wrong answer), and it is how a placeholder the SQL
+# authors added shows up here first. In Python, so a value's characters are
+# never interpreted (bash 5.2's patsub_replacement treats & in a replacement).
+qb_render() {   # <file> <duckdb|trino> <iceberg|paimon>
+    local f="$1" e="$2" arm="$3" t T x args=() dialect
+    dialect=$(qb_dialect_file "$e")
+    [[ -f "$dialect" ]] || { qb_log "no dialect file ${dialect#${CDC_DIR}/} for ${e} (KEY=VALUE lines, e.g. BYTE_LEN_OPEN=...)"; return 1; }
     for t in $QB_TABLES; do
         T=$(qb_upper "$t")
         x=$(qb_table_expr "$e" "$arm" "$t") || { qb_log "no table expression for ${e}/${arm}/${t}"; return 1; }
         args+=("${T}=${x}")
     done
-    args+=("ORDERS_PART=$(qb_part_col "$arm" orders)" "ORDER_ITEMS_PART=$(qb_part_col "$arm" order_items)"
-           "BYTES_FN=$([[ "$e" == starrocks ]] && echo LENGTH || echo STRLEN)")
+    args+=("ORDERS_PART=$(qb_part_col "$arm" orders)" "ORDER_ITEMS_PART=$(qb_part_col "$arm" order_items)")
     # A window value that is not resolved stays unset, so its placeholder fails.
     [[ -n "${QB_HOT_DT:-}" ]]      && args+=("HOT_DT=${QB_HOT_DT}" "HOT_FROM=${QB_HOT_FROM}" "HOT_TO=${QB_HOT_TO}")
     [[ -n "${QB_SNAPSHOT_DT:-}" ]] && args+=("SNAPSHOT_DT=${QB_SNAPSHOT_DT}")
     [[ -n "${QB_S_FROM:-}" ]]      && args+=("S_FROM=${QB_S_FROM}" "S_TO=${QB_S_TO}")
     [[ -n "${QB_LOOKUP_ORDER_ID:-}" ]] && args+=("LOOKUP_ORDER_ID=${QB_LOOKUP_ORDER_ID}" "LOOKUP_ORDER_DT=${QB_LOOKUP_ORDER_DT}")
-    python3 - "$f" "${args[@]}" <<'EOF'
+    python3 - "$f" "$dialect" "${args[@]}" <<'EOF'
 import re, sys
-f, kv = sys.argv[1], dict(a.split("=", 1) for a in sys.argv[2:])
-TABLES = ("CUSTOMERS", "PRODUCTS", "ORDERS", "ORDER_ITEMS")
-NOT_ALIAS = {"WHERE", "GROUP", "ORDER", "LIMIT", "JOIN", "LEFT", "RIGHT", "INNER", "FULL", "CROSS", "ON",
-             "USING", "UNION", "HAVING", "WINDOW", "QUALIFY", "SEMI", "ANTI", "OUTER", "LATERAL", "EXCEPT",
-             "INTERSECT", "FOR", "TABLESAMPLE"}
-def sub(m):
-    k, after = m.group(1), m.group(2) or ""
-    v = kv.get(k)
-    if v is None:
-        return m.group(0)
-    # A parenthesised table expression (SR_PIN_FORM=subquery) gets the table's
-    # name as its alias where the SQL gives none, so `orders.col` still binds.
-    if k in TABLES and v.startswith("("):
-        w = re.match(r"\s+(AS\s+)?([A-Za-z_][A-Za-z0-9_]*)", after, re.I)
-        if not w or (not w.group(1) and w.group(2).upper() in NOT_ALIAS):
-            return v + " AS " + k.lower() + after
-    return v + after
-sql = re.sub(r"\$\{([A-Za-z0-9_]+)\}((?:\s+(?:AS\s+)?[A-Za-z_][A-Za-z0-9_]*)?)", sub, open(f).read(), flags=re.I)
+f, dialect = sys.argv[1], sys.argv[2]
+kv = dict(a.split("=", 1) for a in sys.argv[3:])
+BUILTIN = {"CUSTOMERS", "PRODUCTS", "ORDERS", "ORDER_ITEMS", "ORDERS_PART", "ORDER_ITEMS_PART", "HOT_DT", "HOT_FROM",
+           "HOT_TO", "SNAPSHOT_DT", "S_FROM", "S_TO", "LOOKUP_ORDER_ID", "LOOKUP_ORDER_DT"}
+for n, line in enumerate(open(dialect), 1):
+    s = line.strip()
+    if not s or s.startswith("#"):
+        continue
+    if s.startswith("export "):
+        s = s[7:].lstrip()
+    m = re.fullmatch(r"([A-Z][A-Z0-9_]*)=(.*)", s)
+    if not m:
+        sys.exit("  [querybench] %s:%d: not KEY=VALUE: %r" % (dialect, n, line.rstrip("\n")))
+    k, v = m.group(1), m.group(2)
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    if k in BUILTIN:
+        sys.exit("  [querybench] %s:%d: %s is a harness placeholder; a dialect key may not set it" % (dialect, n, k))
+    kv[k] = v
+sql = re.sub(r"\$\{([A-Za-z0-9_]+)\}", lambda m: kv.get(m.group(1), m.group(0)), open(f).read())
 left = sorted(set(re.findall(r"\$\{[^}]*\}", sql)))
 if left:
-    sys.exit("  [querybench] unresolved in %s: %s (a new placeholder? add it to lib/querybench.sh qb_render)" % (f.rsplit("/", 1)[-1], " ".join(left)))
+    sys.exit("  [querybench] unresolved in %s: %s (a new placeholder? add it to the dialect files or lib/querybench.sh qb_render)"
+             % (f.rsplit("/", 1)[-1], " ".join(left)))
 sys.stdout.write(sql if sql.endswith("\n") else sql + "\n")
 EOF
-}
-
-# One line, comments stripped: the StarRocks audit log records a statement as
-# one Stmt= field, and starrocks.sh pairs each with the marker sent before it.
-# A string literal containing "--" would be cut: do not write one.
-qb_render_oneline() {   # <file> <engine> <arm>
-    local sql
-    sql=$(qb_render "$@") || return 1
-    sql=$(sed 's/--.*$//' <<<"$sql" | tr '\n' ' ' | tr -s ' ' | sed -e 's/^ *//' -e 's/ *;* *$/;/')
-    [[ "$sql" != *";"*";"* ]] || { qb_log "$(basename "$1"): more than one statement"; return 1; }
-    printf '%s\n' "$sql"
 }
 
 # Per-query cap, the same on both engines, so a TIMEOUT means the same thing.
@@ -501,16 +610,17 @@ QB_CSV_HEADER="stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_ro
 qb_csv_init() { mkdir -p "$(dirname "$1")"; [[ -f "$1" ]] || echo "$QB_CSV_HEADER" > "$1"; }
 
 # ── Writers and generator ───────────────────────────────────────────────────
-qb_writer_state() {
+qb_writer_state() {   # [jobs; default QB_QUERY_WRITERS]
     local j out=""
-    for j in $FLINK_JOBS; do
+    for j in ${1:-$QB_QUERY_WRITERS}; do
         out+="${j}=$(kubectl get flinkdeployment "$j" -n "$NAMESPACE" -o jsonpath='{.spec.job.state}' 2>/dev/null || true) "
     done
     echo "${out% }"
 }
 
-# Suspend the CDC writers and wait until no job is RUNNING and no TaskManager
-# is left, so the last commit has landed. upgradeMode is last-state in both
+# Suspend the CDC writers (FLINK_JOBS: both formats, so the Paimon job is not
+# left writing alone) and wait until no job is RUNNING and no TaskManager is
+# left, so the last commit has landed. upgradeMode is last-state in both
 # FlinkDeployments, so `kubectl patch ... state: running` resumes them from
 # their last checkpoint (no new MySQL snapshot). SUSPEND_WRITERS=0 skips it.
 # Patched, never re-applied: an apply over an existing EMR FlinkDeployment
@@ -529,7 +639,7 @@ qb_stop_writers() {
             [[ "$(kubectl get flinkdeployment "$j" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.state}' 2>/dev/null)" == RUNNING ]] && busy+=" ${j}"
             kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep -q "^${j}-taskmanager-" && busy+=" ${j}-tm"
         done
-        [[ -z "$busy" ]] && { qb_log "writers stopped: $(qb_writer_state)"; return 0; }
+        [[ -z "$busy" ]] && { qb_log "writers stopped: $(qb_writer_state "$FLINK_JOBS")"; return 0; }
         (( $(date +%s) < deadline )) || qb_die "writers still running after 600s:${busy}"
         qb_log "waiting for writers to stop:${busy}"
         sleep 15
@@ -549,8 +659,8 @@ qb_generator_live() { [[ "$(qb_generator_state)" =~ =[1-9][0-9]*/ ]]; }
 
 # Scale every generator resource that exists to 0 (deploy-data-generator.sh
 # scale brings it back). Then, unless WRITER_DRAIN_S=0, wait that long (180 s =
-# three 60 s checkpoints) before the writers are suspended, so both commit the
-# binlog tail and hold the same rows: a suspend keeps only the last checkpoint.
+# three 60 s checkpoints) before the writers are suspended, so the writers
+# commit the binlog tail: a suspend keeps only the last checkpoint.
 qb_stop_generator() {
     [[ "${STOP_GENERATOR:-1}" == 0 ]] && { qb_log "STOP_GENERATOR=0: generator left as it is"; return 0; }
     local r was any=0
@@ -565,40 +675,51 @@ qb_stop_generator() {
     if (( drain > 0 )); then qb_log "letting the writers commit the binlog tail: ${drain}s"; sleep "$drain"; fi
 }
 
-# ── One engine at a time ────────────────────────────────────────────────────
-# A CDC-table query already running on the FE is contention bigger than the
-# format effect; an unreadable FE is not an idle one.
-qb_assert_fe_idle() {
-    local pl busy
-    pl=$(qb_sr "SHOW PROCESSLIST") && [[ -n "$pl" ]] || qb_die "cannot read SHOW PROCESSLIST on ${FE_POD}"
-    busy=$(awk -F'\t' '$10 != "SHOW PROCESSLIST" && $10 != "" && $10 != "NULL" && $8 != "Sleep" && $5 != "information_schema" {print "    id=" $2 " " $5 " " $7 " " $8 "s " substr($10,1,70)}' <<<"$pl" \
-           | grep -E 'cdc_|cid_|flink_' || true)
-    [[ -z "$busy" ]] || qb_die "a lakehouse query is already running on ${FE_POD} (KILL QUERY <id>):
-${busy}"
+# ── Engine state ────────────────────────────────────────────────────────────
+qb_duck_health() {   # -> /health JSON, or nothing
+    kubectl exec -n "$NAMESPACE" "deploy/${DUCKDB_NAME}" -c duckdb -- python3 -c \
+        'import json, urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://localhost:8080/health", timeout=10))))' 2>/dev/null || true
+}
+# Active Trino workers (system.runtime.nodes), or nothing if Trino does not answer.
+qb_trino_workers() {
+    { qb_trino "SELECT count(*) FROM system.runtime.nodes WHERE coordinator = false AND state = 'active'" 60 || true; } | tail -1 | tr -dc 0-9
+}
+qb_trino_ready() { local n; n=$(qb_trino_workers); [[ -n "$n" ]] && (( n >= TRINO_WORKERS )); }
+
+# Queries on Trino other than this check itself (and other `system` reads):
+# "<id> <state> <source> <user> <first 70 chars>" per line, or nothing.
+qb_trino_busy() {
+    { qb_trino "SELECT query_id, state, coalesce(source, '-'), \"user\", substr(regexp_replace(query, '\\s+', ' '), 1, 70)
+                FROM system.runtime.queries
+                WHERE state NOT IN ('FINISHED', 'FAILED') AND query NOT LIKE '%system.runtime.queries%'" 60 || true; } | tr '\t' ' '
 }
 
-# Checked on the CLUSTER, so it also catches a run from another laptop, the
-# in-cluster runner, or a throughput-benchmark test on the same engines:
-#   - no CDC/throughput query on the FE; duckdb-warm not busy;
-#   - no throughput-benchmark qb-runner active (it shares StarRocks and duckdb-warm);
-#   - locally, no other harness process (<self> = starrocks | duckdb-warm).
+# Checked on the CLUSTER, so it also catches a run from another laptop or the
+# in-cluster runner:
+#   - no other query on Trino; neither DuckDB server (this harness's and the
+#     throughput benchmark's duckdb-warm, which share the bucket and on a small
+#     nodepool the nodes) busy;
+#   - no throughput-benchmark qb-runner active (same cluster, bucket, nodes);
+#   - locally, no other driver process (<self> = duckdb-warm | trino).
 # ALLOW_CONCURRENT=1 skips it.
-qb_assert_alone() {   # <self: starrocks|duckdb-warm>
+qb_assert_alone() {   # <self: duckdb-warm|trino>
     [[ "${ALLOW_CONCURRENT:-0}" == 1 ]] && return 0
     local other busy a d
     case "$1" in
-        starrocks)   other=$(pgrep -fl 'querybench/duckdb-warm\.sh run' | grep -v 'bash -c' || true) ;;
-        duckdb-warm) other=$(pgrep -fl 'querybench/starrocks\.sh' | grep -v 'bash -c' || true) ;;
-        *)           qb_die "qb_assert_alone: unknown harness '$1'" ;;
+        trino)       other=$(pgrep -fl 'querybench/duckdb-warm\.sh run' | grep -v 'bash -c' || true) ;;
+        duckdb-warm) other=$(pgrep -fl 'querybench/trino\.sh run' | grep -v 'bash -c' || true) ;;
+        *)           qb_die "qb_assert_alone: unknown driver '$1'" ;;
     esac
-    [[ -z "$other" ]] || qb_die "another benchmark is running (ALLOW_CONCURRENT=1 to override):
+    [[ -z "$other" ]] || qb_die "another benchmark driver is running (ALLOW_CONCURRENT=1 to override):
 ${other}"
     a=$(kubectl get job qb-runner -n "$NAMESPACE" -o jsonpath='{.status.active}' 2>/dev/null || true)
-    [[ "${a:-0}" == 0 ]] || qb_die "throughput-benchmark's qb-runner is running on the same engines (ALLOW_CONCURRENT=1 to override)"
-    if kubectl get pod "$FE_POD" -n "$NAMESPACE" >/dev/null 2>&1; then qb_assert_fe_idle; fi
-    # Both DuckDB servers: this harness's and the throughput benchmark's (it
-    # shares the bucket and, on a small nodepool, the nodes).
-    for d in duckdb-warm-cdc duckdb-warm; do
+    [[ "${a:-0}" == 0 ]] || qb_die "throughput-benchmark's qb-runner is running on the same cluster (ALLOW_CONCURRENT=1 to override)"
+    if kubectl get "$TRINO_COORDINATOR" -n "$NAMESPACE" >/dev/null 2>&1; then
+        busy=$(qb_trino_busy)
+        [[ -z "$busy" ]] || qb_die "Trino is running other queries (CALL system.runtime.kill_query('<id>') or ALLOW_CONCURRENT=1):
+${busy}"
+    fi
+    for d in "$DUCKDB_NAME" duckdb-warm; do
         kubectl get deploy "$d" -n "$NAMESPACE" >/dev/null 2>&1 || continue
         busy=$(kubectl exec -n "$NAMESPACE" "deploy/${d}" -c duckdb -- python3 -c \
             'import json, urllib.request; print(json.load(urllib.request.urlopen("http://localhost:8080/health", timeout=10))["busy"])' 2>/dev/null || echo unreachable)
@@ -612,7 +733,7 @@ ${other}"
 
 # ── Suite plumbing shared by both drivers ───────────────────────────────────
 # Resolve and log the suite's values the same way on both engines. Snapshot
-# values come from run.sh (exported SNAPSHOT_DT / S_FROM / S_TO); resolved
+# values come from snapshot.sh (exported SNAPSHOT_DT / S_FROM / S_TO); resolved
 # here only when a driver runs by hand.
 qb_start_suite() {   # <hot|snapshot>
     if [[ "$1" == hot ]]; then
@@ -626,7 +747,7 @@ qb_start_suite() {   # <hot|snapshot>
     fi
 }
 
-# The arms of a suite are ratioed against each other, so a writer change
+# The engines of a suite are ratioed against each other, so a writer change
 # between them makes the suite meaningless: 0 = unchanged, else logged and 1.
 qb_writers_unchanged() {   # <writer state at suite start> <suite>
     local now; now=$(qb_writer_state)
@@ -638,126 +759,50 @@ qb_writers_unchanged() {   # <writer state at suite start> <suite>
 # Every QB_PIN_* variable set in this shell, one per line (for .pins files).
 qb_pins_dump() { local v; for v in $(compgen -v | grep '^QB_PIN_' | sort); do echo "${v}=${!v}"; done; }
 
-# ── StarRocks pin checks and the H8 key (need the FE and the catalogs) ──────
-# qb_sr with the error text kept: "<rc><TAB><last output or error line>".
-qb_sr_try() {
-    local out rc
-    out=$(kubectl exec -n "$NAMESPACE" "$FE_POD" -- mysql -h127.0.0.1 -P9030 -uroot -N -B -e "$1" 2>&1); rc=$?
-    printf '%s\t%s\n' "$rc" "$(tail -1 <<<"$out" | tr '\t' ' ')"
-}
-
-# Every StarRocks arm must read every pinned table, alias included (the SQL
-# writes `${ORDERS} AS o`). An Iceberg-reader arm whose FE metadata cache does
-# not hold the newest snapshot yet ("snapshot ID does not exists") gets
-# REFRESH EXTERNAL TABLE and retries for up to 5 min. If the clause form does
-# not parse, SR_PIN_FORM=subquery is used. If the native Paimon reader cannot
-# read its version, that table is UNPINNED on the paimon arm and the pins say
-# so (throughput-benchmark does the same). Prints the changed exports, if any.
-qb_sr_check_pins() {
-    local arm t T tgt r try v changes=""
-    for arm in ${ARMS-$SR_ARMS_ALL}; do
-        tgt=$(qb_sr_target "$arm") || qb_die "unknown arm ${arm}"
+# Trino must read every pinned table of each arm in FORMATS at its snapshot
+# (FOR VERSION AS OF, alias included, as the SQL writes `${ORDERS} AS o`). A
+# coordinator whose view of the table is older than the pin ("Snapshot ... not
+# found") is retried for up to 5 min. Iceberg: anything else stops the run.
+# Paimon (the export, a separate code path): logged as a WARNING, and the
+# arm's queries then record the error, so the run goes on.
+qb_trino_check_pins() {
+    local arm t r try tries
+    for arm in $(qb_formats); do
         for t in $QB_TABLES; do
-            T=$(qb_upper "$t"); set -- $tgt; v="QB_PIN_SNAP_${3}_${T}"
-            [[ -n "${!v:-}" ]] || continue
-            for (( try = 1; try <= 10; try++ )); do
-                r=$(qb_sr_try "$(qb_sr_sets "$arm")SET new_planner_optimize_timeout = 300000; SELECT 1 FROM $(qb_table_expr starrocks "$arm" "$t") AS q LIMIT 1")
+            tries=10; [[ "$arm" == paimon ]] && tries=4
+            for (( try = 1; try <= tries; try++ )); do
+                r=$(qb_trino_try "SELECT 1 FROM $(qb_table_expr trino "$arm" "$t") AS q LIMIT 1")
                 [[ "$r" == 0$'\t'* ]] && break
-                if [[ "$r" == *[Ss]yntax* && "${SR_PIN_FORM:-clause}" == clause ]]; then
-                    qb_log "pin form 'FOR VERSION AS OF ... AS q' does not parse on this FE (${r#*$'\t'}); using SR_PIN_FORM=subquery"
-                    SR_PIN_FORM=subquery; changes+=" SR_PIN_FORM=subquery"; continue
-                fi
-                [[ "$arm" == paimon ]] && (( try >= 2 )) && break
-                # v3, SR_V3_ARMS=1: the expected deletion-vector refusal is the result.
-                qb_sr_v3_forced "$arm" && [[ "$r" == *[Dd]eletion* ]] && break
-                [[ "$arm" == paimon ]] || qb_sr "REFRESH EXTERNAL TABLE ${1}.${2}.${t}" >/dev/null || true
-                qb_log "pinned ${arm}.${t}@${!v}: ${r#*$'\t'} (try ${try}/10), retrying in 30s"
+                qb_log "Trino pinned ${arm}.${t}: ${r#*$'\t'} (try ${try}/${tries}), retrying in 30s"
                 sleep 30
             done
             [[ "$r" == 0$'\t'* ]] && continue
             if [[ "$arm" == paimon ]]; then
-                qb_log "WARNING: StarRocks native Paimon cannot read ${t} at snapshot ${!v} (${r#*$'\t'}); that table runs UNPINNED on the paimon arm"
-                printf -v "$v" '%s' ""; changes+=" ${v}="
-            elif qb_sr_v3_forced "$arm"; then
-                qb_log "Iceberg v3, SR_V3_ARMS=1: StarRocks ${arm} cannot read ${t} at version ${!v}: ${r#*$'\t'} (expected; its queries will record the error)"
+                qb_log "WARNING: Trino cannot read ${PAIMON_DB}.${t} (Paimon's export) at its pinned snapshot: ${r#*$'\t'}; trino:paimon queries will record the error"
             else
-                qb_die "StarRocks ${arm} cannot read ${t} at version ${!v}: ${r#*$'\t'}"
+                qb_die "Trino cannot read ${ICEBERG_DB}.${t} at its pinned snapshot: ${r#*$'\t'}"
             fi
         done
     done
-    [[ -z "$changes" ]] || echo "export${changes}"
 }
 
-# H8's key: an order UPDATED in the hot window (updated_at in [HOT_FROM, HOT_TO),
-# created before it), picked on the pinned Iceberg arm and confirmed on the
-# pinned native Paimon arm; the next candidates are tried (OFFSET 1..4). Sets
-# QB_LOOKUP_ORDER_ID / QB_LOOKUP_ORDER_DT (LOOKUP_ORDER_ID / LOOKUP_ORDER_DT
-# pin them) and QB_LOOKUP_NOTE (its partition: the hot day or older). The
-# selection reads updated_at over the whole table (no partition filter, like
-# H4): untimed, datacache off.
-qb_resolve_lookup() {
-    if [[ -n "${LOOKUP_ORDER_ID:-}" ]]; then
-        [[ "$LOOKUP_ORDER_ID" =~ ^[0-9]+$ && "${LOOKUP_ORDER_DT:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
-            || qb_die "LOOKUP_ORDER_ID must be an integer and LOOKUP_ORDER_DT a YYYY-MM-DD"
-        QB_LOOKUP_ORDER_ID="$LOOKUP_ORDER_ID"; QB_LOOKUP_ORDER_DT="$LOOKUP_ORDER_DT"; QB_LOOKUP_NOTE="pinned by hand"
-    elif [[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 ]]; then
-        # v3 (also with SR_V3_ARMS=1): StarRocks cannot read the Iceberg tables, so the key is picked on
-        # the pinned native Paimon arm and not confirmed on Iceberg (DuckDB's
-        # iceberg arm returns what it finds; the summary compares the rows).
-        local r
-        r=$(qb_sr "$(qb_sr_sets paimon)SET enable_scan_datacache = false; SET populate_datacache_mode = 'never'; SET query_timeout = 1800;
-                   SELECT o.order_id, o.$(qb_part_col paimon orders) FROM $(qb_table_expr starrocks paimon orders) AS o
-                   WHERE o.updated_at >= '${QB_HOT_FROM}' AND o.updated_at < '${QB_HOT_TO}' AND o.order_date < '${QB_HOT_FROM}'
-                   ORDER BY o.updated_at DESC, o.order_id LIMIT 1" | tail -1)
-        [[ "$r" =~ ^[0-9]+$'\t'[0-9-]+$ ]] || qb_die "no H8 candidate on the paimon arm (got '${r}'): no update of an older order in the window? Set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
-        QB_LOOKUP_ORDER_ID="${r%%$'\t'*}" QB_LOOKUP_ORDER_DT="${r#*$'\t'}"
-        QB_LOOKUP_NOTE="picked on paimon, not confirmed on iceberg (Iceberg v3: StarRocks cannot read it)"
-    else
-        local off r id dt n
-        for off in 0 1 2 3 4; do
-            r=$(qb_sr "SET enable_scan_datacache = false; SET populate_datacache_mode = 'never'; SET query_timeout = 1800;
-                       SELECT o.order_id, o.$(qb_part_col iceberg orders) FROM $(qb_table_expr starrocks iceberg orders) AS o
-                       WHERE o.updated_at >= '${QB_HOT_FROM}' AND o.updated_at < '${QB_HOT_TO}' AND o.order_date < '${QB_HOT_FROM}'
-                       ORDER BY o.updated_at DESC, o.order_id LIMIT 1 OFFSET ${off}" | tail -1)
-            [[ "$r" =~ ^[0-9]+$'\t'[0-9-]+$ ]] || qb_die "no H8 candidate on the iceberg arm at OFFSET ${off} (got '${r}'): no update of an older order in the window? Set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
-            id="${r%%$'\t'*}" dt="${r#*$'\t'}"
-            n=$(qb_sr "$(qb_sr_sets paimon)SET enable_scan_datacache = false; SET populate_datacache_mode = 'never';
-                       SELECT COUNT(*) FROM $(qb_table_expr starrocks paimon orders) AS o
-                       WHERE o.$(qb_part_col paimon orders) = '${dt}' AND o.order_id = ${id}" | tail -1)
-            [[ "$n" == 1 ]] && { QB_LOOKUP_ORDER_ID="$id"; QB_LOOKUP_ORDER_DT="$dt"; break; }
-            qb_log "H8 candidate ${id} (${dt}) is not on the native Paimon arm (count '${n}'); trying the next"
-        done
-        [[ -n "${QB_LOOKUP_ORDER_ID:-}" ]] || qb_die "no H8 key on both formats in 5 candidates; set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
-        QB_LOOKUP_NOTE="picked on iceberg, confirmed on paimon"
-    fi
-    if [[ "$QB_LOOKUP_ORDER_DT" == "${QB_HOT_DT:-}" ]]; then QB_LOOKUP_NOTE+="; partition = HOT_DT"
-    else QB_LOOKUP_NOTE+="; partition older than HOT_DT (more equality deletes on Iceberg)"; fi
-    qb_log "H8 key: order_id=${QB_LOOKUP_ORDER_ID} ${QB_LOOKUP_ORDER_DT} (${QB_LOOKUP_NOTE})"
-}
+# ── Snapshot gates (snapshot.sh; run.sh checks the compaction gate up front) ─
+# Each prints "<name>=<UTC time>" lines for the .pins file on stdout.
 
-# ── Snapshot phase gates (snapshot.sh; run.sh for SNAPSHOT_FORMAT=iceberg) ──
-# Each prints "<name>=<UTC time>" lines for the phase's .pins file on stdout.
-
-# StarRocks FE + all BEs Ready (when starrocks is in ENGINES) and the DuckDB
-# server answering busy=false (when duckdb is), waiting up to
-# ENGINE_GATE_TIMEOUT_S (1800).
-qb_ready_count() {
-    kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/component=$1" \
-        -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null \
-        | { grep -o True || true; } | wc -l | tr -d ' '
-}
+# Every engine in ENGINES up, waiting up to ENGINE_GATE_TIMEOUT_S (1800):
+# duckdb-warm-cdc answering busy=false; Trino answering with TRINO_WORKERS
+# active workers and no query running.
 qb_engines_gate() {
-    local deadline=$(( $(date +%s) + ${ENGINE_GATE_TIMEOUT_S:-1800} )) fe be h why
+    local deadline=$(( $(date +%s) + ${ENGINE_GATE_TIMEOUT_S:-1800} )) h n why
     while :; do
         why=""
-        if [[ "${ENGINES:-starrocks duckdb}" == *starrocks* ]]; then
-            fe=$(qb_ready_count fe); be=$(qb_ready_count be)
-            (( fe >= 1 && be >= ${SR_BE_COUNT:-3} )) || why+=" StarRocks FE ${fe}/1 BE ${be}/${SR_BE_COUNT:-3} Ready;"
+        if qb_has_engine duckdb; then
+            h=$(qb_duck_health)
+            [[ "$h" == *'"busy": false'* ]] || why+=" ${DUCKDB_NAME} ${h:-down};"
         fi
-        if [[ "${ENGINES:-starrocks duckdb}" == *duckdb* ]]; then
-            h=$(kubectl exec -n "$NAMESPACE" "deploy/${DUCKDB_NAME:-duckdb-warm-cdc}" -c duckdb -- python3 -c \
-                'import json, urllib.request; print(json.load(urllib.request.urlopen("http://localhost:8080/health", timeout=10))["busy"])' 2>/dev/null || echo down)
-            [[ "$h" == False ]] || why+=" ${DUCKDB_NAME:-duckdb-warm-cdc} ${h};"
+        if qb_has_engine trino; then
+            n=$(qb_trino_workers)
+            [[ -n "$n" ]] && (( n >= TRINO_WORKERS )) || why+=" Trino ${n:-down}/${TRINO_WORKERS} workers active;"
         fi
         [[ -z "$why" ]] && { echo "gate_engines_ready_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')"; return 0; }
         (( $(date +%s) < deadline )) || qb_die "engines not ready after ${ENGINE_GATE_TIMEOUT_S:-1800}s:${why}"
@@ -766,19 +811,7 @@ qb_engines_gate() {
     done
 }
 
-# "<operation> <commit ms>" of the Iceberg table's current snapshot (Glue).
-qb_iceberg_current() {   # <table>
-    local loc
-    loc=$(aws glue get-table --region "$AWS_REGION" --database-name "$ICEBERG_DB" --name "$1" \
-            --query 'Table.Parameters.metadata_location' --output text 2>/dev/null) || return 1
-    aws s3 cp --region "$AWS_REGION" "$loc" - 2>/dev/null | python3 -c '
-import json, sys
-m = json.load(sys.stdin); sid = m.get("current-snapshot-id")
-s = next((s for s in m.get("snapshots", []) if s.get("snapshot-id") == sid), {})
-print(s.get("summary", {}).get("operation", "?"), s.get("timestamp-ms", 0))'
-}
-
-# The Iceberg phase's gate: for every COMPACT_TABLES table, the Job
+# The compaction gate: for every COMPACT_TABLES table, the Job
 # iceberg-compact-<table> (../iceberg-compaction/run-compaction.sh) has
 # SUCCEEDED, was created at or after COMPACT_NOT_BEFORE (epoch s; run.sh sets
 # it when it submits the Jobs, so an older Job never counts), and the table's
@@ -787,7 +820,7 @@ print(s.get("summary", {}).get("operation", "?"), s.get("timestamp-ms", 0))'
 # write after it would void that. <wait>=1 waits (up to COMPACT_GATE_TIMEOUT_S,
 # 21600) while a Job is missing or running; 0 refuses at once. A failed Job
 # always refuses. ICEBERG_REQUIRE_COMPACTION=0 skips the gate (the uncompacted
-# table is measured, and the pins say so).
+# tables are measured, and the pins say so).
 qb_compaction_gate() {   # <wait 0|1>
     if [[ "${ICEBERG_REQUIRE_COMPACTION:-1}" == 0 ]]; then
         echo "compaction_gate=skipped (ICEBERG_REQUIRE_COMPACTION=0: the tables are measured as they are)"; return 0
@@ -806,23 +839,23 @@ print(state, ep(j["metadata"].get("creationTimestamp")), ep(s.get("startTime")),
             set -- $st
             if [[ "$1" != missing ]] && (( $2 < ${COMPACT_NOT_BEFORE:-0} )); then set -- missing 0 0 -; fi
             case "$1" in
-                failed)  qb_die "Iceberg phase refused: compaction Job ${job} FAILED (kubectl logs job/${job} -n ${NAMESPACE}); fix it and rerun SNAPSHOT_FORMAT=iceberg" ;;
+                failed)  qb_die "snapshot test refused: compaction Job ${job} FAILED (kubectl logs job/${job} -n ${NAMESPACE}); fix it and rerun" ;;
                 missing) pending+=" ${job}: not submitted${COMPACT_NOT_BEFORE:+ since $(date -u -r "$COMPACT_NOT_BEFORE" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$COMPACT_NOT_BEFORE" '+%H:%M:%SZ')};" ;;
                 running) pending+=" ${job}: running;" ;;
                 succeeded)
                     cur=$(qb_iceberg_current "$t") || qb_die "cannot read ${ICEBERG_DB}.${t}'s current snapshot"
                     set -- $st $cur
                     [[ "$5" == replace ]] && (( $6 >= $3 * 1000 )) \
-                        || qb_die "Iceberg phase refused: ${ICEBERG_DB}.${t}'s current snapshot is '${5}' at ${6} ms, not the compaction's replace commit after ${job} started (a write after it, or a no-op compaction); recompact, or ICEBERG_REQUIRE_COMPACTION=0 to measure it as is"
+                        || qb_die "snapshot test refused: ${ICEBERG_DB}.${t}'s current snapshot is '${5}' at ${6} ms, not the compaction's replace commit after ${job} started (a write after it, or a no-op compaction); recompact, or ICEBERG_REQUIRE_COMPACTION=0 to measure it as is"
                     out+="compaction_${t}=${job} completed ${4}, current snapshot replace@${6}"$'\n' ;;
             esac
         done
         if [[ -z "$pending" ]]; then
             printf '%s' "$out"; echo "gate_compaction_finished_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')"; return 0
         fi
-        [[ "$wait_" == 1 ]] || qb_die "Iceberg phase refused: compaction not complete:${pending} (start it with COMPACT_BEFORE_SNAPSHOT=true and SNAPSHOT_FORMAT=paimon|both, or wait)"
-        (( $(date +%s) < deadline )) || qb_die "Iceberg phase refused: compaction not complete after ${COMPACT_GATE_TIMEOUT_S:-21600}s:${pending}"
-        qb_log "Iceberg phase waits for compaction:${pending}"
+        [[ "$wait_" == 1 ]] || qb_die "snapshot test refused: compaction not complete:${pending} (start it with COMPACT_BEFORE_SNAPSHOT=true, or wait)"
+        (( $(date +%s) < deadline )) || qb_die "snapshot test refused: compaction not complete after ${COMPACT_GATE_TIMEOUT_S:-21600}s:${pending}"
+        qb_log "snapshot test waits for compaction:${pending}"
         sleep 60
     done
 }

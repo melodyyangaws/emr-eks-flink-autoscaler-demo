@@ -957,4 +957,4 @@ in `kubectl describe pod`, while the FlinkDeployment shows a healthy-looking
 
 Override the name with `MYSQL_ENV_SECRET_NAME` if you use a different one.
 3. **[Monitor the pipelines](./3-MONITOR.md)** — job status, throughput, checkpoints, table stats.
-4. **[Query with StarRocks](./4-STARROCKS-OLAP-ENGINE.md)** — the Paimon vs Iceberg comparison.
+4. **[Query benchmark: DuckDB vs Trino](./querybench/README.md)** — both engines on the Iceberg tables and on Paimon's Iceberg export (Athena: [README Step 4](./README.md#step-4--olap-query-layer-athena)).

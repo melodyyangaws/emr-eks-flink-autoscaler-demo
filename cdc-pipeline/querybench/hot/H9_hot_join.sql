@@ -13,20 +13,22 @@
 -- all is ZERO_SCAN. orders.order_id is the source key, unique across
 -- partitions, so the orders side needs no partition filter (and cannot have
 -- one: updated orders stay in their creation-date partition).
--- DuckDB: dynamic join filters can prune the orders scan by order_id; StarRocks:
--- runtime filters do the same. A big gap between engines here is that, first.
+-- DuckDB and Trino both push dynamic join filters from the items side into the
+-- orders scan by order_id. A big gap between engines here is that, first.
+-- Runs unchanged on DuckDB and Trino (TIMESTAMP literals: see H1); sums cast
+-- to BIGINT / DECIMAL(38,2) so both engines print the same text.
 SELECT o.order_status,
-       COUNT(*)                   AS items,
-       COUNT(DISTINCT o.order_id) AS orders,
-       SUM(oi.quantity)           AS units,
-       SUM(oi.subtotal)           AS revenue
+       COUNT(*)                                  AS items,
+       COUNT(DISTINCT o.order_id)                AS orders,
+       CAST(SUM(oi.quantity) AS BIGINT)          AS units,
+       CAST(SUM(oi.subtotal) AS DECIMAL(38,2))   AS revenue
 FROM ${ORDER_ITEMS} AS oi
 JOIN ${ORDERS} AS o
   ON o.order_id = oi.order_id
 WHERE oi.${ORDER_ITEMS_PART} = '${HOT_DT}'
-  AND oi.created_at >= '${HOT_FROM}'
-  AND oi.created_at <  '${HOT_TO}'
-  AND o.updated_at  >= '${HOT_FROM}'
-  AND o.updated_at  <  '${HOT_TO}'
+  AND oi.created_at >= TIMESTAMP '${HOT_FROM}'
+  AND oi.created_at <  TIMESTAMP '${HOT_TO}'
+  AND o.updated_at  >= TIMESTAMP '${HOT_FROM}'
+  AND o.updated_at  <  TIMESTAMP '${HOT_TO}'
 GROUP BY o.order_status
 ORDER BY o.order_status;

@@ -8,20 +8,17 @@
 -- partition column), so a key duplicated across two partitions is caught too.
 -- The source never moves a row between partitions, so there should be none.
 -- Fact tables are bounded to the closed partition, dimensions are whole.
--- Compare across arms row by row, not only the first row:
---   paimon vs pmn_as_iceberg (same files, different reader): live_rows must be
---     equal. The export omits files the native reader sees. On the v2 set it
---     lists only the top LSM level (no deletion vectors exported): on
---     2026-09-30 that was 0.4-9.2 percent FEWER rows than the native reader at
---     the same snapshot id. On the v3 set (default; Paimon 2.1 exports bitmap64
---     deletion vectors) only level-0 files are left out. Either way, fully
---     compact Paimon before the snapshot run or that gap is timed as a speed-up.
+-- Compare across arms and engines row by row, not only the first row:
+--   DuckDB vs Trino on the same pinned Iceberg snapshot: every row must be
+--     identical; a difference is a reader bug (a delete file or deletion
+--     vector one engine did not apply).
 --   paimon vs iceberg (different writers): equal only if both pipelines had
 --     consumed the same binlog position when the writers stopped (orders
 --     differed by 8 rows on 2026-09-28). A gap here is pipeline state, not a
 --     reader bug, but it does mean the arms read different data.
 -- COUNT(DISTINCT) forces a full read of the key column, so no metadata
--- shortcut applies to any table.
+-- shortcut applies to any table. Runs unchanged on DuckDB and Trino: counts
+-- are BIGINT on both, and the UNION's ORDER BY sorts the whole result.
 SELECT 'customers'                          AS tbl,
        COUNT(*)                             AS live_rows,
        COUNT(DISTINCT customer_id)          AS distinct_keys,

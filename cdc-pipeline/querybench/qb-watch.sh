@@ -6,16 +6,27 @@
 #
 # Every WATCH_INTERVAL_S (600) it reads the runner's log; the test is over when
 # the runner prints "status: runner-exit=", or its Job or pod is gone or failed.
-# Then:
+#
+# Only a COMPLETED test is torn down: "status: runner-exit=0". Any other end (a
+# non-zero exit, a failed or vanished runner pod or Job) leaves the generator,
+# writers, job monitor, DuckDB and Trino RUNNING and prints a report: why it
+# ended, the runner's last error lines and what is still up. A setup error then
+# costs a fix and a re-run, not a new MySQL snapshot. Tear down by hand with
+# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-6 below).
+#
+#   ./querybench/qb-watch.sh            watch (the cdc-qb-watch Job runs this)
+#   ./querybench/qb-watch.sh teardown   steps 1-6 now, no watching (run.sh stop)
+#
+# Teardown steps:
 #   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it);
 #   2. suspends the CDC writers (SUSPEND_WRITERS=0 leaves them; they resume
 #      from their last checkpoint: upgradeMode last-state);
 #   3. scales the CDC job monitor (flink-cdc-monitor) to 0 once the writers stopped;
 #   4. takes duckdb-warm-cdc down (STOP_DUCKDB=0 leaves it);
-#   5. takes StarRocks down (STOP_STARROCKS=0 leaves it): the StarRocksCluster
-#      and its FE/BE volumes, as throughput-benchmark/engine-deploy/
-#      deploy-starrocks.sh down does (the Helm release and operator stay;
-#      run.sh start installs it again);
+#   5. scales Trino's coordinator and workers to 0 (STOP_TRINO=0 leaves them):
+#      this pod has no helm, so not deploy-trino.sh down; the release stays,
+#      the cache volumes go with their pods, and run.sh start scales them back
+#      and runs deploy-trino.sh up;
 #   6. deletes the runner's ConfigMap and Secret.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +35,7 @@ source "${HERE}/../lib/querybench.sh"
 case "$SUITE" in hot|snapshot) ;; *) qb_die "qb-watch needs SUITE=hot|snapshot, got '${SUITE}'" ;; esac
 WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-600}"
 WATCH_RUNNER=cdc-qb-runner
-DUCK="${DUCKDB_NAME:-duckdb-warm-cdc}"
+DUCK="$DUCKDB_NAME"
 MONITOR="${CDC_MONITOR:-flink-cdc-monitor}"
 
 test_over() {
@@ -38,31 +49,16 @@ test_over() {
     kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" 2>/dev/null | grep -m1 '^status: runner-exit=' || true
 }
 
-# = throughput-benchmark/engine-deploy/deploy-starrocks.sh down, in kubectl only
-# (that script needs throughput's .bench-env, which this pod does not carry).
-starrocks_down() {
-    local i n
-    kubectl delete starrocksclusters.starrocks.com kube-starrocks -n "$NAMESPACE" --ignore-not-found --wait=true --timeout=300s >/dev/null || return 1
-    for (( i = 0; i < 60; i++ )); do
-        n=$(kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=fe -o name 2>/dev/null; \
-            kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=be -o name 2>/dev/null)
-        [[ -z "$n" ]] && break
-        sleep 5
+trino_down() {
+    local d ok=0
+    for d in trino-coordinator "$TRINO_WORKER_DEPLOY"; do
+        kubectl get deploy "$d" -n "$NAMESPACE" >/dev/null 2>&1 || continue
+        kubectl scale "deploy/${d}" -n "$NAMESPACE" --replicas=0 >/dev/null || ok=1
     done
-    kubectl delete pvc -n "$NAMESPACE" -l app.kubernetes.io/component=fe --ignore-not-found >/dev/null || true
-    kubectl delete pvc -n "$NAMESPACE" -l app.kubernetes.io/component=be --ignore-not-found >/dev/null || true
+    return $ok
 }
 
-qb_log "cdc-qb-watch (${SUITE}): checking ${WATCH_RUNNER} every ${WATCH_INTERVAL_S}s"
-while :; do
-    why=$(test_over)
-    [[ -n "$why" ]] && break
-    last=$(kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" --tail=200 2>/dev/null | grep '\[querybench\]' | tail -1 || true)
-    qb_log "${SUITE} test still running: ${last:-no progress line yet}"
-    sleep "$WATCH_INTERVAL_S"
-done
-qb_log "${SUITE} test over: ${why}"
-
+teardown() {
 ( WRITER_DRAIN_S=0 qb_stop_generator ) || qb_log "WARNING: could not stop the generator"
 if ( qb_stop_writers ); then
     if [[ "${SUSPEND_WRITERS:-1}" == 0 ]]; then
@@ -85,15 +81,65 @@ elif kubectl delete deploy "$DUCK" -n "$NAMESPACE" --ignore-not-found --wait=fal
 else
     qb_log "WARNING: could not stop ${DUCK}"
 fi
-if [[ "${STOP_STARROCKS:-1}" == 0 ]]; then
-    qb_log "STOP_STARROCKS=0: StarRocks left running"
-elif starrocks_down; then
-    qb_log "StarRocks stopped (FE/BE and volumes deleted; run.sh start installs it again)"
+if [[ "${STOP_TRINO:-1}" == 0 ]]; then
+    qb_log "STOP_TRINO=0: Trino left running"
+elif trino_down; then
+    qb_log "Trino scaled to 0 (run.sh start brings it back; engine-deploy/deploy-trino.sh down removes the release)"
 else
-    qb_log "WARNING: could not stop StarRocks (throughput-benchmark/engine-deploy/deploy-starrocks.sh down by hand)"
+    qb_log "WARNING: could not scale Trino to 0 (engine-deploy/deploy-trino.sh down by hand)"
 fi
 kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && qb_log "${WATCH_RUNNER}'s ConfigMap and Secret deleted" \
     || qb_log "WARNING: could not delete ${WATCH_RUNNER}'s ConfigMap/Secret"
-echo "status: qb-watch-done $(date -u)"
+}
+
+# What is still up after a failed test, one line each (read-only).
+report_running() {
+    local d st
+    for d in ${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}; do
+        st=$(kubectl get flinkdeployment "$d" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.state}/{.spec.job.state}' 2>/dev/null || true)
+        qb_log "  writer ${d}: ${st:-not deployed}"
+    done
+    for d in ${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}; do
+        st=$(kubectl get "$d" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+        qb_log "  generator ${d}: ${st:-not deployed} ready"
+    done
+    for d in "$MONITOR" "$DUCK" trino-coordinator "$TRINO_WORKER_DEPLOY"; do
+        st=$(kubectl get deploy "$d" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+        qb_log "  ${d}: ${st:-not deployed} ready"
+    done
+}
+
+if [[ "${1:-}" == teardown ]]; then
+    qb_log "teardown requested (${SUITE})"
+    teardown
+    echo "status: qb-teardown-done $(date -u)"
+    exit 0
+fi
+
+qb_log "cdc-qb-watch (${SUITE}): checking ${WATCH_RUNNER} every ${WATCH_INTERVAL_S}s"
+while :; do
+    why=$(test_over)
+    [[ -n "$why" ]] && break
+    last=$(kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" --tail=200 2>/dev/null | grep '\[querybench\]' | tail -1 || true)
+    qb_log "${SUITE} test still running: ${last:-no progress line yet}"
+    sleep "$WATCH_INTERVAL_S"
+done
+qb_log "${SUITE} test over: ${why}"
+
+if [[ "$why" == "status: runner-exit=0"* ]]; then
+    qb_log "${SUITE} test completed: tearing the run down"
+    teardown
+    echo "status: qb-watch-done $(date -u)"
+else
+    qb_log "${SUITE} test did NOT complete (${why}): leaving everything RUNNING, no teardown"
+    qb_log "last runner errors:"
+    kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" --tail=400 2>/dev/null \
+        | grep -E 'ERROR|FAILED|Exception|error:|refus|die' | tail -15 | sed 's/^/    /' \
+        || qb_log "    (runner log unavailable)"
+    qb_log "still running:"
+    report_running
+    qb_log "fix and re-run with SUITE=${SUITE} ./querybench/run.sh start, or tear down with SUITE=${SUITE} ./querybench/run.sh stop"
+    echo "status: qb-watch-failed-left-running $(date -u)"
+fi

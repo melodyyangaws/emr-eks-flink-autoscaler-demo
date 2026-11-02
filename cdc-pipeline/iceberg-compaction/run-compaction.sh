@@ -4,6 +4,8 @@
 # Usage:
 #   ./run-compaction.sh                     # compact flink_iceberg_db_v3.order_items (the v3 set)
 #   DRY_RUN=true ./run-compaction.sh        # report table state only, commit nothing
+#   EXPIRE_SNAPSHOTS=false ./run-compaction.sh   # rewrite only; by default it then expires
+#                                          # snapshots older than 12 h, keeping 5 (Paimon's rule)
 #   ICEBERG_TABLE=orders ./run-compaction.sh
 #   CDC_DB_SUFFIX= ./run-compaction.sh      # the unsuffixed v2 set: flink_iceberg_db
 #   ./run-compaction.sh render              # print the Job manifest it would create; no cluster call
@@ -86,7 +88,8 @@ c["image"] = os.environ["SPARK_IMAGE"]
 env = c["env"]
 given = {k: os.environ[k] for k in ("ICEBERG_DB", "ICEBERG_TABLE", "ICEBERG_WAREHOUSE",
          "AWS_REGION", "DRY_RUN", "TARGET_FILE_SIZE_BYTES", "DRIVER_MEMORY",
-         "SPARK_LOCAL_THREADS") if k in os.environ}
+         "SPARK_LOCAL_THREADS", "EXPIRE_SNAPSHOTS", "EXPIRE_OLDER_THAN_HOURS",
+         "EXPIRE_RETAIN_LAST") if k in os.environ}
 given["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
 for k, v in given.items():
     for e in env:

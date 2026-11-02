@@ -241,8 +241,8 @@ Adjust batch size and interval:
 
 ## Upsert Workload (benchmark load)
 
-The high-rate workload used for the Paimon-vs-Iceberg comparison in
-[4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md). Append `upsert` to every command.
+The high-rate workload used for the Paimon-vs-Iceberg comparison and the hot
+query test ([querybench/README.md](querybench/README.md)). Append `upsert` to every command.
 
 ### **Deploy**
 
@@ -382,6 +382,23 @@ A narrower window makes each key hotter, which **strengthens** the benchmark:
 Iceberg accumulates equality-delete files faster and Paimon's LSM has more to
 compact, and that divergence is the whole point. Expect 1213/1205 to persist —
 concentrating writes raises per-key contention even as it fixes cache misses.
+
+#### The cold tail spans `[MIN(pk), MAX(pk)]`, not `[1, MAX(pk)]`
+
+At startup each pod reads `MIN(pk)` and `MAX(pk)` per table (both ends of the
+primary-key index, so both are instant lookups) and logs them on the `id ranges:`
+line as `(min, max)` pairs. Hot keys come from
+`[max(MIN, MAX - HOT_KEY_WINDOW), MAX]`, sharded per pod as above; the cold
+`1 - HOT_KEY_RATIO` of upserts is drawn uniformly from `[MIN, MAX]`.
+
+The lower bound matters because the tables get shrunk to their newest ~10% of
+ids. After that, ~90% of `[1, MAX]` is ids that no longer exist. A cold "upsert"
+on one of them finds no row, so `ON DUPLICATE KEY UPDATE` takes the INSERT path
+at that old id, and the table grows back toward its original size. Drawing from
+`[MIN, MAX]` keeps cold upserts on live rows. Ids deleted inside that range can
+still be hit, but with a contiguous newest-N shrink there are none. Empty tables
+read as `(1, 1)`. The range is read once, at startup, so restart the pods after a
+shrink. Pods started before it keep the old `MIN` and keep regrowing the table.
 
 #### `BATCH_ROWS` is not monotonic
 

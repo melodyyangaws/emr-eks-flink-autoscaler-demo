@@ -1,76 +1,54 @@
 #!/usr/bin/env bash
-# Empty both engines' caches, so a CDC query test (hot or snapshot) starts cold
-# on both. querybench/run.sh start runs it before every test; run it by hand
-# only for a test started some other way. Copied from
-# throughput-benchmark/querybench/clear-caches.sh; DuckDB here is this
-# harness's duckdb-warm-cdc.
+# Empty both engines' caches, so a CDC query test starts cold on both:
+# run.sh start runs it before a hot test, snapshot.sh right before the
+# snapshot suite's warm-up pass. Run it by hand only for a test started some
+# other way.
 #
 #   ./querybench/clear-caches.sh
 #
-# 1. Refuses while a lakehouse query runs on the StarRocks FE: emptying a
-#    cache under a running test would change its numbers.
-# 2. StarRocks: for each BE, delete its datacache files and restart the pod
-#    (the memory part goes with the restart; the disk part would survive it),
-#    then wait until it is Ready. One BE at a time, so the cluster stays up.
-# 3. DuckDB: restart duckdb-warm-cdc, if it is up: empty disk and memory caches,
+# 1. Refuses while another query runs on Trino or a DuckDB server is busy:
+#    emptying a cache under a running test would change its numbers.
+# 2. DuckDB: restart duckdb-warm-cdc, if it is up: empty disk and memory caches,
 #    Parquet-footer and HTTP-metadata caches included (/clear_cache misses those).
-# 4. Checks every BE reports DiskUsage 0B.
-# ENGINES (run.sh; default both) without starrocks skips steps 1, 2 and 4,
-# without duckdb step 3.
+#    A new pod also gets a new, empty cache volume (an ephemeral PVC per pod).
+# 3. Trino: engine-deploy/deploy-trino.sh clear-cache (whatever caches that
+#    deployment keeps: file-system cache, metadata caches; see its header),
+#    then waits until TRINO_WORKERS workers are active again.
+# ENGINES (default both) without duckdb skips step 2, without trino step 3.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
-DUCK="${DUCKDB_NAME:-duckdb-warm-cdc}"
-BE_PODS="${BE_PODS:-kube-starrocks-be-0 kube-starrocks-be-1 kube-starrocks-be-2}"
-DATACACHE_DIR="${DATACACHE_DIR:-/opt/starrocks/be/storage/datacache}"
+DUCK="$DUCKDB_NAME"
+DEPLOY_TRINO="${CDC_DIR}/engine-deploy/deploy-trino.sh"
 
-ENGINES="${ENGINES:-starrocks duckdb}"
-[[ "$ENGINES" == *starrocks* ]] || BE_PODS=""
-[[ -z "$BE_PODS" ]] || qb_assert_fe_idle
+qb_assert_alone duckdb-warm   # no other query on either engine (ALLOW_CONCURRENT=1 skips)
 
-for p in $BE_PODS; do
-    qb_log "StarRocks ${p}: emptying ${DATACACHE_DIR} and restarting"
-    kubectl exec -n "$NAMESPACE" "$p" -c be -- sh -c "rm -rf ${DATACACHE_DIR:?}/*" \
-        || qb_die "could not empty the datacache on ${p}"
-    kubectl delete pod -n "$NAMESPACE" "$p" --wait=true >/dev/null
-    # The StatefulSet recreates the pod under the same name; `kubectl wait` on a
-    # pod that does not exist yet fails at once, mid-restart, so wait for it first.
-    for (( i = 0; i < 60; i++ )); do
-        kubectl get pod -n "$NAMESPACE" "$p" >/dev/null 2>&1 && break
-        sleep 5
-    done
-    kubectl wait -n "$NAMESPACE" --for=condition=Ready "pod/${p}" --timeout=600s >/dev/null \
-        || qb_die "${p} not Ready 10 min after its restart"
-done
-
-# DuckDB: restart the server rather than ask it to clear. /clear_cache empties
-# cache_httpfs only; the Parquet-footer and HTTP-metadata caches (and anything
-# else in the process) survive it, while StarRocks' BEs are restarted above. A
-# new pod also gets a new, empty cache volume (an ephemeral PVC per pod).
-if [[ "$ENGINES" == *duckdb* ]] && kubectl get deploy "$DUCK" -n "$NAMESPACE" >/dev/null 2>&1; then
+if qb_has_engine duckdb && kubectl get deploy "$DUCK" -n "$NAMESPACE" >/dev/null 2>&1; then
+    # Restart rather than ask the server to clear: /clear_cache empties
+    # cache_httpfs only; the Parquet-footer and HTTP-metadata caches (and
+    # anything else in the process) survive it.
     qb_log "${DUCK}: restarting (empty caches)"
-    kubectl rollout restart -n "$NAMESPACE" deploy/${DUCK} >/dev/null
-    kubectl rollout status -n "$NAMESPACE" deploy/${DUCK} --timeout=1200s >/dev/null \
+    kubectl rollout restart -n "$NAMESPACE" "deploy/${DUCK}" >/dev/null
+    kubectl rollout status -n "$NAMESPACE" "deploy/${DUCK}" --timeout=1200s >/dev/null \
         || qb_die "${DUCK} not ready 20 min after its restart"
-    h=$(kubectl exec -n "$NAMESPACE" deploy/${DUCK} -c duckdb -- python3 -c \
+    h=$(kubectl exec -n "$NAMESPACE" "deploy/${DUCK}" -c duckdb -- python3 -c \
         'import json, urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://localhost:8080/health?cache=1", timeout=30))))' 2>/dev/null || true)
     [[ "$h" == *'"busy": false'* ]] || qb_die "${DUCK} is not ready and idle after its restart (/health: ${h:-no answer})"
     qb_log "${DUCK}: restarted, caches empty (${h:0:120})"
-else
+elif qb_has_engine duckdb; then
     qb_log "${DUCK} is not up: nothing to clear"
 fi
 
-# Every BE back, with an empty datacache. The FE can take a moment to see the
-# restarted BEs, so a few tries.
-[[ -n "$BE_PODS" ]] || { qb_log "StarRocks not in ENGINES: not cleared"; echo "status: caches-cleared $(date -u)"; exit 0; }
-for try in 1 2 3 4 5 6; do
-    m=$(qb_sr "SHOW BACKENDS" | grep -o 'DiskUsage: [^,]*' || true)
-    n=$(grep -c . <<<"$m" || true)
-    nonzero=$(grep -v -c 'DiskUsage: 0B' <<<"$m" || true)
-    (( n == $(wc -w <<<"$BE_PODS") && nonzero == 0 )) && break
-    (( try < 6 )) || qb_die "StarRocks datacache not empty or a BE missing: $(tr '\n' ' ' <<<"$m")"
-    sleep 20
-done
-qb_log "caches cleared: StarRocks $(tr '\n' ' ' <<<"$m")"
+if qb_has_engine trino; then
+    [[ -x "$DEPLOY_TRINO" ]] || qb_die "no ${DEPLOY_TRINO#${CDC_DIR}/}: cannot clear Trino's caches"
+    qb_log "Trino: ${DEPLOY_TRINO#${CDC_DIR}/} clear-cache"
+    "$DEPLOY_TRINO" clear-cache >&2 || qb_die "Trino: clear-cache failed"
+    for (( i = 0; i < 60; i++ )); do
+        qb_trino_ready && break
+        sleep 10
+    done
+    qb_trino_ready || qb_die "Trino: fewer than ${TRINO_WORKERS} active workers 10 min after clear-cache"
+    qb_log "Trino: caches cleared, $(qb_trino_workers) workers active"
+fi
 echo "status: caches-cleared $(date -u)"

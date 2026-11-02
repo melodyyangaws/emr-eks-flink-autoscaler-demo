@@ -2,21 +2,24 @@
 # start; Jobs cdc-qb-runner / cdc-qb-watch, never the throughput benchmark's
 # qb-runner / qb-watch). Copied from throughput-benchmark/querybench/qb-runner.yaml;
 # what differs: the names, statefulsets/scale (the CDC generator is the
-# StatefulSet mysql-upsert-loadgen), pods delete (the snapshot phases empty the
+# StatefulSet mysql-upsert-loadgen), pods delete (the snapshot test empties the
 # caches from inside the runner) and the bundle layout (cdc-pipeline/ subset).
 # Rendered with envsubst over NAME, NAMESPACE, KUBECTL_VERSION and ROLE_ARN only:
 # every other $... below is for the container's shell and stays literal.
 #
-# Permissions: a namespace Role, nothing cluster-wide. Exec into the FE and
-# port-forward to the DuckDB servers, restart those servers (deployments), read
-# and suspend the Flink writers, read the other runner's Job, delete the
-# generator's, scale the job monitor to 0, take duckdb-warm down and delete the
-# runner's ConfigMap and Secret (qb-watch.sh).
+# Permissions: a namespace Role, nothing cluster-wide. Exec into the Trino
+# coordinator (the trino CLI runs there: querybench/trino.sh) and the DuckDB
+# servers, restart both engines' Deployments (clear-caches.sh: DuckDB, and
+# engine-deploy/deploy-trino.sh clear-cache, which also execs into every Trino
+# pod), read and suspend the Flink writers, read the other runner's Job, scale
+# the generator and the job monitor to 0, take duckdb-warm-cdc down, scale
+# Trino to 0 and delete the runner's ConfigMap and Secret (qb-watch.sh).
+# No JDK or trino CLI in this image: the coordinator's own CLI is used.
 #
 # AWS: the ServiceAccount assumes the execution role (IRSA; its trust already
-# covers every ServiceAccount in the namespace), so the runner can upload its
-# bench-results/ to S3 when the test ends. That upload is what lets the Job end
-# on its own: it used to sleep a day for `querybench/run.sh fetch` to copy them out.
+# covers every ServiceAccount in the namespace), so the runner can pin the
+# tables (Glue GetTable, S3 copy to querybench-pins/) and upload its
+# bench-results/ to S3 when the test ends.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -29,7 +32,7 @@ kind: Role
 metadata: {name: ${NAME}, namespace: ${NAMESPACE}}
 rules:
 - {apiGroups: [""], resources: [pods, pods/log], verbs: [get, list, watch]}
-# clear-caches.sh runs IN the runner for each snapshot phase (cold start): it deletes each BE pod
+# clear-caches.sh runs IN the runner for the snapshot test (cold start)
 - {apiGroups: [""], resources: [pods], verbs: [delete]}
 - {apiGroups: [""], resources: [pods/exec, pods/portforward], verbs: [create, get]}
 - {apiGroups: [apps], resources: [deployments, replicasets], verbs: [get, list, watch, patch, delete]}
@@ -38,9 +41,6 @@ rules:
 - {apiGroups: [""], resources: [configmaps, secrets], verbs: [delete]}
 - {apiGroups: [flink.apache.org], resources: [flinkdeployments], verbs: [get, list, patch]}
 - {apiGroups: [batch], resources: [jobs], verbs: [get, list, delete]}
-# qb-watch.sh: engine-deploy/deploy-starrocks.sh down (the cluster and its FE/BE volumes)
-- {apiGroups: [starrocks.com], resources: [starrocksclusters], verbs: [get, list, delete]}
-- {apiGroups: [""], resources: [persistentvolumeclaims], verbs: [get, list, delete]}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

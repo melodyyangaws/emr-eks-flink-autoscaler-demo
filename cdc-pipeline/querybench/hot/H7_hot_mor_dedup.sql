@@ -14,23 +14,22 @@
 --     bitmapped rows, no key join.
 -- dup_rows must be 0 on every arm: > 0 means a superseded version was returned
 -- (a delete not applied, a deletion vector missed). Within one partition the
--- source key alone is unique. units / revenue must match across formats when
--- both pipelines committed past HOT_TO.
--- What can flatter an arm: Paimon's Iceberg export omits files the native
--- reader sees (v3 set: level-0 files, about the last checkpoint, with the
--- deletion vectors exported; v2 set: everything below the top LSM level, and no
--- deletion vectors), so pmn_as_iceberg / DuckDB paimon may read fewer,
--- already-merged rows (check H1); and the window holds fresh
--- inserts, so on Iceberg the deletes mostly match nothing - they still cost the
--- join. Record the pinned snapshot's delete-file and equality-delete counts for
--- this partition next to the time; that is what decides it.
-SELECT COUNT(*)                                   AS live_rows,
-       COUNT(DISTINCT oi.order_item_id)           AS distinct_keys,
-       COUNT(*) - COUNT(DISTINCT oi.order_item_id) AS dup_rows,
-       SUM(oi.quantity)                           AS units,
-       SUM(oi.subtotal)                           AS revenue,
-       SUM(oi.quantity * oi.unit_price)           AS revenue_recomputed
+-- source key alone is unique. units / revenue must match across engines on
+-- the same pin, and across formats when both pipelines committed past HOT_TO.
+-- The window holds fresh inserts, so on Iceberg the deletes mostly match
+-- nothing - they still cost the join. Record the pinned snapshot's delete-file
+-- and equality-delete counts for this partition next to the time; that is what
+-- decides it.
+-- Runs unchanged on DuckDB and Trino (TIMESTAMP literals: see H1). Sums are
+-- cast to BIGINT / DECIMAL(38,2) so both engines print the same text;
+-- quantity * unit_price is exact (INTEGER x DECIMAL(10,2)) on both.
+SELECT COUNT(*)                                           AS live_rows,
+       COUNT(DISTINCT oi.order_item_id)                   AS distinct_keys,
+       COUNT(*) - COUNT(DISTINCT oi.order_item_id)        AS dup_rows,
+       CAST(SUM(oi.quantity) AS BIGINT)                   AS units,
+       CAST(SUM(oi.subtotal) AS DECIMAL(38,2))            AS revenue,
+       CAST(SUM(oi.quantity * oi.unit_price) AS DECIMAL(38,2)) AS revenue_recomputed
 FROM ${ORDER_ITEMS} AS oi
 WHERE oi.${ORDER_ITEMS_PART} = '${HOT_DT}'
-  AND oi.created_at >= '${HOT_FROM}'
-  AND oi.created_at <  '${HOT_TO}';
+  AND oi.created_at >= TIMESTAMP '${HOT_FROM}'
+  AND oi.created_at <  TIMESTAMP '${HOT_TO}';

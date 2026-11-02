@@ -78,18 +78,15 @@ cdc-pipeline/
   │   │   ├── 01-catalog-setup.sql
   │   │   ├── 03-paimon-sinks.sql
   │   │   └── 04-cdc-pipelines.sql
-  │   ├── iceberg/
-  │   │   ├── 01-catalog-setup.sql
-  │   │   ├── 03-iceberg-sinks.sql
-  │   │   └── 04-cdc-pipelines.sql
-  │   └── starrocks/
-  │       ├── 01-starrocks-paimon-catalog.sql
-  │       └── 02-starrocks-iceberg-catalog.sql
+  │   └── iceberg/
+  │       ├── 01-catalog-setup.sql
+  │       ├── 03-iceberg-sinks.sql
+  │       └── 04-cdc-pipelines.sql
   │
   ├── flink-cdc-paimon-sql.yaml    ← Kubernetes manifest (Paimon)
   ├── flink-cdc-iceberg-sql.yaml   ← Kubernetes manifest (Iceberg)
   ├── build-deploy-generic.sh      ← Flink CDC image build and deployment, execute flink jobs
-  ├── deploy-starrocks.sh          ← StarRocks deployment
+  ├── engine-deploy/               ← Query engines: DuckDB warm server, Trino (deploy-*.sh)
 ```
 
 ---
@@ -714,7 +711,7 @@ Both manifests do still set `AWS_DEFAULT_REGION` — for the v1 SDK's
   (StatefulSet, 8 pods) for high-rate benchmark load — its rate is measured from the pods'
   `inst=` line, not configured.
 - **Monitor the pipelines**: [Monitor Guide](./3-MONITOR.md)
-- **Query with StarRocks**: [StarRocks OLAP Engine](./4-STARROCKS-OLAP-ENGINE.md)
+- **Query the tables**: [Query benchmark, DuckDB vs Trino](./querybench/README.md); Athena in [README Step 4](./README.md#step-4--olap-query-layer-athena)
 
 ---
 

@@ -21,7 +21,8 @@ ENV FLINK_VERSION=1.20 \
     PAIMON_VERSION=2.1.0 \
     MYSQL_CDC_VERSION=3.7.0-1.20 \
     ICEBERG_VERSION=${ICEBERG_VERSION} \
-    SCALA_VERSION=2.12
+    SCALA_VERSION=2.12 \
+    AWS_SDK_V2_VERSION=2.44.5
 
 RUN dnf swap -y curl-minimal curl && \
     mkdir -p /tmp/jars && \
@@ -39,6 +40,13 @@ RUN dnf swap -y curl-minimal curl && \
         https://repo1.maven.org/maven2/org/apache/paimon/paimon-hive-connector-3.1/${PAIMON_VERSION}/paimon-hive-connector-3.1-${PAIMON_VERSION}.jar && \
     curl -fsSL -o /tmp/jars/iceberg-flink-runtime-${FLINK_VERSION}-${ICEBERG_VERSION}.jar \
         https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-flink-runtime-${FLINK_VERSION}/${ICEBERG_VERSION}/iceberg-flink-runtime-${FLINK_VERSION}-${ICEBERG_VERSION}.jar && \
+    # The SDK's URLConnection HTTP client, at the version of EMR 7.14's
+    # aws-sdk-java-bundle (2.44.5): Iceberg's GlueCatalog / S3FileIO use it
+    # ('http-client.type' = 'urlconnection' in sql-scripts/iceberg/01). The
+    # bundle ships neither it nor the Apache5 client Iceberg 1.12's 'apache'
+    # type needs (NoClassDefFoundError on the first v3 deploy, 2026-11-02).
+    curl -fsSL -o /tmp/jars/url-connection-client-${AWS_SDK_V2_VERSION}.jar \
+        https://repo1.maven.org/maven2/software/amazon/awssdk/url-connection-client/${AWS_SDK_V2_VERSION}/url-connection-client-${AWS_SDK_V2_VERSION}.jar && \
     curl -fsSL -o /tmp/jars/mysql-connector-j-8.4.0.jar \
         https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.4.0/mysql-connector-j-8.4.0.jar && \
     dnf clean all && \
@@ -79,9 +87,11 @@ ENV HADOOP_CLASSPATH="${FLINK_CLASSPATH}:/usr/share/aws/emr/emrfs/lib/*:/usr/lib
 # than add iceberg-aws-bundle-1.12.0: the bundle is an UNRELOCATED SDK 2.54.17
 # plus unrelocated Apache httpclient5, and from lib/ it would sit ahead of EMR's
 # SDK and shadow it for every EMR component in the JVM — two SDK v2 copies of
-# different versions on one classpath. Every SDK class Iceberg 1.12's aws
-# package references (s3, glue, kms, sts, dynamodb, lakeformation, core, auth,
-# apache5/url-connection clients) exists in SDK 2.44.5 (checked by class name)
+# different versions on one classpath. The service clients Iceberg 1.12's aws
+# package uses (s3, glue, kms, sts, dynamodb, lakeformation, core, auth) are in
+# EMR's 2.44.5 bundle, but its HTTP clients are not: the Apache5 client behind
+# Iceberg's default 'apache' type is missing, so the Iceberg catalog uses
+# 'urlconnection' and the url-connection-client 2.44.5 jar is added in Stage 1.
 RUN rm -f /usr/share/aws/iceberg/lib/iceberg-flink-runtime*.jar && \
     rm -rf ${FLINK_HOME}/examples && \
     rm -rf /tmp/* /var/tmp/* && \
@@ -124,7 +134,7 @@ RUN set -eu; \
     echo "Jars with Iceberg core classes:"; printf '  %s\n' $ice; \
     [ "$ice" = "${FLINK_LIB_DIR}/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar" ] || \
         { echo "ERROR: expected exactly one Iceberg (lib/iceberg-flink-runtime-1.20-${ICEBERG_VERSION}.jar) on the classpath"; exit 1; }; \
-    for cls in software/amazon/awssdk/services/glue/GlueClient software/amazon/awssdk/services/s3/S3Client; do \
+    for cls in software/amazon/awssdk/services/glue/GlueClient software/amazon/awssdk/services/s3/S3Client software/amazon/awssdk/http/urlconnection/UrlConnectionHttpClient; do \
         prov=$(printf '%s\n' $jars | xargs -r env LC_ALL=C grep -l -a -E "(^|[^/])${cls}\.class" || true); \
         echo "Providers of ${cls}:"; printf '  %s\n' $prov; \
         [ -n "$prov" ] || { echo "ERROR: no AWS SDK v2 ${cls} on the classpath; add iceberg-aws-bundle to the jar downloads"; exit 1; }; \

@@ -12,12 +12,14 @@
 --   Paimon: LSM files are sorted by key and compaction mixes old and new rows,
 --     so most files' updated_at max is recent and few are skipped; deletion
 --     vectors are cheap, the read is wide.
--- Paimon's Iceberg export lags (top LSM level only): fewer rows there is lag.
+-- Runs unchanged on DuckDB and Trino (TIMESTAMP literals: see H1). The sum is
+-- cast to DECIMAL(38,2), the type both engines give SUM(DECIMAL(12,2)), so it
+-- prints with two decimals on both; order_status breaks ties in n.
 SELECT o.order_status,
-       COUNT(*)            AS n,
-       SUM(o.total_amount) AS amount
+       COUNT(*)                                   AS n,
+       CAST(SUM(o.total_amount) AS DECIMAL(38,2)) AS amount
 FROM ${ORDERS} AS o
-WHERE o.updated_at >= '${HOT_FROM}'
-  AND o.updated_at <  '${HOT_TO}'
+WHERE o.updated_at >= TIMESTAMP '${HOT_FROM}'
+  AND o.updated_at <  TIMESTAMP '${HOT_TO}'
 GROUP BY o.order_status
 ORDER BY n DESC, o.order_status;

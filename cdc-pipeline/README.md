@@ -17,8 +17,8 @@
 - **Capture benchmark result**
   > "Start to monitor the flink jobs to capture test result"
   >
-- **Test StarRocks queries and capture the result**
-  > "Query hostdata and snapshot data using Starrocks, collect the read performance result for Paimon and Iceberg formats and compare"
+- **Run the query benchmark and capture the result**
+  > "Run the hot and snapshot query tests on DuckDB and Trino, collect the read performance for the Paimon and Iceberg formats and compare"
   >
 - **Choose the table set (Iceberg v3 by default)**
   > "Run the query benchmark on the v2 table set" (`ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=`; see [Step 0b](#step-0b--settings-bench-env-and-bench-envlocal))
@@ -30,7 +30,7 @@ A complete **real-time Change Data Capture (CDC)** pipeline with dual lakehouse 
 - **Source**: MySQL RDS (8.0) with binlog-based CDC (`flink-sql-connector-mysql-cdc` 3.7.0-1.20)
 - **Processing**: Apache Flink 1.20.0-amzn-8 on EMR on EKS 7.14.0
 - **Storage**: Apache Paimon 2.1.0 + Apache Iceberg 1.12.0 on S3 (AWS Glue Catalog); Iceberg format v3 (deletion vectors) by default, v2 on request
-- **OLAP**: AWS Athena (serverless) + StarRocks 4.1.7 on EKS (high-performance) + a DuckDB 2.0.0 warm server for the query benchmark
+- **OLAP**: AWS Athena (serverless, v2 set); for the query benchmark, a DuckDB 2.0.0 warm server and Trino 484 on EKS
 - **Monitoring**: Custom Python monitor app comparing Paimon vs Iceberg CDC pipelines
 
 ## Architecture
@@ -63,7 +63,7 @@ A complete **real-time Change Data Capture (CDC)** pipeline with dual lakehouse 
               ┌────────┴─────────────────────┴────────┐
               │         OLAP Query Layer               │
               │  ┌──────────────┐  ┌───────────────┐  │
-              │  │ AWS Athena   │  │ StarRocks     │  │
+              │  │ AWS Athena   │  │ DuckDB, Trino │  │
               │  │ (Serverless) │  │ (on EKS)      │  │
               │  └──────────────┘  └───────────────┘  │
               └────────────────────────────────────────┘
@@ -77,7 +77,6 @@ cdc-pipeline/
 ├── 1-BUILD-DEPLOY-FLINK-APP-GUIDE.md   ← Step 1: Build & deploy Flink CDC pipelines
 ├── 2-DATA-GEN-GUIDE.md                 ← Step 2: Data generation for source DB with adjustable rate
 ├── 3-MONITOR.md                        ← Step 3: Monitoring setup guide
-├── 4-STARROCKS-OLAP-ENGINE.md          ← Step 4: OLAP layer (Athena + StarRocks) + benchmark results
 │
 ├── docker/
 │   └── Dockerfile.cdc-paimon           ← Flink image (CDC + Paimon + Iceberg), multi-arch
@@ -90,7 +89,7 @@ cdc-pipeline/
 ├── lib/
 │   ├── common.sh                       ← Loads .bench-env (+ .bench-env.local), command-line
 │   │                                     overrides, table-set names, logging, render
-│   └── querybench.sh                   ← Shared query-benchmark functions (pins, gates, arms)
+│   └── querybench.sh                   ← Shared query-benchmark functions (arms, pins, render, gates)
 │
 ├── sql-scripts/
 │   ├── common/
@@ -99,18 +98,11 @@ cdc-pipeline/
 │   │   ├── 01-catalog-setup.sql        ← Paimon catalog (Hive/Glue metastore)
 │   │   ├── 03-paimon-sinks.sql         ← Paimon tables (DV + Iceberg compat)
 │   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
-│   ├── iceberg/
-│   │   ├── 01-catalog-setup.sql        ← Iceberg catalog (Glue)
-│   │   ├── 03-iceberg-sinks.sql        ← Iceberg tables (merge-on-read), format-version
-│   │   │                                 ${ICEBERG_FORMAT_VERSION} (3 by default)
-│   │   └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
-│   └── starrocks/
-│       ├── 01-starrocks-paimon-catalog.sql
-│       ├── 02-starrocks-iceberg-catalog.sql
-│       ├── 03-hot-data-queries.sql     ← Hot-window query suite (UTC_TIMESTAMP)
-│       ├── bench-lib.sh                ← Shared settings for the two scripts below (.bench-env, v3)
-│       ├── bench-server-side.sh        ← Older ad-hoc StarRocks bench; use querybench/ instead
-│       └── bench-hot-data.sh           ← Client-side timing; absolute numbers NOT quotable
+│   └── iceberg/
+│       ├── 01-catalog-setup.sql        ← Iceberg catalog (Glue)
+│       ├── 03-iceberg-sinks.sql        ← Iceberg tables (merge-on-read), format-version
+│       │                                 ${ICEBERG_FORMAT_VERSION} (3 by default)
+│       └── 04-cdc-pipelines.sql        ← INSERT INTO streaming pipelines
 │
 ├── flink-cdc-paimon-sql.yaml           ← FlinkDeployment manifest (Paimon), ${VAR} template
 ├── flink-cdc-iceberg-sql.yaml          ← FlinkDeployment manifest (Iceberg), ${VAR} template
@@ -134,10 +126,14 @@ cdc-pipeline/
 │   │                                     Flink local recovery; unused since hashmap state)
 │   └── kyverno-flink-az-affinity.yaml  ← Pin each Flink job's pods to one AZ
 │
-├── starrocks/
-│   └── deploy-starrocks.sh             ← StarRocks on EKS (4.1.7, chart 1.11.8)
-├── helm/
-│   └── starrocks-eks-values.yaml       ← kube-starrocks chart values (>= 1.11)
+├── engine-deploy/                      ← The query benchmark's engines (README.md there)
+│   ├── deploy-duckdb-cdc.sh            ← DuckDB warm server duckdb-warm-cdc: up | status | clear-cache | down | render
+│   ├── duckdb-cdc.yaml                 ← its Deployment (27 cpu / 114 Gi, 450 GiB disk cache)
+│   ├── duckdb_cdc_server.py            ← the server (one query at a time, every result row)
+│   ├── duckdb-image/                   ← Dockerfile + build-duckdb-image.sh: DuckDB 2.0.0 built
+│   │                                     from source, pushed to ECR as duckdb-cdc-server:2.0.0
+│   ├── deploy-trino.sh                 ← Trino 484 (chart 1.45.0): render | up | status | clear-cache | down | sql | qstats
+│   └── trino-values.yaml               ← its Helm values (3 x 9 cpu / 38 Gi workers + 4 cpu coordinator)
 │
 ├── bench-results/                      ← Local run output: logs, CSVs, summaries. Git-ignored
 │                                         (.gitignore: cdc-pipeline/bench-results); only a few
@@ -148,16 +144,18 @@ cdc-pipeline/
 │   ├── compact-job.yaml                ← Job manifest (EMR 7.14.0 Spark image, local mode)
 │   └── compact-order-items.py          ← The PySpark compaction (Glue catalog, S3FileIO)
 │
-├── querybench/                         ← Step 5: hot + snapshot query benchmark (StarRocks, DuckDB)
-│   ├── README.md                       ← Commands, settings, arms per table set, results
+├── querybench/                         ← Step 5: hot + snapshot query benchmark, DuckDB vs Trino
+│   │                                     on Iceberg and on Paimon's Iceberg export (four arms)
+│   ├── README.md                       ← Design, sizing parity, commands, settings, results
 │   ├── run.sh                          ← Entry point: render | start | status | logs | summary
-│   ├── qb-runner.yaml                  ← Runner Job (bundles querybench/, lib/, .bench-env)
+│   ├── qb-runner.yaml                  ← Runner / watcher Job (bundles querybench/, lib/, engine-deploy/, .bench-env)
+│   ├── hot-interleave.sh, snapshot.sh  ← the two suites (runner steps)
+│   ├── duckdb-warm.sh, trino.sh        ← the engine drivers (same passes, median, CSV)
+│   ├── pin.sh, clear-caches.sh         ← pins (both formats, both engines), cold start
+│   ├── qb-watch.sh, summarize.py       ← shutdown after a test; the Markdown summary
+│   ├── dialect-duckdb.env, dialect-trino.env  ← per-engine SQL fragments the queries use
 │   ├── hot/                            ← hot suite, one query per file + QUERIES.md
-│   ├── snapshot/                       ← snapshot suite; Paimon and Iceberg phases gate separately
-│   └── duckdb-server/                  ← DuckDB warm server duckdb-warm-cdc (deploy-duckdb-cdc.sh,
-│       │                                 duckdb-cdc.yaml, duckdb_cdc_server.py)
-│       └── image/                      ← Dockerfile + build-duckdb-image.sh: DuckDB 2.0.0 built
-│                                         from source, pushed to ECR as duckdb-cdc-server:2.0.0
+│   └── snapshot/                       ← snapshot suite, one query per file + QUERIES.md
 ├── PAIMON-VS-ICEBERG.md                ← Format comparison + benchmark results
 └── README.md                           ← This file
 ```
@@ -172,7 +170,9 @@ mysql-cdc-env.sh                        ← MYSQL_HOST / MYSQL_USER / MYSQL_PASS
 bench-results/                          ← local run output
 *-deployed.yaml                         ← rendered manifests with ${VAR} substituted:
                                           flink-cdc-{paimon,iceberg}-deployed.yaml,
-                                          monitoring/monitor-deployment-deployed.yaml
+                                          monitoring/monitor-deployment-deployed.yaml,
+                                          engine-deploy/{duckdb-cdc,trino-values}-deployed.yaml,
+                                          querybench/cdc-qb-{runner,watch}-deployed.yaml
 ```
 
 Edit the `*-sql.yaml` / `monitor-deployment.yaml` templates, never the `*-deployed.yaml`
@@ -289,13 +289,13 @@ What `.bench-env` sets:
 | Variable | `.bench-env` | Default when unset | Controls |
 |---|---|---|---|
 | `NAMESPACE` | `emr-flink` | `emr-flink` | the EMR on EKS namespace for every job and pod |
-| `ICEBERG_FORMAT_VERSION` | `3` | `3` (`build-deploy-generic.sh`, `lib/common.sh`) | Iceberg `format-version` of the Iceberg sink tables and of Paimon's Iceberg export (`metadata.iceberg.format-version`). It also derives `PAIMON_DV_BITMAP64` (`true` only for 3) and chooses the query-benchmark arms |
-| `CDC_DB_SUFFIX` | `_v3` | `_v3` in `build-deploy-generic.sh` and `deploy-monitor.sh`; empty in `lib/common.sh` | the table set. It is appended to the Glue databases (`flink_{paimon,iceberg}_db<suffix>`), the Flink checkpoint / savepoint / HA / log paths (`flink/cdc-<format><suffix>/`), the StarRocks catalogs and the result prefixes |
+| `ICEBERG_FORMAT_VERSION` | `3` | `3` (`build-deploy-generic.sh`, `lib/common.sh`) | Iceberg `format-version` of the Iceberg sink tables and of Paimon's Iceberg export (`metadata.iceberg.format-version`). It also derives `PAIMON_DV_BITMAP64` (`true` only for 3) and whether DuckDB's `paimon` arm skips puffin verification (Paimon's v3 DV export) |
+| `CDC_DB_SUFFIX` | `_v3` | `_v3` in `build-deploy-generic.sh` and `deploy-monitor.sh`; empty in `lib/common.sh` | the table set. It is appended to the Glue databases (`flink_{paimon,iceberg}_db<suffix>`), the Flink checkpoint / savepoint / HA / log paths (`flink/cdc-<format><suffix>/`), the query engines' database names and the result prefixes |
 | `SESSION_SUFFIX` | empty | empty | labels one round of query results (empty or like `-r2`): `querybench-results/cdc-session<set tag><SESSION_SUFFIX>/`. It selects no tables |
 | `PAIMON_WAREHOUSE` | `s3://${BUCKET_NAME}/paimon-warehouse` | the same | the Paimon warehouse the query benchmark reads. The Flink manifests write `s3://${BUCKET_NAME}/paimon-warehouse/` themselves and do not read this variable |
 | `ICEBERG_WAREHOUSE` | `s3://${BUCKET_NAME}/iceberg-warehouse` | the same | the Iceberg warehouse, read the same way |
 | `FLINK_JOBS` | `flink-cdc-paimon flink-cdc-iceberg` | the same | the writers the query benchmark checks, and stops for the snapshot test |
-| `SR_IMAGE_TAG` / `SR_CHART_VERSION` | `4.1.7` / `1.11.8` | the install script's own defaults | the StarRocks version `querybench/run.sh start` installs, and the version it requires on a cluster that is already up |
+| `TRINO_VERSION` / `TRINO_CHART_VERSION` | `484` / `1.45.0` | the same (`engine-deploy/deploy-trino.sh`) | the Trino `deploy-trino.sh up` installs, and the version `querybench/run.sh start` requires on a Trino that is already up |
 | `DUCKDB_IMAGE` | `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/duckdb-cdc-server:2.0.0` | — | the DuckDB warm-server image (built from source by `engine-deploy/duckdb-image/`). Empty (`DUCKDB_IMAGE=`) means `python:3.12-slim` with a pip install of `duckdb==2.0.0`, which is a different build and so a different timing baseline |
 | `GENERATOR_RESOURCES` | `statefulset/mysql-upsert-loadgen deployment/mysql-data-generator` | the same | the load generators the hot test needs running; the snapshot test scales them to 0 |
 | `COMPACT_BEFORE_SNAPSHOT` | `true` | `false` | the snapshot test submits the Iceberg compaction Jobs (`iceberg-compaction/`) first |
@@ -321,8 +321,8 @@ empty suffix.
 
 | Reads it | How |
 |---|---|
-| `querybench/run.sh`, `querybench/qb-watch.sh`, `engine-deploy/deploy-duckdb-cdc.sh`, `engine-deploy/duckdb-image/build-duckdb-image.sh`, `lib/querybench.sh` | through `lib/common.sh` |
-| the query-benchmark runner pod (`querybench/qb-runner.yaml`) and the scripts it runs (`snapshot.sh`, `pin.sh`, `starrocks.sh`, `duckdb-warm.sh`, ...) | `run.sh` bundles `.bench-env` into the Job and puts `.bench-env.local` in a Secret; the pod's step script sources `.bench-env` first |
+| `querybench/run.sh`, `querybench/qb-watch.sh`, `engine-deploy/deploy-duckdb-cdc.sh`, `engine-deploy/deploy-trino.sh`, `engine-deploy/duckdb-image/build-duckdb-image.sh`, `lib/querybench.sh` | through `lib/common.sh` |
+| the query-benchmark runner pod (`querybench/qb-runner.yaml`) and the scripts it runs (`snapshot.sh`, `pin.sh`, `duckdb-warm.sh`, `trino.sh`, ...) | `run.sh` bundles `.bench-env` into the Job and puts `.bench-env.local` in a Secret; the pod's step script sources `.bench-env` first |
 | `iceberg-compaction/run-compaction.sh` | only when `run.sh` starts it, which passes `ICEBERG_DB` and `ICEBERG_TABLE` |
 | `monitoring/deploy-monitor.sh` | reads only `CDC_DB_SUFFIX` from it, when that is not already set in the environment |
 
@@ -330,8 +330,7 @@ empty suffix.
 |---|---|
 | `build-deploy-generic.sh` | It takes everything from the environment. Run `source .bench-env` first, which also loads `.bench-env.local`, or export the same values by hand (Step 1) |
 | `mysql-data-generator/deploy-data-generator.sh` | `source mysql-cdc-env.sh` (`MYSQL_*`); `NAMESPACE` defaults to `emr-flink` |
-| `engine-deploy/deploy-starrocks.sh` | It has its own `IMAGE_TAG` (default `4.1.7`) and `CHART_VERSION` (default `1.11.8`), not `SR_*`. The query benchmark installs StarRocks with `throughput-benchmark/engine-deploy/deploy-starrocks.sh`, not with this script |
-| `monitoring/capture-flink-metrics.sh`, `sql-scripts/starrocks/bench-*.sh` | environment and their own defaults only |
+| `monitoring/capture-flink-metrics.sh` | environment and its own defaults only |
 
 **Overriding a value for one run.** For scripts that go through
 `lib/common.sh`, a value on the command line wins. The script restores it
@@ -542,8 +541,7 @@ success and duration, as a delta over a sampling window):
 > the windowed "Checkpoints failed" delta, or read the `history` array directly.
 > See [3-MONITOR.md](3-MONITOR.md#checkpoint-failure-counts-are-cumulative-not-current).
 
-### Step 4 — OLAP Query Layer (Athena + StarRocks)
-> Guide: [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md)
+### Step 4 — OLAP Query Layer (Athena)
 
 **Athena (Iceberg v2 set only)**: query the tables from the Athena console.
 ```sql
@@ -552,21 +550,58 @@ SELECT * FROM flink_iceberg_db.customers LIMIT 10;
 Athena cannot query the default v3 set (`flink_iceberg_db_v3`). The AWS
 [Iceberg V3 support table](https://docs.aws.amazon.com/AmazonS3/latest/userguide/working-with-apache-iceberg-v3.html)
 lists Amazon Athena (Trino) as "No" for V3. For Athena, deploy the v2 set
-(`ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=`, Step 0b).
+(`ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=`, Step 0b). The v3 set is read by
+the query benchmark's engines (Step 5).
 
 **Athena (Paimon)** — the `flink_paimon_db` tables are `table_type = PAIMON` and
 Athena cannot read them. Two ways round it; the first is the one verified here
 (on the v2 set, 2026-09-28).
 
-*Athena SQL, via a shadow Glue database.* Register Paimon's exported Iceberg
-metadata (`paimon-warehouse/iceberg/...`) as an Iceberg table in a separate Glue
-database, then query it normally. `StorageDescriptor.Columns` must be populated
-or projections fail with `Relation contains no accessible columns`. Full recipe
-in [4-STARROCKS-OLAP-ENGINE.md §2.1](4-STARROCKS-OLAP-ENGINE.md), results in
-[bench-results/ATHENA-PAIMON-TEST-20260928.md](bench-results/ATHENA-PAIMON-TEST-20260928.md).
+*Athena SQL, via a shadow Glue database.* Register Paimon's *exported* Iceberg
+metadata (`paimon-warehouse/iceberg/...`) as a normal Iceberg table in a
+**separate** Glue database, then query it with plain Athena SQL. Use a separate
+database because the `flink_paimon_db` entries are owned by Paimon's
+`IcebergHiveMetadataCommitter`.
+
+```python
+import boto3, json
+glue, s3 = boto3.client("glue"), boto3.client("s3")
+BUCKET, SRC_DB, DST_DB = "<bucket>", "flink_paimon_db", "paimon_athena_test"
+
+ICE2HIVE = {"long": "bigint", "timestamptz": "timestamp"}   # rest map 1:1
+
+for t in ["customers", "products", "orders", "order_items"]:
+    base = f"paimon-warehouse/iceberg/{SRC_DB}/{t}/metadata"
+    # version-hint.text names the current metadata version
+    v = s3.get_object(Bucket=BUCKET, Key=f"{base}/version-hint.text")["Body"].read().decode().strip()
+    mkey = f"{base}/v{v}.metadata.json"
+    meta = json.load(s3.get_object(Bucket=BUCKET, Key=mkey)["Body"])
+    schema = next(s for s in meta["schemas"] if s["schema-id"] == meta["current-schema-id"])
+    cols = [{"Name": f["name"], "Type": ICE2HIVE.get(f["type"], f["type"])}
+            for f in schema["fields"]]
+
+    glue.create_table(DatabaseName=DST_DB, TableInput={
+        "Name": t, "TableType": "EXTERNAL_TABLE",
+        "Parameters": {"table_type": "ICEBERG",
+                       "metadata_location": f"s3://{BUCKET}/{mkey}"},
+        "StorageDescriptor": {
+            "Location": f"s3://{BUCKET}/paimon-warehouse/{SRC_DB}.db/{t}",
+            "Columns": cols,
+        }})
+```
 ```sql
 SELECT COUNT(*) FROM paimon_athena_test.customers;
 ```
+
+> **`Columns` is not optional.** With an empty column list, `COUNT(*)` still
+> succeeds (answered from manifest statistics, 0 bytes scanned), but any
+> projection fails with `COLUMN_NOT_FOUND: Relation contains no accessible
+> columns`. Athena takes the column list from Glue and the data from the
+> Iceberg metadata, so both have to be right.
+>
+> **`metadata_location` pins a snapshot.** The registered table is frozen at the
+> `v<N>.metadata.json` you named. Re-read `version-hint.text` and `UpdateTable`
+> to refresh. Results: [bench-results/ATHENA-PAIMON-TEST-20260928.md](bench-results/ATHENA-PAIMON-TEST-20260928.md).
 
 *Athena Notebook.* Needs `athena:StartCalculationExecution`, which the admin role
 in this account does not currently have.
@@ -584,83 +619,62 @@ spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
 spark.sql("SELECT * FROM paimon_iceberg.flink_paimon_db.customers LIMIT 10").show()
 ```
 
-**StarRocks 4.1.7 on EKS (chart `kube-starrocks` 1.11.8)**: native readers for
-both Paimon and Iceberg. On the v3 set, StarRocks 4.1.x refuses Iceberg v3 tables
-that have deletion vectors, and it reads Paimon's 64-bit DVs only through the JNI
-reader. See [querybench/README.md](querybench/README.md) ("Why the v3 column").
-```bash
-./engine-deploy/deploy-starrocks.sh install-iam   # one Helm release into emr-flink (IMAGE_TAG 4.1.7, CHART_VERSION 1.11.8)
-./engine-deploy/deploy-starrocks.sh connection
-# The FE service is ClusterIP — there is no LoadBalancer endpoint:
-kubectl exec -it -n emr-flink kube-starrocks-fe-0 -- mysql -h127.0.0.1 -P9030 -uroot
-```
+StarRocks was removed from this pipeline on 2026-11-02 (the v3 set is
+unreadable by StarRocks 4.1.x's Iceberg reader); its 2026-09 results stay in
+`bench-results/` and [PAIMON-VS-ICEBERG.md](PAIMON-VS-ICEBERG.md), the scripts
+in git history.
 
-> See [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md) for full catalog setup, query examples, performance/cost comparison, and decision tree.
-
-### Step 5 — Query benchmark (hot and snapshot)
-> Guide: [querybench/README.md](querybench/README.md) — commands, settings and results.
+### Step 5 — Query benchmark: DuckDB vs Trino (hot and snapshot)
+> Guide: [querybench/README.md](querybench/README.md) — design, sizing parity, commands, settings and results.
+> Engines: [engine-deploy/README.md](engine-deploy/README.md).
 > Queries: [querybench/hot/QUERIES.md](querybench/hot/QUERIES.md),
 > [querybench/snapshot/QUERIES.md](querybench/snapshot/QUERIES.md)
 
-The same pattern as `throughput-benchmark/querybench`, over the four CDC tables:
-a **hot** test while the CDC writers and the upsert generator run, then a
-**snapshot** test on pinned snapshots with the writers stopped. Both run on
-StarRocks and the DuckDB warm server.
+Flink writes both formats; two query engines read them, each on both, so a
+run has up to **four arms** (`ENGINES` × `FORMATS`, default all four):
 
-**The snapshot test is two phases, one per format, and each starts on its own
-gate.** Paimon does not wait for Iceberg compaction:
+| Arm | Reads | How the pinned version is read |
+|---|---|---|
+| `duckdb:iceberg` | the Iceberg tables (`flink_iceberg_db<suffix>`) | `iceberg_scan()` of a copy of the pinned `metadata.json` |
+| `trino:iceberg` | the same | `iceberg.<db>.<t> FOR VERSION AS OF <snapshot id>` |
+| `duckdb:paimon` | Paimon's Iceberg export (`paimon-warehouse/iceberg/...`) | `iceberg_scan()` of a copy of the pinned `vN.metadata.json`, puffin verification skipped on v3 |
+| `trino:paimon` | the same export, registered in the Paimon Glue DB as `table_type=ICEBERG` | `iceberg.<paimon db>.<t> FOR VERSION AS OF <export snapshot id>` |
 
-| Phase | Arms | Can start when | Then |
-|---|---|---|---|
-| **Paimon** | StarRocks `paimon` (JNI reader on v3), `pmn_as_iceberg` (v2 only); DuckDB `paimon` | the CDC writers are stopped and the snapshots pinned, **and** StarRocks (FE + every BE Ready) **and** the DuckDB warm server are both up | cold start: StarRocks data cache cleared and DuckDB restarted, then warm-up and timed passes |
-| **Iceberg** | StarRocks `iceberg` (v2 only); DuckDB `iceberg` | the Iceberg compaction job has **completed successfully**, **and** StarRocks and the DuckDB warm server are both up. The Iceberg snapshots are pinned after compaction, so the compacted state is the one measured | the same cold start, then warm-up and timed passes |
+Both engines of a format read the **same pinned snapshot** of every table, so
+their rows must match (the summary marks the suite INVALID otherwise);
+Iceberg vs Paimon differences are a pipeline gap, recorded. On the v3 set
+`duckdb:paimon` currently errors (`Manifest ... missing required Avro key-value
+metadata field 'schema'`, a Paimon 2.1 export bug): its queries are recorded
+as `ERROR` and the run goes on.
 
-- **Paimon needs no external compaction.** Its writer compacts inline, so the
-  Paimon phase can run while the Iceberg compaction job is still going.
-- **Iceberg must not start early.** If compaction is still running or has
-  failed, the Iceberg phase refuses to start. Uncompacted Iceberg `order_items`
-  carries hundreds of millions of equality deletes, and in 2026-09 it ran both
-  engines out of memory on a bare count.
-- **Each phase starts from a cold cache.** The Paimon phase's cache must not
-  carry into the Iceberg phase, so the caches are emptied again before it.
-- **Read the Paimon-as-Iceberg counts with care.** The `pmn_as_iceberg` and
-  DuckDB `paimon` arms read Paimon's Iceberg export. On v2 the export holds
-  only fully merged files, so their row counts can trail native Paimon. Each
-  arm's counts are recorded next to its timings.
-- **The v3 set (default) runs fewer StarRocks arms.** StarRocks 4.1.x refuses
-  Iceberg v3 scans with deletion vectors, so `iceberg` and `pmn_as_iceberg` are
-  skipped (`SR_V3_ARMS=1` runs them to record the error). StarRocks `paimon`
-  runs on the JNI reader, so its v3 times are not like-for-like with a v2
-  run's native reader. DuckDB 2.0.0 runs both of its arms. See
-  [querybench/README.md](querybench/README.md).
+- **hot**: the CDC writers and the upsert generator run; a 5-minute window,
+  the tables pinned again before every pass, DuckDB and Trino interleaved pass
+  by pass.
+- **snapshot**: the writers are stopped, the Iceberg compaction Jobs
+  (`iceberg-compaction/`) run first and must complete (Paimon compacts in its
+  writer), the tables are pinned after that, and both engines start cold
+  (DuckDB restarted, `deploy-trino.sh clear-cache`) before the first warm-up pass.
+- **Sizing parity**: DuckDB 27 cpu / 114 GiB on one node; Trino 3 workers ×
+  9 cpu / 38 GiB (= 27 cpu / 114 GiB) plus a 4 cpu / 16 GiB coordinator that
+  runs no splits; both with a ~450 GiB disk cache.
 
 ```bash
 # from cdc-pipeline/; session values in .bench-env, account values in .bench-env.local (Step 0b)
 # v2 set for one run: prefix ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= to any command below
-SUITE=hot ./querybench/run.sh render       # dry run: renders every query for every arm, no cluster or AWS
-SUITE=hot ./querybench/run.sh start        # hot test, writers and generator running
-
-# Snapshot, both phases (default SNAPSHOT_FORMAT=both): submits the Iceberg
-# compaction Jobs, runs the Paimon phase as soon as its gate passes, then waits
-# (up to COMPACT_GATE_TIMEOUT_S, 6 h) for compaction and runs the Iceberg phase.
-SUITE=snapshot ./querybench/run.sh start
-
-# Or one phase at a time:
-SUITE=snapshot SNAPSHOT_FORMAT=paimon ./querybench/run.sh start    # Paimon now (also submits compaction)
-COMPACT_BEFORE_SNAPSHOT=false SUITE=snapshot SNAPSHOT_FORMAT=iceberg \
-  ./querybench/run.sh start                                        # later; refuses until compaction succeeded
-
+SUITE=hot ./querybench/run.sh render        # dry run: renders every query for all four arms, no cluster or AWS
+SUITE=hot ./querybench/run.sh start         # hot test, writers and generator running
+SUITE=snapshot ./querybench/run.sh start    # snapshot test: stops the writers, submits the Iceberg
+                                            # compaction, waits for it, then cold start + passes
+ENGINES=trino FORMATS=iceberg SUITE=snapshot ./querybench/run.sh start   # one arm only
 ./querybench/run.sh status | logs [watch] | summary
 ```
 
-Each phase records its gate times (`gate_writers_stopped_at`,
-`gate_engines_ready_at`, `gate_compaction_finished_at`), `pinned_at`,
-`caches_cleared_at` and the pinned snapshot ids in
-`snapshot-<STAMP>-<format>.pins`, next to its results in
+The snapshot run records its gate times (`gate_writers_stopped_at`,
+`gate_compaction_finished_at`, `gate_engines_ready_at`), `pinned_at`,
+`caches_cleared_at` and the pinned snapshot ids in `snapshot-<STAMP>.pins`,
+next to its results in
 `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/` (set tag
-`-v3` for `CDC_DB_SUFFIX=_v3`, empty for v2). StarRocks is
-the same cluster as the throughput benchmark (own `cdc_*` catalogs); DuckDB is
-its own server, `duckdb-warm-cdc`.
+`-v3` for `CDC_DB_SUFFIX=_v3`, empty for v2).
 
 ---
 
@@ -718,7 +732,7 @@ Throughput numbers are **workload- and run-specific** — measure them, do not q
 a table. Source-side write rate comes from the load generator's `inst=` line (see
 [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md)); sink-side rates and per-format
 comparisons come from the monitor and the benchmark harness (see
-[3-MONITOR.md](3-MONITOR.md) and [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md)).
+[3-MONITOR.md](3-MONITOR.md) and [querybench/README.md](querybench/README.md)).
 
 ---
 
@@ -734,7 +748,6 @@ comparisons come from the monitor and the benchmark harness (see
 | `cp_fail` / "Lifetime ckpt failed" is non-zero but unchanged | That counter is `counts.failed`, cumulative since job start; it never decreases. Only the `history` array from `/jobs/<id>/checkpoints` shows current health — see [3-MONITOR.md](3-MONITOR.md#checkpoint-failure-counts-are-cumulative-not-current) |
 | Load generator far below target rate, no errors in the logs | 1213 (deadlock) and 1205 (lock-wait timeout) are retried silently and never printed — they only show in the `errors=` counter. Check `errors=` vs `batches=`, and judge rate by `inst=`, not `avg=`. See [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md) |
 | Both jobs are up but the benchmark isn't comparable | `deploy both` starts them ~30s apart. Use `render` + a single `kubectl apply -f a -f b` so the snapshot phases overlap |
-| StarRocks BEs orphaned after a scale-down / PVCs still billing after uninstall | Scale the BEs down before the FE, and note `helm uninstall` leaves the 200 Gi BE and 50 Gi FE PVCs behind — see [4-STARROCKS-OLAP-ENGINE.md](4-STARROCKS-OLAP-ENGINE.md) |
 | FlinkDeployment won't start | Check IAM role, secrets, image pull, ECR auth |
 | CDC not capturing changes | Verify binlog enabled, CDC user has REPLICATION SLAVE |
 | Duplicate email crash | Data generator uses UUID-based emails |
@@ -742,9 +755,8 @@ comparisons come from the monitor and the benchmark harness (see
 | Data generator connects but no data | Check pod logs for per-operation errors; ensure ConfigMap is redeployed |
 | Monitor `PaimonStorageHandler` error | Paimon tables are read from their own S3 snapshots and manifests, not through pyiceberg; redeploy the monitor (`./monitoring/deploy-monitor.sh`) if an old version is running |
 | Athena Spark can't read Paimon tables | Use Hadoop catalog in Athena Spark; set `metadata.iceberg.format-version = '2'` |
-| Athena SQL can't read Paimon tables | Register the exported Iceberg metadata as `table_type = ICEBERG` in a **separate** Glue database — see [4-STARROCKS-OLAP-ENGINE.md §2.1](4-STARROCKS-OLAP-ENGINE.md). Don't edit `flink_paimon_db` in place; Paimon's committer owns those entries |
+| Athena SQL can't read Paimon tables | Register the exported Iceberg metadata as `table_type = ICEBERG` in a **separate** Glue database — see [Step 4](#step-4--olap-query-layer-athena). Don't edit `flink_paimon_db` in place; Paimon's committer owns those entries |
 | `COLUMN_NOT_FOUND: Relation contains no accessible columns` | The Glue table has an empty `StorageDescriptor.Columns`. Athena reads the column list from Glue and the data from Iceberg metadata; populate columns from the metadata JSON's `current-schema-id` schema |
-| StarRocks SA conflict | Annotate existing SA with Helm release metadata |
 | Flink image build fails locally | Builds run in-cluster with Kaniko; no local Docker needed |
 | Monitor pod stuck `ContainerCreating`/no logs | First boot pip-installs pyiceberg+pyarrow (~2 min); check `kubectl logs` again |
 | Monitor pod can't assume role | Update IAM trust policy to allow the SA's OIDC subject |
@@ -763,9 +775,9 @@ comparisons come from the monitor and the benchmark harness (see
 - ☑️ 4 Iceberg tables on S3 (Glue catalog) in `flink_iceberg_db${CDC_DB_SUFFIX}`: format v3
   (`flink_iceberg_db_v3`) by default, format v2 (`flink_iceberg_db`) for the v2 set. Each set
   is a separate pair of Glue databases, and both can exist at once
-- ☑️ 1 StarRocks 4.1.7 cluster on EKS (1 FE + 3 BE pods, chart 1.11.8), optional
 - ☑️ For the query benchmark (Step 5), optional: the DuckDB 2.0.0 warm server `duckdb-warm-cdc`
-  (image `duckdb-cdc-server:2.0.0` in this account's ECR), the `iceberg-compact-<table>`
+  (image `duckdb-cdc-server:2.0.0` in this account's ECR), Trino 484 (Helm release `trino`:
+  1 coordinator + 3 workers, per-pod gp3 cache volumes), the `iceberg-compact-<table>`
   Spark Jobs (EMR 7.14.0 Spark image), and results under `s3://$BUCKET_NAME/querybench-results/`
 - ☑️ S3 checkpoint, savepoint and HA storage under `s3://$BUCKET_NAME/flink/cdc-<format>${CDC_DB_SUFFIX}/`
   (`hashmap` state backend: no changelog storage, no EBS local-recovery volumes)
@@ -785,14 +797,6 @@ comparisons come from the monitor and the benchmark harness (see
 **Iceberg Version**: 1.12.0 (OSS `iceberg-flink-runtime-1.20`, replacing EMR's bundled 1.10.1-amzn-1; writes deletion vectors on v3 tables). Tables: format v3 by default on this branch.
 Compaction (`iceberg-compaction/`): EMR 7.14.0 Spark 3.5.8-amzn-0 image with Iceberg 1.10.1-amzn-1
 **Flink CDC MySQL connector**: 3.7.0-1.20
-**StarRocks Version**: 4.1.7, chart `kube-starrocks` 1.11.8 (was 4.1.4 / 1.11.7).
-Both the chart and the images are pinned: `engine-deploy/deploy-starrocks.sh` passes
-`--version ${CHART_VERSION:-1.11.8}` and `--set starrocks.starrocks{FE,Be}Spec.image.tag`
-from `${IMAGE_TAG-4.1.7}`. The query benchmark's `.bench-env` pins the same pair as
-`SR_IMAGE_TAG` / `SR_CHART_VERSION`. `helm/starrocks-eks-values.yaml` still leaves
-`image.tag: ""`, which would otherwise resolve to the chart appVersion, the mutable
-`4.1-latest` tag, so do not override `IMAGE_TAG` to empty for benchmark runs.
-Note that `helm list` always reports APP VERSION as `4.1-latest`: that column is the
-chart's appVersion, not the image tag pulled.
+**Trino Version** (query benchmark): 484, chart `trinodb/trino` 1.45.0 (`engine-deploy/deploy-trino.sh`; `.bench-env` `TRINO_VERSION` / `TRINO_CHART_VERSION`)
 **DuckDB Version** (query benchmark): 2.0.0, built from source (`engine-deploy/duckdb-image/`)
 **MySQL Version**: 8.0.45

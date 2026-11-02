@@ -48,7 +48,7 @@
 -- + Glue entries) before this DDL takes effect.
 --
 -- Streaming best practices applied:
---   1. Smaller target file sizes (32-64MB) to match checkpoint-driven writes
+--   1. Target data files: 64 MB on customers/products, 128 MB on orders/order_items (same as Paimon)
 --   2. Hash distribution ensures same-PK rows land in the same file writer
 --   3. Aggressive metadata cleanup (delete-after-commit) to prevent S3 bloat
 --   4. Manifest merging to keep read planning fast as snapshots accumulate
@@ -99,7 +99,9 @@ CREATE TABLE IF NOT EXISTS customers (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    'write.target-file-size-bytes' = '33554432',
+    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
+    -- Paimon's target-file-size.
+    'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -108,13 +110,18 @@ CREATE TABLE IF NOT EXISTS customers (
     -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '8388608',
-    'history.expire.max-snapshot-age-ms' = '3600000',
+    -- 12 h, paired with Paimon's snapshot.time-retained.
+    'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '3',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    'write.metadata.metrics.default' = 'full'
+    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
+    'commit.manifest.min-count-to-merge' = '5',
+    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
+    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
+    'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
@@ -141,7 +148,9 @@ CREATE TABLE IF NOT EXISTS products (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    'write.target-file-size-bytes' = '33554432',
+    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
+    -- Paimon's target-file-size.
+    'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -150,13 +159,18 @@ CREATE TABLE IF NOT EXISTS products (
     -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '8388608',
-    'history.expire.max-snapshot-age-ms' = '3600000',
+    -- 12 h, paired with Paimon's snapshot.time-retained.
+    'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '3',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    'write.metadata.metrics.default' = 'full'
+    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
+    'commit.manifest.min-count-to-merge' = '5',
+    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
+    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
+    'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
@@ -184,7 +198,9 @@ CREATE TABLE IF NOT EXISTS orders (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    'write.target-file-size-bytes' = '67108864',
+    -- 128 MB on the fact tables (64 MB on customers/products), paired with
+    -- Paimon's target-file-size.
+    'write.target-file-size-bytes' = '134217728',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -193,13 +209,18 @@ CREATE TABLE IF NOT EXISTS orders (
     -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
-    'history.expire.max-snapshot-age-ms' = '3600000',
+    -- 12 h, paired with Paimon's snapshot.time-retained.
+    'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '3',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    'write.metadata.metrics.default' = 'full'
+    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
+    'commit.manifest.min-count-to-merge' = '5',
+    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
+    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
+    'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
@@ -226,7 +247,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    'write.target-file-size-bytes' = '67108864',
+    -- 128 MB on the fact tables (64 MB on customers/products), paired with
+    -- Paimon's target-file-size.
+    'write.target-file-size-bytes' = '134217728',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -235,11 +258,16 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
-    'history.expire.max-snapshot-age-ms' = '3600000',
+    -- 12 h, paired with Paimon's snapshot.time-retained.
+    'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '3',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    'write.metadata.metrics.default' = 'full'
+    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
+    'commit.manifest.min-count-to-merge' = '5',
+    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
+    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
+    'write.metadata.metrics.default' = 'truncate(16)'
 );

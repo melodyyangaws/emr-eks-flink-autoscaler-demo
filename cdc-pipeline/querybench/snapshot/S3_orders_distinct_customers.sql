@@ -10,6 +10,7 @@
 -- are, it shows the file-layout cost only. Record which.
 -- payment_method is the column the upserts change, so an unapplied delete
 -- shows up as a wrong n or custs, not only as time.
+-- Runs unchanged on DuckDB and Trino (exact COUNT(DISTINCT) on both).
 SELECT payment_method,
        COUNT(*)                    AS n,
        COUNT(DISTINCT customer_id) AS custs

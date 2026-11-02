@@ -56,10 +56,13 @@ remove-dangling-deletes = true
 max-concurrent-file-group-rewrites = 1
     Memory safety, not throughput: one delete set in flight at a time.
 
-Old snapshots are deliberately NOT expired and orphan files are NOT removed. The
-engines read the CURRENT snapshot, so dropping the deletes there is sufficient to
-fix the queries, while expiry would irreversibly delete S3 data the benchmark
-writeups cite. Those are separate, explicitly-authorised operations.
+After the rewrite, snapshots older than EXPIRE_OLDER_THAN_HOURS (12) are expired,
+keeping at least EXPIRE_RETAIN_LAST (5): the same age rule Paimon's writer applies
+in-job (snapshot.time-retained = 12h, num-retained.min = 5). Iceberg's Flink sink
+never expires snapshots, so without this its metadata grows for the whole run.
+EXPIRE_SNAPSHOTS=false skips it. Expiry adds no snapshot, so the current snapshot
+stays the compaction's replace commit (the snapshot gate checks that). Orphan
+files are NOT removed. Expiry deletes S3 data of old snapshots irreversibly.
 """
 import json
 import os
@@ -83,6 +86,9 @@ TARGET_FILE_SIZE = os.environ.get("TARGET_FILE_SIZE_BYTES", "268435456")  # 256 
 # A dry run reports the before-state and exits without committing, so the catalog,
 # credentials and classpath can be validated in ~1 minute instead of an hour.
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
+EXPIRE_SNAPSHOTS = os.environ.get("EXPIRE_SNAPSHOTS", "true").lower() in ("1", "true", "yes")
+EXPIRE_OLDER_THAN_HOURS = float(os.environ.get("EXPIRE_OLDER_THAN_HOURS", "12"))
+EXPIRE_RETAIN_LAST = int(os.environ.get("EXPIRE_RETAIN_LAST", "5"))
 
 
 def build_session():
@@ -236,6 +242,28 @@ def rewrite(spark):
     raise RuntimeError("every option set was rejected")
 
 
+def expire(spark):
+    """expire_snapshots with Paimon's retention rule; never fails the job (the
+    rewrite already committed, and the gate only needs that commit)."""
+    cutoff = time.strftime("%Y-%m-%d %H:%M:%S",
+                           time.gmtime(time.time() - EXPIRE_OLDER_THAN_HOURS * 3600))
+    sql = (f"CALL {CAT}.system.expire_snapshots(table => '{DB}.{TABLE}', "
+           f"older_than => TIMESTAMP '{cutoff}', retain_last => {EXPIRE_RETAIN_LAST})")
+    print(f"\n-- expire_snapshots (older than {cutoff} UTC, retain {EXPIRE_RETAIN_LAST}) "
+          + "-" * 8, flush=True)
+    st = time.time()
+    try:
+        r = spark.sql(sql).collect()
+        res = r[0].asDict() if r else {}
+        print(f"     done in {time.time() - st:.0f}s: {res}", flush=True)
+        return {"elapsed_s": round(time.time() - st, 1), "cutoff_utc": cutoff,
+                "result": {k: str(v) for k, v in res.items()}}
+    except Exception as e:
+        msg = str(e).replace("\n", " ")[:600]
+        print(f"     expire_snapshots FAILED (rewrite kept): {msg}", flush=True)
+        return {"error": msg, "cutoff_utc": cutoff}
+
+
 def main():
     spark = build_session()
     spark.sparkContext.setLogLevel("WARN")
@@ -271,6 +299,8 @@ def main():
         print(f"  COUNT(*) = {n:,} in {time.time() - st:.1f}s", flush=True)
         payload["verify_count"] = n
         payload["delete_files_remaining"] = after["delete_files"]
+        if EXPIRE_SNAPSHOTS:
+            payload["expire"] = expire(spark)
 
     print("\n===JSON===")
     print(json.dumps(payload, indent=2, default=str))

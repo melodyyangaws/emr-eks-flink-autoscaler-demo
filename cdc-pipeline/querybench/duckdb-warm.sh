@@ -1,26 +1,28 @@
 #!/usr/bin/env bash
 # The DuckDB side of the CDC query tests: runs a suite on the warm DuckDB server
 # (Deployment duckdb-warm-cdc, engine-deploy/deploy-duckdb-cdc.sh), the
-# counterpart of starrocks.sh. Adapted from throughput-benchmark/querybench/duckdb-warm.sh.
+# counterpart of trino.sh. Adapted from throughput-benchmark/querybench/duckdb-warm.sh.
 #
 #   SUITE=hot|snapshot ./querybench/duckdb-warm.sh run
 #   ./querybench/duckdb-warm.sh render <suite> [arm]   print the rendered SQL (no cluster; dry run)
 #
-# Arms: paimon (iceberg_scan over Paimon's Iceberg export) and iceberg
-# (FORMAT=paimon|iceberg|both). DuckDB has no Paimon reader. Both run on an
-# Iceberg v3 set too; the server runs the paimon arm's queries with
-# iceberg_unsafe_skip_puffin_verification = true there (duckdb_cdc_server.py). Every table is an
-# iceberg_scan() of its pinned, copied metadata.json (QB_PIN_META_*, pin.sh):
-# the client renders the whole statement, the server only runs it.
+# Arms (FORMATS=iceberg|paimon|both, default both): iceberg (the Iceberg
+# tables) and paimon (Paimon's Iceberg export). Every table is an
+# iceberg_scan() of its pinned, copied metadata.json (QB_PIN_META_<FMT>_*,
+# pin.sh), the same pin Trino reads by snapshot id. The client renders the
+# whole statement, the server only runs it; it runs the paimon arm's queries
+# with iceberg_unsafe_skip_puffin_verification = true on v3
+# (SKIP_PUFFIN_VERIFICATION_ARMS, duckdb_cdc_server.py). An arm that cannot
+# read its tables records ERROR per query; the other arm still runs.
 #
-# Same RUNS/WARMUP, pass-major order, median, timeouts and ZERO_SCAN guard as
-# throughput (allow-zero-rows, leading-col-is-label). What is new:
+# Same RUNS/WARMUP, pass-major order, median, timeouts and ZERO_SCAN guard
+# as trino.sh (allow-zero-rows, leading-col-is-label). Also:
 #   - every result row of the last OK pass -> duckdb_warm-<STAMP>-rows.tsv
-#     (the summary compares all rows across arms);
-#   - a server restart under a query (an OOM kill on uncompacted equality
-#     deletes: the container restarts) is detected from /health's started_at:
-#     that query is CRASH, and the rest of that pass runs on emptied memory
-#     caches, recorded as `cold` in duckdb_warm-<STAMP>-events.csv.
+#     (the summary compares all rows across the engines);
+#   - a server restart under a query (an OOM kill: the container restarts) is
+#     detected from /health's started_at: that query is CRASH, and the rest of
+#     that pass runs on emptied memory caches, recorded as `cold` in
+#     duckdb_warm-<STAMP>-events.csv.
 #
 # Output: $OUT_DIR/duckdb_warm-<STAMP>.csv ($QB_CSV_HEADER), .log, -rows.tsv,
 # -firstrows.csv, -events.csv.
@@ -29,20 +31,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
 
-FORMAT="${FORMAT:-both}"
 READY_GRACE="${READY_GRACE:-1200}"
 POLL_S=5
 CSV="${OUT_DIR}/duckdb_warm-${STAMP}.csv"
 LOG="${OUT_DIR}/duckdb_warm-${STAMP}.log"
 ROWS_TSV="${CSV%.csv}-rows.tsv"
 EVENTS="${CSV%.csv}-events.csv"
-NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
+NAME="$DUCKDB_NAME"
 PORT="${DUCKDB_LOCAL_PORT:-18182}"
-case "$FORMAT" in
-    iceberg|paimon) ARMS="$FORMAT" ;;
-    both)           ARMS="$DUCK_ARMS_ALL" ;;
-    *) qb_die "FORMAT must be iceberg|paimon|both, got '${FORMAT}'" ;;
-esac
+ARMS="$(qb_formats)"
 
 PF_PIDS=""
 cleanup() { local p; for p in $PF_PIDS; do kill "$p" 2>/dev/null || true; done; }
@@ -142,7 +139,7 @@ profile_pass() {   # suite arm query-file rendered-sql-file
     done
 }
 
-# All passes of all queries of one arm, pass-major (as starrocks.sh). A query
+# All passes of all queries of one arm, pass-major (as trino.sh). A query
 # that fails on any pass is not run again; its CSV status is the first non-OK.
 run_arm() {   # suite arm rendered-dir rows-file
     local s="$1" arm="$2" dir="$3" rows="$4" files f pass n name j st q t0 t1 cold
@@ -221,7 +218,7 @@ render_suite_dir() {   # suite dir
     for arm in $ARMS; do
         n=0
         for f in $(qb_query_files "$1"); do
-            n=$((n + 1)); qb_render "$f" duckdb "$arm" > "${2}/${arm}.$(printf '%02d' "$n").sql" || qb_die "render failed: ${f} (${arm})"
+            n=$((n + 1)); qb_render "$f" duckdb "$arm" > "${2}/${arm}.$(printf '%02d' "$n").sql" || qb_die "render failed: ${f} (duckdb/${arm})"
         done
     done
 }
@@ -230,6 +227,10 @@ run_suite() {   # suite
     local s="$1" dir arm writers rows bad
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
     qb_start_suite "$s"
+    # H8's key: exported by hot-interleave.sh; resolved here when run by hand.
+    if [[ "$s" == hot && -z "${QB_LOOKUP_ORDER_ID:-}" ]] && grep -q 'LOOKUP_ORDER' "${QB_DIR}"/hot/*.sql; then
+        qb_resolve_lookup
+    fi
     render_suite_dir "$s" "$dir"
     pf_up || qb_die "${NAME} is not up: ./engine-deploy/deploy-duckdb-cdc.sh up"
     writers=$(qb_writer_state)
@@ -262,7 +263,7 @@ case "${1:-run}" in
     run)    cmd_run ;;
     render) s="${2:?render <hot|snapshot> [arm]}"
             for arm in ${3:-$ARMS}; do
-                for f in $(qb_query_files "$s"); do echo "-- arm ${arm}: $(qb_query_name "$f")"; qb_render "$f" duckdb "$arm"; done
+                for f in $(qb_query_files "$s"); do echo "-- duckdb/${arm}: $(qb_query_name "$f")"; qb_render "$f" duckdb "$arm"; done
             done ;;
     *)      qb_die "usage: $0 run | render <suite> [arm]" ;;
 esac

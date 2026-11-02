@@ -1,0 +1,157 @@
+# Helm values for the CDC query benchmark's Trino (chart trinodb/trino
+# ${TRINO_CHART_VERSION}, Trino ${TRINO_VERSION}). A TEMPLATE: deploy-trino.sh renders
+# the placeholders (envsubst, lib/common.sh render) into trino-values-deployed.yaml
+# and feeds that to helm. Do not pass this file to helm directly.
+#
+# Shape (resource parity with duckdb-cdc.yaml's 27 cpu / 114 Gi on one
+# m5.8xlarge): ${TRINO_WORKERS} workers x ${TRINO_WORKER_CPU} cpu / ${TRINO_WORKER_MEMORY_GI}Gi
+# (requests = limits, one per m5.${TRINO_WORKER_INSTANCE_SIZE}) plus a
+# coordinator of ${TRINO_COORD_CPU} cpu / ${TRINO_COORD_MEMORY_GI}Gi that schedules no splits.
+# The memory numbers below are computed by deploy-trino.sh (see its header).
+
+image:
+  repository: trinodb/trino
+  tag: "${TRINO_VERSION}"                 # pinned: the chart's appVersion, but explicit
+
+server:
+  workers: ${TRINO_WORKERS}
+  node:
+    environment: cdcbench
+  config:
+    query:
+      maxMemory: "${TRINO_QUERY_MAX_MEMORY}"    # cluster-wide user memory = workers x worker max-memory-per-node
+
+# One catalog only: drop the chart's default tpch/tpcds.
+catalogs:
+  tpch: null
+  tpcds: null
+  iceberg: |
+    connector.name=iceberg
+    iceberg.catalog.type=glue
+    hive.metastore.glue.region=${AWS_REGION}
+    hive.metastore.glue.use-web-identity-token-credentials-provider=true
+    fs.native-s3.enabled=true
+    s3.region=${AWS_REGION}
+    fs.cache.enabled=true
+
+# node.id: the 484 image dropped run-trino, which used to set it (484 release
+# notes, Docker section); pod name = node id in system.runtime.nodes.
+additionalNodeProperties:
+  - node.id=${ENV:HOSTNAME}
+
+# On every node (coordinator and workers; the 484 file system cache docs: all
+# nodes must load the same cache manager config, and a catalog with
+# fs.cache.enabled=true fails to start on a node without an alluxio manager).
+additionalConfigProperties:
+  - cache-manager.config-files=/etc/trino/cache-manager-alluxio.properties
+  # keep finished queries long enough for the harness to read their stats
+  # (system.runtime.queries and /v1/query/<id>)
+  - query.max-history=1000
+  - query.min-expire-age=60m
+
+env:
+  - {name: AWS_REGION,         value: "${AWS_REGION}"}
+  - {name: AWS_DEFAULT_REGION, value: "${AWS_REGION}"}
+
+serviceAccount:
+  create: false
+  name: ${TRINO_SERVICE_ACCOUNT}           # IRSA: the role that reads Glue + the warehouses (= duckdb-cdc.yaml's)
+
+# fsGroup: the cache volumes are fresh ext4 EBS volumes owned by root; the
+# trino user (1000) needs write access to /cache.
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+service:
+  type: ClusterIP
+  port: 8080                               # Service "trino" (release name = chart name)
+
+coordinator:
+  deployment:
+    strategy: {type: Recreate}
+  jvm:
+    maxHeapSize: "${TRINO_COORD_HEAP}"
+  config:
+    nodeScheduler:
+      includeCoordinator: false            # node-scheduler.include-coordinator=false: no splits on the coordinator
+    memory:
+      heapHeadroomPerNode: "${TRINO_COORD_HEADROOM}"
+    query:
+      maxMemoryPerNode: "${TRINO_COORD_MAX_MEM_PER_NODE}"
+  additionalConfigFiles:
+    cache-manager-alluxio.properties: |
+      cache-manager.name=alluxio
+      fs.cache.directories=/cache
+      fs.cache.max-disk-usage-percentages=${TRINO_CACHE_DISK_PCT}
+      fs.cache.page-size=${TRINO_CACHE_PAGE_SIZE}
+  resources:
+    requests: {cpu: "${TRINO_COORD_CPU}", memory: ${TRINO_COORD_MEMORY_GI}Gi}
+    limits:   {cpu: "${TRINO_COORD_CPU}", memory: ${TRINO_COORD_MEMORY_GI}Gi}
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    karpenter.sh/nodepool: ${TRINO_NODEPOOL}
+    karpenter.k8s.aws/instance-family: m5
+    karpenter.k8s.aws/instance-size: ${TRINO_COORD_INSTANCE_SIZE}
+    karpenter.sh/capacity-type: on-demand
+  additionalVolumes:
+    - name: cache                          # metadata files only (planning reads); same config as the workers'
+      ephemeral:
+        volumeClaimTemplate:
+          metadata:
+            labels: {app.kubernetes.io/instance: trino, trino.cdcbench/cache: "true"}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: ${CACHE_STORAGE_CLASS}
+            resources: {requests: {storage: ${TRINO_COORD_CACHE_VOLUME}}}
+  additionalVolumeMounts:
+    - {name: cache, mountPath: /cache}
+
+worker:
+  deployment:
+    strategy: {type: Recreate}             # all workers replaced together: clear-cache restarts them on fresh volumes
+  jvm:
+    maxHeapSize: "${TRINO_WORKER_HEAP}"
+  config:
+    memory:
+      heapHeadroomPerNode: "${TRINO_WORKER_HEADROOM}"
+    query:
+      maxMemoryPerNode: "${TRINO_WORKER_MAX_MEM_PER_NODE}"
+  additionalConfigFiles:
+    cache-manager-alluxio.properties: |
+      cache-manager.name=alluxio
+      fs.cache.directories=/cache
+      fs.cache.max-disk-usage-percentages=${TRINO_CACHE_DISK_PCT}
+      fs.cache.page-size=${TRINO_CACHE_PAGE_SIZE}
+  resources:                               # requests = limits: Guaranteed QoS, no CPU burst over parity
+    requests: {cpu: "${TRINO_WORKER_CPU}", memory: ${TRINO_WORKER_MEMORY_GI}Gi}
+    limits:   {cpu: "${TRINO_WORKER_CPU}", memory: ${TRINO_WORKER_MEMORY_GI}Gi}
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"    # consolidation would drop the warm cache
+  nodeSelector:                            # = duckdb-cdc.yaml / StarRocks' BEs: m5, on-demand, driver-nodepool
+    kubernetes.io/arch: amd64
+    karpenter.sh/nodepool: ${TRINO_NODEPOOL}
+    karpenter.k8s.aws/instance-family: m5
+    karpenter.k8s.aws/instance-size: ${TRINO_WORKER_INSTANCE_SIZE}
+    karpenter.sh/capacity-type: on-demand
+  affinity:
+    podAntiAffinity:                       # one worker per node
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels: {app.kubernetes.io/instance: trino, app.kubernetes.io/component: worker}
+          topologyKey: kubernetes.io/hostname
+  additionalVolumes:
+    - name: cache                          # generic ephemeral gp3 volume: born and deleted with the pod
+      ephemeral:
+        volumeClaimTemplate:
+          metadata:
+            labels: {app.kubernetes.io/instance: trino, trino.cdcbench/cache: "true"}
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: ${CACHE_STORAGE_CLASS}
+            resources: {requests: {storage: ${TRINO_CACHE_VOLUME}}}
+  additionalVolumeMounts:
+    - {name: cache, mountPath: /cache}
