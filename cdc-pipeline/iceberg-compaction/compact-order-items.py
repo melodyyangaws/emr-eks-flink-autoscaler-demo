@@ -89,6 +89,11 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes")
 EXPIRE_SNAPSHOTS = os.environ.get("EXPIRE_SNAPSHOTS", "true").lower() in ("1", "true", "yes")
 EXPIRE_OLDER_THAN_HOURS = float(os.environ.get("EXPIRE_OLDER_THAN_HOURS", "12"))
 EXPIRE_RETAIN_LAST = int(os.environ.get("EXPIRE_RETAIN_LAST", "5"))
+# Executor (delete-file) cache cap: half the driver heap, at most 48 GiB (the
+# one-off Job's 100g heap -> 48 GiB, the hourly CronJob's 40g -> 20 GiB).
+_heap = os.environ.get("DRIVER_MEMORY", "100g").lower()
+_heap_gib = float(_heap[:-1]) if _heap[-1:] == "g" else float(_heap[:-1]) / 1024 if _heap[-1:] == "m" else 100.0
+CACHE_MAX_TOTAL = int(min(48, _heap_gib / 2) * 1024**3)
 
 
 def build_session():
@@ -161,9 +166,11 @@ def build_session():
         # for the parallelism half). Adding memory does not help — that was already
         # disproven on DuckDB at 52Gi and 72Gi.
         .config("spark.sql.iceberg.executor-cache.enabled", "true")
-        .config("spark.sql.iceberg.executor-cache.max-total", str(48 * 1024**3))
-        .config("spark.sql.iceberg.executor-cache.max-entry", str(24 * 1024**3))
-        .config("spark.sql.iceberg.executor-cache.timeout", "PT2H")
+        .config("spark.sql.iceberg.executor-cache.max-total", str(CACHE_MAX_TOTAL))
+        .config("spark.sql.iceberg.executor-cache.max-entry", str(CACHE_MAX_TOTAL // 2))
+        # Spark's duration syntax: Iceberg 1.10.1 rejects ISO-8601 "PT2H" with
+        # NumberFormatException "Time must be specified as seconds (s)...".
+        .config("spark.sql.iceberg.executor-cache.timeout", "2h")
         # Independently of the Iceberg catalog, the EMRFS/hadoop-s3 default above
         # also applies to any read that goes through the Hadoop FileSystem, so it is
         # raised too rather than left to bite somewhere else.
@@ -192,21 +199,52 @@ def state(spark, label):
     return s
 
 
+# REWRITE_MODE picks the option sets.
+#   full (default): the snapshot test, writers SUSPENDED. rewrite-all with
+#     use-starting-sequence-number=false: the new files take a fresh sequence
+#     number, so every old equality delete detaches and can be dropped. Unsafe
+#     while Flink commits: an equality delete committed during the rewrite has a
+#     LOWER sequence number than the new files and would no longer apply to them.
+#   live: the hourly CronJob, writers RUNNING. use-starting-sequence-number=true
+#     keeps the rewritten files at the rewrite's starting sequence number, so
+#     equality deletes Flink commits meanwhile still apply to them; deletes the
+#     rewrite already applied become dangling and remove-dangling-deletes drops
+#     them. partial-progress commits file groups as they finish, so one conflict
+#     with a Flink commit loses a group, not the run. Flink's deletion vectors
+#     only point at files of their own commit, never at files being rewritten.
+REWRITE_MODE = os.environ.get("REWRITE_MODE", "full").lower()
+if REWRITE_MODE not in ("full", "live"):
+    raise SystemExit(f"REWRITE_MODE must be full|live, got {REWRITE_MODE!r}")
+
 # Tried in order. Iceberg rejects unknown procedure options outright and these
 # option names have moved between releases, so a rejected option degrades to a
-# still-correct call rather than aborting. use-starting-sequence-number=false is
-# kept in EVERY fallback: without it the rewrite cannot detach the old deletes and
-# would not be worth committing.
-OPTION_SETS = [
-    {"rewrite-all": "true", "use-starting-sequence-number": "false",
-     "remove-dangling-deletes": "true",
-     "max-concurrent-file-group-rewrites": "1",
-     "target-file-size-bytes": TARGET_FILE_SIZE},
-    {"rewrite-all": "true", "use-starting-sequence-number": "false",
-     "max-concurrent-file-group-rewrites": "1",
-     "target-file-size-bytes": TARGET_FILE_SIZE},
-    {"rewrite-all": "true", "use-starting-sequence-number": "false"},
-]
+# still-correct call rather than aborting. Each mode keeps its
+# use-starting-sequence-number value in EVERY fallback: in full mode without
+# false the rewrite cannot detach the old deletes; in live mode without true it
+# is unsafe (above).
+if REWRITE_MODE == "full":
+    OPTION_SETS = [
+        {"rewrite-all": "true", "use-starting-sequence-number": "false",
+         "remove-dangling-deletes": "true",
+         "max-concurrent-file-group-rewrites": "1",
+         "target-file-size-bytes": TARGET_FILE_SIZE},
+        {"rewrite-all": "true", "use-starting-sequence-number": "false",
+         "max-concurrent-file-group-rewrites": "1",
+         "target-file-size-bytes": TARGET_FILE_SIZE},
+        {"rewrite-all": "true", "use-starting-sequence-number": "false"},
+    ]
+else:
+    OPTION_SETS = [
+        {"rewrite-all": "true", "use-starting-sequence-number": "true",
+         "remove-dangling-deletes": "true",
+         "partial-progress.enabled": "true",
+         "max-concurrent-file-group-rewrites": "4",
+         "target-file-size-bytes": TARGET_FILE_SIZE},
+        {"rewrite-all": "true", "use-starting-sequence-number": "true",
+         "partial-progress.enabled": "true",
+         "target-file-size-bytes": TARGET_FILE_SIZE},
+        {"rewrite-all": "true", "use-starting-sequence-number": "true"},
+    ]
 
 
 def rewrite(spark):
@@ -275,12 +313,13 @@ def main():
     print(f"  warehouse  : {WAREHOUSE}")
     print(f"  driver mem : {conf.get('spark.driver.memory', '(default)')}")
     print(f"  dry run    : {DRY_RUN}")
+    print(f"  mode       : {REWRITE_MODE}")
     print("=" * 72, flush=True)
 
     print("\n-- Table state " + "-" * 56, flush=True)
     before = state(spark, "BEFORE")
     payload = {"table": f"{DB}.{TABLE}", "spark": spark.version, "region": REGION,
-               "before": before, "dry_run": DRY_RUN}
+               "before": before, "dry_run": DRY_RUN, "mode": REWRITE_MODE}
 
     if DRY_RUN:
         print("\nDRY_RUN — no rewrite committed.", flush=True)

@@ -7,7 +7,10 @@
 # CDC source for the benchmark. Repeated upserts on a skewed hot-key window are
 # what make Iceberg accumulate equality-delete files while Paimon compacts them
 # away in the background. A uniformly random key stream over 14M keys would
-# measure raw ingest only and show neither effect.
+# measure raw ingest only and show neither effect. RECENT_KEY_RATIO of each
+# batch re-writes keys the same thread wrote seconds earlier, so about half of
+# the Iceberg writer's deletes are position deletes (DVs on v3) — a design
+# target, see 2-DATA-GEN-GUIDE.md for how to measure it.
 #
 # The target rate is RATE_PER_POD x replicas (manifest: 80,000 x 4). That is a
 # token-bucket ceiling set deliberately out of reach, so the pods run flat out
@@ -144,8 +147,10 @@ deploy_generator() {
     echo ""
     info "Target rate: RATE_PER_POD x replicas (manifest: 80,000 x 4 = 320,000 rows/s),"
     info "a deliberately unreachable token-bucket ceiling so the pods run flat out."
-    info "UPSERT_RATIO 0.5: half the rows update existing primary keys, half are new"
-    info "inserts. No DELETE events are emitted."
+    info "RECENT_KEY_RATIO 0.6: that share of each batch re-writes keys the same thread"
+    info "wrote in the last RECENT_KEY_MAX_AGE_S (20) s, targeting ~50% Iceberg position"
+    info "deletes. UPSERT_RATIO 0.5 splits the rest: half update hot/cold keys, half are"
+    info "new inserts. No DELETE events are emitted."
     echo ""
     info "The per-pod counter line is the authoritative rate — rolled-back batches"
     info "show up as a shortfall there rather than as an error:"
@@ -166,6 +171,13 @@ stop_generator() {
     log "✓ Data generator stopped"
 }
 
+# One numeric field (name=1,234) from a generator counter line, digits only;
+# empty if the field is absent. Anchored on a preceding space or ']' so that
+# e.g. `rows=` cannot match inside another field name.
+counter_field() {
+    echo "$1" | grep -oE "(^|[] ])$2=[0-9,]+" | head -1 | tr -cd '0-9'
+}
+
 # Show data generator status
 status_generator() {
     log "Upsert load generator status:"
@@ -175,7 +187,8 @@ status_generator() {
     kubectl get pods -l app="$APP_LABEL" -n "$NAMESPACE" || true
 
     echo ""
-    log "Achieved rate per pod (avg is the number to quote):"
+    log "Achieved rate per pod (inst= is the current rate; recent= is the share of"
+    log "rows that re-wrote a recent key, cumulative since pod start):"
     local pods
     pods=$(kubectl get pods -n "$NAMESPACE" -l app="$APP_LABEL" \
              -o name 2>/dev/null) || true
@@ -186,8 +199,23 @@ status_generator() {
         line=$(kubectl logs -n "$NAMESPACE" "$p" --tail=60 2>/dev/null \
                  | grep '^\[' | tail -1)
         [[ -z "$line" ]] && continue
-        printf '  %-42s %s\n' "$(basename "$p")" \
-            "$(echo "$line" | grep -oE 'inst=[0-9,]+/s avg=[0-9,]+/s errors=[0-9]+' || echo "$line")"
+        # Pick the fields one by one: the counter line carries upserts=,
+        # inserts=, recent= and batches= between them, so a single
+        # 'inst=… avg=… errors=…' pattern never matched and the whole line was
+        # printed instead. recent= is absent on pods that predate it.
+        local inst avg_s errs batches rows recent share=""
+        rows=$(counter_field "$line" rows);  inst=$(counter_field "$line" inst)
+        avg_s=$(counter_field "$line" avg);  errs=$(counter_field "$line" errors)
+        batches=$(counter_field "$line" batches)
+        recent=$(counter_field "$line" recent)
+        [[ -n "$recent" && -n "$rows" && "$rows" -gt 0 ]] && \
+            share=" recent=$(( 100 * recent / rows ))%"
+        if [[ -n "$inst" && -n "$avg_s" ]]; then
+            printf '  %-42s inst=%s/s avg=%s/s errors=%s batches=%s%s\n' \
+                "$(basename "$p")" "$inst" "$avg_s" "${errs:-?}" "${batches:-?}" "$share"
+        else
+            printf '  %-42s %s\n' "$(basename "$p")" "$line"
+        fi
         # Sum the averages rather than the instantaneous values: `inst` is a
         # 15s sample and the pods report on staggered clocks, so summing it
         # reads high or low depending on when this ran.
@@ -282,31 +310,74 @@ configure_rate() {
 # tightly those updates concentrate. Concentration is what drives Iceberg
 # delete-file accumulation, so widening the window weakens the very effect the
 # Paimon-vs-Iceberg comparison is looking for.
+#
+# Arguments 5 and 6 (RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S) are optional and
+# left untouched on the live StatefulSet when omitted, so a 3-argument call
+# keeps working exactly as before. UPSERT_RATIO applies only to the rows that
+# are not recent re-writes.
 configure_upsert_mix() {
     # Defaults are the manifest's current values.
     local upsert_ratio=${2:-0.5}
     local hot_ratio=${3:-0.6}
     local hot_window=${4:-5000000}
+    local recent_ratio=${5:-}
+    local recent_age=${6:-}
 
     log "Configuring upsert mix..."
-    log "  Upsert ratio   : ${upsert_ratio} (rest are new inserts)"
+    log "  Upsert ratio   : ${upsert_ratio} (of the non-recent rows; rest are new inserts)"
     log "  Hot-key ratio  : ${hot_ratio}"
     log "  Hot-key window : ${hot_window} keys"
+    local extra=()
+    if [[ -n "$recent_ratio" ]]; then
+        log "  Recent ratio   : ${recent_ratio}"
+        extra+=(RECENT_KEY_RATIO="$recent_ratio")
+    fi
+    if [[ -n "$recent_age" ]]; then
+        log "  Recent max age : ${recent_age}s"
+        extra+=(RECENT_KEY_MAX_AGE_S="$recent_age")
+    fi
 
     kubectl set env "$KIND"/"$DEPLOYMENT" \
         UPSERT_RATIO="$upsert_ratio" \
         HOT_KEY_RATIO="$hot_ratio" \
         HOT_KEY_WINDOW="$hot_window" \
+        "${extra[@]}" \
         -n "$NAMESPACE" || error "Failed to update configuration"
 
     log "✓ Upsert mix updated. Pods will restart automatically."
+}
+
+# Set only the recent-key knobs: the share of each batch that re-writes a key
+# the same thread wrote within RECENT_KEY_MAX_AGE_S seconds, which is what turns
+# Iceberg's deletes into position deletes (DVs on v3) instead of equality
+# deletes. Keep the age well under the 60s checkpoint interval: a re-write a
+# seconds after the previous write shares its checkpoint with probability
+# 1 - a/60. RECENT_KEY_RATIO=0 (with TABLE_RUN_BATCHES=1) is the old generator.
+configure_recent_mix() {
+    local recent_ratio=${2:-0.6}
+    local recent_age=${3:-20}
+
+    log "Configuring recent-key re-writes..."
+    log "  Recent ratio   : ${recent_ratio} (share of all rows; target ~50% position deletes at 0.6)"
+    log "  Recent max age : ${recent_age}s"
+    if awk -v a="$recent_age" 'BEGIN { exit !(a >= 60) }'; then
+        warn "RECENT_KEY_MAX_AGE_S >= 60 (the checkpoint interval): most re-writes will"
+        warn "land in a later checkpoint and become equality deletes, not position deletes."
+    fi
+
+    kubectl set env "$KIND"/"$DEPLOYMENT" \
+        RECENT_KEY_RATIO="$recent_ratio" \
+        RECENT_KEY_MAX_AGE_S="$recent_age" \
+        -n "$NAMESPACE" || error "Failed to update configuration"
+
+    log "✓ Recent-key mix updated. Pods will restart automatically."
 }
 
 # Show help
 show_help() {
     echo "MySQL Data Generator Management Tool (upsert load generator)"
     echo ""
-    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|help} [upsert]"
+    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|recent-mix|help} [upsert]"
     echo ""
     echo "Manages StatefulSet mysql-upsert-loadgen (mysql-upsert-loadgen.yaml):"
     echo "batched INSERT ... ON DUPLICATE KEY UPDATE on a skewed hot-key window, so"
@@ -324,6 +395,8 @@ show_help() {
     echo "  scale       - Scale generator pods (keeps POD_COUNT in step)"
     echo "  config      - Set RATE_PER_POD, THREADS, BATCH_ROWS"
     echo "  upsert-mix  - Set UPSERT_RATIO, HOT_KEY_RATIO, HOT_KEY_WINDOW"
+    echo "                [, RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S]"
+    echo "  recent-mix  - Set RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S only"
     echo "  help        - Show this help message"
     echo ""
     echo "Examples:"
@@ -334,6 +407,9 @@ show_help() {
     echo "  ./deploy-data-generator.sh upsert-mix 0.5 0.6 5000000"
     echo "        # upsert ratio, hot-key ratio, hot-key window — a tighter"
     echo "        # window accumulates Iceberg delete files faster"
+    echo "  ./deploy-data-generator.sh recent-mix 0.6 20"
+    echo "        # share of rows re-writing a key written <20s ago -> Iceberg"
+    echo "        # position deletes (DVs on v3); target ~50% at 0.6, measure it"
     echo "  ./deploy-data-generator.sh stop"
     echo ""
     echo "Environment variables:"
@@ -367,6 +443,9 @@ main() {
             ;;
         upsert-mix|mix)
             configure_upsert_mix "$@"
+            ;;
+        recent-mix)
+            configure_recent_mix "$@"
             ;;
         help|*)
             show_help

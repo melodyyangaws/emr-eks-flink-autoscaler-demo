@@ -166,7 +166,7 @@ spec:
             --conf spark.sql.shuffle.partitions=8 \
             --conf spark.sql.adaptive.enabled=true \
             --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
-            --conf "spark.driver.extraJavaOptions=-Xlog:gc:stdout:time,uptime -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError" \
+            --conf "spark.driver.extraJavaOptions=-Xlog:gc:stdout:time,uptime -XX:+ExitOnOutOfMemoryError" \
             /opt/compact/compact-order-items.py
         env:
         - name: PYTHONUNBUFFERED

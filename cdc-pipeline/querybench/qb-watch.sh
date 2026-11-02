@@ -12,10 +12,10 @@
 # writers, job monitor, DuckDB and Trino RUNNING and prints a report: why it
 # ended, the runner's last error lines and what is still up. A setup error then
 # costs a fix and a re-run, not a new MySQL snapshot. Tear down by hand with
-# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-6 below).
+# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-7 below).
 #
 #   ./querybench/qb-watch.sh            watch (the cdc-qb-watch Job runs this)
-#   ./querybench/qb-watch.sh teardown   steps 1-6 now, no watching (run.sh stop)
+#   ./querybench/qb-watch.sh teardown   steps 1-7 now, no watching (run.sh stop)
 #
 # Teardown steps:
 #   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it);
@@ -27,7 +27,9 @@
 #      this pod has no helm, so not deploy-trino.sh down; the release stays,
 #      the cache volumes go with their pods, and run.sh start scales them back
 #      and runs deploy-trino.sh up;
-#   6. deletes the runner's ConfigMap and Secret.
+#   6. suspends the hourly Iceberg compaction CronJob and cancels a run in
+#      progress (STOP_COMPACTION_CRON=0 leaves it; a hot run.sh start resumes it);
+#   7. deletes the runner's ConfigMap and Secret.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
@@ -37,6 +39,7 @@ WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-600}"
 WATCH_RUNNER=cdc-qb-runner
 DUCK="$DUCKDB_NAME"
 MONITOR="${CDC_MONITOR:-flink-cdc-monitor}"
+COMPACT_CRON="${CRON_NAME:-iceberg-compact-hourly}"
 
 test_over() {
     local phase
@@ -87,6 +90,18 @@ elif trino_down; then
     qb_log "Trino scaled to 0 (run.sh start brings it back; engine-deploy/deploy-trino.sh down removes the release)"
 else
     qb_log "WARNING: could not scale Trino to 0 (engine-deploy/deploy-trino.sh down by hand)"
+fi
+if [[ "${STOP_COMPACTION_CRON:-1}" == 0 ]]; then
+    qb_log "STOP_COMPACTION_CRON=0: cronjob/${COMPACT_CRON} left as is"
+elif ! kubectl get cronjob "$COMPACT_CRON" -n "$NAMESPACE" >/dev/null 2>&1; then
+    qb_log "no cronjob/${COMPACT_CRON}"
+elif kubectl patch cronjob "$COMPACT_CRON" -n "$NAMESPACE" --type merge -p '{"spec":{"suspend":true}}' >/dev/null; then
+    for j in $(kubectl get jobs -n "$NAMESPACE" -l "app=${COMPACT_CRON}" -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+        kubectl delete job "$j" -n "$NAMESPACE" --wait=false >/dev/null && qb_log "cancelled running job/${j}"
+    done
+    qb_log "cronjob/${COMPACT_CRON} suspended (a hot run.sh start resumes it)"
+else
+    qb_log "WARNING: could not suspend cronjob/${COMPACT_CRON}"
 fi
 kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \

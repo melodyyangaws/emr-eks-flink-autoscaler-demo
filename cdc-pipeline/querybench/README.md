@@ -50,14 +50,18 @@ Check `run-meta.txt` names the table set the writers write.
 **Engines: automatic vs by hand.** `run.sh start` brings both engines up on
 the laptop before it starts the runner:
 
+- **Writers first** (hot only): `start` waits until both writers have been
+  RUNNING 15 min (`WRITERS_UP_S`, 900 s; `wait_writers_up` in `lib/common.sh`)
+  before it touches an engine, then resumes the hourly Iceberg compaction
+  CronJob (`iceberg-compaction/run-compaction.sh cron-up`; README Step 9a). The
+  snapshot `start` suspends that CronJob instead, before its own compaction.
 - **DuckDB** (`duckdb-warm-cdc`): `engine-deploy/deploy-duckdb-cdc.sh up` when
   the server does not answer `/health`, or answers for another
   `ICEBERG_FORMAT_VERSION` or image. It must then report `"busy": false`.
 - **Trino**: `engine-deploy/deploy-trino.sh up` when fewer than
   `TRINO_WORKERS` (3) workers are active. Replicas the watcher scaled to 0
-  are restored first. `up` waits until the running writers have been RUNNING
-  15 min (`TRINO_AFTER_WRITERS_S`, 900 s), so a `start` right after a writer
-  deploy blocks for up to 15 min. A Trino that is already up must run `TRINO_VERSION`
+  are restored first. `up` makes the same 15 min writer check
+  (`TRINO_AFTER_WRITERS_S`), which a hot `start` has already passed. A Trino that is already up must run `TRINO_VERSION`
   (484), else `start` stops (`TRINO_VERSION_CHECK=0` measures it as is).
 
 By hand: building the DuckDB image, `deploy-trino.sh down`, and redeploying
@@ -212,7 +216,7 @@ In order: generator to 0 (no drain wait), writers suspended (wait for the
 TaskManagers to go), `flink-cdc-monitor` to 0, `duckdb-warm-cdc` deleted,
 Trino's coordinator and workers scaled to 0 (the Helm release stays), the
 runner's ConfigMap and Secret deleted. `STOP_GENERATOR=0`, `SUSPEND_WRITERS=0`,
-`STOP_DUCKDB=0`, `STOP_TRINO=0` each keep one running. `SUITE` only labels
+`STOP_DUCKDB=0`, `STOP_TRINO=0`, `STOP_COMPACTION_CRON=0` each keep one running. `SUITE` only labels
 the log. Finished Jobs are deleted by their TTL (1 day) or the next `start`.
 
 Remove Trino completely: `./engine-deploy/deploy-trino.sh down`.
@@ -452,7 +456,8 @@ to the pods (`PASS_VARS` in `run.sh`).
 | `MAX_RESULT_ROWS` | `10000` | rows kept per query for the comparison |
 | `PROFILE_SCAN` | `1` | DuckDB's untimed scan-bytes pass (hot: last pass only) |
 | `WATCH_INTERVAL_S` | `600` | watcher poll |
-| `STOP_GENERATOR` / `SUSPEND_WRITERS` / `STOP_DUCKDB` / `STOP_TRINO` | `1` | what the teardown stops |
+| `STOP_GENERATOR` / `SUSPEND_WRITERS` / `STOP_DUCKDB` / `STOP_TRINO` / `STOP_COMPACTION_CRON` | `1` | what the teardown stops |
+| `WRITERS_UP_S` | `900` | a hot `start` waits until the writers have been RUNNING this long |
 | `FORCE` / `ALLOW_CONCURRENT` | off | replace an active runner, ignore throughput's Jobs / skip the one-test-at-a-time guard |
 | `RENDER_DIR` | temp dir | `render` output |
 | `HOT_STAMP` / `SNAPSHOT_STAMP` / `SUMMARY_DIR` / `SESSION` | newest / S3 / derived | `summary` inputs and name |

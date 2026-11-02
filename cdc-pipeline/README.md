@@ -340,6 +340,19 @@ generator: the row-at-a-time INSERT/UPDATE/DELETE "mixed" generator was removed 
 2026-11-02, so the benchmark has no DELETE events. Details are in
 [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md).
 
+`RECENT_KEY_RATIO=0.6` of every batch re-writes keys that the same worker thread
+wrote within the last `RECENT_KEY_MAX_AGE_S=20` seconds. `TABLE_RUN_BATCHES=8`
+keeps each thread on one table for 8 batches so that this works for the small tables
+too. `UPSERT_RATIO` splits only the remaining rows. The Iceberg upsert writer
+emits a delete for every row. A key it already wrote in the current checkpoint gets
+a position delete (a DV on v3), and any other key gets an equality delete. So this
+targets **~50% position deletes**, against ~2% before. **That is a design target from
+an offline simulation, not a measurement.** Measure it with
+[Measure the position-delete share](2-DATA-GEN-GUIDE.md#measure-the-position-delete-share)
+and tune with `deploy-data-generator.sh recent-mix <ratio> <max-age-s>`. Paimon
+receives the same stream and dedups the repeats in its write buffer. That
+difference is intended.
+
 ```bash
 # after any shrink of the source tables: re-read the id ranges
 kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink
@@ -347,7 +360,7 @@ kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink
 ./mysql-data-generator/deploy-data-generator.sh scale 4   # also sets POD_COUNT
 ```
 
-- **Check:** each pod logs `inst=` / `avg=` / `errors=` lines. Judge the current rate by `inst=` and the failures by `errors=` against `batches=`.
+- **Check:** each pod logs `inst=` / `avg=` / `errors=` lines. Judge the current rate by `inst=` and the failures by `errors=` against `batches=`. `recent= / rows=` is the achieved re-write share (expect ~0.55 at ratio 0.6); `status` prints it as `recent=N%`.
 - **Rate:** source-bound at about **52–64K rows/s**, with about **34% batch errors** from lock contention, retried silently (measured on the 2026-11-02 dry run, with 8 pods; 4 pods since then, not measured yet). The `40,000 rows/s` and `5000 x 8` figures printed by the script's help are out of date.
 - **Time:** pods ready in about 1–2 min (estimate).
 - **If it fails:** `Secret mysql-credentials not found` means you need to export `MYSQL_HOST`, `MYSQL_USER` and `MYSQL_PASSWORD` and re-run. If the source tables regrow after a shrink, the pods were not restarted. A bare `kubectl scale` leaves `POD_COUNT` stale and the hot-key slices overlap, so use `scale N upsert`.
@@ -380,13 +393,14 @@ optional. Run it to see the engines come up before a test:
 ./engine-deploy/deploy-trino.sh status
 ```
 
-**Trino waits for the writers.** `deploy-trino.sh up` (and so `run.sh start`,
-when Trino is not up yet) installs only once every RUNNING writer in
-`FLINK_JOBS` has been RUNNING for `TRINO_AFTER_WRITERS_S` (900 s = 15 min) since
+**The engines wait for the writers.** `SUITE=hot run.sh start` and
+`deploy-trino.sh up` both wait (`wait_writers_up`, `lib/common.sh`) until every
+writer in `FLINK_JOBS` has been RUNNING for `WRITERS_UP_S` (900 s = 15 min) since
 its current job start, so a restarted writer restarts the clock. The writers'
 start-up and first snapshot get the nodes to themselves. Suspended writers are
-skipped, a missing one stops it, and it gives up after
-`TRINO_WRITER_WAIT_MAX_S` (7200 s). `TRINO_AFTER_WRITERS_S=0` installs at once.
+skipped, a missing one stops the wait, and it gives up after
+`WRITER_WAIT_MAX_S` (7200 s). `WRITERS_UP_S=0` (or `TRINO_AFTER_WRITERS_S=0` for
+Trino alone) skips it.
 
 The four arms (`ENGINES` × `FORMATS`) on the v3 set, as known on 2026-11-02:
 
@@ -424,8 +438,14 @@ SUITE=hot ./querybench/run.sh start
 Preconditions: both writers are `RUNNING`, the generator is running, and no other
 `cdc-qb-runner` or throughput `qb-runner` is active (`FORCE=1` overrides).
 
-`start` brings up the engines and clears their caches, then starts the runner
-Job and the watcher Job in the cluster. The laptop can disconnect after that.
+`start`, in order:
+
+1. Waits until both writers have been RUNNING 15 min (`WRITERS_UP_S`, see Step 8).
+   Run it right after Step 5 and it simply blocks until then.
+2. Resumes the hourly Iceberg compaction CronJob, if it exists (Step 9a).
+3. Brings up DuckDB, then Trino, and clears their caches.
+4. Starts the runner Job and the watcher Job in the cluster. The laptop can
+   disconnect after that.
 The runner:
 
 1. Checks the writers' stability 10 times, once a minute.
@@ -436,18 +456,52 @@ The runner:
 
 **The watcher tears down only after a completed test.** That means
 `status: runner-exit=0`. It then scales the generator to 0, suspends both
-writers, scales the monitor to 0, deletes DuckDB, and scales Trino to 0. On any
+writers, scales the monitor to 0, deletes DuckDB, scales Trino to 0 and
+suspends the compaction CronJob. On any
 failure it **leaves everything running** and logs why, the last errors, and
 what is still up (`status: qb-watch-failed-left-running`). Fix the problem and
 re-run `start`, or tear down with Step 12.
 
 Before a second hot test after a completed one, resume the writers (Step 5),
-the generator (`scale 8 upsert`) and the monitor
+the generator (`scale 4 upsert`) and the monitor
 (`kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=1`).
 
 - **Check:** the runner logs `status: results-uploaded ...`, and the watcher logs `status: qb-watch-done`.
 - **Time:** about 45–90 min end to end (estimate). The stability check alone takes 10 min, the window lags 5 min, and the watcher polls every 10 min.
 - **If it fails:** read `./querybench/run.sh logs`. Any setup error in `start` stops it before a Job is created ("no query Job left running"). See [querybench/README.md](querybench/README.md) for every setting.
+
+### Step 9a: Hourly Iceberg compaction during the hot test
+
+Iceberg's Flink writer never merges files: every checkpoint adds a data file, an
+equality-delete file and a deletion vector per writer subtask, and readers pay
+for them until a compaction. Paimon's writer compacts as it goes. To keep the
+hot comparison about the formats rather than about missing maintenance, a
+CronJob compacts the four Iceberg tables every hour while the writers run:
+
+```bash
+./iceberg-compaction/run-compaction.sh cron-up       # CronJob iceberg-compact-hourly, "0 * * * *" UTC
+./iceberg-compaction/run-compaction.sh cron-run      # one run now
+./iceberg-compaction/run-compaction.sh cron-status   # last runs and their log lines
+./iceberg-compaction/run-compaction.sh cron-down     # remove it
+```
+
+- One pod (12 cpu / 56 GiB on an m5.4xlarge) compacts the four tables one
+  after another with `REWRITE_MODE=live`. Live mode keeps the rewrite's
+  starting sequence number, so equality deletes Flink commits during the
+  rewrite still apply, and commits file groups as they finish
+  (`partial-progress`). The target file size is each table's own: 64 MiB for
+  customers and products, 128 MiB for orders and order_items. It then expires
+  snapshots older than 12 h (keeping 5), as before.
+- `concurrencyPolicy: Forbid` and a 55 min deadline: runs never overlap.
+- A hot `start` resumes it; the snapshot `start` suspends it and cancels a
+  running pass before its own full compaction; the watcher's teardown
+  suspends it (`STOP_COMPACTION_CRON=0` leaves it).
+- **Check:** `cron-status` shows `=== <table> end` for all four tables and no
+  `FAILED`; the job monitor's Iceberg "New Delete Files" stop accumulating.
+- **If it fails:** `kubectl logs job/<name> -n emr-flink`. The first run on
+  2026-11-02 failed in the JVM ("Multiple garbage collectors selected"): the
+  EMR 7.14 Spark image sets its own GC, so `compact-job.yaml` no longer passes
+  `-XX:+UseG1GC`.
 
 ## Step 10: Snapshot test (compaction gate)
 

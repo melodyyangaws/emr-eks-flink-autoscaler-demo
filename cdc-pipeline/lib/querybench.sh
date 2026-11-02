@@ -420,8 +420,13 @@ qb_trino() {   # <sql> [timeout s]
 qb_trino_try() {   # <sql>
     local out rc
     out=$(qb_trino_cli "$1" --output-format TSV --source querybench-setup 2>&1); rc=$?
-    out=$(grep -v '^Picked up JAVA_TOOL_OPTIONS' <<<"$out" || true)
-    printf '%s\t%s\n' "$rc" "$(tail -1 <<<"$out" | tr '\t' ' ')"
+    out=$(grep -v -E '^Picked up JAVA_TOOL_OPTIONS|^command terminated with exit code' <<<"$out" || true)
+    # The Trino CLI's own error ("Query ... failed: ...") rather than kubectl's
+    # trailing "command terminated with exit code 1", which hid it on 2026-11-02.
+    if [[ "$rc" != 0 ]] && grep -q -E 'failed:|Error|Exception' <<<"$out"; then
+        out=$(grep -E 'failed:|Error|Exception' <<<"$out" | head -1)
+    fi
+    printf '%s\t%s\n' "$rc" "$(tail -1 <<<"$out" | tr '\t' ' ' | cut -c1-400)"
 }
 
 qb_setup_query() {   # <engine> <arm> <sql with ${ORDERS}-style table placeholders> [timeout s]

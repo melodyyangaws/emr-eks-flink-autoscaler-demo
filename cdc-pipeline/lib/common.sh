@@ -73,6 +73,39 @@ die()   { echo -e "${_R}[ERROR]${_N} $*" >&2; exit 1; }
 # render <template> <out> VAR...: substitutes ${VAR} for exactly the named
 # variables (envsubst; any other $... stays for the container's shell), then
 # fails if an UPPERCASE ${...} is left. *-deployed.yaml is git-ignored.
+# Block until every writer in FLINK_JOBS has been RUNNING <seconds> (default
+# WRITERS_UP_S, 900 = 15 min) since its current job start, so a restarted writer
+# restarts the clock. Used before the query engines start (querybench/run.sh
+# start with SUITE=hot, engine-deploy/deploy-trino.sh up). 0 skips the wait.
+# Suspended writers (spec.job.state=suspended: a snapshot test, a teardown) are
+# skipped; a writer that is not deployed stops it; it gives up after
+# WRITER_WAIT_MAX_S (7200 s).
+wait_writers_up() {
+    local need="${1:-${WRITERS_UP_S:-900}}"
+    (( need > 0 )) || return 0
+    local j st t0 want up left deadline=$(( $(date +%s) + ${WRITER_WAIT_MAX_S:-7200} ))
+    while :; do
+        left=0
+        for j in ${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}; do
+            read -r want st t0 < <(kubectl get flinkdeployment "$j" -n "${NAMESPACE:-emr-flink}" \
+                -o jsonpath='{.spec.job.state} {.status.jobStatus.state} {.status.jobStatus.startTime}' 2>/dev/null || true) || true
+            [[ "$want" == suspended ]] && continue    # stopped on purpose (snapshot test, teardown): nothing to wait for
+            [[ -n "$st" ]] || die "writer ${j} is not deployed (FLINK_JOBS; WRITERS_UP_S=0 skips the wait)"
+            if [[ "$st" != RUNNING || ! "$t0" =~ ^[0-9]+$ ]]; then
+                up=0
+            else
+                up=$(( $(date +%s) - t0 / 1000 ))
+            fi
+            (( need - up > left )) && left=$(( need - up ))
+            [[ "$st" == RUNNING ]] || log "writer ${j} is ${st}, not RUNNING"
+        done
+        (( left <= 0 )) && { log "writers RUNNING >= ${need}s"; return 0; }
+        (( $(date +%s) < deadline )) || die "writers not RUNNING for ${need}s within ${WRITER_WAIT_MAX_S:-7200}s"
+        log "waiting for the writers: ~${left}s until they have been RUNNING ${need}s"
+        sleep $(( left < 60 ? left : 60 ))
+    done
+}
+
 render() {
     local tpl="$1" out="$2" list="" v; shift 2
     command -v envsubst >/dev/null || { echo "envsubst not found (brew install gettext)" >&2; return 1; }

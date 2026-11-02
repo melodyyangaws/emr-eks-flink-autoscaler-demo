@@ -62,13 +62,9 @@ TRINO_COORD_CACHE_VOLUME="${TRINO_COORD_CACHE_VOLUME:-20Gi}"
 TRINO_CACHE_DISK_PCT="${TRINO_CACHE_DISK_PCT:-90}"
 TRINO_CACHE_PAGE_SIZE="${TRINO_CACHE_PAGE_SIZE:-1MB}"           # Trino's default (64kB..15MB)
 READY_GRACE="${READY_GRACE:-1200}"
-# up waits until every Flink writer in FLINK_JOBS has been RUNNING this long
-# (its current job start, so a restart resets it), then installs: the
-# writers' first snapshot and start-up get the nodes to themselves. 0 skips the
-# wait; suspended writers are skipped; it gives up after TRINO_WRITER_WAIT_MAX_S.
-FLINK_JOBS="${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}"
-TRINO_AFTER_WRITERS_S="${TRINO_AFTER_WRITERS_S:-900}"
-TRINO_WRITER_WAIT_MAX_S="${TRINO_WRITER_WAIT_MAX_S:-7200}"
+# up waits until the writers have been RUNNING this long (wait_writers_up in
+# lib/common.sh): their start-up and first snapshot get the nodes to themselves.
+TRINO_AFTER_WRITERS_S="${TRINO_AFTER_WRITERS_S:-${WRITERS_UP_S:-900}}"
 CLEAR_COORDINATOR="${CLEAR_COORDINATOR:-1}"                     # clear-cache restarts the coordinator too (its metadata cache)
 TRINO_USER="${TRINO_USER:-cdcbench}"
 
@@ -143,34 +139,8 @@ cmd_render() {
     log "rendered ${VALUES_OUT##*/} (chart ${TRINO_CHART_VERSION}, Trino ${TRINO_VERSION}; workers ${TRINO_WORKERS} x ${TRINO_WORKER_CPU} cpu / ${TRINO_WORKER_MEMORY_GI}Gi, heap ${TRINO_WORKER_HEAP}, max-memory-per-node ${TRINO_WORKER_MAX_MEM_PER_NODE}, query.max-memory ${TRINO_QUERY_MAX_MEMORY})"
 }
 
-# Block until each writer has been RUNNING TRINO_AFTER_WRITERS_S seconds.
-wait_writers() {
-    (( TRINO_AFTER_WRITERS_S > 0 )) || return 0
-    local j st t0 want up left deadline=$(( $(date +%s) + TRINO_WRITER_WAIT_MAX_S ))
-    while :; do
-        left=0
-        for j in $FLINK_JOBS; do
-            read -r want st t0 < <(kubectl get flinkdeployment "$j" -n "$NAMESPACE" \
-                -o jsonpath='{.spec.job.state} {.status.jobStatus.state} {.status.jobStatus.startTime}' 2>/dev/null || true) || true
-            [[ "$want" == suspended ]] && continue    # stopped on purpose (snapshot test, teardown): nothing to wait for
-            [[ -n "$st" ]] || die "writer ${j} is not deployed (FLINK_JOBS, or TRINO_AFTER_WRITERS_S=0 to install anyway)"
-            if [[ "$st" != RUNNING || ! "$t0" =~ ^[0-9]+$ ]]; then
-                up=0
-            else
-                up=$(( $(date +%s) - t0 / 1000 ))
-            fi
-            (( TRINO_AFTER_WRITERS_S - up > left )) && left=$(( TRINO_AFTER_WRITERS_S - up ))
-            [[ "$st" == RUNNING ]] || log "writer ${j} is ${st}, not RUNNING"
-        done
-        (( left <= 0 )) && { log "writers RUNNING >= ${TRINO_AFTER_WRITERS_S}s: installing Trino"; return 0; }
-        (( $(date +%s) < deadline )) || die "writers not RUNNING for ${TRINO_AFTER_WRITERS_S}s within ${TRINO_WRITER_WAIT_MAX_S}s"
-        log "waiting for the writers: ~${left}s until they have been RUNNING ${TRINO_AFTER_WRITERS_S}s"
-        sleep $(( left < 60 ? left : 60 ))
-    done
-}
-
 cmd_up() {
-    wait_writers
+    wait_writers_up "$TRINO_AFTER_WRITERS_S"
     if ! kubectl get storageclass "$CACHE_STORAGE_CLASS" >/dev/null 2>&1; then
         [[ "$CACHE_STORAGE_CLASS" == gp3-fast ]] || die "storageclass ${CACHE_STORAGE_CLASS} not found"
         kubectl apply -f "${TB_DIR}/engine-deploy/gp3-fast-sc.yaml" >/dev/null

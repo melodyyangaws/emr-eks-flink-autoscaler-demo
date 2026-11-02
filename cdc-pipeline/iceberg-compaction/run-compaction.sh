@@ -11,6 +11,21 @@
 #   ./run-compaction.sh render              # print the Job manifest it would create; no cluster call
 #   ./run-compaction.sh clean               # delete job + configmap
 #
+# Hourly, while the writers run (CronJob CRON_NAME, default iceberg-compact-hourly):
+#   ./run-compaction.sh cron-up             # create/update it: every CRON_TABLES table, one
+#                                          # after another in one pod, REWRITE_MODE=live
+#   ./run-compaction.sh cron-run            # one run now (a Job from the CronJob)
+#   ./run-compaction.sh cron-status         # schedule, suspend flag, last runs, last log lines
+#   ./run-compaction.sh cron-suspend|cron-resume   # querybench/run.sh and qb-watch.sh use these
+#   ./run-compaction.sh cron-down           # delete it and its Jobs
+# CRON_SCHEDULE (default "0 * * * *", UTC), CRON_TABLES (default the four tables),
+# CRON_CPU / CRON_MEMORY / CRON_DRIVER_MEMORY / CRON_THREADS / CRON_INSTANCE_SIZE
+# (default 12 / 56Gi / 40g / 8 / 4xlarge: the live tables are a few GB, far from
+# the 365 M-delete v2 table the one-off Job is sized for). Its runs are named
+# <CRON_NAME>-<n>, so the snapshot gate (Jobs iceberg-compact-<table>) never
+# mistakes one for the snapshot compaction; the snapshot test suspends it first
+# (live and full rewrites of one table would conflict) and a hot test resumes it.
+#
 # Settings come from cdc-pipeline/.bench-env (+ .bench-env.local) through
 # lib/common.sh, the same as querybench/run.sh, which submits this script once
 # per COMPACT_TABLES table:
@@ -66,6 +81,11 @@ if [[ -z "${SPARK_IMAGE:-}" ]]; then
     SPARK_IMAGE="895885662937.dkr.ecr.us-west-2.amazonaws.com/spark/emr-7.14.0:latest"
 fi
 export SPARK_IMAGE
+export CRON_NAME="${CRON_NAME:-iceberg-compact-hourly}"
+export CRON_SCHEDULE="${CRON_SCHEDULE:-0 * * * *}"
+export CRON_TABLES="${CRON_TABLES:-customers products orders order_items}"
+export CRON_CPU="${CRON_CPU:-12}" CRON_MEMORY="${CRON_MEMORY:-56Gi}" CRON_DRIVER_MEMORY="${CRON_DRIVER_MEMORY:-40g}"
+export CRON_THREADS="${CRON_THREADS:-8}" CRON_INSTANCE_SIZE="${CRON_INSTANCE_SIZE:-4xlarge}"
 
 # The manifest is rendered locally: the YAML is parsed and patched, then
 # `kubectl create`d. NOT `kubectl apply --dry-run=client`: that flag still fetches
@@ -89,7 +109,7 @@ env = c["env"]
 given = {k: os.environ[k] for k in ("ICEBERG_DB", "ICEBERG_TABLE", "ICEBERG_WAREHOUSE",
          "AWS_REGION", "DRY_RUN", "TARGET_FILE_SIZE_BYTES", "DRIVER_MEMORY",
          "SPARK_LOCAL_THREADS", "EXPIRE_SNAPSHOTS", "EXPIRE_OLDER_THAN_HOURS",
-         "EXPIRE_RETAIN_LAST") if k in os.environ}
+         "EXPIRE_RETAIN_LAST", "REWRITE_MODE") if k in os.environ}
 given["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
 for k, v in given.items():
     for e in env:
@@ -110,6 +130,44 @@ if not re.match(r"^s3://[^/]+/", vals["ICEBERG_WAREHOUSE"]):
 if not re.match(r"^[a-z0-9_]+$", vals["ICEBERG_DB"]) or not re.match(r"^[a-z0-9_]+$", vals["ICEBERG_TABLE"]):
     sys.exit("ICEBERG_DB / ICEBERG_TABLE must be Glue names ([a-z0-9_]+), got %r / %r"
              % (vals["ICEBERG_DB"], vals["ICEBERG_TABLE"]))
+if os.environ.get("CRON") == "1":
+    # The same pod, sized down, running every CRON_TABLES table in turn
+    # (REWRITE_MODE=live) at its own write.target-file-size-bytes (64 MiB customers /
+    # products, 128 MiB orders / order_items: the paired sink settings, not the
+    # one-off Job 256 MiB); one failed table does not stop the others, but fails the run.
+    E = os.environ
+    for k, v in (("REWRITE_MODE", "live"), ("DRIVER_MEMORY", E["CRON_DRIVER_MEMORY"]),
+                 ("SPARK_LOCAL_THREADS", E["CRON_THREADS"]), ("CRON_TABLES", E["CRON_TABLES"])):
+        for e in env:
+            if e["name"] == k:
+                e["value"] = v
+                break
+        else:
+            env.append({"name": k, "value": v})
+    c["resources"] = {"requests": {"cpu": E["CRON_CPU"], "memory": E["CRON_MEMORY"]},
+                      "limits": {"cpu": E["CRON_CPU"], "memory": E["CRON_MEMORY"]}}
+    pod = d["spec"]["template"]["spec"]
+    pod["nodeSelector"]["karpenter.k8s.aws/instance-size"] = E["CRON_INSTANCE_SIZE"]
+    for vol in pod["volumes"]:
+        if "ephemeral" in vol:
+            vol["ephemeral"]["volumeClaimTemplate"]["spec"]["resources"]["requests"]["storage"] = "100Gi"
+    submit = c["args"][0].split("exec ", 1)[1]
+    c["args"] = ["set -uo pipefail\nrc=0\nfor ICEBERG_TABLE in $CRON_TABLES; do\n"
+                 "  export ICEBERG_TABLE\n"
+                 "  case $ICEBERG_TABLE in customers|products) TARGET_FILE_SIZE_BYTES=67108864 ;; *) TARGET_FILE_SIZE_BYTES=134217728 ;; esac\n"
+                 "  export TARGET_FILE_SIZE_BYTES; echo \"=== ${ICEBERG_TABLE} start $(date -u +%FT%TZ)\"\n  "
+                 + submit.strip().replace("\n", "\n  ")
+                 + " || { echo \"=== ${ICEBERG_TABLE} FAILED\"; rc=1; }\n"
+                 "  echo \"=== ${ICEBERG_TABLE} end $(date -u +%FT%TZ)\"\ndone\nexit $rc\n"]
+    labels = lambda: {"app": E["CRON_NAME"]}
+    d["spec"]["template"].setdefault("metadata", {})["labels"] = labels()
+    d["spec"]["activeDeadlineSeconds"] = 3300      # done (or killed) before the next run
+    d = {"apiVersion": "batch/v1", "kind": "CronJob",
+         "metadata": {"name": E["CRON_NAME"], "namespace": d["metadata"]["namespace"], "labels": labels()},
+         "spec": {"schedule": E["CRON_SCHEDULE"], "timeZone": "Etc/UTC",
+                  "concurrencyPolicy": "Forbid", "startingDeadlineSeconds": 600,
+                  "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 3,
+                  "jobTemplate": {"metadata": {"labels": labels()}, "spec": d["spec"]}}}
 if os.environ.get("RENDER_FORMAT") == "yaml":
     yaml.safe_dump(d, sys.stdout, sort_keys=False, width=200)
 else:
@@ -124,8 +182,52 @@ case "${1:-run}" in
     render)
         RENDER_FORMAT=yaml render_job
         exit 0 ;;
+    cron-up)
+        J=$(CRON=1 render_job) || die "compact-job.yaml did not render as a CronJob (see above)"
+        kubectl create configmap "$CM" -n "$NAMESPACE" \
+            --from-file=compact-order-items.py="${SCRIPT_DIR}/compact-order-items.py" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        kubectl apply -f - <<<"$J" >/dev/null
+        echo "cronjob/${CRON_NAME}: '${CRON_SCHEDULE}' UTC, ${ICEBERG_DB}: ${CRON_TABLES} (REWRITE_MODE=live, ${CRON_CPU} cpu / ${CRON_MEMORY})"
+        echo "  first run now: $0 cron-run"
+        exit 0 ;;
+    cron-render)
+        CRON=1 RENDER_FORMAT=yaml render_job
+        exit 0 ;;
+    cron-run)
+        kubectl get cronjob "$CRON_NAME" -n "$NAMESPACE" >/dev/null 2>&1 || die "no cronjob/${CRON_NAME}: $0 cron-up first"
+        j="${CRON_NAME}-manual-$(date -u +%H%M%S)"
+        kubectl create job "$j" --from="cronjob/${CRON_NAME}" -n "$NAMESPACE" >/dev/null
+        echo "job/${j} started: kubectl logs -f job/${j} -n ${NAMESPACE}"
+        exit 0 ;;
+    cron-suspend|cron-resume)
+        kubectl get cronjob "$CRON_NAME" -n "$NAMESPACE" >/dev/null 2>&1 || { echo "no cronjob/${CRON_NAME}"; exit 0; }
+        flag=$([[ "$1" == cron-suspend ]] && echo true || echo false)
+        kubectl patch cronjob "$CRON_NAME" -n "$NAMESPACE" --type merge -p "{\"spec\":{\"suspend\":${flag}}}" >/dev/null
+        echo "cronjob/${CRON_NAME} suspend=${flag}"
+        # Suspending also cancels a run in progress: the snapshot test's full
+        # rewrite must not race a live one (its partial commits are kept).
+        if [[ "$flag" == true ]]; then
+            for j in $(kubectl get jobs -n "$NAMESPACE" -l "app=${CRON_NAME}" -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name}{" "}{end}'); do
+                kubectl delete job "$j" -n "$NAMESPACE" --wait=true >/dev/null && echo "  cancelled running job/${j}"
+            done
+        fi
+        exit 0 ;;
+    cron-status)
+        kubectl get cronjob "$CRON_NAME" -n "$NAMESPACE" \
+            -o custom-columns='NAME:.metadata.name,SCHEDULE:.spec.schedule,SUSPEND:.spec.suspend,LAST:.status.lastScheduleTime,LAST_OK:.status.lastSuccessfulTime' \
+            || exit 0
+        kubectl get jobs -n "$NAMESPACE" -l "app=${CRON_NAME}" --sort-by=.metadata.creationTimestamp \
+            -o custom-columns='JOB:.metadata.name,START:.status.startTime,DONE:.status.completionTime,OK:.status.succeeded,FAILED:.status.failed'
+        last=$(kubectl get jobs -n "$NAMESPACE" -l "app=${CRON_NAME}" --sort-by=.metadata.creationTimestamp -o name | tail -1)
+        [[ -n "$last" ]] && kubectl logs "$last" -n "$NAMESPACE" --tail=400 2>/dev/null \
+            | grep -E '^=== |committed in|FAILED|COUNT\(\*\)|AFTER|BEFORE' | tail -30
+        exit 0 ;;
+    cron-down)
+        kubectl delete cronjob "$CRON_NAME" -n "$NAMESPACE" --ignore-not-found --cascade=foreground
+        exit 0 ;;
     run) ;;
-    *) die "usage: $0 [run|render|clean]" ;;
+    *) die "usage: $0 [run|render|clean|cron-up|cron-run|cron-status|cron-suspend|cron-resume|cron-down|cron-render]" ;;
 esac
 
 JOB_JSON=$(render_job) || die "compact-job.yaml did not render (see above); nothing was submitted"

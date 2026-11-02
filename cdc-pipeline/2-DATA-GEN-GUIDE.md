@@ -16,6 +16,7 @@ for new keys and `-U`/`+U` pairs for existing ones. `deploy-data-generator.sh` m
 | Statements | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows/statement (manifest: 5000) |
 | Rate | measure it — `RATE_PER_POD` is 80,000, a deliberately unreachable token-bucket ceiling |
 | DELETE events | none |
+| Iceberg position deletes | **design target ~50%** of the Iceberg writer's deletes (`RECENT_KEY_RATIO`), not yet measured; ~2% before 2026-11-02 |
 | Use it for | the Paimon-vs-Iceberg storage benchmark and the hot query test |
 
 > **The mixed generator is gone.** The row-at-a-time INSERT/UPDATE/DELETE generator
@@ -33,6 +34,11 @@ for new keys and `-U`/`+U` pairs for existing ones. `deploy-data-generator.sh` m
 Repeated upserts on a skewed hot-key window are what
 make Iceberg accumulate equality-delete files while Paimon's LSM compacts them away; a
 uniformly random key stream over the whole id range would measure raw ingest and show neither effect.
+
+On top of that, `RECENT_KEY_RATIO` (0.6) of every batch **re-writes keys the same
+worker thread wrote a few seconds earlier**, so that about half of the deletes the
+Iceberg writer produces are position deletes (deletion vectors on v3) instead of
+equality deletes. See [Recent re-writes](#recent-re-writes-iceberg-position-deletes).
 
 > **The generator is a StatefulSet, not a Deployment.** Each pod owns a *disjoint
 > slice* of the hot-key window and derives that slice from its ordinal, and only a
@@ -102,7 +108,7 @@ kubectl logs -l app=mysql-upsert-loadgen -n emr-flink --tail=40 | grep '^\['
 Each pod prints a counter line every `REPORT_SECONDS` (15):
 
 ```
-[  120s] rows=1,234,567 inst=8,104/s avg=7,910/s upserts=… inserts=… batches=… errors=… | <per-table rows>
+[  120s] rows=1,234,567 inst=8,104/s avg=7,910/s upserts=… inserts=… recent=… batches=… errors=… | <per-table rows>
 ```
 
 - Quote **`inst=`** (the last 15 s), summed across the pods, after the pods have
@@ -116,6 +122,13 @@ Each pod prints a counter line every `REPORT_SECONDS` (15):
   multi-row statement. `errors=` counts every failed attempt, and `batches=` counts
   only committed batches, so compare `errors=` against `batches=` before you blame
   RDS. `1153` (`max_allowed_packet`) has not been seen at these settings.
+- **`recent=`** counts rows that re-wrote a key from the thread's recent-key buffer.
+  It is a subset of `upserts=` (so `upserts= + inserts= = rows=` still holds), and
+  cumulative like the other counters. `recent= / rows=` is the achieved re-write
+  share; expect it a few points under `RECENT_KEY_RATIO` (the simulation gave ~0.55
+  at 0.6), because a buffer that runs short hands its rows to the normal path.
+  `status` prints it as a percentage. It says nothing yet about Iceberg: for that,
+  see [Measure the position-delete share](#measure-the-position-delete-share).
 
 `RATE_PER_POD` is a token-bucket ceiling set far above anything the instance has
 delivered (4 x 80,000 = 320,000 rows/s of *target*), so the bucket never binds and
@@ -184,11 +197,16 @@ returns. Too high, and part of the window goes unwritten. If you scale with a ba
 # rate/pod, worker threads, rows per statement (script defaults = manifest values)
 ./mysql-data-generator/deploy-data-generator.sh config 80000 8 5000
 
-# upsert ratio, hot-key ratio, hot-key window (script defaults = manifest values)
+# upsert ratio, hot-key ratio, hot-key window (script defaults = manifest values);
+# optional 5th/6th: RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S (left as-is if omitted)
 ./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.6 5000000
+
+# only the recent-key knobs: ratio, max age in seconds
+./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
 ```
 
-`config` changes *how fast*. `upsert-mix` changes *what is being measured*.
+`config` changes *how fast*. `upsert-mix` and `recent-mix` change *what is being
+measured*. `recent-mix` warns if the age is 60 s or more (the checkpoint interval).
 
 Both commands are `kubectl set env`, which starts a rolling restart. The StatefulSet
 replaces pods one at a time in descending ordinal order, so for 4 pods the cluster
@@ -209,7 +227,10 @@ but not this file: check the live values with
 | `RATE_PER_POD` | 80000 | token-bucket ceiling, deliberately unreachable |
 | `THREADS` | 8 | |
 | `BATCH_ROWS` | 5000 | the measured optimum; 10,000 was worse. Multiplies with `THREADS` x `replicas` into lock contention |
-| `UPSERT_RATIO` | 0.5 | the rest are new inserts |
+| `UPSERT_RATIO` | 0.5 | applies to the **non-recent** rows only: of those, half update a `pick_key()` key, half are new inserts |
+| `RECENT_KEY_RATIO` | 0.6 | share of **all** rows that re-write a key this thread wrote within `RECENT_KEY_MAX_AGE_S`. Design target ~50% Iceberg position deletes; 0 disables it. Added 2026-11-02 |
+| `RECENT_KEY_MAX_AGE_S` | 20 | well under the 60 s checkpoint interval |
+| `TABLE_RUN_BATCHES` | 8 | consecutive batches a thread spends on one table; long-run mix unchanged. 1 = the old one draw per batch |
 | `HOT_KEY_RATIO` | 0.6 | share of upserts drawn from the hot window |
 | `HOT_KEY_WINDOW` | 5000000 | sized to the buffer pool, about 16 GB of rows |
 | `POD_COUNT` | 4 | must equal `replicas` |
@@ -220,7 +241,14 @@ but not this file: check the live values with
 | resources | requests 2 cpu / 2 Gi, limits 4 cpu / 4 Gi | `nodeSelector: karpenter.sh/nodepool: driver-nodepool`, off the TaskManager pool |
 
 The Python defaults (used only when a variable is unset) are `HOT_KEY_RATIO=0.95`
-and `HOT_KEY_WINDOW=2000000`. The manifest overrides both.
+and `HOT_KEY_WINDOW=2000000`. The manifest overrides both. The new knobs have the
+same defaults in Python as in the manifest, plus `RECENT_KEY_BUFFER=50000` (entries
+per table per thread, not in the manifest). The startup banner prints all of them on
+the `recent keys :` line.
+
+Stream-wide, the manifest values give at most 60% recent re-writes, 20% hot/cold
+upserts and 20% inserts. A batch never lists the same primary key twice: duplicates
+are dropped from the recent draw and redrawn in the normal path.
 
 ### How keys are picked
 
@@ -277,6 +305,117 @@ a shrink ([Step 3](#step-3--restart-the-pods-after-a-source-shrink)).
 
 Foreign-key parents for new `orders` and `order_items` come from a sample of the
 newest 20,000 customer, product and order ids, also read at startup.
+
+#### Recent re-writes: Iceberg position deletes
+
+**Why.** The Iceberg sink runs in upsert mode with `write.distribution-mode=hash`, so
+a key always reaches the same writer subtask. That writer emits one delete for
+**every** row it writes, inserts included (orders, live: `total-equality-deletes`
+28.3M against `total-records` 28.8M). Which kind depends on one thing. Iceberg's
+`BaseEqualityDeltaWriter` keeps an in-memory map of the rows it inserted in the
+current, not yet committed checkpoint:
+
+- If the key is in that map, the writer emits a **position delete** (a DV on v3).
+- Otherwise it emits an **equality delete**.
+
+The map resets at every checkpoint (60 s, min-pause 30 s). The hot window repeats a
+key minutes to hours apart, so before this change only ~2% of deletes were
+positional (orders: `total-position-deletes` 0.5M).
+
+So the position share is roughly the share of rows whose key was already written,
+by any pod, earlier in the same checkpoint. To get ~50%, about half the rows must
+re-write a key written a few seconds before.
+
+**How.** Each worker thread keeps a bounded buffer per table of the keys it
+committed (upserts and inserts; new ids are derived from `LAST_INSERT_ID()` and
+`@@auto_increment_increment`, read at startup), with commit timestamps.
+
+- `RECENT_KEY_RATIO` of each batch is drawn from the entries younger than
+  `RECENT_KEY_MAX_AGE_S`.
+- The rest of the batch follows the old rules: `UPSERT_RATIO` upserts through the
+  hot window or cold tail, and the remainder new inserts.
+- Keys stay sorted ascending (the deadlock fix) and distinct.
+
+The buffer is per thread, and only the thread's own committed rows go into it, so a
+re-write touches a row whose last statement has already committed on that same
+connection. That adds no cross-thread or cross-pod row-lock contention, and the row
+is still in the buffer pool. Foreign keys work as before. A re-write of an existing
+`orders`/`order_items` row takes the update path, which does not touch the FK
+columns. New rows still draw their parents from the startup samples.
+
+**Same-checkpoint probability.** Checkpoint boundaries are unrelated to the
+generator, so a re-write `a` seconds after the previous write of the key shares its
+checkpoint with probability `1 - a/60`. Ages spread evenly over `[0, MAX_AGE]`
+average `1 - MAX_AGE/120`: 0.83 at 20 s, 0.75 at 30 s. That is why the age limit is
+well under 60 s.
+
+The age is never near 0, though, because a thread writes one table per batch. With
+an independent table draw per batch, `products` (10%) comes back only every ~10
+batches, 25–50 s at 1,000–2,000 rows/s per thread. `TABLE_RUN_BATCHES=8` keeps a
+thread on one table for 8 batches, chosen with the same weights, so the previous
+same-table batch is one batch back.
+
+**Why 0.6 for a 50% target.** The position share is about
+`RECENT_KEY_RATIO` × (share of re-writes the buffer can serve, ~0.92) ×
+(same-checkpoint probability, ~0.89), plus the ~1–2% the hot window already makes.
+An offline simulation of the planner gave these numbers. It used the real
+`plan_keys` / `RecentKeys` / `pick_table` code, a fake clock, fixed 60 s checkpoint
+windows and one pod of 8 threads, with ratio 0.6, max age 20 s and runs of 8:
+
+| rows/s per thread | 500 | 1,000 | 1,500 | 2,000 | 3,000 |
+|---|---:|---:|---:|---:|---:|
+| position share, all tables | 0.42 | 0.47 | 0.49 | 0.51 | 0.52 |
+
+All four tables came out within ±0.03 of each other. With one table draw per batch
+(runs of 1) the overall share was 0.38–0.47, and `products` only 0.15–0.30. The
+per-thread rate is the achieved `inst=` divided by `THREADS` (8). At 4 pods, ~50,000
+rows/s is ~1,560 rows/s per thread. **This 50% is a design target, not a
+measurement.** The model ignores Flink-side jitter between the two writes and
+checkpoints that run long, and both of those lower the share. Measure it and adjust
+`RECENT_KEY_RATIO`.
+
+**Side effects to expect (not yet measured):**
+
+- **Inserts.** Fewer rows are new inserts (about 20% of rows instead of 50%), so the
+  source tables grow more slowly.
+- **Write cost.** More rows are updates, and an update writes undo and redo for the
+  old image, so achieved rows/s may move either way. Re-written rows are hot in the
+  buffer pool, so they add no read I/O.
+- **Paimon.** Paimon gets the identical stream and collapses the repeats in its
+  write buffer. That asymmetry is intended. Its committed row counts per checkpoint
+  can come out lower than Iceberg's for the same source rows.
+
+#### Measure the position-delete share
+
+1. Wait until every pod has printed the new startup banner (`recent keys :` line).
+   Use only commits after that.
+2. Read the per-commit snapshot summaries. Iceberg reports
+   `added-position-deletes` and `added-equality-deletes` per commit, and the share is
+   `added-position-deletes / (added-position-deletes + added-equality-deletes)`.
+   Skip `replace` (compaction) commits. From the current metadata file:
+
+   ```bash
+   source .bench-env
+   DB=flink_iceberg_db${CDC_DB_SUFFIX}
+   for T in customers products orders order_items; do
+     LOC=$(aws glue get-table --database-name "$DB" --name "$T" \
+             --query 'Table.Parameters.metadata_location' --output text)
+     aws s3 cp "$LOC" - | python3 -c '
+   import json, sys
+   m = json.load(sys.stdin)
+   snaps = sorted(m["snapshots"], key=lambda s: s["timestamp-ms"])[-20:]   # ~20 min
+   snaps = [s["summary"] for s in snaps if s["summary"].get("operation") != "replace"]
+   p = sum(int(s.get("added-position-deletes", 0)) for s in snaps)
+   e = sum(int(s.get("added-equality-deletes", 0)) for s in snaps)
+   print(f"{sys.argv[1]:12s} position {p:>12,}  equality {e:>12,}  share {p / max(1, p + e):.1%}")' "$T"
+   done
+   ```
+
+3. Cross-check in the monitor ([3-MONITOR.md](./3-MONITOR.md)). Compare
+   `↳ Position Deletes (Δ)` with `↳ Equality Deletes (Δ)` in the Iceberg column. The
+   two should be about equal, and `↳ Deletion Vectors (added / removed)` should be
+   non-zero on v3. These rows are deltas of the `total-*` counters, so a compaction
+   commit inside the window distorts them. Use step 2 for a clean number.
 
 #### `BATCH_ROWS` is not monotonic
 
@@ -337,9 +476,13 @@ SELECT
 SELECT MAX(updated_at), UTC_TIMESTAMP() FROM orders;
 ```
 
-With the generator running, the counts should grow only by the insert share
-(`1 - UPSERT_RATIO`). If a shrunk table grows much faster, the pods are running with
-a stale `MIN` ([Step 3](#step-3--restart-the-pods-after-a-source-shrink)).
+With the generator running, the counts should grow only by the insert share,
+`(1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO)`: about 20–22% of the row rate at the
+manifest values. Equivalently, the growth should match the pods' `inserts=`. If a
+shrunk table grows much faster, the pods are running with a stale `MIN`
+([Step 3](#step-3--restart-the-pods-after-a-source-shrink)). The growth should not
+exceed `inserts=`. If it does, the ids derived for recent re-writes are wrong and
+those re-writes are taking the insert path.
 
 ### **2. Check Flink CDC Ingestion**
 
@@ -505,6 +648,9 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 # Key skew: upsert ratio, hot-key ratio, hot-key window (rolling restart)
 ./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.6 5000000
 
+# Recent re-writes (Iceberg position deletes): ratio, max age s (rolling restart)
+./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
+
 # Find the RDS ceiling: hold_seconds, then replica steps
 ./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
 ```
@@ -522,6 +668,8 @@ The manifest values are in [Current manifest values](#current-manifest-values).
 ✅ **Purpose**: the storage-format benchmark and the hot query test
 ✅ **Operations**: batched `ON DUPLICATE KEY UPDATE` on 4 tables
 ✅ **Keys**: hot window sharded per pod; cold tail drawn from the live
-   `[MIN(id), MAX(id)]`, read at pod start (restart the pods after a shrink)
+   `[MIN(id), MAX(id)]`, read at pod start (restart the pods after a shrink);
+   60% of rows re-write a key written < 20 s earlier by the same thread, so that
+   ~50% of Iceberg deletes are position deletes (design target, not yet measured)
 ✅ **Measured**: ~64,000 rows/s at 8 pods on the 2026-11-02 dry run (RDS CPU 64–79%,
    errors/batches ~34%). Re-measure; never quote a stale ceiling.

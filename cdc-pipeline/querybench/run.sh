@@ -53,7 +53,7 @@ PASS_VARS="STAMP SESSION_SUFFIX RUNS WARMUP ALLOW_CONCURRENT ENGINES FORMATS PRO
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS HOT_LAG_SECONDS HOT_COMMIT_MARGIN_S HOT_COMMIT_TABLES HOT_REPIN
 STABLE_CHECKS WAIT_COMMIT_S LOOKUP_ORDER_ID LOOKUP_ORDER_DT QB_QUERY_WRITERS
 SNAPSHOT_DT S_FROM S_TO SNAPSHOT_SLICE_MINUTES SNAPSHOT_SLICE_MARGIN_S COMPACT_BEFORE_SNAPSHOT COMPACT_TABLES
-WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB STOP_COMPACTION_CRON CRON_NAME
 HOT_QUERY_TIMEOUT_S SNAPSHOT_QUERY_TIMEOUT_S MAX_RESULT_ROWS
 COMPACT_NOT_BEFORE ICEBERG_REQUIRE_COMPACTION COMPACT_GATE_TIMEOUT_S ENGINE_GATE_TIMEOUT_S
 QB_RESULTS_PREFIX_RUN TRINO_VERSION TRINO_WORKERS TRINO_USER TRINO_CATALOG CLEAR_COORDINATOR"
@@ -244,6 +244,7 @@ cmd_start() {
     wait_for_runner                                                          # 0
     wait_for_watcher; delete_job "$WATCHER"                                  # 1
     if [[ "$SUITE" == snapshot ]]; then                                      # 2
+        "${CDC_DIR}/iceberg-compaction/run-compaction.sh" cron-suspend       # no live rewrite racing the snapshot one
         qb_stop_generator; qb_stop_writers
         qb_resolve_snapshot_dt; export SNAPSHOT_DT="$QB_SNAPSHOT_DT"
         echo "  snapshot partition: ${SNAPSHOT_DT}"
@@ -260,6 +261,10 @@ cmd_start() {
         else
             ( qb_compaction_gate 0 ) || die "the snapshot test cannot start"
         fi
+    fi
+    if [[ "$SUITE" == hot ]]; then                                           # 2c
+        wait_writers_up "${WRITERS_UP_S:-900}"                               # writers 15 min up before the engines
+        "${CDC_DIR}/iceberg-compaction/run-compaction.sh" cron-resume        # hourly compaction during the hot test
     fi
     for e in $ENGINES; do                                                    # 3
         case "$e" in duckdb) duckdb_up ;; trino) trino_up ;; esac
