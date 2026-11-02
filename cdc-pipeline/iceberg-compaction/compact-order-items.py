@@ -274,6 +274,15 @@ def rewrite(spark):
             raise
         el = time.time() - st
         r = rows[0].asDict() if rows else {}
+        # partial-progress turns a failed file group into a count, not an error:
+        # on 2026-11-02 every group of customers failed and the call "succeeded".
+        failed = int(r.get("failed_data_files_count") or 0)
+        done = int(r.get("rewritten_data_files_count") or 0)
+        if failed and not done:
+            raise RuntimeError(f"rewrite_data_files rewrote nothing: {failed} data files failed "
+                               f"(see the executor errors above): {r}")
+        if failed:
+            print(f"     WARNING: {failed} data files failed, {done} rewritten", flush=True)
         print(f"     committed in {el:.0f}s: {r}", flush=True)
         return {"elapsed_s": round(el, 1),
                 "result": {k: str(v) for k, v in r.items()}, "options": opts}
