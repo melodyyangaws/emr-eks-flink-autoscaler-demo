@@ -16,7 +16,7 @@ unset _cdc_env_dir
 export NAMESPACE=emr-flink
 
 export ICEBERG_FORMAT_VERSION=3
-export CDC_DB_SUFFIX=_v3r1
+export CDC_DB_SUFFIX=_v3r2
 
 # SESSION_SUFFIX names one round of query results: they go to
 # s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/

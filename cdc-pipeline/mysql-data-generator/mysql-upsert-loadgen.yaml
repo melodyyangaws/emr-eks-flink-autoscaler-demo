@@ -949,13 +949,15 @@ spec:
         - name: BATCH_ROWS
           value: "5000"
         # Of the rows that are NOT recent re-writes (1 - RECENT_KEY_RATIO = 40%),
-        # half update a hot/cold key from pick_key() and half are new inserts.
-        # Stream-wide that is at most 60% recent re-writes, 20% hot/cold upserts
-        # and 20% inserts (the simulation achieved ~55% recent; a short buffer
-        # hands its rows to this split), so the source tables now grow at ~20-22%
-        # of the row rate instead of 50%.
+        # 90% update a hot/cold key from pick_key() and 10% are new inserts.
+        # Stream-wide that is at most 60% recent re-writes, 36% hot/cold upserts
+        # and 4% inserts (the simulation achieved ~55% recent; a short buffer
+        # hands its rows to this split), so the source tables grow at ~4-5% of
+        # the row rate. Raised 0.5 -> 0.9 on 2026-11-02: at 0.5 (50% inserts, no
+        # recent re-writes) 4 pods inserted ~370M rows in 4 h, the tables
+        # outgrew the buffer pool and the rate fell from ~85K to ~30K rows/s.
         - name: UPSERT_RATIO
-          value: "0.5"
+          value: "0.9"
         # 2026-11-02, Iceberg v3. Share of each batch that re-writes a key this
         # thread wrote in the last RECENT_KEY_MAX_AGE_S seconds, so that about
         # half of the Iceberg writer's deletes become POSITION deletes (DVs on

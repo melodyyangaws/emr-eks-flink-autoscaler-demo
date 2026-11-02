@@ -149,7 +149,7 @@ deploy_generator() {
     info "a deliberately unreachable token-bucket ceiling so the pods run flat out."
     info "RECENT_KEY_RATIO 0.6: that share of each batch re-writes keys the same thread"
     info "wrote in the last RECENT_KEY_MAX_AGE_S (20) s, targeting ~50% Iceberg position"
-    info "deletes. UPSERT_RATIO 0.5 splits the rest: half update hot/cold keys, half are"
+    info "deletes. UPSERT_RATIO 0.9 splits the rest: 90% update hot/cold keys, 10% are"
     info "new inserts. No DELETE events are emitted."
     echo ""
     info "The per-pod counter line is the authoritative rate — rolled-back batches"

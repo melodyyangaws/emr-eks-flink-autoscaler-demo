@@ -333,7 +333,7 @@ source mysql-cdc-env.sh
 
 This is batched `INSERT ... ON DUPLICATE KEY UPDATE` from 4 pods. The current
 manifest sets `RATE_PER_POD=80000` (a token-bucket ceiling set out of reach on
-purpose), `THREADS=8`, `BATCH_ROWS=5000`, `UPSERT_RATIO=0.5`,
+purpose), `THREADS=8`, `BATCH_ROWS=5000`, `UPSERT_RATIO=0.9`,
 `HOT_KEY_RATIO=0.6`, `HOT_KEY_WINDOW=5000000` and `POD_COUNT=4`. Cold keys are
 drawn from `[MIN(id), MAX(id)]`, read **once at pod start**. This is the only
 generator: the row-at-a-time INSERT/UPDATE/DELETE "mixed" generator was removed on
@@ -485,14 +485,14 @@ CronJob compacts the four Iceberg tables every hour while the writers run:
 ./iceberg-compaction/run-compaction.sh cron-down     # remove it
 ```
 
-- One pod (12 cpu / 56 GiB on an m5.4xlarge) compacts the four tables one
+- One pod (24 cpu / 150 GiB on an m5.12xlarge, the snapshot Job's size) compacts the four tables one
   after another with `REWRITE_MODE=live`. Live mode keeps the rewrite's
   starting sequence number, so equality deletes Flink commits during the
   rewrite still apply, and commits file groups as they finish
   (`partial-progress`). The target file size is each table's own: 64 MiB for
   customers and products, 128 MiB for orders and order_items. It then expires
   snapshots older than 12 h (keeping 5), as before.
-- `concurrencyPolicy: Forbid` and a 55 min deadline: runs never overlap.
+- `concurrencyPolicy: Forbid` and a 3 h deadline (`CRON_DEADLINE_S`): a catch-up run may span several hours, the hours it covers are skipped, runs never overlap. At 12 cpu / 55 min (the first try) no run finished even `customers`.
 - A hot `start` resumes it; the snapshot `start` suspends it and cancels a
   running pass before its own full compaction; the watcher's teardown
   suspends it (`STOP_COMPACTION_CRON=0` leaves it).

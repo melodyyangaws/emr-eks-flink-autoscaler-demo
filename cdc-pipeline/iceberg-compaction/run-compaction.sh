@@ -20,8 +20,10 @@
 #   ./run-compaction.sh cron-down           # delete it and its Jobs
 # CRON_SCHEDULE (default "0 * * * *", UTC), CRON_TABLES (default the four tables),
 # CRON_CPU / CRON_MEMORY / CRON_DRIVER_MEMORY / CRON_THREADS / CRON_INSTANCE_SIZE
-# (default 12 / 56Gi / 40g / 8 / 4xlarge: the live tables are a few GB, far from
-# the 365 M-delete v2 table the one-off Job is sized for). Its runs are named
+# (default 24 / 150Gi / 100g / 8 / 12xlarge, the one-off Job's size: at 12 cpu
+# / 40g on a 4xlarge no run on 2026-11-02 finished even customers, unpartitioned
+# with 20-84M equality deletes, inside 55 min), CRON_DEADLINE_S (10800: a
+# catch-up run may span hours; concurrencyPolicy Forbid skips the hours it covers). Its runs are named
 # <CRON_NAME>-<n>, so the snapshot gate (Jobs iceberg-compact-<table>) never
 # mistakes one for the snapshot compaction; the snapshot test suspends it first
 # (live and full rewrites of one table would conflict) and a hot test resumes it.
@@ -84,8 +86,9 @@ export SPARK_IMAGE
 export CRON_NAME="${CRON_NAME:-iceberg-compact-hourly}"
 export CRON_SCHEDULE="${CRON_SCHEDULE:-0 * * * *}"
 export CRON_TABLES="${CRON_TABLES:-customers products orders order_items}"
-export CRON_CPU="${CRON_CPU:-12}" CRON_MEMORY="${CRON_MEMORY:-56Gi}" CRON_DRIVER_MEMORY="${CRON_DRIVER_MEMORY:-40g}"
-export CRON_THREADS="${CRON_THREADS:-8}" CRON_INSTANCE_SIZE="${CRON_INSTANCE_SIZE:-4xlarge}"
+export CRON_CPU="${CRON_CPU:-24}" CRON_MEMORY="${CRON_MEMORY:-150Gi}" CRON_DRIVER_MEMORY="${CRON_DRIVER_MEMORY:-100g}"
+export CRON_THREADS="${CRON_THREADS:-8}" CRON_INSTANCE_SIZE="${CRON_INSTANCE_SIZE:-12xlarge}"
+export CRON_DEADLINE_S="${CRON_DEADLINE_S:-10800}"
 
 # The manifest is rendered locally: the YAML is parsed and patched, then
 # `kubectl create`d. NOT `kubectl apply --dry-run=client`: that flag still fetches
@@ -161,7 +164,7 @@ if os.environ.get("CRON") == "1":
                  "  echo \"=== ${ICEBERG_TABLE} end $(date -u +%FT%TZ)\"\ndone\nexit $rc\n"]
     labels = lambda: {"app": E["CRON_NAME"]}
     d["spec"]["template"].setdefault("metadata", {})["labels"] = labels()
-    d["spec"]["activeDeadlineSeconds"] = 3300      # done (or killed) before the next run
+    d["spec"]["activeDeadlineSeconds"] = int(E["CRON_DEADLINE_S"])   # Forbid: no overlap either way
     d = {"apiVersion": "batch/v1", "kind": "CronJob",
          "metadata": {"name": E["CRON_NAME"], "namespace": d["metadata"]["namespace"], "labels": labels()},
          "spec": {"schedule": E["CRON_SCHEDULE"], "timeZone": "Etc/UTC",

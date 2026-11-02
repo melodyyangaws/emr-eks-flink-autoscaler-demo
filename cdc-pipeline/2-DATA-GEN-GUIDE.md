@@ -227,7 +227,7 @@ but not this file: check the live values with
 | `RATE_PER_POD` | 80000 | token-bucket ceiling, deliberately unreachable |
 | `THREADS` | 8 | |
 | `BATCH_ROWS` | 5000 | the measured optimum; 10,000 was worse. Multiplies with `THREADS` x `replicas` into lock contention |
-| `UPSERT_RATIO` | 0.5 | applies to the **non-recent** rows only: of those, half update a `pick_key()` key, half are new inserts |
+| `UPSERT_RATIO` | 0.9 | applies to the **non-recent** rows only: of those, 90% update a `pick_key()` key, 10% are new inserts (was 0.5 until 2026-11-02: the tables outgrew the buffer pool and the rate fell from ~85K to ~30K rows/s in 4 h) |
 | `RECENT_KEY_RATIO` | 0.6 | share of **all** rows that re-write a key this thread wrote within `RECENT_KEY_MAX_AGE_S`. Design target ~50% Iceberg position deletes; 0 disables it. Added 2026-11-02 |
 | `RECENT_KEY_MAX_AGE_S` | 20 | well under the 60 s checkpoint interval |
 | `TABLE_RUN_BATCHES` | 8 | consecutive batches a thread spends on one table; long-run mix unchanged. 1 = the old one draw per batch |
@@ -477,7 +477,7 @@ SELECT MAX(updated_at), UTC_TIMESTAMP() FROM orders;
 ```
 
 With the generator running, the counts should grow only by the insert share,
-`(1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO)`: about 20–22% of the row rate at the
+`(1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO)`: about 4–5% of the row rate at the
 manifest values. Equivalently, the growth should match the pods' `inserts=`. If a
 shrunk table grows much faster, the pods are running with a stale `MIN`
 ([Step 3](#step-3--restart-the-pods-after-a-source-shrink)). The growth should not
