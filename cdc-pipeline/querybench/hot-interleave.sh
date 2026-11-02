@@ -22,12 +22,22 @@
 # 4. Warm-up pass p0 (discarded), then RUNS timed passes; each pass runs every
 #    engine in ENGINES (default "duckdb trino", in that order; ENGINES=trino or
 #    duckdb runs one alone), each on its arms (FORMATS), on the SAME pins.
-#    HOT_REPIN=pass (default) pins the tables again before every pass: Paimon
-#    keeps 5-10 snapshots (~10 min at 60 s checkpoints) and expiry deletes
-#    files an older pin still lists; HOT_REPIN=run keeps the first pin for
-#    every pass (then passes must stay well under ~10 min).
+#    HOT_REPIN=pass (default) pins the tables again before every pass, so
+#    each pass reads the live tables as they are when it starts, not a version
+#    one more pass older each time. HOT_REPIN=run keeps the first pin for every
+#    pass. Either is safe for expiry: the Paimon sinks keep snapshots 12 h
+#    (snapshot.time-retained 12h, num-retained min 5 / max 1000,
+#    sql-scripts/paimon/03-paimon-sinks.sql), as the Iceberg tables do, so the
+#    files a pin lists outlive a run.
 # 5. Medians of the timed passes -> duckdb_warm-<STAMP>.csv / trino-<STAMP>.csv;
 #    every pass's CSVs (-p<N>), the last pass's rows; hot-interleave-<STAMP>.pins.
+#
+# Exit: a query that is not OK is a result (in the CSVs and the summary, and
+# listed in the "N of M queries not OK" line at the end); it never changes the
+# exit, and the drivers do not exit non-zero for one. A pass whose driver exits
+# non-zero (engine not up, render/pin failure, no rows: duckdb-warm.sh /
+# trino.sh "Exit") does not stop the other passes, but makes this script exit 1
+# once the medians are written, so the watcher leaves the run up.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SUITE=hot
@@ -96,6 +106,7 @@ qb_resolve_lookup
 export QB_LOOKUP_ORDER_ID QB_LOOKUP_ORDER_DT
 echo "h8_key order_id=${QB_LOOKUP_ORDER_ID} dt=${QB_LOOKUP_ORDER_DT} (${QB_LOOKUP_NOTE})" >> "$PINS"
 
+failed=""
 for (( pass = 0; pass <= RUNS; pass++ )); do
     (( pass > 0 )) && [[ "$HOT_REPIN" == pass ]] && pin "${BASE}-p${pass}"
     # shellcheck disable=SC2046
@@ -105,9 +116,9 @@ for (( pass = 0; pass <= RUNS; pass++ )); do
         case "$e" in
             duckdb) PROFILE_SCAN=$(( pass == RUNS && ${PROFILE_SCAN:-1} != 0 ? 1 : 0 )) \
                     STAMP="${BASE}-p${pass}" RUNS=1 WARMUP=0 "${HERE}/duckdb-warm.sh" run >> "${OUT_DIR}/hot-interleave-${BASE}.log" 2>&1 \
-                        || qb_log "WARNING: DuckDB pass ${pass} exited non-zero (see the log)" ;;
+                        || { failed+=" duckdb:p${pass}"; qb_log "ERROR: the DuckDB driver failed in pass ${pass} (see the log)"; } ;;
             trino)  STAMP="${BASE}-p${pass}" RUNS=1 WARMUP=0 "${HERE}/trino.sh" run >> "${OUT_DIR}/hot-interleave-${BASE}.log" 2>&1 \
-                        || qb_log "WARNING: Trino pass ${pass} exited non-zero (see the log)" ;;
+                        || { failed+=" trino:p${pass}"; qb_log "ERROR: the Trino driver failed in pass ${pass} (see the log)"; } ;;
         esac
     done
 done
@@ -121,6 +132,7 @@ qb_generator_live || qb_log "WARNING: the generator stopped before the last pass
 python3 - "$OUT_DIR" "$BASE" "$RUNS" "$QB_CSV_HEADER" <<'EOF'
 import csv, os, shutil, statistics, sys
 out, base, runs, header = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+total, notok = 0, []
 for eng in ("duckdb_warm", "trino"):
     rows = {}
     for p in range(1, runs + 1):
@@ -141,6 +153,9 @@ for eng in ("duckdb_warm", "trino"):
             last = rs[-1]
             w.write(",".join([base, last["engine"], arm, "hot", q, status, str(med), last["result_rows"],
                               last.get("scan_rows", ""), last.get("scan_bytes", "")]) + "\n")
+            total += 1
+            if status != "OK":
+                notok.append("%s:%s:%s=%s" % ("duckdb" if eng == "duckdb_warm" else eng, arm, q, status))
     for suffix in ("-rows.tsv", "-firstrows.csv"):
         src = os.path.join(out, "%s-%s-p%d%s" % (eng, base, runs, suffix))
         if os.path.exists(src):
@@ -159,5 +174,11 @@ for eng in ("duckdb_warm", "trino"):
         if lines:
             open(os.path.join(out, "%s-%s%s" % (eng, base, suffix)), "w").write(head + "\n" + "\n".join(lines) + "\n")
     print("%s: %s" % (eng, os.path.join(out, "%s-%s.csv" % (eng, base))))
+# Not-OK queries are results, not a failure: listed here, exit unchanged.
+print("hot: %d of %d queries not OK: %s" % (len(notok), total, " ".join(notok)) if notok else "hot: %d queries, all OK" % total)
 EOF
 qb_log "done. Pins: ${PINS}  Log: ${OUT_DIR}/hot-interleave-${BASE}.log"
+if [[ -n "$failed" ]]; then
+    echo "driver_failed=${failed# }" >> "$PINS"
+    qb_die "driver failures in passes:${failed} (results written; see the log)"
+fi

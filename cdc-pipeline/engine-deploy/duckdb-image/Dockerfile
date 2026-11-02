@@ -85,7 +85,7 @@ RUN git clone --quiet --branch "${VCPKG_TAG}" https://github.com/microsoft/vcpkg
  && echo "vcpkg triplet: $(cat /opt/vcpkg-triplet)"
 
 # DuckDB sources. duckdb-python v2.0.0 vendors duckdb as a submodule at exactly
-# the v2.0.0 commit, so the CLI and the Python module are built from ONE tree.
+# the v2.0.0 commit, so the wheel is built from exactly that tree.
 WORKDIR /src
 RUN git clone --quiet --branch "${DUCKDB_TAG}" https://github.com/duckdb/duckdb-python.git duckdb-python \
  && test "$(git -C duckdb-python rev-parse HEAD)" = "${DUCKDB_PYTHON_COMMIT}" \

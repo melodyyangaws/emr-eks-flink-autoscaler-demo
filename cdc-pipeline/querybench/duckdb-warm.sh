@@ -26,6 +26,14 @@
 #
 # Output: $OUT_DIR/duckdb_warm-<STAMP>.csv ($QB_CSV_HEADER), .log, -rows.tsv,
 # -firstrows.csv, -events.csv.
+#
+# Exit: non-zero only when the driver itself fails: the server is not up (or
+# not answering at the end of a suite), a render fails (a pin missing), the
+# writers changed under the suite, or no result row was written. A query that
+# is not OK (ERROR, TIMEOUT, CRASH, ZERO_SCAN: duckdb:paimon on v3, say) stays
+# in the CSV and the summary, and in the suite's last log line
+# ("N of M queries not OK: duckdb:<arm>:<query>=<status> ..."); it does not
+# change the exit.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
@@ -224,7 +232,7 @@ render_suite_dir() {   # suite dir
 }
 
 run_suite() {   # suite
-    local s="$1" dir arm writers rows bad
+    local s="$1" dir arm writers rows bad n
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
     qb_start_suite "$s"
     # H8's key: exported by hot-interleave.sh; resolved here when run by hand.
@@ -241,11 +249,19 @@ run_suite() {   # suite
         run_arm "$s" "$arm" "$dir" "$rows"
     done
     qb_writers_unchanged "$writers" "$s" || { rm -rf "$dir"; return 1; }
+    n=$(grep -c . "$rows" || true)
+    (( n > 0 )) || { qb_log "ERROR: ${s}: no result rows written"; rm -rf "$dir"; return 1; }
     cat "$rows" >> "$CSV"
-    bad=$(grep -cv ',OK,' "$rows" || true)
-    qb_log "${s}: $(grep -c . "$rows" || true) queries, ${bad} not OK"
+    # Not-OK queries are results, not a driver failure: logged, exit unchanged.
+    bad=$(awk -F, '$6 != "OK" { printf " duckdb:%s:%s=%s", $3, $5, $6 }' "$rows")
+    if [[ -n "$bad" ]]; then
+        qb_log "${s}: $(wc -w <<<"$bad" | tr -d ' ') of ${n} queries not OK:${bad}"
+    else
+        qb_log "${s}: ${n} queries, all OK"
+    fi
+    echo "# suite=${s} queries=${n} not OK:${bad:- none}" >> "$LOG"
     rm -rf "$dir"
-    (( bad == 0 ))
+    pf_up || { qb_log "ERROR: ${NAME} stopped answering during the ${s} suite"; return 1; }
 }
 
 cmd_run() {

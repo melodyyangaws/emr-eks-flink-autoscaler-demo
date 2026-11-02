@@ -6,7 +6,7 @@
 #
 # Image: DUCKDB_IMAGE (.bench-env; default the source-built DuckDB 2.0.0 image,
 # <account>.dkr.ecr.<region>.amazonaws.com/duckdb-cdc-server:2.0.0, built by
-# image/build-duckdb-image.sh) runs as is: no pip install at start, so its
+# duckdb-image/build-duckdb-image.sh) runs as is: no pip install at start, so its
 # engine and its statically linked iceberg/httpfs/aws/avro are what runs.
 # DUCKDB_IMAGE empty: python:3.12-slim + pip duckdb==${DUCKDB_VERSION} (2.0.0
 # from PyPI) and awscli at every start, the extensions downloaded by the server.

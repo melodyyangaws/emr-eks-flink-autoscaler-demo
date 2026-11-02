@@ -21,7 +21,7 @@ REPO=duckdb-cdc-server
 IMAGE_TAG=2.0.0
 COMPILE_JOBS="${COMPILE_JOBS:-30}"
 IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}"
-TIMEOUT_S=14400   # a cold build is ~1.5-3 h per arch
+TIMEOUT_S=14400   # the cap per arch build; measured 34 min arm64 / 43 min amd64 at COMPILE_JOBS=8 (README.md)
 
 aws ecr describe-repositories --repository-names "$REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
     || aws ecr create-repository --repository-name "$REPO" --region "$AWS_REGION" >/dev/null

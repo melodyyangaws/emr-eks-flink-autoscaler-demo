@@ -8,9 +8,9 @@
 #   NAMESPACE          emr-flink unless set
 #   SESSION_SUFFIX     checked (empty or like -r1)
 #   ICEBERG_FORMAT_VERSION  checked (2 | 3; default 3 when unset)
-#   CDC_DB_SUFFIX      checked (empty or like _v3): the table set
+#   CDC_DB_SUFFIX      checked (empty or like _v3r1): the table set, as .bench-env sets it
 #   PAIMON_DB / ICEBERG_DB  flink_paimon_db<CDC_DB_SUFFIX> / flink_iceberg_db<CDC_DB_SUFFIX>
-#   CDC_SET_TAG        CDC_DB_SUFFIX with - for _ (-v3), for results paths and names
+#   CDC_SET_TAG        CDC_DB_SUFFIX with - for _ (_v3r1 -> -v3r1), for results paths and names
 #   QB_RESULTS_PREFIX  querybench-results/cdc-session<CDC_SET_TAG><SESSION_SUFFIX>
 #   log/info/warn/die  to stderr
 #   render             a manifest template -> its *-deployed.yaml (git-ignored)
@@ -49,8 +49,9 @@ export SESSION_SUFFIX="${SESSION_SUFFIX:-}"
 # `CDC_DB_SUFFIX= ./querybench/run.sh ...` reaches the database names too.
 export ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}"
 [[ "$ICEBERG_FORMAT_VERSION" =~ ^[23]$ ]] || { echo "ICEBERG_FORMAT_VERSION must be 2 or 3, got '${ICEBERG_FORMAT_VERSION}' (.bench-env)" >&2; exit 1; }
-# Unset -> the v3 set (_v3), as in build-deploy-generic.sh and deploy-monitor.sh;
-# an explicit CDC_DB_SUFFIX= is the unsuffixed v2 set.
+# The live set is whatever .bench-env sets (CDC_DB_SUFFIX=_v3r1 there now). Only
+# when nothing sets it does this fall back to _v3, as build-deploy-generic.sh and
+# deploy-monitor.sh do; an explicit CDC_DB_SUFFIX= is the unsuffixed v2 set.
 export CDC_DB_SUFFIX="${CDC_DB_SUFFIX-_v3}"
 [[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || { echo "CDC_DB_SUFFIX must be empty or like _v3, got '${CDC_DB_SUFFIX}' (.bench-env)" >&2; exit 1; }
 export PAIMON_DB="flink_paimon_db${CDC_DB_SUFFIX}"

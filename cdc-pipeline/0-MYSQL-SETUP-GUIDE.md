@@ -53,6 +53,22 @@ This guide walks you through creating and configuring a MySQL database as the so
 > Option A below is the smaller Dev/POC shape and will not reproduce the numbers
 > in the benchmark guides.
 
+> **State of the live source (2026-11-02).** The `ecommerce` tables were shrunk
+> to about **10% of their rows (~37.5M rows in total)**, keeping the newest ids, by a
+> one-off copy-and-swap: copy the rows to keep into a new table, then swap names
+> with `RENAME TABLE`. This was a one-time operation, and no script in the repo
+> does it. Two consequences:
+>
+> - **RDS allocated storage cannot shrink.** The instance is still billed for
+>   500 GB, even though the data now uses a fraction of it. Only a new instance
+>   (snapshot restore or dump/load into a smaller allocation) reduces it.
+> - **Restart the upsert generator after any shrink.** It reads `MIN(id)` /
+>   `MAX(id)` once at pod start and draws cold keys from that range. See
+>   [2-DATA-GEN-GUIDE.md](./2-DATA-GEN-GUIDE.md#the-cold-tail-spans-minpk-maxpk-not-1-maxpk).
+>
+> Both Flink jobs use `scan.startup.mode = initial`, so a fresh table set
+> (`CDC_DB_SUFFIX`) snapshots whatever the source holds when the jobs start.
+
 ### Option A: Using AWS Console (Dev/POC shape — smaller than the benchmark instance)
 
 1. **Navigate to RDS Console**
@@ -832,6 +848,52 @@ chmod +x mysql-cdc-env.sh
 echo $MYSQL_HOST
 ```
 
+`mysql-cdc-env.sh` is git-ignored. Do not put a real password in it. The copy on the
+benchmark laptop stores none: it reads `MYSQL_PASSWORD` from a Kubernetes Secret
+when you source it.
+
+---
+
+## Step 8: Create the Kubernetes Secrets
+
+The generators and the Flink jobs read the CDC password from **two different
+secrets** in `emr-flink`. Neither secret is ever written into a manifest, rendered
+or not.
+
+| Secret | Keys | Read by | Created by |
+|---|---|---|---|
+| `mysql-credentials` | `hostname`, `username`, `password` | the upsert load generator (`secretKeyRef`) | `deploy-data-generator.sh deploy`, on first run, from `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` in your shell |
+| `flink-cdc-mysql-env` | `MYSQL_PASSWORD` | both FlinkDeployments (`envFrom: secretRef`) | you, by hand (below) |
+
+1. Create the Flink secret before you deploy either pipeline:
+
+   ```bash
+   kubectl create secret generic flink-cdc-mysql-env \
+       --namespace emr-flink \
+       --from-literal=MYSQL_PASSWORD="${MYSQL_PASSWORD}" \
+       --dry-run=client -o yaml | kubectl apply -f -
+   ```
+
+   The key must be `MYSQL_PASSWORD`. `envFrom` maps every key to an env var of the
+   same name, so the key name is the env var the job reads. `MYSQL_HOST` and
+   `MYSQL_USER` are rendered into the manifests as plain values. To use a different
+   secret name, set `MYSQL_ENV_SECRET_NAME` before rendering.
+
+2. Check that both secrets exist (the generator one appears after the first
+   generator deploy):
+
+   ```bash
+   kubectl get secret mysql-credentials flink-cdc-mysql-env -n emr-flink
+   ```
+
+If `flink-cdc-mysql-env` is missing, the JobManager pod does not report a credential
+error. It sits in `CreateContainerConfigError` (`secret "flink-cdc-mysql-env" not
+found` shows only in `kubectl describe pod`), and the FlinkDeployment still shows a
+healthy-looking `RECONCILING` / `DEPLOYED`.
+
+`deploy-data-generator.sh` does not refresh an existing `mysql-credentials`. After a
+password change, delete it and re-run the deploy, or recreate it by hand.
+
 ---
 
 ## Troubleshooting
@@ -905,6 +967,7 @@ FLUSH PRIVILEGES;
 ✅ **Database schema deployed** (4 tables)
 ✅ **Sample data loaded** for testing
 ✅ **CDC readiness verified**
+✅ **Secrets created**: `mysql-credentials` (generators), `flink-cdc-mysql-env` (Flink)
 
 Your MySQL database is now ready to be the source for Flink CDC! 🎉
 
@@ -912,49 +975,19 @@ Your MySQL database is now ready to be the source for Flink CDC! 🎉
 
 ## Next Steps
 
-1. **[Build and deploy the Flink CDC jobs](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)** — build the
+1. **[Build and deploy the Flink CDC jobs](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)**: build the
    image, upload the SQL scripts, and start the Paimon and Iceberg pipelines.
-2. **[Generate streaming data](./2-DATA-GEN-GUIDE.md)** — two workloads share one script:
+2. **[Generate streaming data](./2-DATA-GEN-GUIDE.md)**: the upsert load generator.
+   Run it from `cdc-pipeline/`:
 
    ```bash
-   # mixed: INSERT/UPDATE/DELETE, ~400 rows/s. The only workload that emits DELETEs,
-   # so this is the one that proves CDC handles all three event types.
+   # batched ON DUPLICATE KEY UPDATE across 4 pods (StatefulSet mysql-upsert-loadgen),
+   # the storage-format benchmark load. RATE_PER_POD is a token-bucket ceiling, not an
+   # achieved rate. Read the actual rate from the pods' `inst=` line. It emits no
+   # DELETEs (the mixed INSERT/UPDATE/DELETE generator was removed on 2026-11-02).
    ./mysql-data-generator/deploy-data-generator.sh deploy
    ./mysql-data-generator/deploy-data-generator.sh stop
-
-   # upsert: batched ON DUPLICATE KEY UPDATE across 8 pods (StatefulSet). The
-   # storage-format benchmark load. The manifest's RATE_PER_POD is a token-bucket
-   # ceiling, not an achieved rate — read the actual rate from the pods' `inst=`
-   # line (see 2-DATA-GEN-GUIDE.md).
-   ./mysql-data-generator/deploy-data-generator.sh deploy upsert
-   ./mysql-data-generator/deploy-data-generator.sh stop upsert
    ```
 
-   Both read `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` from the `mysql-credentials`
-   secret, which the script creates from this guide's exported variables on first run.
-
-### Secret required by the Flink CDC jobs
-
-The data generators and the Flink jobs read the CDC password from **two different
-secrets**, and only the generator's is created for you. Create the Flink one before
-deploying either pipeline:
-
-```bash
-kubectl create secret generic flink-cdc-mysql-env \
-    --namespace emr-flink \
-    --from-literal=MYSQL_PASSWORD="${MYSQL_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-```
-
-The key must be named `MYSQL_PASSWORD`: both `flink-cdc-*-sql.yaml` manifests pull it
-in with `envFrom: secretRef`, which maps every key in the secret to an env var of the
-same name, so the name inside the secret *is* the env var the job reads.
-
-If this secret is missing, the JobManager pod does not report a credential error — it
-sits in `CreateContainerConfigError` with `secret "flink-cdc-mysql-env" not found` only
-in `kubectl describe pod`, while the FlinkDeployment shows a healthy-looking
-`RECONCILING` / `DEPLOYED`.
-
-Override the name with `MYSQL_ENV_SECRET_NAME` if you use a different one.
-3. **[Monitor the pipelines](./3-MONITOR.md)** — job status, throughput, checkpoints, table stats.
-4. **[Query benchmark: DuckDB vs Trino](./querybench/README.md)** — both engines on the Iceberg tables and on Paimon's Iceberg export (Athena: [README Step 4](./README.md#step-4--olap-query-layer-athena)).
+3. **[Monitor the pipelines](./3-MONITOR.md)**: job status, throughput, checkpoints, table stats.
+4. **[Query benchmark: DuckDB vs Trino](./querybench/README.md)**: both engines on the Iceberg tables and on Paimon's Iceberg export (Athena: [README Step 4](./README.md#step-4--olap-query-layer-athena)).

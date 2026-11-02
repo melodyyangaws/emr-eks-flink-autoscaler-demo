@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The CDC query benchmark's warm DuckDB server (Deployment duckdb-warm-cdc,
-# duckdb_cdc_server.py), the counterpart of the always-up StarRocks cluster.
+# duckdb_cdc_server.py), queried by querybench/duckdb-warm.sh; Trino is the
+# other engine (deploy-trino.sh).
 #
 #   ./engine-deploy/deploy-duckdb-cdc.sh up            start (or restart) the server
 #   ./engine-deploy/deploy-duckdb-cdc.sh status        health, busy flag, cache size
@@ -25,9 +26,9 @@ CM="${CM:-${NAME}}"
 # The engine: DUCKDB_IMAGE (.bench-env; default the source-built 2.0.0 image in
 # ECR, duckdb-cdc-server:2.0.0) as is, or, with DUCKDB_IMAGE empty,
 # python:3.12-slim + pip duckdb==DUCKDB_VERSION at every start (2.0.0: the PyPI
-# wheel, clang + ThinLTO; the image is GCC 12 without LTO, so the two are not
-# the same build and their timings are separate baselines). The server needs
-# Python >= 3.11.
+# wheel, clang + ThinLTO; the image is GCC 14 (Debian trixie) without LTO, so
+# the two are not the same build and their timings are separate baselines).
+# The server needs Python >= 3.11.
 DUCKDB_IMAGE="${DUCKDB_IMAGE-}"
 DUCKDB_VERSION="${DUCKDB_VERSION:-2.0.0}"
 DUCKDB_FALLBACK_IMAGE="${DUCKDB_FALLBACK_IMAGE:-python:3.12-slim}"

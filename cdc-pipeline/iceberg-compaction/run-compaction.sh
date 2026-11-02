@@ -2,7 +2,7 @@
 # Run the Iceberg compaction as a Kubernetes Job and collect its output.
 #
 # Usage:
-#   ./run-compaction.sh                     # compact flink_iceberg_db_v3.order_items (the v3 set)
+#   ./run-compaction.sh                     # compact flink_iceberg_db<CDC_DB_SUFFIX>.order_items (.bench-env's set)
 #   DRY_RUN=true ./run-compaction.sh        # report table state only, commit nothing
 #   EXPIRE_SNAPSHOTS=false ./run-compaction.sh   # rewrite only; by default it then expires
 #                                          # snapshots older than 12 h, keeping 5 (Paimon's rule)
@@ -14,9 +14,9 @@
 # Settings come from cdc-pipeline/.bench-env (+ .bench-env.local) through
 # lib/common.sh, the same as querybench/run.sh, which submits this script once
 # per COMPACT_TABLES table:
-#   ICEBERG_DB         default flink_iceberg_db<CDC_DB_SUFFIX>: CDC_DB_SUFFIX unset
-#                      -> _v3 (flink_iceberg_db_v3), an explicit CDC_DB_SUFFIX=
-#                      -> the v2 set (flink_iceberg_db). An ICEBERG_DB in the
+#   ICEBERG_DB         default flink_iceberg_db<CDC_DB_SUFFIX>, the live set from
+#                      .bench-env (CDC_DB_SUFFIX=_v3r1 there now); an explicit
+#                      CDC_DB_SUFFIX= -> the v2 set (flink_iceberg_db). An ICEBERG_DB in the
 #                      environment (run.sh passes one) wins over the derived name.
 #   ICEBERG_WAREHOUSE  s3://<BUCKET_NAME>/iceberg-warehouse (.bench-env)
 #   AWS_REGION         .bench-env.local (default us-west-2); also AWS_DEFAULT_REGION

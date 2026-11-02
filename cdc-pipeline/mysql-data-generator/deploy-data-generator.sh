@@ -2,27 +2,22 @@
 ###############################################################################
 # MySQL Data Generator Deployment Script
 #
-# Manages two different generator workloads against the same MySQL database.
-# Pick one with WORKLOAD= (or the `upsert` / `mixed` alias as the last argument):
+# Manages the upsert load generator (mysql-upsert-loadgen.yaml, StatefulSet
+# mysql-upsert-loadgen): batched INSERT ... ON DUPLICATE KEY UPDATE, the only
+# CDC source for the benchmark. Repeated upserts on a skewed hot-key window are
+# what make Iceberg accumulate equality-delete files while Paimon compacts them
+# away in the background. A uniformly random key stream over 14M keys would
+# measure raw ingest only and show neither effect.
 #
-#   WORKLOAD=mixed   (default)  mysql-data-generator.yaml
-#       Row-at-a-time INSERT / UPDATE / DELETE mix. Exercises all three CDC
-#       event types including deletes, which the upsert workload never emits.
-#       Ceiling is roughly 400 rows/s — it issues one statement per row and
-#       picks rows with ORDER BY RAND(), so it does not scale. Use it for
-#       correctness and event-type coverage, not for load.
+# The target rate is RATE_PER_POD x replicas (manifest: 80,000 x 4). That is a
+# token-bucket ceiling set deliberately out of reach, so the pods run flat out
+# and the achieved rate (the `inst=` counter in the pod logs) is the real limit
+# of MySQL plus the driver. It emits no DELETE events.
 #
-#   WORKLOAD=upsert             mysql-upsert-loadgen.yaml
-#       Batched INSERT ... ON DUPLICATE KEY UPDATE at ~40,000 rows/s across 8
-#       pods. This is the storage-format benchmark workload: repeated upserts on
-#       a skewed hot-key window are what make Iceberg accumulate equality-delete
-#       files while Paimon compacts them away in the background. A uniformly
-#       random key stream over 14M keys would measure raw ingest only and show
-#       neither effect.
-#
-# The two rate models are NOT interchangeable, which is why `config` branches on
-# the workload: mixed is driven by BATCH_SIZE + SLEEP_SECONDS (rows per tick),
-# upsert by RATE_PER_POD + THREADS + BATCH_ROWS (a token-bucket rows/sec target).
+# The row-at-a-time INSERT/UPDATE/DELETE "mixed" generator
+# (mysql-data-generator.yaml, Deployment mysql-data-generator) was removed on
+# 2026-11-02; it is recoverable from git history. A trailing `upsert` argument
+# and WORKLOAD=upsert are still accepted so older commands keep working.
 ###############################################################################
 
 set -e
@@ -55,49 +50,45 @@ info() {
 NAMESPACE=${NAMESPACE:-emr-flink}
 ACTION=${1:-help}
 
-# ── Workload selection ──────────────────────────────────────────────────────
-# Accept `mixed`/`upsert` as a trailing argument as well as WORKLOAD=, so both
-# `WORKLOAD=upsert ./deploy-data-generator.sh deploy` and
-# `./deploy-data-generator.sh deploy upsert` work. The trailing form is stripped
-# from the argument list before the positional rate arguments are read, so it
-# cannot be mistaken for a batch size or replica count.
-WORKLOAD=${WORKLOAD:-mixed}
+# ── Backward compatibility ─────────────────────────────────────────────────
+# There used to be two workloads, picked with WORKLOAD= or a trailing
+# `mixed`/`upsert` argument. Only upsert remains; the trailing `upsert` is
+# stripped from the argument list before the positional rate arguments are read
+# (so `scale 4 upsert` still works), and WORKLOAD=mixed is rejected rather than
+# silently deploying something else.
+WORKLOAD=${WORKLOAD:-upsert}
 ARGS=()
 for arg in "$@"; do
     case $arg in
-        upsert|mixed) WORKLOAD=$arg ;;
+        upsert) ;;
+        mixed) WORKLOAD=mixed ;;
         *) ARGS+=("$arg") ;;
     esac
 done
 set -- "${ARGS[@]}"
 
-# KIND differs between the two workloads: the upsert generator is a StatefulSet
-# so that each pod gets a stable 0..N-1 ordinal to shard the hot-key window by
-# (a Deployment's random name suffix had to be hashed, and hashing collided).
-# Every kubectl call below is parameterised on it, since `scale`, `set env` and
-# `get` all need the resource kind spelled correctly.
 case $WORKLOAD in
+    upsert) ;;
     mixed)
-        MANIFEST="mysql-data-generator/mysql-data-generator.yaml"
-        DEPLOYMENT="mysql-data-generator"
-        APP_LABEL="mysql-data-generator"
-        KIND="deployment"
-        ;;
-    upsert)
-        MANIFEST="mysql-data-generator/mysql-upsert-loadgen.yaml"
-        DEPLOYMENT="mysql-upsert-loadgen"
-        APP_LABEL="mysql-upsert-loadgen"
-        KIND="statefulset"
+        error "The mixed workload (mysql-data-generator.yaml) was removed on 2026-11-02; the upsert generator is the only one. Drop WORKLOAD=mixed / the 'mixed' argument (the old manifest is in git history)."
         ;;
     *)
-        error "Unknown WORKLOAD '$WORKLOAD' (expected 'mixed' or 'upsert')"
+        error "Unknown WORKLOAD '$WORKLOAD' (only 'upsert' is supported)"
         ;;
 esac
 
-# Both manifests pin `namespace: emr-flink` on every object, so kubectl rejects
+# A StatefulSet so that each pod gets a stable 0..N-1 ordinal to shard the
+# hot-key window by (a Deployment's random name suffix had to be hashed, and
+# hashing collided). Every kubectl call below names the kind.
+MANIFEST="mysql-data-generator/mysql-upsert-loadgen.yaml"
+DEPLOYMENT="mysql-upsert-loadgen"
+APP_LABEL="mysql-upsert-loadgen"
+KIND="statefulset"
+
+# The manifest pins `namespace: emr-flink` on every object, so kubectl rejects
 # an -n that disagrees rather than silently redirecting the deployment.
 if [[ "$NAMESPACE" != "emr-flink" ]]; then
-    warn "NAMESPACE=$NAMESPACE but the manifests hardcode namespace: emr-flink."
+    warn "NAMESPACE=$NAMESPACE but the manifest hardcodes namespace: emr-flink."
     warn "Edit $MANIFEST if you really need a different namespace."
 fi
 
@@ -142,7 +133,7 @@ create_mysql_secret() {
 
 # Deploy data generator
 deploy_generator() {
-    log "Deploying MySQL data generator (workload: $WORKLOAD)..."
+    log "Deploying MySQL upsert load generator..."
 
     check_mysql_secret
 
@@ -150,17 +141,15 @@ deploy_generator() {
 
     log "✓ Data generator deployed successfully"
 
-    if [[ "$WORKLOAD" == upsert ]]; then
-        echo ""
-        info "Target rate: RATE_PER_POD x replicas (default 5000 x 8 = 40,000 rows/s)"
-        info "80% of rows are upserts on existing primary keys; no DELETEs are"
-        info "emitted, so use the mixed workload if you need delete-event coverage."
-        echo ""
-        info "The per-pod counter line is the authoritative rate — the target is a"
-        info "token-bucket ceiling, and rolled-back batches would show up as a"
-        info "shortfall there rather than as an error:"
-        echo "  kubectl logs -l app=$APP_LABEL -n $NAMESPACE --tail=40 | grep '^\\['"
-    fi
+    echo ""
+    info "Target rate: RATE_PER_POD x replicas (manifest: 80,000 x 4 = 320,000 rows/s),"
+    info "a deliberately unreachable token-bucket ceiling so the pods run flat out."
+    info "UPSERT_RATIO 0.5: half the rows update existing primary keys, half are new"
+    info "inserts. No DELETE events are emitted."
+    echo ""
+    info "The per-pod counter line is the authoritative rate — rolled-back batches"
+    info "show up as a shortfall there rather than as an error:"
+    echo "  kubectl logs -l app=$APP_LABEL -n $NAMESPACE --tail=40 | grep '^\\['"
 
     echo ""
     log "Monitor logs with:"
@@ -169,7 +158,7 @@ deploy_generator() {
 
 # Stop data generator
 stop_generator() {
-    log "Stopping MySQL data generator (workload: $WORKLOAD)..."
+    log "Stopping MySQL upsert load generator..."
 
     kubectl delete -f "$MANIFEST" --ignore-not-found || \
         error "Failed to stop data generator"
@@ -179,41 +168,39 @@ stop_generator() {
 
 # Show data generator status
 status_generator() {
-    log "Data generator status (workload: $WORKLOAD):"
+    log "Upsert load generator status:"
     echo ""
     kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" || true
     echo ""
     kubectl get pods -l app="$APP_LABEL" -n "$NAMESPACE" || true
 
-    if [[ "$WORKLOAD" == upsert ]]; then
-        echo ""
-        log "Achieved rate per pod (avg is the number to quote):"
-        local pods
-        pods=$(kubectl get pods -n "$NAMESPACE" -l app="$APP_LABEL" \
-                 -o name 2>/dev/null) || true
-        [[ -z "$pods" ]] && { info "no pods running"; return; }
-        local total=0
-        for p in $pods; do
-            local line
-            line=$(kubectl logs -n "$NAMESPACE" "$p" --tail=60 2>/dev/null \
-                     | grep '^\[' | tail -1)
-            [[ -z "$line" ]] && continue
-            printf '  %-42s %s\n' "$(basename "$p")" \
-                "$(echo "$line" | grep -oE 'inst=[0-9,]+/s avg=[0-9,]+/s errors=[0-9]+' || echo "$line")"
-            # Sum the averages rather than the instantaneous values: `inst` is a
-            # 15s sample and the pods report on staggered clocks, so summing it
-            # reads high or low depending on when this ran.
-            local avg
-            avg=$(echo "$line" | grep -oE 'avg=[0-9,]+' | head -1 | tr -d 'avg=,')
-            [[ -n "$avg" ]] && total=$(( total + avg ))
-        done
-        [[ $total -gt 0 ]] && log "  aggregate ≈ $(printf "%'d" "$total") rows/s"
-    fi
+    echo ""
+    log "Achieved rate per pod (avg is the number to quote):"
+    local pods
+    pods=$(kubectl get pods -n "$NAMESPACE" -l app="$APP_LABEL" \
+             -o name 2>/dev/null) || true
+    [[ -z "$pods" ]] && { info "no pods running"; return; }
+    local total=0
+    for p in $pods; do
+        local line
+        line=$(kubectl logs -n "$NAMESPACE" "$p" --tail=60 2>/dev/null \
+                 | grep '^\[' | tail -1)
+        [[ -z "$line" ]] && continue
+        printf '  %-42s %s\n' "$(basename "$p")" \
+            "$(echo "$line" | grep -oE 'inst=[0-9,]+/s avg=[0-9,]+/s errors=[0-9]+' || echo "$line")"
+        # Sum the averages rather than the instantaneous values: `inst` is a
+        # 15s sample and the pods report on staggered clocks, so summing it
+        # reads high or low depending on when this ran.
+        local avg
+        avg=$(echo "$line" | grep -oE 'avg=[0-9,]+' | head -1 | tr -d 'avg=,')
+        [[ -n "$avg" ]] && total=$(( total + avg ))
+    done
+    [[ $total -gt 0 ]] && log "  aggregate ≈ $(printf "%'d" "$total") rows/s"
 }
 
 # Show logs
 logs_generator() {
-    log "Streaming data generator logs (workload: $WORKLOAD)..."
+    log "Streaming upsert load generator logs..."
     kubectl logs -f -l app="$APP_LABEL" -n "$NAMESPACE"
 }
 
@@ -222,22 +209,20 @@ scale_generator() {
     local replicas=${2:-1}
     log "Scaling data generator to $replicas replicas..."
 
-    # The upsert workload shards the hot-key window by POD_COUNT, so that value
+    # The generator shards the hot-key window by POD_COUNT, so that value
     # has to move with the replica count. Setting it BEFORE scaling means the
     # rollout the env change triggers already carries the right divisor, instead
     # of pods starting on a stale one and restarting a second time. A POD_COUNT
     # below the real replica count makes slices overlap and brings back the
     # cross-pod lock convoy that capped throughput at ~69,000 rows/s.
-    if [[ "$WORKLOAD" == upsert ]]; then
-        local shard
-        shard=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
-                  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SHARD_HOT_KEYS")].value}' \
-                  2>/dev/null)
-        if [[ "${shard:-true}" == "true" ]]; then
-            log "Setting POD_COUNT=$replicas to keep hot-key slices disjoint..."
-            kubectl set env "$KIND"/"$DEPLOYMENT" POD_COUNT="$replicas" \
-                -n "$NAMESPACE" >/dev/null || warn "Could not update POD_COUNT"
-        fi
+    local shard
+    shard=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SHARD_HOT_KEYS")].value}' \
+              2>/dev/null)
+    if [[ "${shard:-true}" == "true" ]]; then
+        log "Setting POD_COUNT=$replicas to keep hot-key slices disjoint..."
+        kubectl set env "$KIND"/"$DEPLOYMENT" POD_COUNT="$replicas" \
+            -n "$NAMESPACE" >/dev/null || warn "Could not update POD_COUNT"
     fi
 
     kubectl scale "$KIND" "$DEPLOYMENT" \
@@ -246,65 +231,51 @@ scale_generator() {
 
     log "✓ Scaled to $replicas replicas"
 
-    if [[ "$WORKLOAD" == upsert ]]; then
-        local per_pod
-        per_pod=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
-                    -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RATE_PER_POD")].value}' \
-                    2>/dev/null)
-        [[ -n "$per_pod" ]] && \
-            info "Aggregate target is now ${replicas} x ${per_pod} = $(( replicas * per_pod )) rows/s"
-    fi
+    local per_pod
+    per_pod=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
+                -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="RATE_PER_POD")].value}' \
+                2>/dev/null)
+    [[ -n "$per_pod" ]] && \
+        info "Aggregate target is now ${replicas} x ${per_pod} = $(( replicas * per_pod )) rows/s"
 }
 
-# Configure generation rate. The two workloads have different rate models, so
-# the positional arguments mean different things for each.
+# Configure generation rate: rows/sec per pod, worker threads, rows per
+# statement. The defaults are the manifest's current values.
 configure_rate() {
-    if [[ "$WORKLOAD" == upsert ]]; then
-        # upsert: rows/sec per pod, worker threads, rows per statement.
-        local rate=${2:-5000}
-        local threads=${3:-4}
-        local batch_rows=${4:-500}
+    local rate=${2:-80000}
+    local threads=${3:-8}
+    local batch_rows=${4:-5000}
 
-        log "Configuring upsert load rate..."
-        log "  Rate per pod : ${rate} rows/s"
-        log "  Threads      : ${threads}"
-        log "  Rows/batch   : ${batch_rows}"
+    log "Configuring upsert load rate..."
+    log "  Rate per pod : ${rate} rows/s"
+    log "  Threads      : ${threads}"
+    log "  Rows/batch   : ${batch_rows}"
 
-        kubectl set env "$KIND"/"$DEPLOYMENT" \
-            RATE_PER_POD="$rate" \
-            THREADS="$threads" \
-            BATCH_ROWS="$batch_rows" \
-            -n "$NAMESPACE" || error "Failed to update configuration"
+    kubectl set env "$KIND"/"$DEPLOYMENT" \
+        RATE_PER_POD="$rate" \
+        THREADS="$threads" \
+        BATCH_ROWS="$batch_rows" \
+        -n "$NAMESPACE" || error "Failed to update configuration"
 
-        local replicas
-        replicas=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
-                     -o jsonpath='{.spec.replicas}' 2>/dev/null)
-        [[ -n "$replicas" ]] && \
-            info "Aggregate target: ${replicas} x ${rate} = $(( replicas * rate )) rows/s"
-        # Raising RATE_PER_POD past ~5000 on one pod hits the GIL before it hits
-        # MySQL — the driver burns real CPU building the multi-row statement text.
-        # Add replicas instead.
-        [[ $rate -gt 6000 ]] && \
-            warn "RATE_PER_POD > 6000 is usually GIL-bound; prefer more replicas"
-    else
-        # mixed: rows per tick, and seconds between ticks.
-        local batch_size=${2:-10}
-        local sleep_seconds=${3:-5}
-
-        log "Configuring data generation rate..."
-        log "  Batch size: $batch_size"
-        log "  Sleep interval: ${sleep_seconds}s"
-
-        kubectl set env "$KIND"/"$DEPLOYMENT" \
-            BATCH_SIZE="$batch_size" \
-            SLEEP_SECONDS="$sleep_seconds" \
-            -n "$NAMESPACE" || error "Failed to update configuration"
-    fi
+    local replicas
+    replicas=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
+                 -o jsonpath='{.spec.replicas}' 2>/dev/null)
+    [[ -n "$replicas" ]] && \
+        info "Aggregate target: ${replicas} x ${rate} = $(( replicas * rate )) rows/s"
+    # With the pure-Python driver (USE_PURE=true) a pod hits the GIL at about
+    # 5,000 rows/s — it burns real CPU building the multi-row statement text.
+    # The C extension (the manifest default) lifts that ceiling.
+    local use_pure
+    use_pure=$(kubectl get "$KIND" "$DEPLOYMENT" -n "$NAMESPACE" \
+                 -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="USE_PURE")].value}' \
+                 2>/dev/null)
+    [[ "$use_pure" == "true" && $rate -gt 6000 ]] && \
+        warn "USE_PURE=true: RATE_PER_POD > 6000 is usually GIL-bound; prefer more replicas"
 
     log "✓ Configuration updated. Pods will restart automatically."
 }
 
-# Tune the upsert workload's key distribution and insert/update balance. These
+# Tune the generator's key distribution and insert/update balance. These
 # are the knobs that decide WHAT is being measured rather than how fast, which is
 # why they are a separate command from `config`: UPSERT_RATIO sets how much of
 # the stream updates existing keys, and HOT_KEY_RATIO / HOT_KEY_WINDOW set how
@@ -312,12 +283,10 @@ configure_rate() {
 # delete-file accumulation, so widening the window weakens the very effect the
 # Paimon-vs-Iceberg comparison is looking for.
 configure_upsert_mix() {
-    [[ "$WORKLOAD" == upsert ]] || \
-        error "upsert-mix applies to the upsert workload only (pass 'upsert')"
-
-    local upsert_ratio=${2:-0.8}
+    # Defaults are the manifest's current values.
+    local upsert_ratio=${2:-0.5}
     local hot_ratio=${3:-0.6}
-    local hot_window=${4:-50000}
+    local hot_window=${4:-5000000}
 
     log "Configuring upsert mix..."
     log "  Upsert ratio   : ${upsert_ratio} (rest are new inserts)"
@@ -335,49 +304,40 @@ configure_upsert_mix() {
 
 # Show help
 show_help() {
-    echo "MySQL Data Generator Management Tool"
+    echo "MySQL Data Generator Management Tool (upsert load generator)"
     echo ""
-    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|help} [mixed|upsert]"
+    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|help} [upsert]"
     echo ""
-    echo "Workloads (append 'mixed' or 'upsert' to any command; default mixed):"
-    echo "  mixed    - INSERT/UPDATE/DELETE mix, row-at-a-time. ~400 rows/s ceiling."
-    echo "             The only workload that emits DELETE events."
-    echo "  upsert   - Batched INSERT ... ON DUPLICATE KEY UPDATE, ~40,000 rows/s"
-    echo "             across 8 pods. The storage-format benchmark workload: hot-key"
-    echo "             upserts make Iceberg accumulate equality-delete files while"
-    echo "             Paimon compacts them in the background. Emits no DELETEs."
+    echo "Manages StatefulSet mysql-upsert-loadgen (mysql-upsert-loadgen.yaml):"
+    echo "batched INSERT ... ON DUPLICATE KEY UPDATE on a skewed hot-key window, so"
+    echo "Iceberg accumulates equality-delete files while Paimon compacts them in the"
+    echo "background. Target rate = RATE_PER_POD x replicas (manifest: 80,000 x 4), a"
+    echo "deliberately unreachable ceiling; read the achieved rate from 'status'."
+    echo "Emits no DELETE events. (The mixed INSERT/UPDATE/DELETE generator was"
+    echo "removed on 2026-11-02; a trailing 'upsert' argument is still accepted.)"
     echo ""
     echo "Commands:"
-    echo "  deploy      - Deploy data generator pods"
-    echo "  stop        - Stop and remove data generator"
-    echo "  status      - Show deployment status (+ achieved rate for upsert)"
+    echo "  deploy      - Deploy generator pods"
+    echo "  stop        - Stop and remove the generator"
+    echo "  status      - Show StatefulSet status and achieved rate per pod"
     echo "  logs        - Stream generator logs"
-    echo "  scale       - Scale number of generator pods"
-    echo "  config      - Configure generation rate (arguments differ per workload)"
-    echo "  upsert-mix  - Tune upsert ratio and hot-key skew (upsert only)"
+    echo "  scale       - Scale generator pods (keeps POD_COUNT in step)"
+    echo "  config      - Set RATE_PER_POD, THREADS, BATCH_ROWS"
+    echo "  upsert-mix  - Set UPSERT_RATIO, HOT_KEY_RATIO, HOT_KEY_WINDOW"
     echo "  help        - Show this help message"
     echo ""
-    echo "Examples — mixed workload (CDC correctness, all three event types):"
-    echo "  ./deploy-data-generator.sh deploy"
-    echo "  ./deploy-data-generator.sh config 20 2      # 20 records every 2s"
-    echo "  ./deploy-data-generator.sh scale 3"
-    echo ""
-    echo "Examples — upsert workload (40k/s benchmark load):"
-    echo "  ./deploy-data-generator.sh deploy upsert          # 8 pods x 5000 = 40k/s"
-    echo "  ./deploy-data-generator.sh status upsert          # achieved rate per pod"
-    echo "  ./deploy-data-generator.sh config 5000 4 500 upsert   # rate, threads, rows/batch"
-    echo "  ./deploy-data-generator.sh scale 12 upsert        # 12 x 5000 = 60k/s"
-    echo "  ./deploy-data-generator.sh upsert-mix 0.9 0.8 20000 upsert"
-    echo "        # 90% upserts, 80% of them into a 20k-key window — a tighter"
+    echo "Examples:"
+    echo "  ./deploy-data-generator.sh deploy                 # 4 pods x 80,000 target"
+    echo "  ./deploy-data-generator.sh status                 # achieved rate per pod"
+    echo "  ./deploy-data-generator.sh config 80000 8 5000    # rate, threads, rows/batch"
+    echo "  ./deploy-data-generator.sh scale 4                # POD_COUNT follows"
+    echo "  ./deploy-data-generator.sh upsert-mix 0.5 0.6 5000000"
+    echo "        # upsert ratio, hot-key ratio, hot-key window — a tighter"
     echo "        # window accumulates Iceberg delete files faster"
-    echo "  ./deploy-data-generator.sh stop upsert"
-    echo ""
-    echo "  # WORKLOAD= works too, if you prefer it to the trailing argument:"
-    echo "  WORKLOAD=upsert ./deploy-data-generator.sh deploy"
+    echo "  ./deploy-data-generator.sh stop"
     echo ""
     echo "Environment variables:"
     echo "  NAMESPACE - Kubernetes namespace (default: emr-flink)"
-    echo "  WORKLOAD  - mixed | upsert (default: mixed)"
 }
 
 # Main
@@ -388,7 +348,7 @@ main() {
             status_generator
             echo ""
             info "To watch live data generation:"
-            echo "  ./deploy-data-generator.sh logs $WORKLOAD"
+            echo "  ./deploy-data-generator.sh logs"
             ;;
         stop)
             stop_generator

@@ -22,7 +22,7 @@
 #
 # Results: the runner uploads its bench-results/ to
 # s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
-# (set tag: CDC_DB_SUFFIX with - for _, -v3 for the Iceberg v3 set; .bench-env).
+# (set tag: .bench-env's CDC_DB_SUFFIX with - for _, e.g. _v3r1 -> -v3r1).
 #
 # `start`, in order (any failure stops it before a Job is created):
 #   0. waits while cdc-qb-runner still runs (FORCE=1: replace it); refuses while

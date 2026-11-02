@@ -42,6 +42,13 @@
 # execution ms; scan_rows / scan_bytes = physical input of the last timed
 # pass), -queries.csv (every pass: query id, elapsed, queued, execution, CPU,
 # bytes), -rows.tsv (every row of the last timed pass), -firstrows.csv, .log.
+#
+# Exit: non-zero only when the driver itself fails: Trino is not up with
+# TRINO_WORKERS workers (at the start or the end of a suite), a render fails (a
+# pin missing), the writers changed under the suite, or no result row was
+# written. A query that is not OK (ERROR, TIMEOUT, OOM, ZERO_SCAN) stays in the
+# CSV and the summary, and in the suite's last log line ("N of M queries not
+# OK: trino:<arm>:<query>=<status> ..."); it does not change the exit.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
@@ -292,7 +299,7 @@ render_suite_dir() {   # suite dir
 }
 
 run_suite() {   # suite
-    local s="$1" dir writers rows bad arm
+    local s="$1" dir writers rows bad arm n
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
     qb_start_suite "$s"
     # H8's key: exported by hot-interleave.sh; resolved here when run by hand.
@@ -311,12 +318,20 @@ run_suite() {   # suite
         run_suite_passes "$s" "$arm" "$dir" "$rows"
     done
     qb_writers_unchanged "$writers" "$s" || { rm -rf "$dir"; return 1; }
+    n=$(grep -c . "$rows" || true)
+    (( n > 0 )) || { qb_log "ERROR: ${s}: no result rows written"; rm -rf "$dir"; return 1; }
     { echo "# suite=${s} writers: ${writers}"; echo "# suite=${s} runs=${RUNS} warmup=${WARMUP} run_id=${RUN_ID} time=execution (elapsed - queued), system.runtime.queries"; } >> "$CSV"
     cat "$rows" >> "$CSV"
-    bad=$(grep -cv ',OK,' "$rows" || true)
-    qb_log "${s}: $(grep -c . "$rows" || true) queries, ${bad} not OK"
+    # Not-OK queries are results, not a driver failure: logged, exit unchanged.
+    bad=$(awk -F, '$6 != "OK" { printf " trino:%s:%s=%s", $3, $5, $6 }' "$rows")
+    if [[ -n "$bad" ]]; then
+        qb_log "${s}: $(wc -w <<<"$bad" | tr -d ' ') of ${n} queries not OK:${bad}"
+    else
+        qb_log "${s}: ${n} queries, all OK"
+    fi
+    echo "# suite=${s} queries=${n} not OK:${bad:- none}" >> "$LOG"
     rm -rf "$dir"
-    (( bad == 0 ))
+    qb_trino_ready || { qb_log "ERROR: Trino lost its ${TRINO_WORKERS} active workers during the ${s} suite"; return 1; }
 }
 
 cmd_run() {

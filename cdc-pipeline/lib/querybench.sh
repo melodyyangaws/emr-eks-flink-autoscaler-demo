@@ -80,7 +80,7 @@ ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${CDC_DB_SUFFIX:-}}"
 # plus version-hint.text. N is Paimon's own snapshot id.
 PMNICE_ROOT="${PMNICE_ROOT:-${PAIMON_WAREHOUSE}/iceberg/${PAIMON_DB}}"
 FLINK_JOBS="${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}"
-GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen deployment/mysql-data-generator}"
+GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}"
 DUCKDB_NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
 # Trino (engine-deploy/deploy-trino.sh: the trino Helm chart, release `trino`).
 # The CLI ships in the coordinator image (/usr/bin/trino, same version as the

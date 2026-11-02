@@ -46,10 +46,9 @@ export TRINO_CHART_VERSION=1.45.0
 # ThinLTO) at every start: a different build, so a different timing baseline.
 export DUCKDB_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/duckdb-cdc-server:2.0.0"
 
-# The MySQL load generator(s) the hot test needs running and the snapshot test
-# stops (scaled to 0; whichever of them exists). deploy-data-generator.sh brings
-# them back.
-export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen deployment/mysql-data-generator"
+# The MySQL load generator the hot test needs running and the snapshot test
+# stops (scaled to 0). deploy-data-generator.sh scale brings it back.
+export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen"
 
 # The snapshot test submits these Iceberg compaction Jobs and measures the
 # compacted tables; ICEBERG_REQUIRE_COMPACTION=0 (one run) measures them as they are.

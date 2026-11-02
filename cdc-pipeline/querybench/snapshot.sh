@@ -29,6 +29,12 @@
 # Output: as duckdb-warm.sh / trino.sh, tables-<STAMP>.tsv, and
 # snapshot-<STAMP>.pins (gate times, cache-clear time, pinned snapshot ids,
 # windows, writer state).
+#
+# Exit: non-zero when a gate, the pins, the cache clear or an engine's driver
+# fails (duckdb-warm.sh / trino.sh "Exit": engine not up, render/pin failure,
+# no rows). A query that is not OK (duckdb:paimon on v3, say) is a result: in
+# the CSVs, the summary and the driver's "N of M queries not OK" line, with
+# its engine still `status: <engine>-snapshot-exit=0`.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SUITE=snapshot

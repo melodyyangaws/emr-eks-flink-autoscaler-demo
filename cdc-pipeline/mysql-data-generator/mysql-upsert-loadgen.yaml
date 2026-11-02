@@ -4,9 +4,11 @@
 # (db.m5.2xlarge, 500GB gp3, 12,000 IOPS), not a chosen target — see the
 # replicas: comment on the StatefulSet for the sweep that established it.
 #
-# Why this exists alongside mysql-data-generator.yaml
-# ---------------------------------------------------
-# The original generator tops out around 400 rows/sec. Two reasons, both fatal at
+# Why it replaced mysql-data-generator.yaml
+# -----------------------------------------
+# The original row-at-a-time INSERT/UPDATE/DELETE generator (Deployment
+# mysql-data-generator, removed 2026-11-02; in git history) tops out around
+# 400 rows/sec. Two reasons, both fatal at
 # 40k:
 #   1. It issues one cursor.execute() per order AND one per order item, so a
 #      "batch" of 10 orders is ~40 round trips. At ~1ms RTT to RDS that alone
@@ -581,7 +583,9 @@ spec:
   # bigger commits amortize the redo-log flush that is the actual bottleneck, and
   # cut the lock-timeout errors that 128 competing writers produced. See
   # bench-results/rds-ceiling-20260923T081657Z.csv.
-  replicas: 8
+  #
+  # 2026-11-02: 8 -> 4 replicas (POD_COUNT 4 with it).
+  replicas: 4
   selector:
     matchLabels:
       app: mysql-upsert-loadgen
@@ -786,7 +790,7 @@ spec:
         # StatefulSet restarts each pod the moment it self-exits, so the pods
         # cycled 4-5 times and every "average rows/sec" reading was diluted by
         # a fresh ramp-up. Bound a measurement window by scaling the StatefulSet
-        # down instead, which stops all 8 pods at the same moment without the
+        # down instead, which stops all pods at the same moment without the
         # restart loop.
         - name: DURATION_SECONDS
           value: "0"
@@ -796,7 +800,7 @@ spec:
         # convoy comes back; if it drifts high, part of the window goes unwritten
         # (harmless, just less hot-key pressure than intended).
         - name: POD_COUNT
-          value: "8"
+          value: "4"
         - name: SHARD_HOT_KEYS
           value: "true"
         # Pure-Python protocol fallback. Leave false to use the C extension,

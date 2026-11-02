@@ -2,158 +2,212 @@
 
 ## Overview
 
-A custom monitoring pod that continuously tracks both **Paimon** and **Iceberg** CDC pipelines, comparing throughput, checkpoint health, and table growth side-by-side.
+A monitoring pod that tracks both CDC pipelines, **Paimon** and **Iceberg**, and
+compares committed rows/s, checkpoint health and table growth side by side.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │              Flink CDC Monitor Pod (emr-flink)              │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  entrypoint.py — Continuous monitoring loop            │  │
-│  │  flink_cdc_monitor.py — Flink REST API + table stats  │  │
+│  │  entrypoint.py        — loop: Paimon window, Iceberg   │  │
+│  │                         window, comparison, sleep      │  │
+│  │  flink_cdc_monitor.py — Flink REST + table metadata    │  │
 │  │                                                       │  │
-│  │  Data Sources:                                        │  │
-│  │  • Flink REST API → job status, throughput, checkpts  │  │
-│  │  • pyiceberg       → Iceberg table snapshots          │  │
-│  │  • boto3 Glue API  → Paimon table stats (fallback)   │  │
+│  │  Data sources:                                        │  │
+│  │  • Flink REST API → job state, source rate, checkpts  │  │
+│  │  • pyiceberg + Glue → Iceberg snapshots and summaries │  │
+│  │  • boto3 + fastavro → Paimon snapshots and manifests  │  │
+│  │                       read directly from S3           │  │
 │  └───────────────────────────────────────────────────────┘  │
-│  Output: /tmp/reports/*.json + structured logs              │
+│  Output: /tmp/reports/*.json + the comparison table in logs │
 └─────────────────────────────────────────────────────────────┘
          │                              │
          ↓                              ↓
 ┌──────────────────┐          ┌──────────────────┐
-│  Paimon Flink    │          │  Iceberg Flink   │
-│  REST API :8081  │          │  REST API :8081  │
+│ flink-cdc-paimon │          │ flink-cdc-iceberg│
+│ -rest:8081       │          │ -rest:8081       │
 └──────────────────┘          └──────────────────┘
 ```
 
+The monitor is a port of `throughput-benchmark/monitoring/flink_cid_monitor.py`,
+extended from one table to the four CDC tables.
+
 ---
 
-## Quick Start
+## Step 1 — Prerequisites
 
-### Set Environment Variables
+- Both FlinkDeployments are running ([1-BUILD-DEPLOY-FLINK-APP-GUIDE.md](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)).
+  The monitor reaches them at `flink-cdc-{paimon,iceberg}-rest:8081`.
+- `kubectl` on the cluster, the AWS CLI, and `envsubst` (`brew install gettext`).
+- A ServiceAccount in `emr-flink` with IRSA that can read Glue and the warehouse
+  buckets. The default is `starrocks-sa` (`MONITOR_SERVICE_ACCOUNT` overrides it).
+  The name is historical: the query engines share it. If the ServiceAccount has no
+  `eks.amazonaws.com/role-arn` annotation, the deploy script annotates it with
+  `EMR_EXECUTION_ROLE_ARN`. An existing annotation is never changed. The role's
+  trust policy must allow that ServiceAccount (see [IRSA](#irsa)).
 
-```bash
-export AWS_REGION=us-west-2
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
-export NAMESPACE=emr-flink
-export EKS_CLUSTER_NAME=loadtest-mcp   # only needed for the IRSA step below
-```
-
-### Deploy Monitor
+## Step 2 — Deploy
 
 ```bash
 cd cdc-pipeline
-bash ./monitoring/deploy-monitor.sh                       # the v3 set (default): flink_*_db_v3
-CDC_DB_SUFFIX= bash ./monitoring/deploy-monitor.sh        # the v2 set: flink_paimon_db, flink_iceberg_db
+source .bench-env                      # BUCKET_NAME, AWS_REGION, CDC_DB_SUFFIX (_v3r1 now)
+bash ./monitoring/deploy-monitor.sh    # the file has no execute bit
 ```
 
-`CDC_DB_SUFFIX` picks the table set the monitor reads (`PAIMON_GLUE_DB` /
-`ICEBERG_GLUE_DB` = `flink_paimon_db<suffix>` / `flink_iceberg_db<suffix>`,
-rendered into the ConfigMap with envsubst). Unset, it is the value in
-`cdc-pipeline/.bench-env` (`_v3` on this branch, the Iceberg v3 set), else
-`_v3`; set but empty, the v2 set. Match it to the Flink jobs being monitored.
+The script:
 
-There is **no image to build**. The monitor runs stock `python:3.11-slim`: the
-script pushes `flink_cdc_monitor.py`, `entrypoint.py`, and `requirements.txt`
-into the `flink-cdc-monitor-code` ConfigMap (~41 KB, well under the 1 MB limit),
-and the pod `pip install`s the requirements at boot. That trades ~2 min of cold
-pod startup for dropping the whole build-and-push path — no Dockerfile, no ECR
-repository, and no `ecr:*` push grant on the execution role.
+1. resolves `AWS_REGION` (default `us-west-2`), `AWS_ACCOUNT_ID` (always from
+   `aws sts get-caller-identity`), `BUCKET_NAME` (default
+   `emr-on-eks-test-<account>-<region>`), `NAMESPACE` (default `emr-flink`) and
+   `EMR_EXECUTION_ROLE_ARN`
+2. resolves `CDC_DB_SUFFIX` (below) and rejects anything other than empty or
+   `_[a-z0-9]+`
+3. annotates the ServiceAccount if it has no role yet
+4. recreates the `flink-cdc-monitor-code` ConfigMap from `flink_cdc_monitor.py`,
+   `entrypoint.py` and `requirements.txt`
+5. renders `monitor-deployment.yaml` to `monitor-deployment-deployed.yaml`
+   (git-ignored) with `envsubst`, and fails on any placeholder left
+6. applies it, runs `kubectl rollout restart`, and waits up to 300 s for the rollout
 
-To pick up a code change, re-run the same script: it refreshes the ConfigMap and
-restarts the Deployment.
+There is **no image to build**. The pod runs stock `python:3.11-slim`, copies the code
+from the ConfigMap, and `pip install`s the pinned requirements at boot (about 1–2
+minutes on a cold pod). To pick up a code change, re-run the script.
 
-### View Logs
+Check the banner it prints. `Glue DBs:` must name the databases the Flink jobs write:
+
+```
+  Glue DBs:  flink_paimon_db_v3r1, flink_iceberg_db_v3r1
+```
+
+### Which table set it reads: `CDC_DB_SUFFIX`
+
+| `CDC_DB_SUFFIX` in your shell | Monitored databases |
+|---|---|
+| unset | the value in `cdc-pipeline/.bench-env` (`_v3r1` now); `_v3` if that file does not set it |
+| set, e.g. `_v3` | `flink_paimon_db_v3`, `flink_iceberg_db_v3` |
+| set but empty (`CDC_DB_SUFFIX=`) | the v2 set: `flink_paimon_db`, `flink_iceberg_db` |
+
+```bash
+CDC_DB_SUFFIX= bash ./monitoring/deploy-monitor.sh  # the v2 set
+```
+
+`build-deploy-generic.sh` resolves it the same way, so with an unchanged `.bench-env`
+the monitor and the jobs agree. The suffix also selects the Paimon warehouse path the
+monitor reads: `paimon-warehouse/flink_paimon_db<suffix>.db/<table>/`.
+
+## Step 3 — Read the reports
 
 ```bash
 kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 ```
 
-### Stop Monitoring
+Each cycle runs a 120 s window on Paimon, then a 120 s window on Iceberg, logs the
+comparison table, writes `paimon-cdc_<UTC>.json` and `iceberg-cdc_<UTC>.json` to
+`/tmp/reports` in the pod, then sleeps 60 s. The two windows are back to back, **not
+concurrent**, so the two columns describe adjacent 2-minute intervals.
+
+To copy the JSON reports out (they are on an `emptyDir` and are lost when the pod
+restarts):
 
 ```bash
-# Pause (keeps the Deployment and ConfigMap, so restarting is instant)
+POD=$(kubectl get pod -n emr-flink -l app=flink-cdc-monitor -o name | head -1)
+kubectl cp emr-flink/${POD#pod/}:/tmp/reports ./bench-results/monitor-$(date -u +%Y%m%d)
+```
+
+## Step 4 — Stop or remove
+
+```bash
+# Pause (keeps the Deployment and ConfigMaps; resuming skips nothing but pip)
 kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=0
 
 # Resume
 kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=1
 
-# Or remove entirely
-kubectl delete -f monitoring/monitor-deployment-deployed.yaml
+# Remove
+kubectl delete deployment/flink-cdc-monitor -n emr-flink
+kubectl delete configmap flink-cdc-monitor-config flink-cdc-monitor-code -n emr-flink
 ```
 
-Prefer scaling to zero: the pod `pip install`s its requirements at boot, so a full redeploy
-costs ~2 min of cold start while a scale-up is near-instant.
-
-The monitor is **independent** of the pipelines and the load generator — stopping it does not
-affect them, and `./build-deploy-generic.sh cleanup` does not stop it. The related commands:
-
-```bash
-# Flink CDC jobs (prompts for confirmation)
-./build-deploy-generic.sh cleanup [paimon|iceberg]
-
-# Load generator — `mixed` (Deployment) or `upsert` (StatefulSet)
-./mysql-data-generator/deploy-data-generator.sh stop upsert
-```
-
-> `monitor-deployment-deployed.yaml` is the rendered output of the template and is
-> gitignored, so `kubectl delete -f` only works on a machine that has run
-> `deploy-monitor.sh`. Elsewhere use
-> `kubectl delete deployment/flink-cdc-monitor -n emr-flink`.
+`deploy-monitor.sh` has no stop action. The monitor is independent of the pipelines
+and the load generator: `./build-deploy-generic.sh cleanup` does not stop it, and
+stopping it does not affect them.
 
 ---
 
-## What the Monitor Tracks
+## How the numbers are computed
 
-### Per Pipeline (Paimon & Iceberg)
+### Rows/s: from the tables' commit history, per table
 
-| Metric | Source | Description |
-|--------|--------|-------------|
-| **Job Status** | Flink REST `/jobs` | RUNNING, FAILING, RESTARTING, etc. |
-| **Parallelism** | Flink REST `/jobs/:id` | Current task parallelism |
-| **Throughput (rows/s)** | The tables' commit history | Rows each commit added / time between commits, per table and summed (`commits`). Falls back to the sources' `numRecordsOutPerSecond` (`rate meter`), then the source `numRecordsOut` delta (`counter`) when no commit landed in the window |
-| **Records Processed (counter)** | Flink REST `/vertices/:vid/subtasks/metrics` | Operator-scoped: the sources' `numRecordsOut` and the writers' `numRecordsIn`, restart-aware |
-| **Committed bytes** | Iceberg: `committedDataFilesByteCount`; Paimon: APPEND commits' delta manifests | Parquet bytes the window committed; compaction rewrites excluded |
-| **Checkpoint Status** | Flink REST `/jobs/:id/checkpoints` | Latest checkpoint size, duration, alignment |
-| **Checkpoint failures** | Flink REST `/jobs/:id/checkpoints` → `counts.failed` | Reported as the **delta over the window**; the raw counter is cumulative — see the caveat below |
-| **Table Row Count** | Iceberg snapshot summary / Paimon snapshot | Total records per sink table |
-| **Table File Count** | Iceberg snapshot summary / Paimon manifests | Live data files per table (Paimon compaction nets out) |
-| **Table Size** | Iceberg snapshot summary (`total-files-size`) | Total bytes on S3 |
-| **Snapshot Count** | Iceberg metadata / Paimon `snapshot/` | Number of snapshots retained |
+The headline "Throughput (rows/s)" is computed from each table's own commits, not from
+Flink counters:
 
-The monitor is a port of `throughput-benchmark/monitoring/flink_cid_monitor.py`,
-extended to the four CDC tables. Throughput figures from the previous version
-(before 2026-11-01, including `bench-results/JOB-MONITOR-2026092*.md`) are **not
-comparable**: it summed `numRecordsOut` over every vertex, and with operator
-chaining off that counts each row once per hop — 6× on the Paimon graph (Source,
-DropUpdateBefore, Calc, ConstraintEnforcer, Map, bucket assigner), 3× on Iceberg
-(Source, Calc, ConstraintEnforcer).
+1. At the start of the window the monitor records each table's current snapshot,
+   then polls Flink every 20 s for 120 s, then reads the tables again.
+2. For each of the four tables it builds the list of commits as
+   `(commit time, rows added)`:
+   - **Iceberg**: every snapshot in the current metadata (`timestamp-ms`,
+     summary `added-records`). In upsert mode `added-records` counts the data rows
+     written: inserts and the new image of each update. The equality deletes and
+     DVs that retire old images are counted separately.
+   - **Paimon**: snapshots from the one current at the window start to the one
+     current at the end, read from `snapshot/snapshot-N` on S3 (`timeMillis`,
+     `deltaRecordCount`). Only `APPEND` commits count. `COMPACT` commits rewrite rows
+     already counted, so they are skipped, except that the start snapshot is always
+     kept as the anchor.
+3. The **anchor** is the last commit at or before the window start. The table's
+   rate is the rows of the commits inside the window, divided by the time from the
+   anchor to the last commit inside:
 
-### Checkpoint failure counts are cumulative, not current
+   ```
+   rate(table) = Σ rows(commits in (t0, t1]) / (time(last commit in window) − time(anchor))
+   ```
 
-`monitoring/capture-flink-metrics.sh` reads `CP_FAIL` from
-`counts.failed` in `/jobs/<jobid>/checkpoints`, and reports it two ways:
+   A table with no anchor or no commit in the window contributes 0.
+4. The pipeline rate is the sum over the four tables. Each table also gets its own
+   row in the comparison (`↳ <table> (committed rows/s)`), which shows where one
+   format falls behind (order_items carries most of the upsert load).
 
-```
-Checkpoints failed     <delta over the sampling window>
-Lifetime ckpt failed    <the raw cumulative counter>
-```
+Because the rate comes from what was committed, it has no REST-counter caching and no
+restart artifacts: rows replayed after a restart are not committed twice. With 60 s
+checkpoints, a 120 s window holds one or two commits per table.
 
-`counts.failed` **never decreases for the life of a job**. A job that failed
-checkpoints during its snapshot phase and has been checkpointing cleanly ever
-since still reports the same non-zero `counts.failed` forever. A byte-identical
-`cp_fail` across two captures therefore tells you nothing about current health —
-it is the *expected* reading for a healthy job.
+**Fallbacks**, used only when no commit landed in the window. The label next to the
+number says which one was used:
 
-The monitor's "Failed Checkpoints (Δ)" row is the change in that counter over
-its window, so a stale lifetime value no longer shows there. Only the `history`
-array in the same response is authoritative for "is it checkpointing right now",
-and neither `capture-flink-metrics.sh` nor the monitor reads it, so check it by
-hand:
+| Label | Source |
+|---|---|
+| `commits` | the commit history, as above |
+| `rate meter` | median over the window of the sum of the sources' `numRecordsOutPerSecond` (Flink's smoothed per-second meter), RUNNING samples only |
+| `counter` | delta of the sources' operator-scoped `numRecordsOut` over the longest stretch without a counter reset. Each reset is reported as a restart |
+
+Records come from **operator-scoped** metrics: the sources' `numRecordsOut` and the
+writers' `numRecordsIn`. Summing vertex-level `numRecordsOut` counts a row once per
+hop, and with chaining on, a chained writer's vertex counters see only committables.
+Figures from the earlier monitor (before 2026-11-01, including
+the `bench-results/JOB-MONITOR-2026092*.md` reports, now in git history only) summed every vertex and are **not
+comparable**: 6x on the Paimon graph, 3x on Iceberg.
+
+**Bytes**: Iceberg uses the committer's `committedDataFilesByteCount`. Paimon uses
+the file sizes of the `APPEND` commits' delta manifests, because Paimon's committer
+byte counter also counts compaction rewrites. Both exclude compaction output.
+
+### Failed checkpoints: a delta per window
+
+"Failed Checkpoints (Δ)" (`failed_checkpoints_in_window` in the JSON) is
+`counts.failed` from `/jobs/<id>/checkpoints` at the last poll of the window minus the
+same value at the first. "Checkpoints" is the same delta of `counts.completed`. The
+raw `counts.failed` is cumulative for the job's life and never decreases, so a job
+that failed checkpoints during its snapshot phase reports the same non-zero value
+forever. Only the delta says something about the window.
+
+Checkpoints *aborted at trigger time* (because not every task is running) are not
+counted as FAILED, so neither `counts.failed` nor `tolerable-failed-checkpoints`
+reacts to them. That failure mode is what the manifests' `failover-strategy: full`
+prevents. To see whether a job is checkpointing right now, read the `history` array
+by hand:
 
 ```bash
-JM=$(kubectl get pods -n emr-flink -o name | grep flink-cdc-paimon | grep -v taskmanager | head -1)
+JM=$(kubectl get pods -n emr-flink -l app=flink-cdc-paimon,component=jobmanager -o name | head -1)
 JID=$(kubectl exec -n emr-flink "$JM" -c flink-main-container -- \
         curl -s localhost:8081/jobs | python3 -c 'import sys,json; print(json.load(sys.stdin)["jobs"][0]["id"])')
 kubectl exec -n emr-flink "$JM" -c flink-main-container -- \
@@ -161,101 +215,133 @@ kubectl exec -n emr-flink "$JM" -c flink-main-container -- \
   | python3 -c 'import sys,json; d=json.load(sys.stdin); [print(c["id"], c["status"], c["trigger_timestamp"]) for c in d["history"]]'
 ```
 
-Recent `COMPLETED` entries with advancing ids and timestamps mean the job is
-healthy regardless of what `counts.failed` says. Use the **delta** row
-("Checkpoints failed") from `capture-flink-metrics.sh`, never the lifetime row.
+Recent `COMPLETED` entries with advancing ids mean the job is healthy, whatever the
+lifetime counter says.
 
-> A related trap: checkpoints that are *aborted at trigger time* (because not
-> every task is running) are **not** counted as FAILED, so neither
-> `counts.failed` nor `tolerable-failed-checkpoints` reacts to them. That was the
-> failure mode the manifests' `failover-strategy: full` setting exists to prevent.
+### Deletion vectors (Iceberg v3)
 
-### Table Stats: Iceberg vs Paimon
+Iceberg 1.12's snapshot summary has no running DV total. Each commit carries
+`added-dvs` and `removed-dvs`, and `total-delete-files` / `added-delete-files` count
+DVs together with equality-delete files. So the monitor keeps the per-commit DV counts
+of every retained snapshot, at the start and at the end of the window, and sums the
+commits present at the end but not at the start. Snapshot expiry in between does not
+distort it.
 
-| Table Type | How Stats Are Read |
-|------------|-------------------|
-| **Iceberg** | `pyiceberg` loads Glue catalog → reads snapshot summary from S3 metadata. On an Iceberg v3 table the summaries also carry deletion-vector counts per commit (`added-dvs`, `removed-dvs`; Iceberg 1.12's SnapshotSummary has no running DV total, and `total-delete-files` / `added-delete-files` count the DVs too): the report sums them over the commits new in the window and shows a "Deletion Vectors (added / removed)" row and `total_new_dvs` / `total_removed_dvs` (per table `dvs_added_in_window`, ...) in the JSON. A v2 table has no such keys, and its report is unchanged |
-| **Paimon** | Its own metadata on S3: `snapshot/LATEST` → `snapshot-N` (`totalRecordCount`, commit kind and time), the manifest lists for live files, and APPEND commits' delta manifests for added bytes. Not the Glue parameters, which a Flink-written table never fills |
+- The comparison shows `↳ Deletion Vectors (added / removed)` as `+<added> / -<removed>`
+  when either side's summaries carry DV keys, and `n/a` for a side without them.
+- The JSON adds `total_new_dvs` / `total_removed_dvs`, and per table `added_dvs` (the
+  current snapshot), `dvs_added_in_window` and `dvs_removed_in_window`.
+- A v2 table and Paimon have no such keys, and their reports are unchanged.
+  Paimon's own deletion vectors live in its index files and are not counted here.
+- "New Delete Files" counts DVs too, so on v3 it is equality-delete files plus DV
+  files.
+
+### Table stats
+
+| Format | How stats are read |
+|---|---|
+| **Iceberg** | `pyiceberg` (0.12.0) loads the table through Glue and reads the current snapshot summary: `total-records`, `total-data-files`, `total-files-size`, `total-delete-files`, `total-position-deletes`, `total-equality-deletes`. Snapshot count = snapshots in the metadata |
+| **Paimon** | Its own metadata on S3: `snapshot/LATEST` → `snapshot-N` (`totalRecordCount`), live files = Σ(`_NUM_ADDED_FILES` − `_NUM_DELETED_FILES`) over the base and delta manifest lists, snapshot count = retained `snapshot-*` files. New snapshots = snapshot-id delta (Paimon ids are sequential; Iceberg's are random, so Iceberg uses the count delta) |
+
+All table deltas are clamped at 0, because snapshot expiry between the two reads can
+make a raw delta negative.
 
 ---
 
-## Monitor Architecture
+## Sample report
 
-### File Structure
+The table `compare_reports()` logs each cycle. The rows are fixed; the values here
+are placeholders, not a measurement:
+
+```
+================================================================================
+  CDC Pipeline Comparison: Paimon CDC vs Iceberg CDC
+  Time: <start> → <end>
+================================================================================
+| Metric                                 | Paimon CDC         | Iceberg CDC        | Delta |
+| Job Name / Status / Parallelism        | …  RUNNING  32     | …  RUNNING  32     |       |
+| Duration (s)                           | 120                | 120                |       |
+| Throughput (rows/s)                    | <n> (commits)      | <n> (commits)      | ±x%   |
+|   ↳ customers (committed rows/s)       | <n>                | <n>                | ±x%   |
+|   ↳ products / orders / order_items    | …                  | …                  |       |
+| Source rate meter (rows/s)             | <n>                | <n>                |       |
+| Restarts in window                     | 0                  | 0                  |       |
+| Records Processed (counter)            | <n>                | <n>                |       |
+| Committed bytes/s (Parquet)            | <n> MB             | <n> MB             |       |
+| Committed Bytes (Parquet)              | <n> MB             | <n> MB             |       |
+| Checkpoints                            | 2                  | 2                  |       |
+| Failed Checkpoints (Δ)                 | 0                  | 0                  |       |
+| Avg Checkpoint (ms)                    | <n>                | <n>                |       |
+| New Table Snapshots                    | <n>                | <n>                |       |
+| New Data Files                         | <n>                | <n>                |       |
+| New Delete Files                       | 0                  | <n>                |       |
+|   ↳ Position Deletes (Δ)               | 0                  | <n>                |       |
+|   ↳ Equality Deletes (Δ)               | 0                  | <n>                |       |
+|   ↳ Deletion Vectors (added / removed) | n/a                | +<n> / -<n>        |       |
+| New Records in Tables                  | <n>                | <n>                |       |
+| New Bytes in Tables                    | <n> MB             | <n> MB             |       |
+| Errors                                 | None               | None               |       |   (only when an error occurred)
+```
+
+---
+
+## Key configuration (ConfigMap `flink-cdc-monitor-config`)
+
+| Env var | Value | Description |
+|---|---|---|
+| `PAIMON_FLINK_URL` | `http://flink-cdc-paimon-rest:8081` | Paimon Flink REST endpoint |
+| `ICEBERG_FLINK_URL` | `http://flink-cdc-iceberg-rest:8081` | Iceberg Flink REST endpoint |
+| `AWS_REGION` | `${AWS_REGION}` | |
+| `PAIMON_GLUE_DB` | `flink_paimon_db${CDC_DB_SUFFIX}` | also the Paimon path `<warehouse>/<db>.db/` |
+| `ICEBERG_GLUE_DB` | `flink_iceberg_db${CDC_DB_SUFFIX}` | |
+| `PAIMON_WAREHOUSE` | `s3://${BUCKET_NAME}/paimon-warehouse` | required; the pod exits if unset |
+| `ICEBERG_WAREHOUSE` | `s3://${BUCKET_NAME}/iceberg-warehouse/` | required |
+| `CDC_TABLES` | `customers,products,orders,order_items` | |
+| `MONITOR_DURATION` | `120` | window per pipeline, s; must span at least one 60 s checkpoint |
+| `POLL_INTERVAL` | `20` | Flink REST poll interval inside the window, s |
+| `REPEAT_INTERVAL` | `60` | sleep between cycles, s |
+| `RUN_MODE` | `continuous` | `once` runs one cycle and exits |
+
+`REPORT_OUTPUT_DIR` (default `/tmp/reports`) is read by `entrypoint.py` but not set in
+the ConfigMap. To change any value, edit `monitoring/monitor-deployment.yaml` and
+re-run `bash ./monitoring/deploy-monitor.sh`.
+
+### Files
 
 ```
 monitoring/
-├── deploy-monitor.sh           ← Code ConfigMap + envsubst + kubectl apply (no image build)
-├── flink_cdc_monitor.py        ← FlinkCDCMonitor class
-│   ├── Flink REST API client   → job status, throughput, checkpoints
-│   ├── pyiceberg table reader  → Iceberg snapshot stats and commit history
-│   └── Paimon metadata reader  → snapshots + Avro manifests on S3 (fastavro)
-├── entrypoint.py               ← Main loop: build monitors → run → sleep → repeat
-├── monitor-deployment.yaml     ← Template: Deployment (python:3.11-slim) + ConfigMap
-├── monitor-deployment-deployed.yaml ← Rendered output of the template (gitignored)
-└── requirements.txt            ← boto3, pyiceberg[glue,s3fs] 0.12.0 (v3 metadata + DVs; was 0.9.1), pyarrow 21.0.0, requests, tabulate, fastavro, zstandard
+├── deploy-monitor.sh                ← Code ConfigMap + envsubst + apply + rollout restart
+├── flink_cdc_monitor.py             ← FlinkCDCMonitor: Flink REST, Iceberg and Paimon metadata readers
+├── entrypoint.py                    ← Loop: Paimon window → Iceberg window → comparison → sleep
+├── monitor-deployment.yaml          ← Template: ConfigMap + Deployment (python:3.11-slim)
+├── monitor-deployment-deployed.yaml ← Rendered output (git-ignored)
+├── capture-flink-metrics.sh         ← One bounded REST-only window, from the laptop
+└── requirements.txt                 ← boto3 1.40.0, pyiceberg[glue,s3fs] 0.12.0, pyarrow 21.0.0,
+                                       requests, tabulate, fastavro, zstandard (all pinned)
 ```
 
-### Key Configuration (ConfigMap)
-
-| Env Var | Default | Description |
-|---------|---------|-------------|
-| `PAIMON_FLINK_URL` | `http://flink-cdc-paimon-rest:8081` | Paimon Flink REST endpoint |
-| `ICEBERG_FLINK_URL` | `http://flink-cdc-iceberg-rest:8081` | Iceberg Flink REST endpoint |
-| `PAIMON_GLUE_DB` | `flink_paimon_db${CDC_DB_SUFFIX}` | Paimon Glue database name (`flink_paimon_db_v3` by default on this branch) |
-| `ICEBERG_GLUE_DB` | `flink_iceberg_db${CDC_DB_SUFFIX}` | Iceberg Glue database name (`flink_iceberg_db_v3` by default on this branch) |
-| `PAIMON_WAREHOUSE` | `s3://<BUCKET>/paimon-warehouse/` | Paimon S3 warehouse path |
-| `ICEBERG_WAREHOUSE` | `s3://<BUCKET>/iceberg-warehouse/` | Iceberg S3 warehouse path |
-| `CDC_TABLES` | `customers,products,orders,order_items` | Tables to monitor |
-| `MONITOR_INTERVAL` | `60` | Seconds between monitoring cycles |
-| `REPORT_DIR` | `/tmp/reports` | JSON report output directory |
+`pyiceberg` is 0.12.0 rather than 0.9.1 for v3 tables. The monitor reads only metadata
+and snapshot summaries, which both versions load.
 
 ---
 
-## IRSA Setup (Required)
+## IRSA
 
-The monitor pod needs S3 + Glue read access. It uses the `default` service account annotated with the EMR execution role.
-
-### 1. Get OIDC Issuer
-
-```bash
-export EKS_CLUSTER_NAME=loadtest-mcp   # the cluster this pipeline runs on
-OIDC_ID=$(aws eks describe-cluster --name $EKS_CLUSTER_NAME --region $AWS_REGION \
-  --query "cluster.identity.oidc.issuer" --output text | cut -d'/' -f5)
-```
-
-### 2. Update IAM Trust Policy
-The mornitoring pod will use default ServiceAccount in the namesapce emr-flink:
+The monitor needs read access to Glue and to both warehouse prefixes. The role in the
+ServiceAccount's annotation must trust that ServiceAccount. Check what is there first:
 
 ```bash
-aws iam update-assume-role-policy \
-  --role-name emr-on-eks-test-execution-role \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/oidc.eks.${AWS_REGION}.amazonaws.com/id/'$OIDC_ID'"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringLike": {
-          "oidc.eks.${AWS_REGION}.amazonaws.com/id/'$OIDC_ID':sub": "system:serviceaccount:${NAMESPACE}:default"
-        }
-      }
-    }]
-  }'
+SA=${MONITOR_SERVICE_ACCOUNT:-starrocks-sa}
+kubectl get sa $SA -n emr-flink -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'; echo
+aws iam get-role --role-name emr-on-eks-test-execution-role \
+  --query 'Role.AssumeRolePolicyDocument.Statement[].Condition' --output json
 ```
 
-### 3. Annotate Service Account
-
-```bash
-kubectl annotate serviceaccount default -n emr-flink \
-  eks.amazonaws.com/role-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role \
-  --overwrite
-```
-
-### 4. Restart Monitor
+If the trust policy does not list `system:serviceaccount:emr-flink:<SA>`, **add** a
+statement for it. Do not replace the policy with
+`aws iam update-assume-role-policy` and a single-statement document: that would drop
+the trust the Flink jobs, the query engines and EMR on EKS already rely on. Then
+restart the monitor:
 
 ```bash
 kubectl rollout restart deployment/flink-cdc-monitor -n emr-flink
@@ -263,54 +349,22 @@ kubectl rollout restart deployment/flink-cdc-monitor -n emr-flink
 
 ---
 
-## Sample Output
+## Monitoring Flink directly (without the monitor pod)
 
-```
-════════════════════════════════════════════════════════════
- Flink CDC Monitor — Paimon vs Iceberg Comparison
-════════════════════════════════════════════════════════════
-
-Job: flink-cdc-paimon [3812d4307feb3a01f59c4b5fe5346a56] parallelism=32
-Job: flink-cdc-iceberg [a1b2c3d4e5f67890abcdef1234567890] parallelism=32
-
-┌──────────────┬─────────┬──────────┬───────────┬──────────┐
-│ Table        │ Format  │ Records  │ Files     │ Size     │
-├──────────────┼─────────┼──────────┼───────────┼──────────┤
-│ customers    │ paimon  │ 12,345   │ 8         │ 2.4 MB   │
-│ customers    │ iceberg │ 12,340   │ 12        │ 3.1 MB   │
-│ products     │ paimon  │ 8,234    │ 6         │ 1.8 MB   │
-│ products     │ iceberg │ 8,230    │ 10        │ 2.5 MB   │
-│ orders       │ paimon  │ 45,678   │ 24        │ 12.3 MB  │
-│ orders       │ iceberg │ 45,670   │ 32        │ 15.1 MB  │
-│ order_items  │ paimon  │ 123,456  │ 48        │ 28.7 MB  │
-│ order_items  │ iceberg │ 123,450  │ 64        │ 34.2 MB  │
-└──────────────┴─────────┴──────────┴───────────┴──────────┘
-
-Report saved to /tmp/reports/comparison_20260308_081200.json
-```
-
----
-
-## Monitoring Flink Directly (Without Monitor Pod)
+`monitoring/capture-flink-metrics.sh` takes two REST samples `WINDOW` seconds apart
+(default 120) through `kubectl exec` into each JobManager, and writes
+`bench-results/flink-metrics-<UTC>.csv`. It reports checkpoint failures as the delta
+over the window and the lifetime counter separately. Quote the delta.
 
 ```bash
-# Check FlinkDeployment status
+./monitoring/capture-flink-metrics.sh
+WINDOW=300 ./monitoring/capture-flink-metrics.sh
+
 kubectl get flinkdeployment -n emr-flink
-
-# View Flink job logs
-kubectl logs -f -l app=flink-cdc-paimon -n emr-flink -c flink-main-container
-kubectl logs -f -l app=flink-cdc-iceberg -n emr-flink -c flink-main-container
-
-# Access Flink Web UI
-kubectl port-forward svc/flink-cdc-paimon-rest 8081:8081 -n emr-flink
-# Open: http://localhost:8081
-
-# Check S3 data freshness
-aws s3 ls s3://${BUCKET_NAME}/paimon-warehouse/ --recursive | tail -10
-aws s3 ls s3://${BUCKET_NAME}/iceberg-warehouse/ --recursive | tail -10
+kubectl logs -f -l app=flink-cdc-iceberg,component=jobmanager -n emr-flink -c flink-main-container
+kubectl port-forward svc/flink-cdc-paimon-rest 8081:8081 -n emr-flink    # http://localhost:8081
 ```
 
 ---
 
-**Status**: ✅ Production Ready
-**Last Updated**: 2026-09-27
+**Last Updated**: 2026-11-02
