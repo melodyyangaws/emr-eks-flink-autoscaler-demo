@@ -195,7 +195,7 @@ qb_table_expr() {   # <duckdb|trino> <iceberg|paimon> <table>
         trino)
             v="QB_PIN_SNAP_${A}_${T}"
             [[ "${!v:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${v}: Trino reads only the pinned snapshot (run pin.sh first)"; return 1; }
-            echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF ${!v}" ;;
+            echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'" ;;
         *) return 1 ;;
     esac
 }
