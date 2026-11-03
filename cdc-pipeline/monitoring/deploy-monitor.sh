@@ -25,6 +25,14 @@ if [[ -z "${CDC_DB_SUFFIX+set}" ]]; then
                     _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
 fi
 export CDC_DB_SUFFIX
+# Reports are copied to the query benchmark's results prefix
+# (lib/common.sh QB_RESULTS_PREFIX: cdc-session<CDC_SET_TAG><SESSION_SUFFIX>).
+export CDC_SET_TAG="${CDC_DB_SUFFIX//_/-}"
+if [[ -z "${SESSION_SUFFIX+set}" ]]; then
+  SESSION_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1; printf %s "${SESSION_SUFFIX:-}"' \
+                     _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || SESSION_SUFFIX=""
+fi
+export SESSION_SUFFIX
 [[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || { echo "CDC_DB_SUFFIX must be empty or like _v3, got '${CDC_DB_SUFFIX}'" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,6 +48,7 @@ echo "  Bucket:    ${BUCKET_NAME}"
 echo "  Namespace: ${NAMESPACE}"
 echo "  SA:        ${MONITOR_SERVICE_ACCOUNT}"
 echo "  Glue DBs:  flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}"
+echo "  Reports:   s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}${SESSION_SUFFIX}/monitor/"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── IRSA ─────────────────────────────────────────────────────────────────────
@@ -67,7 +76,7 @@ kubectl create configmap flink-cdc-monitor-code -n "${NAMESPACE}" \
 
 # ── Resolve variables in deployment manifest and apply ───────────────────────
 echo "Resolving variables in monitor-deployment.yaml..."
-envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${CDC_DB_SUFFIX}' \
+envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${CDC_DB_SUFFIX} ${CDC_SET_TAG} ${SESSION_SUFFIX}' \
   < "${DEPLOYMENT_TEMPLATE}" > "${DEPLOYED_MANIFEST}"
 if grep -nE '^[^#]*\$\{[A-Z][A-Z0-9_]*\}' "${DEPLOYED_MANIFEST}" >&2; then
   echo "unrendered placeholder(s) above in ${DEPLOYED_MANIFEST}" >&2; exit 1

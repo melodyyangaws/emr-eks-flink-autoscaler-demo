@@ -18,17 +18,21 @@
 #   ./querybench/qb-watch.sh teardown   steps 1-7 now, no watching (run.sh stop)
 #
 # Teardown steps:
-#   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it);
-#   2. suspends the CDC writers (SUSPEND_WRITERS=0 leaves them; they resume
-#      from their last checkpoint: upgradeMode last-state);
+#   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it) and waits
+#      WRITER_DRAIN_S (180) for the writers to read the binlog tail;
+#   2. waits until each writer completed a checkpoint >= 60 s after the generator
+#      stopped (qb_wait_writers_committed), then suspends the CDC writers
+#      (SUSPEND_WRITERS=0 leaves them; they resume from their last checkpoint:
+#      upgradeMode last-state), so their tables match MySQL;
 #   3. scales the CDC job monitor (flink-cdc-monitor) to 0 once the writers stopped;
 #   4. takes duckdb-warm-cdc down (STOP_DUCKDB=0 leaves it);
 #   5. scales Trino's coordinator and workers to 0 (STOP_TRINO=0 leaves them):
 #      this pod has no helm, so not deploy-trino.sh down; the release stays,
 #      the cache volumes go with their pods, and run.sh start scales them back
 #      and runs deploy-trino.sh up;
-#   6. suspends the hourly Iceberg compaction CronJob and cancels a run in
-#      progress (STOP_COMPACTION_CRON=0 leaves it; a hot run.sh start resumes it);
+#   6. suspends the Iceberg compaction FlinkDeployment iceberg-maintain
+#      (iceberg-compaction/run-maintain.sh; STOP_COMPACTION_CRON=0 leaves it;
+#      a hot run.sh start resumes it);
 #   7. deletes the runner's ConfigMap and Secret.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +43,6 @@ WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-600}"
 WATCH_RUNNER=cdc-qb-runner
 DUCK="$DUCKDB_NAME"
 MONITOR="${CDC_MONITOR:-flink-cdc-monitor}"
-COMPACT_CRON="${CRON_NAME:-iceberg-compact-hourly}"
 
 test_over() {
     local phase
@@ -62,7 +65,13 @@ trino_down() {
 }
 
 teardown() {
-( WRITER_DRAIN_S=0 qb_stop_generator ) || qb_log "WARNING: could not stop the generator"
+# The generator first, then the default drain (WRITER_DRAIN_S, 180 s), then a check that
+# each writer committed a checkpoint after the generator stopped, and only then the
+# writers: a later snapshot test or MySQL-gated compaction starts from tables that match
+# MySQL. (With WRITER_DRAIN_S=0 here, both formats stayed ~55 s behind on 2026-11-02.)
+gen_stopped_at=$(date +%s)
+( qb_stop_generator ) || qb_log "WARNING: could not stop the generator"
+( qb_wait_writers_committed "$gen_stopped_at" ) || qb_log "WARNING: suspending the writers without a commit after the generator stopped"
 if ( qb_stop_writers ); then
     if [[ "${SUSPEND_WRITERS:-1}" == 0 ]]; then
         qb_log "SUSPEND_WRITERS=0: job monitor left running"
@@ -92,16 +101,11 @@ else
     qb_log "WARNING: could not scale Trino to 0 (engine-deploy/deploy-trino.sh down by hand)"
 fi
 if [[ "${STOP_COMPACTION_CRON:-1}" == 0 ]]; then
-    qb_log "STOP_COMPACTION_CRON=0: cronjob/${COMPACT_CRON} left as is"
-elif ! kubectl get cronjob "$COMPACT_CRON" -n "$NAMESPACE" >/dev/null 2>&1; then
-    qb_log "no cronjob/${COMPACT_CRON}"
-elif kubectl patch cronjob "$COMPACT_CRON" -n "$NAMESPACE" --type merge -p '{"spec":{"suspend":true}}' >/dev/null; then
-    for j in $(kubectl get jobs -n "$NAMESPACE" -l "app=${COMPACT_CRON}" -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name}{" "}{end}' 2>/dev/null); do
-        kubectl delete job "$j" -n "$NAMESPACE" --wait=false >/dev/null && qb_log "cancelled running job/${j}"
-    done
-    qb_log "cronjob/${COMPACT_CRON} suspended (a hot run.sh start resumes it)"
-else
-    qb_log "WARNING: could not suspend cronjob/${COMPACT_CRON}"
+    qb_log "STOP_COMPACTION_CRON=0: flinkdeployment/iceberg-maintain left as is"
+elif kubectl get flinkdeployment iceberg-maintain -n "$NAMESPACE" >/dev/null 2>&1; then
+    kubectl patch flinkdeployment iceberg-maintain -n "$NAMESPACE" --type merge -p '{"spec":{"job":{"state":"suspended"}}}' >/dev/null \
+        && qb_log "flinkdeployment/iceberg-maintain suspended (a hot run.sh start resumes it)" \
+        || qb_log "WARNING: could not suspend flinkdeployment/iceberg-maintain"
 fi
 kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \

@@ -41,8 +41,6 @@ rules:
 - {apiGroups: [""], resources: [configmaps, secrets], verbs: [delete]}
 - {apiGroups: [flink.apache.org], resources: [flinkdeployments], verbs: [get, list, patch]}
 - {apiGroups: [batch], resources: [jobs], verbs: [get, list, delete]}
-# qb-watch.sh teardown suspends the hourly Iceberg compaction CronJob
-- {apiGroups: [batch], resources: [cronjobs], verbs: [get, patch]}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -7,12 +7,11 @@
 #   ./querybench/duckdb-warm.sh render <suite> [arm]   print the rendered SQL (no cluster; dry run)
 #
 # Arms (FORMATS=iceberg|paimon|both, default both): iceberg (the Iceberg
-# tables) and paimon (Paimon's Iceberg export). Every table is an
-# iceberg_scan() of its pinned, copied metadata.json (QB_PIN_META_<FMT>_*,
-# pin.sh), the same pin Trino reads by snapshot id. The client renders the
-# whole statement, the server only runs it; it runs the paimon arm's queries
-# with iceberg_unsafe_skip_puffin_verification = true on v3
-# (SKIP_PUFFIN_VERIFICATION_ARMS, duckdb_cdc_server.py). An arm that cannot
+# tables) and paimon (native Paimon). Every table is read at
+# its pinned version: iceberg_scan() of the copied metadata.json for `iceberg`,
+# paimon_scan(<table path>, snapshot_from_id=N) (the native Paimon extension) for
+# `paimon` (QB_PIN_* from pin.sh), the same pins Trino reads by snapshot id. The
+# client renders the whole statement, the server only runs it. An arm that cannot
 # read its tables records ERROR per query; the other arm still runs.
 #
 # Same RUNS/WARMUP, pass-major order, median, timeouts and ZERO_SCAN guard
@@ -172,14 +171,18 @@ run_arm() {   # suite arm rendered-dir rows-file
                 cold=1
             fi
             python3 - "$j" "$name" "$pass" "$WARMUP" "$q" "$n" 2>>"$LOG" <<'EOF'
-import json, sys
+import json, os, sys
 j, name, p, w, q, n = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
 t = (j.get("times") or [None])[0]
-tag = "warm-up" if p < w else "run %d" % (p - w + 1)
+cold = os.environ.get("COLD_PASS") == "1" and p == 0
+tag = "cold" if cold else "warm-up" if p < w else "run %d" % (p - w + 1)
 print("  %-30s %-8s %9s ms  %s  first_row=%s%s" % (name, tag, t if t is not None else "-", j["status"],
       j.get("first_row", "")[:80], ("  error=" + j["error"]) if j.get("error") else ""), file=sys.stderr)
-if j["status"] == "OK" and p >= w:
+if j["status"] == "OK" and cold:
+    open("%s/%s.cold" % (q, n), "w").write("%d\n" % t)
+elif j["status"] == "OK" and p >= w:
     open("%s/%s.times" % (q, n), "a").write("%d\n" % t)
+if j["status"] == "OK" and (cold or p >= w):
     open("%s/%s.last" % (q, n), "w").write(json.dumps(j))
 EOF
             if [[ "$st" != OK ]]; then
@@ -201,13 +204,14 @@ EOF
     n=0
     for f in $files; do
         n=$((n + 1)); name=$(qb_query_name "$f")
-        local med="" st="OK" rr=0 sb="" srr=""
+        local med="" st="OK" rr=0 sb="" srr="" cms=""
         [[ -f "${q}/${n}.times" ]] && med=$(qb_median < "${q}/${n}.times")
+        [[ -f "${q}/${n}.cold" ]] && cms=$(<"${q}/${n}.cold")
         [[ -f "${q}/${n}.bad" ]] && st=$(<"${q}/${n}.bad")
         [[ -z "$med" && "$st" == OK ]] && st=ERROR
         [[ -f "${q}/${n}.last" ]] && rr=$(jget result_rows < "${q}/${n}.last")
         [[ -s "${q}/${n}.scan" ]] && read -r sb srr < "${q}/${n}.scan"
-        echo "${STAMP},duckdb_warm,${arm},${s},${name},${st},${med},${rr},${srr},${sb}" >> "$rows"
+        echo "${STAMP},duckdb_warm,${arm},${s},${name},${st},${med},${rr},${srr},${sb},${cms}" >> "$rows"
         if [[ -f "${q}/${n}.last" ]]; then
             echo "${arm},${s},${name},$(jget first_row < "${q}/${n}.last")" >> "${CSV%.csv}-firstrows.csv"
             python3 - "${q}/${n}.last" "$arm" "$s" "$name" >> "$ROWS_TSV" <<'EOF'

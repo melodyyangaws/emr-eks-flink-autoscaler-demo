@@ -4,27 +4,30 @@ MySQL RDS → Flink CDC (EMR on EKS) → **Apache Paimon** and **Apache Iceberg*
 (AWS Glue catalog), written side by side from the same binlog, then read by
 **DuckDB** and **Trino** in a hot and a snapshot query benchmark.
 
-This file is the end-to-end runbook (state as of **2026-11-02**). The detailed
-guides it links to:
+This file is the end-to-end runbook (state as of **2026-11-04**; last full run
+`_v3r3`, summary `bench-results/QUERYBENCH-SUMMARY-20261103-v3r3.md`). The
+detailed guides it links to:
 [0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md) ·
 [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md) ·
 [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md) ·
 [3-MONITOR.md](3-MONITOR.md) ·
 [engine-deploy/README.md](engine-deploy/README.md) ·
+[engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md) ·
+[iceberg-compaction/README.md](iceberg-compaction/README.md) ·
 [querybench/README.md](querybench/README.md) ·
 [PAIMON-VS-ICEBERG.md](PAIMON-VS-ICEBERG.md)
 
 ## Quick start: what to ask your AI assistant
 
-Clone the repo, `cd cdc-pipeline`, start the assistant, and ask in plain language, for example:
+Clone the repo, `cd cdc-pipeline`, start the AI assistant, and ask in plain language, for example:
 
 - "Follow the README runbook on my existing EKS cluster `demo`, using the table set in `.bench-env`"
-- "Start a new table set `_v3r2` and deploy both writers in one apply"
+- "Start a new table set `_v3r4` and deploy both writers in one apply, with Iceberg compaction"
 - "Start the upsert generator and report the achieved rate"
 - "Run the hot test, then the snapshot test, and write the summary"
-- "Tear the run down and clean up the old table set `_v3`"
+- "Tear the run down and clean up the old table set `_v3r3` (after moving to `_v3r4`)"
 
-## Stack (2026-11-02)
+## Stack
 
 | Component | Version / setting |
 |---|---|
@@ -37,15 +40,16 @@ Clone the repo, `cd cdc-pipeline`, start the assistant, and ask in plain languag
 | Flink image | `<account>.dkr.ecr.<region>.amazonaws.com/emr-flink-cdc-paimon:7.14.0`: multi-arch (amd64 + arm64), `imagePullPolicy: Always` |
 | Table format | Iceberg format **v3** by default (`ICEBERG_FORMAT_VERSION=3`). Paimon exports Iceberg v3 metadata with the same version |
 | Query engines | DuckDB **2.0.0**, a source-built image `duckdb-cdc-server:2.0.0` (multi-arch); Trino **484** (chart 1.45.0). StarRocks was removed on 2026-11-02 |
-| Iceberg compaction | EMR 7.14.0 Spark image (Spark 3.5, Iceberg 1.10.1-amzn-1), run as a bare Kubernetes Job |
-| Source | RDS MySQL 8.0 `ecommerce` DB. It was shrunk to its newest ~10% (**37.5M rows**) on 2026-11-02 |
+| Engine size | Tripled on 2026-11-02, both about **81 cpu / 342 GiB**: DuckDB one pod of 81 cpu / 342 GiB on an m5.24xlarge; Trino 9 workers × 9 cpu / 38 GiB (one per m5.4xlarge) + a 4 cpu coordinator. Total cache stays about 450 GiB (DuckDB 450 GiB disk; Trino 9 × 56 Gi × 90%). Before: DuckDB 27 cpu / 114 GiB, Trino 3 workers |
+| Iceberg compaction | One continuous FlinkDeployment `iceberg-maintain` ([iceberg-compaction/](iceberg-compaction/README.md): `maintain.py`, Iceberg 1.12's `TableMaintenance`): rewrite + snapshot expiry every 10 writer commits, started with the writers. The Spark job (2026-11-02) and the Java hourly/merge app (2026-11-03) were removed |
+| Source | RDS MySQL **8.0.45** on **db.r6i.4xlarge** (was db.m5.2xlarge), 500 GB gp3, 64,000 IOPS, buffer pool 92 GiB. `ecommerce` DB shrunk to its newest ~10% on 2026-11-02: **491.0M → 49.36M rows** |
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│ MySQL RDS 8.0 (ecommerce: customers, products, orders, order_items)  │
-│ binlog ROW, CDC user with REPLICATION SLAVE / CLIENT                 │
+│ MySQL RDS 8.0.45, db.r6i.4xlarge (ecommerce: customers, products,    │
+│ orders, order_items), binlog ROW, CDC user REPLICATION SLAVE/CLIENT  │
 │   ▲ upsert load generator (StatefulSet mysql-upsert-loadgen, 4 pods) │
 └──────────────┬─────────────────────────────────────┬─────────────────┘
                │ full snapshot, then binlog          │ (server-ids 64xx)
@@ -60,17 +64,19 @@ Clone the repo, `cd cdc-pipeline`, start the assistant, and ask in plain languag
                │                                     │
    paimon-warehouse/ (S3)                iceberg-warehouse/ (S3)
    Glue DB flink_paimon_db<suffix>       Glue DB flink_iceberg_db<suffix>
-   + Iceberg export under                + external compaction Job
-     paimon-warehouse/iceberg/             (rewrite + expire_snapshots)
+   + Iceberg export under                + FlinkDeployment iceberg-maintain
+     paimon-warehouse/iceberg/             (rewrite + expiry every 10 commits)
                │                                     │
                └───────────────┬─────────────────────┘
                                ▼
         ┌──────────────────────────────────────────────┐
         │ Query benchmark (querybench/): four arms     │
-        │ DuckDB 2.0.0 warm server │ Trino 484 (3 wkr) │
-        │ × Iceberg native         │ × Paimon export   │
+        │ DuckDB 2.0.0 warm     │ Trino 484            │
+        │ 81 cpu / 342 GiB      │ 9 wkr x 9 cpu/38 GiB │
+        │ × Iceberg native      │ × Paimon native      │
         └──────────────────────────────────────────────┘
-   monitor: flink-cdc-monitor (Flink REST + table stats, both formats)
+   monitor: flink-cdc-monitor (Flink REST + table stats, both formats in
+            parallel; reports to s3://<bucket>/querybench-results/.../monitor/)
 ```
 
 ## Files
@@ -79,23 +85,23 @@ Clone the repo, `cd cdc-pipeline`, start the assistant, and ask in plain languag
 cdc-pipeline/
 ├── .bench-env                  session settings: table set, warehouses, engine versions (git)
 ├── .bench-env.local            account values (git-ignored, you create it)
-├── mysql-cdc-env.sh            MYSQL_* values (git-ignored, from 0-MYSQL-SETUP-GUIDE.md)
 ├── lib/common.sh               loads .bench-env, keeps command-line overrides, derives table-set names
 ├── lib/querybench.sh           shared query-benchmark functions (arms, pins, gates, stop/suspend)
-├── build-deploy-generic.sh     build | render | deploy | all | cleanup | monitor
-├── docker/Dockerfile.cdc-paimon   Flink image (CDC + Paimon + Iceberg jars)
-├── flink-cdc-executor.py       PyFlink executor: runs the SQL files in order
-├── flink-cdc-{paimon,iceberg}-sql.yaml   FlinkDeployment templates (${VAR})
-├── sql-scripts/
-│   ├── common/02-cdc-sources.sql          MySQL CDC source tables
-│   ├── paimon/01-catalog-setup.sql, 03-paimon-sinks.sql, 04-cdc-pipelines.sql
-│   └── iceberg/01-catalog-setup.sql, 03-iceberg-sinks.sql, 04-cdc-pipelines.sql
-├── k8s/                        ebs-sc StorageClass, Kyverno single-AZ policy
-├── mysql-data-generator/       deploy-data-generator.sh, mysql-upsert-loadgen.yaml, find-rds-ceiling.sh
+├── ingest-deploy/               the Flink CDC writers (run its script from cdc-pipeline/ or anywhere)
+│   ├── build-deploy-generic.sh build | render | deploy | all | cleanup | monitor
+│   ├── flink-cdc-executor.py   PyFlink executor: runs the SQL files in order (the jobs' jarURI)
+│   ├── flink-cdc-{paimon,iceberg}-sql.yaml   FlinkDeployment templates (${VAR}; renders next to them)
+│   ├── docker/Dockerfile.cdc-paimon          Flink image (CDC + Paimon + Iceberg jars)
+│   ├── sql-scripts/
+│   │   ├── common/02-cdc-sources.sql         MySQL CDC source tables
+│   │   ├── paimon/01-catalog-setup.sql, 03-paimon-sinks.sql, 04-cdc-pipelines.sql
+│   │   └── iceberg/01-catalog-setup.sql, 03-iceberg-sinks.sql, 04-cdc-pipelines.sql
+│   └── k8s/                    ebs-sc StorageClass, Kyverno single-AZ policy
+├── mysql-data-generator/       deploy-data-generator.sh, mysql-upsert-loadgen.yaml
 ├── monitoring/                 deploy-monitor.sh, monitor code, capture-flink-metrics.sh
-├── engine-deploy/              deploy-duckdb-cdc.sh, deploy-trino.sh, duckdb-image/ (README.md there)
-├── iceberg-compaction/         run-compaction.sh, compact-job.yaml, compact-order-items.py
-├── querybench/                 run.sh (start|render|status|logs|summary|stop), suites, README.md
+├── engine-deploy/              deploy-duckdb-cdc.sh, deploy-trino.sh, duckdb-image/, trino-image/ (README.md there)
+├── iceberg-compaction/         Iceberg compaction: maintain.py / maintain.yaml / run-maintain.sh (FlinkDeployment iceberg-maintain)
+├── querybench/                 run.sh (start|render|status|logs|summary|stop), suites, ingest_stats.py, README.md
 └── bench-results/              local output (git-ignored)
 ```
 
@@ -106,52 +112,84 @@ git-ignored, and every run overwrites them. Edit the templates instead.
 
 # Runbook
 
-Run every command from `cdc-pipeline/`. Each step lists what it does, how to
-check it worked, how long it takes, and the main failure with its fix. Times
-are marked **(measured)** when they were observed in the 2026-11-02 dry run.
-They are marked **(estimate)** otherwise.
+Run every command from `cdc-pipeline/`. Each step says what it does, how to
+check it, how long it takes and the usual failure. **(measured)** times are
+from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
+
+**The whole run at a glance**
+
+| # | Step | Command (short) | Time |
+|---|---|---|---|
+| 0 | Prerequisites (once per cluster) | ServiceAccounts, Secret `mysql-credentials` | minutes |
+| 1 | Settings | `.bench-env`, `.bench-env.local` | 1 min |
+| 2 | EMR Flink operator 7.14.0 (once) | `helm install ...` | ~5 min |
+| 3 | Images (after a Dockerfile/SQL/executor change) | `./ingest-deploy/build-deploy-generic.sh build` | 20–40 min |
+| 4 | A fresh table set | new `CDC_DB_SUFFIX`, clear leftovers | ~1 min |
+| 5 | Writers + Iceberg compaction | `render`, one `kubectl apply`, `run-maintain.sh up` | ~8 min to RUNNING |
+| 6 | Load generator | `deploy-data-generator.sh deploy` | 1–2 min |
+| 7 | Monitor | `monitoring/deploy-monitor.sh` (or let Step 9 do it) | 1–2 min |
+| 8 | Query engines (optional, Step 9 does it) | `deploy-duckdb-cdc.sh up`, `deploy-trino.sh up` | 5–20 min |
+| 9 | Hot test | `SUITE=hot ./querybench/run.sh start` | ~35 min after the 15 min writer wait |
+| 10 | Snapshot test | `SUITE=snapshot ./querybench/run.sh start` | ~50 min |
+| 11 | Summary | `./querybench/run.sh summary` | a few min |
+| 12 | Teardown | `SUITE=hot ./querybench/run.sh stop` | 2–5 min |
+| 13 | Clean up the old table set | Glue + S3 removal | minutes–1 h |
 
 ## Step 0: Prerequisites
 
 | Item | Requirement |
 |---|---|
-| EKS cluster | `kubectl` points at it. It needs Karpenter NodePools `driver-nodepool` (on-demand: JobManagers, generator, DuckDB, Trino, runner) and `executor-memorynodepool` (TaskManagers). The TaskManager pool provisions both x86 and Graviton nodes, so every image must be multi-arch |
-| Namespace | `emr-flink`, set up for EMR on EKS. The execution role `emr-on-eks-test-execution-role` (`EMR_EXECUTION_ROLE_ARN`) must trust `system:serviceaccount:emr-flink:*` through the cluster's OIDC provider. It also needs Glue and S3 read/write on the bucket |
+| EKS cluster | `kubectl` points at it. Karpenter NodePools `driver-nodepool` (on-demand: JobManagers, generator, DuckDB, Trino, runner) and `executor-memorynodepool` (TaskManagers, compaction). The TaskManager pool mixes x86 and Graviton, so every image must be multi-arch |
+| `driver-nodepool` sizes | Must allow `12xlarge`, `16xlarge` and `24xlarge` (the 81-cpu DuckDB pod needs an m5.24xlarge), and `limits.cpu` must cover DuckDB + Trino (512). A cluster-side patch, **not in the repo**; check below |
+| Namespace | `emr-flink`, set up for EMR on EKS. The execution role (`EMR_EXECUTION_ROLE_ARN`) must trust `system:serviceaccount:emr-flink:*` through the cluster's OIDC provider, with Glue and S3 read/write on the bucket |
 | cert-manager | Needed by the operator chart ([1-BUILD guide, step 0](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)) |
-| IRSA ServiceAccount `starrocks-sa` | **The name is historical.** StarRocks is gone, but this is still the IRSA account shared by the monitor, the DuckDB server, Trino and the Iceberg compaction Jobs. It is annotated with the EMR execution role |
-| IRSA ServiceAccount `image-builder-sa` | Used by the Kaniko build pods (Flink image and DuckDB image). Its role must be able to push to ECR and read `s3://$BUCKET_NAME/flink/build/` |
-| ECR | The repositories `emr-flink-cdc-paimon` and `duckdb-cdc-server` are created by the build scripts. Do **not** add a lifecycle rule that expires untagged images: the per-arch children of the multi-arch tag are untagged |
-| S3 | `BUCKET_NAME` holds the warehouses, Flink state, logs, query pins and results. The bucket is versioned (see Step 13) |
-| RDS MySQL 8.0 | Set up as in [0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md): in the EKS VPC, binlog `ROW`, `cdcuser` with `REPLICATION SLAVE` / `REPLICATION CLIENT`, the `ecommerce` schema. The guide also writes `mysql-cdc-env.sh` |
-| Secrets | `flink-cdc-mysql-env` (key `MYSQL_PASSWORD`; the Flink jobs read it through `envFrom`) and `mysql-credentials` (`hostname` / `username` / `password`; the generator reads it). `deploy-data-generator.sh` creates `mysql-credentials` from `MYSQL_*` if it is missing |
-| Laptop | `kubectl`, `helm`, AWS CLI, `envsubst` (`brew install gettext`), `python3` with PyYAML (used by `run-compaction.sh`). You also need this repo's `throughput-benchmark/` directory: the engine scripts apply its `gp3-fast` StorageClass |
+| IRSA ServiceAccount `starrocks-sa` | **Historical name**, still the IRSA account of the monitor, DuckDB, Trino, the Iceberg compaction and the query Jobs; annotated with the EMR execution role |
+| IRSA ServiceAccount `image-builder-sa` | The Kaniko build pods (Flink and DuckDB images): push to ECR, read `s3://$BUCKET_NAME/flink/build/` |
+| ECR | `emr-flink-cdc-paimon` and `duckdb-cdc-server` are created by the build scripts. No lifecycle rule that expires untagged images: the per-arch children of a multi-arch tag are untagged |
+| S3 | `BUCKET_NAME`: warehouses, Flink state and logs, query pins, results, monitor reports. Versioned (Step 13) |
+| RDS MySQL 8.0 | As in [0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md): in the EKS VPC, binlog `ROW`, `cdcuser` with `REPLICATION SLAVE` / `REPLICATION CLIENT`, schema `ecommerce`. Now **db.r6i.4xlarge**, 8.0.45, 500 GB gp3 at 64,000 IOPS, buffer pool 92 GiB |
+| Secret | **One**, `mysql-credentials` (keys `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`), shared by the Flink jobs (`envFrom`, hence env-var key names) and the generator (`secretKeyRef`). You create it below. **No file in the repo or on the laptop holds the password** |
+| Laptop | `kubectl`, `helm`, AWS CLI, `python3`, `uv` (Step 11's ingest stats), and this repo's `throughput-benchmark/` directory (the engine scripts apply its `gp3-fast` StorageClass) |
 
 ```bash
-# ServiceAccounts (skip any that already exist)
+# ServiceAccounts (skip any that exist)
 kubectl create serviceaccount starrocks-sa -n emr-flink
-kubectl annotate serviceaccount starrocks-sa -n emr-flink \
-  eks.amazonaws.com/role-arn="$EMR_EXECUTION_ROLE_ARN"
+kubectl annotate serviceaccount starrocks-sa -n emr-flink eks.amazonaws.com/role-arn="$EMR_EXECUTION_ROLE_ARN"
 kubectl create serviceaccount image-builder-sa -n emr-flink
 kubectl annotate serviceaccount image-builder-sa -n emr-flink \
   eks.amazonaws.com/role-arn=<role that can push to ECR and read the S3 build context>
 
-# Flink secret (the generator secret is created by Step 6 if missing)
-source mysql-cdc-env.sh
-kubectl create secret generic flink-cdc-mysql-env -n emr-flink \
+# The one MySQL Secret (Flink jobs + generator), from a prompt: never a file or shell history
+source .bench-env                                   # MYSQL_HOST (.bench-env.local), MYSQL_USER
+read -rs -p 'cdcuser password: ' MYSQL_PASSWORD; echo
+kubectl create secret generic mysql-credentials -n emr-flink \
+  --from-literal=MYSQL_HOST="$MYSQL_HOST" --from-literal=MYSQL_USER="$MYSQL_USER" \
   --from-literal=MYSQL_PASSWORD="$MYSQL_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
+unset MYSQL_PASSWORD
+
+# Checks
+kubectl get sa starrocks-sa image-builder-sa -n emr-flink -o yaml | grep role-arn      # two lines
+kubectl get secret mysql-credentials -n emr-flink   # keys MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD
+kubectl get nodepool driver-nodepool \
+  -o jsonpath='{range .spec.template.spec.requirements[*]}{.key}={.values}{"\n"}{end}{.spec.limits}{"\n"}' \
+  | grep -E 'instance-size|cpu'                                                      # lists 24xlarge
+aws rds describe-db-instances --db-instance-identifier flink-cdc-mysql-8-0 \
+  --query 'DBInstances[0].[DBInstanceClass,EngineVersion,AllocatedStorage,Iops]' --output text
 ```
 
-- **Check:** run `kubectl get sa starrocks-sa image-builder-sa -n emr-flink -o yaml | grep role-arn` (two lines), then `kubectl get secret flink-cdc-mysql-env mysql-credentials -n emr-flink`. Finally, the MySQL connectivity test in the MySQL guide must pass.
-- **Time:** RDS creation is about 15–20 min (estimate). Everything else takes minutes.
-- **If it fails:** a JobManager stuck in `CreateContainerConfigError` means `flink-cdc-mysql-env` is missing (it only shows in `kubectl describe pod`). Pods that cannot assume their role need the role's trust policy to cover the SA's OIDC subject.
+To **rotate** the CDC password: `ALTER USER 'cdcuser'@'%'` from an in-cluster
+`mysql:8.0` pod that takes both passwords only through `secretKeyRef`, then
+update `mysql-credentials`' `MYSQL_PASSWORD`, then delete + create the writers
+and restart the generator. Never print the value; the Secrets are the only place it lives.
+
+- **If it fails:** a JobManager in `CreateContainerConfigError` = `mysql-credentials` missing (only `kubectl describe pod` says so). `Access denied for user 'cdcuser'` in the JobManager = the Secret does not hold cdcuser's current password. A pod that cannot assume its role = the trust policy does not cover the SA. DuckDB Pending = `driver-nodepool` lacks `24xlarge` or cpu.
 
 ## Step 1: Settings (`.bench-env`, `.bench-env.local`)
 
 | File | In git | Holds |
 |---|---|---|
-| `.bench-env` | yes | `NAMESPACE=emr-flink`, **`ICEBERG_FORMAT_VERSION=3`**, **`CDC_DB_SUFFIX=_v3r1`**, `SESSION_SUFFIX`, the warehouses, `FLINK_JOBS`, `TRINO_VERSION=484` / `TRINO_CHART_VERSION=1.45.0`, `DUCKDB_IMAGE`, `GENERATOR_RESOURCES`, `COMPACT_BEFORE_SNAPSHOT=true`, `COMPACT_TABLES` |
-| `.bench-env.local` | no | `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`. `.bench-env` sources it, and falls back to `../throughput-benchmark/.bench-env.local` |
-| `mysql-cdc-env.sh` | no | `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` |
+| `.bench-env` | yes | `NAMESPACE`, `ICEBERG_FORMAT_VERSION=3`, **`CDC_DB_SUFFIX`** (the table set), `SESSION_SUFFIX`, warehouses, `FLINK_JOBS`, Trino/DuckDB versions and sizes, `MYSQL_PORT` / `MYSQL_DATABASE` / `MYSQL_USER` / `MYSQL_ENV_SECRET_NAME`, `GENERATOR_RESOURCES`, the Paimon write and S3A upload settings, `HOT_WINDOW_SECONDS=30` |
+| `.bench-env.local` | no | `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`, **`MYSQL_HOST`** (the RDS endpoint). `.bench-env` sources it (fallback: `../throughput-benchmark/.bench-env.local`) |
 
 ```bash
 cat > .bench-env.local <<'EOF'
@@ -159,483 +197,402 @@ export AWS_REGION=<region>
 export AWS_ACCOUNT_ID=<account-id>
 export BUCKET_NAME=emr-on-eks-test-<account-id>-<region>
 export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::<account-id>:role/emr-on-eks-test-execution-role
+export MYSQL_HOST=<rds-endpoint>
 EOF
 ```
 
-Which scripts read what:
+Settings worth knowing (all in `.bench-env`):
 
-| Script | Reads |
-|---|---|
-| `querybench/run.sh`, `engine-deploy/*.sh`, `duckdb-image/build-duckdb-image.sh`, `iceberg-compaction/run-compaction.sh` | `.bench-env` and `.bench-env.local` through `lib/common.sh`. A value set on the command line wins, with a `[cdc-bench] X=... overrides` line |
-| `build-deploy-generic.sh` | The environment. When `CDC_DB_SUFFIX` is **unset**, it reads only that one value from `.bench-env`. `ICEBERG_FORMAT_VERSION` defaults to 3 and is *not* read from `.bench-env`. So `source .bench-env` first (export any override after that) |
-| `monitoring/deploy-monitor.sh` | The environment. When `CDC_DB_SUFFIX` is unset, it also reads it from `.bench-env` |
-| `mysql-data-generator/deploy-data-generator.sh` | The environment only (`MYSQL_*`, `NAMESPACE`) |
+| Setting | Value | Meaning |
+|---|---|---|
+| `CDC_DB_SUFFIX` | e.g. `_v3r4` | the table set: Glue DBs `flink_{paimon,iceberg}_db<suffix>`, Flink state paths, result prefixes (Step 4) |
+| `PAIMON_WRITE_ONLY` | `false` | Paimon `INSERT` hint; `true` turns off Paimon's inline compaction **and** snapshot expiry. Keep `false` for the comparison |
+| `PAIMON_WRITE_BUFFER_SPILLABLE` / `PAIMON_WRITE_BUFFER_SIZE` | `true` / unset (64mb dimension, 128mb fact = Iceberg's target file sizes) | Paimon `INSERT` hints |
+| `S3A_MULTIPART_SIZE` / `S3A_MULTIPART_THRESHOLD` / `S3A_ACTIVE_BLOCKS` | `16M` / `16M` / `6` | Paimon's S3A upload shape; Iceberg's S3FileIO gets the derived equivalent (16 MiB parts, 24 threads) |
+| `TRINO_WORKERS` / `DUCKDB_CPU` … | `9` / `81` … | engine size (about 81 cpu / 342 GiB each); the script defaults are smaller, these lines make the engines big |
 
-- **Check** (offline): `bash -c 'source lib/common.sh; echo $ICEBERG_FORMAT_VERSION $PAIMON_DB $ICEBERG_DB $QB_RESULTS_PREFIX'` prints `3 flink_paimon_db_v3r1 flink_iceberg_db_v3r1 querybench-results/cdc-session-v3r1`.
-- **Time:** about 1 min.
-- **If it fails:** `CDC_DB_SUFFIX must be empty or like _v3` means the suffix has to match `^(_[a-z0-9]+)?$`. Likewise `SESSION_SUFFIX` must be empty or look like `-r2`.
+Who reads what: `querybench/run.sh`, `engine-deploy/*.sh`, `iceberg-compaction/run-maintain.sh`
+and the DuckDB image build read `.bench-env` through `lib/common.sh` (a value on
+the command line wins, with an `overrides` line). `ingest-deploy/build-deploy-generic.sh`
+reads the **environment**, so `source .bench-env` first (it reads only
+`CDC_DB_SUFFIX` itself when that is unset). `mysql-data-generator/deploy-data-generator.sh`
+sources `.bench-env` for `MYSQL_HOST` / `MYSQL_USER`; `monitoring/deploy-monitor.sh`
+reads `CDC_DB_SUFFIX` from it.
+
+- **Check (offline):** `bash -c 'source lib/common.sh; echo $ICEBERG_FORMAT_VERSION $PAIMON_DB $ICEBERG_DB $QB_RESULTS_PREFIX'` prints e.g. `3 flink_paimon_db_v3r4 flink_iceberg_db_v3r4 querybench-results/cdc-session-v3r4`.
+- **If it fails:** `CDC_DB_SUFFIX must be empty or like _v3` = the suffix must match `^(_[a-z0-9]+)?$`.
 
 ## Step 2: EMR Flink operator 7.14.0
 
-A fresh install uses the commands in [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md step 0](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md).
-An upgrade from an older chart works differently. `helm upgrade` never updates CRDs, so the upgrade path is
-uninstall → delete the CRDs → install:
+A fresh install: [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md step 0](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md).
+An upgrade cannot use `helm upgrade` (it never updates CRDs): uninstall, delete the CRDs, install.
 
 ```bash
-helm list -n emr-flink                                   # what is installed now
-kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n emr-flink --ignore-not-found
+helm list -n emr-flink
+kubectl delete flinkdeployment --all -n emr-flink --ignore-not-found    # deleting the CRDs would anyway
 helm uninstall flink-kubernetes-operator -n emr-flink
-# Deleting these CRDs DELETES EVERY FlinkDeployment / FlinkSessionJob in the cluster.
 kubectl delete crd flinkdeployments.flink.apache.org flinksessionjobs.flink.apache.org
-#   If this hangs, a CR is stuck on its finalizer (its operator is gone). In another shell:
-#   kubectl get flinkdeployment -A
-#   kubectl patch flinkdeployment <name> -n <ns> --type=merge -p '{"metadata":{"finalizers":null}}'
+#   hangs = a CR stuck on its finalizer:
+#   kubectl patch flinkdeployment <name> -n emr-flink --type=merge -p '{"metadata":{"finalizers":null}}'
 helm install flink-kubernetes-operator oci://public.ecr.aws/emr-on-eks/flink-kubernetes-operator \
   --version 7.14.0 -n emr-flink --set emrContainers.awsRegion=${AWS_REGION:-us-west-2}
 kubectl wait deployment flink-kubernetes-operator -n emr-flink --for condition=Available=True --timeout=120s
 ```
 
-- **Check:** `helm list -n emr-flink` shows `flink-kubernetes-operator-7.14.0`, and `kubectl get crd flinkdeployments.flink.apache.org` exists.
+- **Check:** `helm list -n emr-flink` shows `flink-kubernetes-operator-7.14.0`.
 - **Time:** about 5 min (estimate).
-- **If it fails:** the CRD delete hangs on finalizers (clear them as above). After an upgrade, clear leftover HA ConfigMaps before re-applying the jobs (Step 4).
 
 ## Step 3: Images
 
-### 3a. Flink image + executor + SQL upload
+### 3a. Flink image, executor and SQL upload
 
 ```bash
-source .bench-env                # AWS_* and the table set
-./build-deploy-generic.sh build  # needs no MySQL values
+source .bench-env
+./ingest-deploy/build-deploy-generic.sh build
 ```
 
-This step:
+Packs `ingest-deploy/docker/Dockerfile.cdc-paimon`, builds it with Kaniko per
+architecture (`image-builder-sa`), joins one multi-arch tag
+`emr-flink-cdc-paimon:7.14.0`, and uploads `ingest-deploy/flink-cdc-executor.py`
+(the jobs' `jarURI`) and `ingest-deploy/sql-scripts/` to
+`s3://$BUCKET_NAME/flink/{scripts,sql-scripts}/`. There is no upload-only
+command: **re-run `build` after any SQL or executor change**, before Step 5.
 
-1. Packs `docker/Dockerfile.cdc-paimon` into `s3://$BUCKET_NAME/flink/build/`.
-2. Builds it with Kaniko, one pod per architecture (`flink-cdc-image-build-{amd64,arm64}`, built in sequence, `image-builder-sa`).
-3. Joins the two builds into **one** multi-arch tag, `emr-flink-cdc-paimon:7.14.0`, and verifies both children.
-4. Uploads `flink-cdc-executor.py` to `s3://$BUCKET_NAME/flink/scripts/` (the `jarURI`) and the SQL to `flink/sql-scripts/{paimon,iceberg}/`.
+- **Check:** the log ends `✓ Verified emr-flink-cdc-paimon:7.14.0 is one tag serving amd64/arm64`; `aws s3 ls s3://$BUCKET_NAME/flink/sql-scripts/ --recursive`.
+- **Time:** 20–40 min for both architectures (estimate).
+- **If it fails:** `ServiceAccount image-builder-sa not found` = Step 0. TaskManagers dying with `exitCode=255` / `NoResourceAvailableException` = a single-arch image.
 
-There is no upload-only command, so re-run `build` after any change to the
-SQL or the executor. `PLATFORMS="amd64"` builds one architecture. Don't use it
-for the TaskManager pool, which mixes architectures.
-
-- **Check:** the log ends with `✓ Verified emr-flink-cdc-paimon:7.14.0 is one tag serving amd64/arm64`. Then run `aws s3 ls s3://$BUCKET_NAME/flink/sql-scripts/ --recursive`.
-- **Time:** about 10–20 min per architecture, about 20–40 min total (estimate; each architecture has a 30 min timeout).
-- **If it fails:**
-  - `ServiceAccount image-builder-sa not found` means Step 0 is incomplete.
-  - A failed Kaniko pod prints its last 60 log lines.
-  - If TaskManagers die with `exitCode=255` while the JobManager survives (`NoResourceAvailableException`), the image is single-arch.
-
-### 3b. DuckDB image (only if `duckdb-cdc-server:2.0.0` is missing, or its Dockerfile changed)
+### 3b. DuckDB image (only if `duckdb-cdc-server:2.0.0` is missing or its Dockerfile changed)
 
 ```bash
-./engine-deploy/duckdb-image/build-duckdb-image.sh     # COMPILE_JOBS=30 by default
+./engine-deploy/duckdb-image/build-duckdb-image.sh
 ```
 
-This compiles DuckDB 2.0.0 from source with iceberg, httpfs, aws and avro
-linked in. Kaniko builds amd64 and arm64 **in parallel** on on-demand nodes
-(30 cpu / 68 GiB each), and the script joins them into one multi-arch tag. See
+Compiles DuckDB 2.0.0 with iceberg, httpfs, aws, avro (and the paimon extension)
+for amd64 and arm64 in parallel. 1.5–3 h per architecture cold (estimate). See
 [engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md).
 
-- **Check:** `aws ecr describe-images --repository-name duckdb-cdc-server --image-ids imageTag=2.0.0`.
-- **Time:** about 1.5–3 h per architecture on a cold build. That is the script's own figure (estimate); the timeout is 4 h.
-- **If it fails:** an OOM or eviction in the build pod calls for a lower `COMPILE_JOBS`. To skip the build, set `DUCKDB_IMAGE=` (empty) to use `python:3.12-slim` + pip `duckdb==2.0.0`. That is a different build, so it is a different timing baseline.
+## Step 4: A fresh table set
 
-## Step 4: Choose the table set
+A **table set** is `ICEBERG_FORMAT_VERSION` + `CDC_DB_SUFFIX`. **Every full test
+uses a new suffix** (`_v3r3` → `_v3r4`, ...): the sink DDL is `CREATE TABLE IF NOT
+EXISTS`, so table options (buckets, formats, file sizes) apply at creation only,
+and a new set gives empty tables, empty Flink state and a fresh MySQL snapshot.
+Never reuse a suffix: its Flink HA/checkpoint state on S3 would be recovered.
 
-A **table set** is `ICEBERG_FORMAT_VERSION` + `CDC_DB_SUFFIX`:
-
-| | Current set (`.bench-env`) |
+| Per set | Where |
 |---|---|
-| Glue databases | `flink_paimon_db_v3r1`, `flink_iceberg_db_v3r1` |
-| Flink state / HA / logs | `s3://$BUCKET_NAME/flink/cdc-{paimon,iceberg}_v3r1/`, `flink/logs/cdc-{paimon,iceberg}_v3r1` |
-| Warehouse data | `paimon-warehouse/flink_paimon_db_v3r1.db/`, Paimon's Iceberg export `paimon-warehouse/iceberg/flink_paimon_db_v3r1/`, `iceberg-warehouse/flink_iceberg_db_v3r1.db/` |
-| Query results / pins | `querybench-results/cdc-session-v3r1<SESSION_SUFFIX>/`, `querybench-pins/cdc-session-v3r1<SESSION_SUFFIX>/` |
-
-**An existing table never changes its format or options.** The DDL is
-`CREATE TABLE IF NOT EXISTS`, so options apply at creation only. To test new
-table settings (or another format version), set a **new** `CDC_DB_SUFFIX` in
-`.bench-env`, e.g. `_v3r2`. A new set starts with empty tables and empty Flink
-state, and the CDC sources run the full MySQL snapshot again (37.5M rows).
-
-Before you deploy a set, nothing from the previous one may be left. The HA ConfigMap
-names do **not** include the suffix, so a leftover makes the new JobManager
-recover the old job graph:
+| Glue databases | `flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>` |
+| Writer state / HA / logs | `s3://$BUCKET_NAME/flink/cdc-{paimon,iceberg}<suffix>/`, `flink/logs/cdc-{paimon,iceberg}<suffix>` |
+| Compaction state | `s3://$BUCKET_NAME/flink/iceberg-maintain<suffix>/` |
+| Warehouse data | `paimon-warehouse/flink_paimon_db<suffix>.db/`, `paimon-warehouse/iceberg/flink_paimon_db<suffix>/` (Paimon's Iceberg export), `iceberg-warehouse/flink_iceberg_db<suffix>.db/` |
+| Results / pins / monitor reports | `querybench-results/cdc-session<tag><SESSION_SUFFIX>/`, `querybench-pins/...` (`<tag>` = suffix with `-`, e.g. `-v3r4`) |
 
 ```bash
-kubectl get flinkdeployment -n emr-flink                         # expect: No resources found
-kubectl get configmap -n emr-flink -o name | grep -E 'flink-cdc-(paimon|iceberg)-.*config-map'   # expect: nothing
-# delete any leftovers:
-kubectl get configmap -n emr-flink -o name | grep -E 'flink-cdc-(paimon|iceberg)-.*config-map' \
+# 1. stop everything that writes the old set
+kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg iceberg-maintain -n emr-flink --ignore-not-found
+kubectl get pods -n emr-flink | grep -E 'flink-cdc|iceberg-maintain'      # wait until empty
+# 2. HA ConfigMaps (their names carry NO suffix; a leftover makes a new JobManager recover the old job)
+kubectl get configmap -n emr-flink -o name | grep -E '(flink-cdc-(paimon|iceberg)|iceberg-maintain)-.*config-map' \
   | xargs -r kubectl delete -n emr-flink
-# a NEW set must not exist yet:
-aws glue get-database --name "flink_iceberg_db${CDC_DB_SUFFIX}"   # expect EntityNotFoundException
-aws s3 ls "s3://$BUCKET_NAME/flink/cdc-iceberg${CDC_DB_SUFFIX}/"  # expect nothing
-```
-
-- **Check:** all four checks come back empty or not found.
-- **Time:** about 1 min.
-- **If it fails:** a FlinkDeployment that is still running must be deleted first (Step 12). The old set's data can stay; Step 13 removes it.
-
-## Step 5: Writers (both FlinkDeployments in one apply)
-
-```bash
-source mysql-cdc-env.sh            # MYSQL_HOST, MYSQL_USER (render requires them; the password comes from the Secret)
+# 3. the new suffix in .bench-env, then check it is really the one every script sees
+sed -i '' 's/^export CDC_DB_SUFFIX=.*/export CDC_DB_SUFFIX=_v3r4/' .bench-env
+bash -c 'source .bench-env; echo "CDC_DB_SUFFIX=$CDC_DB_SUFFIX"'
+# 4. the new set must not exist yet
 source .bench-env
-./build-deploy-generic.sh render   # writes flink-cdc-{paimon,iceberg}-deployed.yaml, applies nothing
-kubectl apply -n emr-flink -f flink-cdc-paimon-deployed.yaml -f flink-cdc-iceberg-deployed.yaml
+aws glue get-database --name "flink_iceberg_db${CDC_DB_SUFFIX}"   # expect EntityNotFoundException
+aws glue get-database --name "flink_paimon_db${CDC_DB_SUFFIX}"    # expect EntityNotFoundException
+for p in flink/cdc-iceberg flink/cdc-paimon flink/iceberg-maintain; do aws s3 ls "s3://$BUCKET_NAME/${p}${CDC_DB_SUFFIX}/"; done   # expect nothing
 ```
 
-`render` checks the variables, applies the `ebs-sc` StorageClass and Kyverno with the
-`flink-cdc-single-az` policy if they are missing, creates the Iceberg Glue
-database, and renders both manifests. It fails on any `${VAR}` it leaves
-behind and on any `value: ""`.
+- **Check:** every check is empty / not found, and `render` (Step 5) later says **"Glue database created"**, not "already exists".
+- **Time:** about 1 min.
+- **If it fails:** a Glue DB or S3 prefix of the new suffix already exists = pick another suffix (or remove that set, Step 13).
 
-**Apply both files in one `kubectl apply`** so the two initial snapshots start
-together. `./build-deploy-generic.sh deploy` (and `all`) applies Paimon,
-waits, and then applies Iceberg. The jobs then start about 30 s apart, which
-spoils the comparison.
+### Step 4a: Shrink the source to ~10% (only when it outgrew the buffer pool)
 
-**Re-deploying is delete + create, never `kubectl apply` over a live CR.** EMR
-stages the `jarURI` into `/opt/flink/usrlib` on CREATE only. An apply over an
-existing FlinkDeployment empties that directory, and the JobManager fails with
-`NoSuchFileException: /tmp/pyflink/...`. With `upgradeMode: last-state`, a
-bare apply also ignores most spec changes.
+The generator inserts as well as updates, so the source grows; past the 92 GiB
+buffer pool the rate drops. On 2026-11-02 the newest ~10% of each table (plus
+its FK closure and the generator's hot window) was kept by **copy-and-swap stored
+procedures** (`shrink_10pct_build` → `swap` → `verify` → `drop_old_and_add_fks`;
+`unswap` rolls back until `*_old` is dropped): 491.0M → 49.36M rows, ~14 min.
+The procedure file is **not in the repo**. Preconditions: generator at 0, both
+writers suspended, no `Binlog Dump` session, a manual RDS snapshot. Afterwards:
+a new `CDC_DB_SUFFIX` (Step 4) and a generator restart (it reads `MIN`/`MAX` ids
+at pod start).
+
+## Step 5: Writers and Iceberg compaction
 
 ```bash
-kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n emr-flink
-kubectl get pods -n emr-flink | grep flink-cdc        # wait until empty
-# HA ConfigMap check from Step 4, then the same single apply as above
+source .bench-env                                   # MYSQL_HOST (from .bench-env.local), MYSQL_USER, the suffix
+./ingest-deploy/build-deploy-generic.sh build       # only if the SQL / executor / Dockerfile changed (Step 3a)
+./ingest-deploy/build-deploy-generic.sh render      # renders ingest-deploy/flink-cdc-*-deployed.yaml, applies nothing
+kubectl apply -n emr-flink -f ingest-deploy/flink-cdc-paimon-deployed.yaml -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
+./iceberg-compaction/run-maintain.sh up             # continuous Iceberg compaction, started WITH the writers
 ```
 
-Pausing and resuming (no new snapshot, they restore their last checkpoint) only patches `job.state`:
+`render` validates the settings, applies the `ebs-sc` StorageClass and the
+Kyverno `flink-cdc-single-az` policy if missing, creates the Iceberg Glue
+database, prints the Paimon write and S3A upload settings, and fails on any
+`${VAR}` left or `value: ""`.
 
-```bash
-for j in flink-cdc-paimon flink-cdc-iceberg; do
-  kubectl patch flinkdeployment $j -n emr-flink --type=merge -p '{"spec":{"job":{"state":"running"}}}'   # or "suspended"
-done
-```
+- **One `kubectl apply` for both files**, so the two initial snapshots start together (`build-deploy-generic.sh deploy` applies them ~30 s apart).
+- **Re-deploying is delete + create, never `apply` over a live CR**: EMR stages `jarURI` on CREATE only, and an apply over an existing FlinkDeployment empties `/opt/flink/usrlib` (`NoSuchFileException: /tmp/pyflink/...`). Delete, wait for the pods, clear the HA ConfigMaps (Step 4), apply again.
+- **Pause / resume** (no new snapshot; restores the last checkpoint): `kubectl patch flinkdeployment <job> -n emr-flink --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'` (or `"running"`).
+
+**Iceberg compaction (`iceberg-maintain`).** Iceberg's Flink writer never merges
+files: every checkpoint adds data files, equality-delete files and deletion
+vectors. `iceberg-compaction/run-maintain.sh up` creates one FlinkDeployment
+(`maintain.py`, Iceberg's own `TableMaintenance`) that rewrites each table and
+expires its snapshots (older than 12 h, keep 5) every 10 writer commits (~10 min).
+**Start it right after the writers**: the first pass has to read every
+equality delete written so far, and a late start meant ~35M deletes on
+`customers` and an OOM at 8 Gi (now 32 Gi). It only runs while the writers
+commit. `run-maintain.sh status | plan | suspend | resume | down`; details in
+[iceberg-compaction/README.md](iceberg-compaction/README.md). Paimon compacts
+and expires inline in its writer.
 
 - **Check:**
-  - `kubectl get flinkdeployment -n emr-flink` shows both jobs `RUNNING` / `STABLE`.
-  - `aws glue get-tables --database-name flink_iceberg_db${CDC_DB_SUFFIX} --query 'TableList[].Name'` lists 4 tables, and the same holds for `flink_paimon_db${CDC_DB_SUFFIX}`.
-  - Flink UI: `kubectl port-forward svc/flink-cdc-iceberg-rest 8081:8081 -n emr-flink`.
-- **Time:** both JobManagers and TaskManagers come up in about 3–10 min, including Karpenter nodes (estimate). The initial MySQL snapshot of 37.5M rows has not been measured on the shrunk source; expect about 15–45 min (estimate).
-- **If it fails:** see [Troubleshooting](#troubleshooting). The usual causes are a missing Secret, an apply over an existing CR, a leftover HA ConfigMap, or nodepool limits.
+  - `kubectl get flinkdeployment -n emr-flink`: `flink-cdc-paimon`, `flink-cdc-iceberg` and `iceberg-maintain` `RUNNING` / `STABLE`.
+  - `aws glue get-tables --database-name flink_iceberg_db${CDC_DB_SUFFIX} --query 'TableList[].Name'` lists 4 tables, and the same for `flink_paimon_db${CDC_DB_SUFFIX}`.
+  - No `Access denied` in `kubectl logs deploy/flink-cdc-iceberg -n emr-flink -c flink-main-container`.
+- **Time:** both writers `RUNNING` / `STABLE` with 16 TaskManagers about **8 min** after the apply (measured). The initial snapshot (~50M rows plus what the generator added) then runs for tens of minutes (estimate).
+- **If it fails:** see [Troubleshooting](#troubleshooting): a missing or stale Secret, an apply over an existing CR, a leftover HA ConfigMap, nodepool limits, or (Paimon) a JobManager `OutOfMemoryError: Metaspace` (metaspace is 512m in both manifests).
 
 ## Step 6: Load generator (upsert)
 
 ```bash
-source mysql-cdc-env.sh
-./mysql-data-generator/deploy-data-generator.sh deploy   # StatefulSet mysql-upsert-loadgen, 4 pods
-./mysql-data-generator/deploy-data-generator.sh status   # per-pod inst= / avg= / errors=
+./mysql-data-generator/deploy-data-generator.sh deploy          # StatefulSet mysql-upsert-loadgen, 4 pods
+./mysql-data-generator/deploy-data-generator.sh status          # per pod: inst= / avg= / recent= / deletes= / errors=
+./mysql-data-generator/deploy-data-generator.sh scale 8 upsert  # change the pod count (also sets POD_COUNT)
 ```
 
-This is batched `INSERT ... ON DUPLICATE KEY UPDATE` from 4 pods. The current
-manifest sets `RATE_PER_POD=80000` (a token-bucket ceiling set out of reach on
-purpose), `THREADS=8`, `BATCH_ROWS=5000`, `UPSERT_RATIO=0.9`,
-`HOT_KEY_RATIO=0.6`, `HOT_KEY_WINDOW=5000000` and `POD_COUNT=4`. Cold keys are
-drawn from `[MIN(id), MAX(id)]`, read **once at pod start**. This is the only
-generator: the row-at-a-time INSERT/UPDATE/DELETE "mixed" generator was removed on
-2026-11-02, so the benchmark has no DELETE events. Details are in
-[2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md).
+Batched `INSERT ... ON DUPLICATE KEY UPDATE` plus FK-safe `DELETE`s on
+`orders` / `order_items`, from the manifest `mysql-data-generator/mysql-upsert-loadgen.yaml`:
 
-`RECENT_KEY_RATIO=0.6` of every batch re-writes keys that the same worker thread
-wrote within the last `RECENT_KEY_MAX_AGE_S=20` seconds. `TABLE_RUN_BATCHES=8`
-keeps each thread on one table for 8 batches so that this works for the small tables
-too. `UPSERT_RATIO` splits only the remaining rows. The Iceberg upsert writer
-emits a delete for every row. A key it already wrote in the current checkpoint gets
-a position delete (a DV on v3), and any other key gets an equality delete. So this
-targets **~50% position deletes**, against ~2% before. **That is a design target from
-an offline simulation, not a measurement.** Measure it with
-[Measure the position-delete share](2-DATA-GEN-GUIDE.md#measure-the-position-delete-share)
-and tune with `deploy-data-generator.sh recent-mix <ratio> <max-age-s>`. Paimon
-receives the same stream and dedups the repeats in its write buffer. That
-difference is intended.
+| Setting | Value | Meaning |
+|---|---|---|
+| `replicas` / `POD_COUNT` | 4 / 4 | `POD_COUNT` shards the hot window; always change both with `scale N upsert` |
+| `RATE_PER_POD` | 80000 | token-bucket ceiling, out of reach on purpose |
+| `THREADS` / `BATCH_ROWS` | 8 / 5000 | |
+| `UPSERT_RATIO` | 0.9 | 90% updates of existing keys |
+| `HOT_KEY_RATIO` / `HOT_KEY_WINDOW` | 0.6 / 5000000 | skew to the newest 5M ids; `[MIN, MAX]` id range read once at pod start |
+| `RECENT_KEY_RATIO` / `RECENT_KEY_MAX_AGE_S` | 0.6 / 20 | re-writes of keys the thread wrote in the last 20 s → Iceberg position deletes (DVs) |
+| `TABLE_RUN_BATCHES` | 8 | each thread stays on one table for 8 batches |
+| `DELETE_RATIO` | 0.05 | `orders` / `order_items` only; an order is deleted with its items; ids divisible by 16 never |
 
-```bash
-# after any shrink of the source tables: re-read the id ranges
-kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink
-# after the snapshot test (which scales it to 0): bring it back
-./mysql-data-generator/deploy-data-generator.sh scale 4   # also sets POD_COUNT
-```
+Change the mix with `upsert-mix <upsert> <hot> <window>`, `recent-mix <ratio> <age_s>`,
+`delete-mix <ratio>` (each a rolling restart). Details:
+[2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md). It reads the same Secret
+`mysql-credentials` as the writers, and refuses to deploy without it.
 
-- **Check:** each pod logs `inst=` / `avg=` / `errors=` lines. Judge the current rate by `inst=` and the failures by `errors=` against `batches=`. `recent= / rows=` is the achieved re-write share (expect ~0.55 at ratio 0.6); `status` prints it as `recent=N%`.
-- **Rate:** source-bound at about **52–64K rows/s**, with about **34% batch errors** from lock contention, retried silently (measured on the 2026-11-02 dry run, with 8 pods; 4 pods since then, not measured yet). The `40,000 rows/s` and `5000 x 8` figures printed by the script's help are out of date.
-- **Time:** pods ready in about 1–2 min (estimate).
-- **If it fails:** `Secret mysql-credentials not found` means you need to export `MYSQL_HOST`, `MYSQL_USER` and `MYSQL_PASSWORD` and re-run. If the source tables regrow after a shrink, the pods were not restarted. A bare `kubectl scale` leaves `POD_COUNT` stale and the hot-key slices overlap, so use `scale N upsert`.
+- **Check:** `status` prints a rate per pod and `recent=` around 50%; `errors=` against `batches=` is the failure share (MySQL 1213/1205 retries are silent).
+- **Rate (measured 2026-11-03):** 4 pods ≈ **89K rows/s** in total, 8 pods ≈ **79K rows/s**: past a few pods, extra pods add lock contention, not throughput. The source, not the writers, sets the ingest rate (both writers read ~165K rows/s of CDC records with no backpressure).
+- **Time:** pods ready in 1–2 min (estimate).
+- **If it fails:** `Secret mysql-credentials not found` / `has no key` = Step 0. Rows below the shrink cutoff = pods not restarted after a shrink (`kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink`).
 
 ## Step 7: Monitor
 
+`SUITE=hot ./querybench/run.sh start` brings it up itself (`MONITOR_UP=0`
+skips that). By hand:
+
 ```bash
-./monitoring/deploy-monitor.sh                  # python:3.11-slim + ConfigMap code, SA starrocks-sa
+./monitoring/deploy-monitor.sh
 kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 ```
 
-The monitor prints one Paimon-vs-Iceberg table per cycle for the four tables of the
-current set: rows/s from commit history, checkpoints, and table stats.
-`./monitoring/capture-flink-metrics.sh` writes a point-in-time Flink metrics CSV.
-Details are in [3-MONITOR.md](3-MONITOR.md).
+Every ~2–3 min it samples Paimon and Iceberg in parallel over the same 120 s
+window and prints one comparison (rows/s from commit history, source rate,
+checkpoints, backpressure, table stats). Every report JSON is uploaded to
+`s3://<bucket>/querybench-results/cdc-session<tag><SESSION_SUFFIX>/monitor/`;
+Step 11 reads them back. Details: [3-MONITOR.md](3-MONITOR.md).
 
-- **Check:** the banner shows `Glue DBs: flink_paimon_db_v3r1, flink_iceberg_db_v3r1`, and `rollout status` succeeds.
-- **Time:** about 2 min on first boot, because it pip-installs pyiceberg and pyarrow (estimate).
-- **If it fails:** a pod that can't assume its role points to the trust policy or the SA annotation. The checkpoint "failed" counter is cumulative since job start ([3-MONITOR.md](3-MONITOR.md#checkpoint-failure-counts-are-cumulative-not-current)).
+- **Check:** the banner says `Reports : ... cdc-session-v3r4/monitor/` for the current set; `aws s3 ls` of that prefix lists `paimon-cdc_*.json` and `iceberg-cdc_*.json` after the first cycle.
+- **Note:** "committed rows/s" is lower on Paimon by design: it merges re-written keys in its write buffer before committing. Compare the **source rate meter** for input.
 
-## Step 8: Query engines
+## Step 8: Query engines (optional)
 
-`querybench/run.sh start` brings both engines up when needed, so this step is
-optional. Run it to see the engines come up before a test:
+`querybench/run.sh start` brings both up when needed. To bring them up first:
 
 ```bash
-./engine-deploy/deploy-duckdb-cdc.sh up       # Deployment duckdb-warm-cdc: 27 cpu / 114 GiB, 450 GiB disk cache
-./engine-deploy/deploy-trino.sh up            # waits until the writers have run 15 min, then Helm release trino: 3 workers x 9 cpu / 38 GiB + 4 cpu coordinator
+./engine-deploy/deploy-duckdb-cdc.sh up      # duckdb-warm-cdc: 81 cpu / 342 GiB, one m5.24xlarge, 450 GiB disk cache
+./engine-deploy/deploy-trino.sh up           # waits until the writers have run 15 min, then 9 workers + coordinator
 ./engine-deploy/deploy-duckdb-cdc.sh status
 ./engine-deploy/deploy-trino.sh status
 ```
 
-**The engines wait for the writers.** `SUITE=hot run.sh start` and
-`deploy-trino.sh up` both wait (`wait_writers_up`, `lib/common.sh`) until every
-writer in `FLINK_JOBS` has been RUNNING for `WRITERS_UP_S` (900 s = 15 min) since
-its current job start, so a restarted writer restarts the clock. The writers'
-start-up and first snapshot get the nodes to themselves. Suspended writers are
-skipped, a missing one stops the wait, and it gives up after
-`WRITER_WAIT_MAX_S` (7200 s). `WRITERS_UP_S=0` (or `TRINO_AFTER_WRITERS_S=0` for
-Trino alone) skips it.
+The four arms (`ENGINES` × `FORMATS`):
 
-The four arms (`ENGINES` × `FORMATS`) on the v3 set, as known on 2026-11-02:
-
-| Arm | Reads | Status |
+| Arm | Reads | Status (v3) |
 |---|---|---|
 | `duckdb:iceberg` | `flink_iceberg_db<suffix>`, pinned `metadata.json` copy | works |
-| `trino:iceberg` | the same, `FOR VERSION AS OF <snapshot>` | works |
-| `duckdb:paimon` | Paimon's Iceberg export, pinned `vN.metadata.json` copy | **fails on v3**: `Manifest ... missing required Avro key-value metadata field 'schema'` (the export's manifests lack the key). Its queries are recorded as `ERROR` and the run continues |
-| `trino:paimon` | the export, through the Paimon Glue tables | **unverified** |
+| `trino:iceberg` | the same, `FOR VERSION AS OF BIGINT '<snapshot>'` | works |
+| `duckdb:paimon` | **native Paimon**, `paimon_scan('<warehouse>/<PAIMON_DB>.db/<t>', snapshot_from_id=N)` (the image's `paimon` extension) | new 2026-11-04, **not yet run live**; reads S3 uncached (paimon-cpp's own S3 client) |
+| `trino:paimon` | **native Paimon**, catalog `paimon` (paimon-trino 2.1.0 in `trino-cdc:484-paimon-2.1.0`), `FOR VERSION AS OF BIGINT 'N'` | new 2026-11-04, **not yet run live** |
 
-Paimon's Iceberg export (`metadata.iceberg.storage = hive-catalog`)
-re-registers the **Paimon Glue tables as `table_type=ICEBERG`**, and that entry
-is the one `trino:paimon` reads. Athena reads only Iceberg v2, so it cannot
-read this set.
+Both Paimon arms are pinned at the native snapshot `N` of `<table>/snapshot/LATEST`.
+Runs up to `_v3r3` read Paimon's Iceberg export instead (a partial view: top-LSM
+files only until a full compaction; DuckDB could not read its v3 manifests).
 
-- **Check:**
-  - DuckDB `/health` shows `"busy": false`, `iceberg_format_version` 3 and the image.
-  - Trino shows `3` active workers, version `484`, and lists the set's schemas.
-- **Time:** Trino first waits until the writers have run 15 min; then about 5–20 min, including new m5 nodes; the scripts wait up to 20 min (estimate).
-- **If it fails:**
-  - `serviceaccount starrocks-sa not found` means Step 0 is incomplete.
-  - A Trino on another version is refused by `run.sh start`. Run `deploy-trino.sh up`, or set `TRINO_VERSION_CHECK=0`.
-  - A DuckDB server for another set or image is redeployed automatically.
+- **Check:** DuckDB `/health` `"busy": false`, `iceberg_format_version` 3; Trino 9 active workers, version 484.
+- **Time:** 5–20 min including new nodes (estimate); Trino first waits for the writers' 15 min.
 
-## Step 9: Hot test (writers and generator live)
+## Step 9: Hot test (writers, generator and compaction live)
 
 ```bash
-SUITE=hot ./querybench/run.sh render   # optional dry run: renders the Jobs and every query, no cluster/AWS
-SUITE=hot ./querybench/run.sh start
+SUITE=hot ./querybench/run.sh render   # optional dry run: the Jobs and every query, no cluster/AWS call
+SUITE=hot ./querybench/run.sh start    # leave the laptop up until it prints "job/cdc-qb-watch started"
 ./querybench/run.sh logs               # the runner (cdc-qb-runner)
 ./querybench/run.sh logs watch         # the watcher (cdc-qb-watch)
-./querybench/run.sh status             # writers, generator, engines, Jobs
+./querybench/run.sh status
 ```
 
-Preconditions: both writers are `RUNNING`, the generator is running, and no other
-`cdc-qb-runner` or throughput `qb-runner` is active (`FORCE=1` overrides).
+Preconditions: both writers `RUNNING`, the generator running, no other
+`cdc-qb-runner` or throughput `qb-runner` active (`FORCE=1` overrides).
 
-`start`, in order:
+`start`, on the laptop:
+1. waits until every writer has been RUNNING `WRITERS_UP_S` (900 s) since its current job start (a restart restarts the clock), so run it right after Steps 5–6 and it just blocks;
+2. resumes `iceberg-maintain` (or creates it with `run-maintain.sh up` if missing);
+3. brings the monitor up, then DuckDB, then Trino; empties the caches unless every engine just started fresh;
+4. starts the runner and watcher Jobs in the cluster. The laptop can disconnect after that.
 
-1. Waits until both writers have been RUNNING 15 min (`WRITERS_UP_S`, see Step 8).
-   Run it right after Step 5 and it simply blocks until then.
-2. Resumes the hourly Iceberg compaction CronJob, if it exists (Step 9a).
-3. Brings up DuckDB, then Trino, and clears their caches.
-4. Starts the runner Job and the watcher Job in the cluster. The laptop can
-   disconnect after that.
-The runner:
+The runner pins every table of both formats on a **30 s** window ending
+`HOT_LAG_SECONDS=300` before the start, runs a warm-up pass and `RUNS=3` timed
+passes, interleaving DuckDB and Trino and re-pinning before each pass, and
+uploads to `s3://$BUCKET_NAME/querybench-results/cdc-session<tag><SESSION_SUFFIX>/<STAMP>-hot/`.
+A query that errors on one arm is recorded as `ERROR`; the run goes on.
 
-1. Checks the writers' stability 10 times, once a minute.
-2. Takes a 5 min window ending 5 min ago and waits for commits after it.
-3. Pins every table in both formats.
-4. Runs a warm-up pass and then `RUNS=3` timed passes, interleaving DuckDB and Trino. It re-pins before each pass.
-5. Uploads the results to `s3://$BUCKET_NAME/querybench-results/cdc-session-v3r1<SESSION_SUFFIX>/<STAMP>-hot/`.
+**The watcher tears down only after a completed test** (`status: runner-exit=0`):
+generator → 0, writers suspended, `iceberg-maintain` suspended, monitor → 0,
+DuckDB deleted, Trino → 0 (`STOP_GENERATOR=0`, `SUSPEND_WRITERS=0`,
+`STOP_COMPACTION_CRON=0`, `STOP_DUCKDB=0`, `STOP_TRINO=0` keep one). On a failure
+it leaves everything running and logs why.
 
-**The watcher tears down only after a completed test.** That means
-`status: runner-exit=0`. It then scales the generator to 0, suspends both
-writers, scales the monitor to 0, deletes DuckDB, scales Trino to 0 and
-suspends the compaction CronJob. On any
-failure it **leaves everything running** and logs why, the last errors, and
-what is still up (`status: qb-watch-failed-left-running`). Fix the problem and
-re-run `start`, or tear down with Step 12.
+- **Check:** the runner logs `status: results-uploaded ...`, the watcher `status: qb-watch-done`.
+- **Time (measured):** engines up ~7 min after the writer wait, runner ~22 min.
+- **If it fails:** `./querybench/run.sh logs`; [querybench/README.md](querybench/README.md). A failure inside `start` stops before any Job ("no query Job left running").
 
-Before a second hot test after a completed one, resume the writers (Step 5),
-the generator (`scale 4 upsert`) and the monitor
-(`kubectl scale deployment/flink-cdc-monitor -n emr-flink --replicas=1`).
+### Step 9a: Iceberg compaction during the hot test
 
-- **Check:** the runner logs `status: results-uploaded ...`, and the watcher logs `status: qb-watch-done`.
-- **Time:** about 45–90 min end to end (estimate). The stability check alone takes 10 min, the window lags 5 min, and the watcher polls every 10 min.
-- **If it fails:** read `./querybench/run.sh logs`. Any setup error in `start` stops it before a Job is created ("no query Job left running"). See [querybench/README.md](querybench/README.md) for every setting.
+`iceberg-maintain` (started in Step 5) keeps compacting while the writers run;
+the hot `start` resumes it and the watcher suspends it. Check it with
+`./iceberg-compaction/run-maintain.sh status` and `./iceberg-compaction/run-maintain.sh plan`
+(read-only: data/delete files and delete counts per table). On 2026-11-03 it
+started late and completed passes on `products` only, so the Iceberg arms read
+uncompacted tables: the summary must say so.
 
-### Step 9a: Hourly Iceberg compaction during the hot test
+## Step 10: Snapshot test (writers stopped, cold start)
 
-Iceberg's Flink writer never merges files: every checkpoint adds a data file, an
-equality-delete file and a deletion vector per writer subtask, and readers pay
-for them until a compaction. Paimon's writer compacts as it goes. To keep the
-hot comparison about the formats rather than about missing maintenance, a
-CronJob compacts the four Iceberg tables every hour while the writers run:
-
-```bash
-./iceberg-compaction/run-compaction.sh cron-up       # CronJob iceberg-compact-hourly, "0 * * * *" UTC
-./iceberg-compaction/run-compaction.sh cron-run      # one run now
-./iceberg-compaction/run-compaction.sh cron-status   # last runs and their log lines
-./iceberg-compaction/run-compaction.sh cron-down     # remove it
-```
-
-- One pod (24 cpu / 150 GiB on an m5.12xlarge, the snapshot Job's size) compacts the four tables one
-  after another with `REWRITE_MODE=live`. Live mode keeps the rewrite's
-  starting sequence number, so equality deletes Flink commits during the
-  rewrite still apply, and commits file groups as they finish
-  (`partial-progress`). The target file size is each table's own: 64 MiB for
-  customers and products, 128 MiB for orders and order_items. It then expires
-  snapshots older than 12 h (keeping 5), as before.
-- `concurrencyPolicy: Forbid` and a 3 h deadline (`CRON_DEADLINE_S`): a catch-up run may span several hours, the hours it covers are skipped, runs never overlap. At 12 cpu / 55 min (the first try) no run finished even `customers`.
-- A hot `start` resumes it; the snapshot `start` suspends it and cancels a
-  running pass before its own full compaction; the watcher's teardown
-  suspends it (`STOP_COMPACTION_CRON=0` leaves it).
-- **Check:** `cron-status` shows `=== <table> end` for all four tables and no
-  `FAILED`; the job monitor's Iceberg "New Delete Files" stop accumulating.
-- **If it fails:** `kubectl logs job/<name> -n emr-flink`. The first run on
-  2026-11-02 failed in the JVM ("Multiple garbage collectors selected"): the
-  EMR 7.14 Spark image sets its own GC, so `compact-job.yaml` no longer passes
-  `-XX:+UseG1GC`.
-
-## Step 10: Snapshot test (compaction gate)
+Run it after the hot test (it stops the writers):
 
 ```bash
 SUITE=snapshot ./querybench/run.sh start
 ./querybench/run.sh logs
-kubectl get jobs -n emr-flink | grep iceberg-compact
 ```
 
-In order, `start`:
+`start`, on the laptop:
+1. suspends `iceberg-maintain` so the pinned tables stay put;
+2. scales the generator to 0, waits `WRITER_DRAIN_S` (180 s) and until each running writer completed a checkpoint ≥ 60 s after the generator stopped (refuses otherwise), then suspends both writers;
+3. resolves `SNAPSHOT_DT`, the newest closed date in both formats' fact tables;
+4. brings the engines up and starts the runner and watcher.
 
-1. Scales the generator to 0.
-2. Waits `WRITER_DRAIN_S=180` s so the writers commit the binlog tail.
-3. **Suspends both writers** and waits until no TaskManager is left.
-4. Resolves `SNAPSHOT_DT`, the newest closed date in both formats' fact tables.
-5. Because `COMPACT_BEFORE_SNAPSHOT=true`, **submits one Iceberg compaction Job per `COMPACT_TABLES` table** (`iceberg-compact-{customers,products,orders,order-items}`). It runs them in the background from the laptop; the submit logs go to `bench-results/iceberg-compact-<t>-<STAMP>.submit.log`, but the Jobs themselves run in the cluster.
-6. Brings the engines up and starts the runner and watcher.
+There is **no pre-test compaction**: Iceberg is measured as the writers and
+`iceberg-maintain` left it; the summary reports its file and delete counts.
 
-Each compaction Job runs `rewrite_data_files` and then
-`expire_snapshots` (older than 12 h, keep 5), Paimon's retention rule.
+The runner (`querybench/snapshot.sh`): waits for the engines, pins the four
+tables of every format, resolves the S4 slice, **empties both caches**, then
+runs each engine (DuckDB, then Trino) for `SNAPSHOT_RUNS=3` passes with no
+warm-up: **pass 0 is timed as the cold pass** (`cold_ms`), `median_ms` is the
+median of passes 1–2. Results go to `.../<STAMP>-snapshot/`.
 
-The runner then waits on the **compaction gate**. Every Job must have
-succeeded, and each table's current snapshot must be that Job's `replace`
-commit. The gate waits up to `COMPACT_GATE_TIMEOUT_S=21600`. After that the
-runner pins every table, does a cold start (DuckDB restarted, Trino caches
-cleared), and runs the passes. `snapshot-<STAMP>.pins` records the gate times
-and the pinned snapshot ids. Paimon gets no extra step, because it compacts
-inside its writer.
-
-- **Check:**
-  - All four `iceberg-compact-*` Jobs show `Complete`.
-  - The runner logs `gate_compaction_finished_at=` and then `status: results-uploaded ...<STAMP>-snapshot/`.
-- **Time:** compaction depends on the equality-delete backlog, from minutes to hours. It has not been measured on the 37.5M-row set (estimate). The passes take about 30–60 min (estimate).
-- **If it fails:**
-  - `compaction Job ... FAILED`: read `kubectl logs job/iceberg-compact-<t> -n emr-flink`. For a quick classpath, Glue and IRSA check, run `DRY_RUN=true ICEBERG_TABLE=<t> ./iceberg-compaction/run-compaction.sh` (about 1 min).
-  - `current snapshot is ... not the compaction's replace commit`: something wrote after the compaction, so recompact. `ICEBERG_REQUIRE_COMPACTION=0` measures the tables as they are, and the run records that.
-  - Outside us-west-2, `SPARK_IMAGE` must be set.
+- **Check:** `status: results-uploaded ...` and `status: runner-exit=0`.
+- **Time (measured):** ~48 min from `start` to the runner's exit.
+- **If it fails:** `no date before <today> in the orders and order_items partitions` → `SNAPSHOT_DT=YYYY-MM-DD`. `snapshot slice ... under the 10-min slice` → lower `SNAPSHOT_SLICE_MINUTES` or set `S_FROM` / `S_TO`.
 
 ## Step 11: Summary
 
 ```bash
-./querybench/run.sh summary     # newest hot + snapshot run of the session
-#   HOT_STAMP=... SNAPSHOT_STAMP=... pick other runs; SUMMARY_DIR=<dir> reads local results instead of S3
+./querybench/run.sh summary            # newest hot + snapshot run of the current set
+#   HOT_STAMP=<stamp> SNAPSHOT_STAMP=<stamp>   pick other runs
+#   SUMMARY_DIR=<dir with hot/ and snapshot/>  read local results instead of S3
+#   INGEST=0                                   skip the ingest part
 ```
 
-This writes `bench-results/QUERYBENCH-SUMMARY-<YYYYMMDD>-v3r1<SESSION_SUFFIX>.md`
-with the bucket and account redacted. `bench-results/` is git-ignored, so use
-`git add -f` to commit the file. A suite in which two engines on the same
-format return different rows is marked **INVALID**.
+`summary` downloads both runs' results, runs `querybench/ingest_stats.py`
+(read-only, laptop credentials, through `uv`) over the hot run's window, and
+writes **`bench-results/QUERYBENCH-SUMMARY-<YYYYMMDD><tag><SESSION_SUFFIX>.md`**
+with the bucket and account redacted. **Only that `.md` stays local**: the
+ingest JSON goes to `s3://.../cdc-session<tag>/<session>-summary/`, and every raw
+result stays in its run's S3 prefix. Contents:
 
-- **Check:** the file exists and lists both suites.
-- **Time:** about 1 min (estimate).
-- **If it fails:** `no runs under querybench-results/...` means the wrong set or `SESSION_SUFFIX`, or the runner never uploaded.
+1. run configuration; 2. headline; 3. query latency per suite (snapshot: cold
+pass and warm median, each with Trino / DuckDB ratios and geometric means);
+4. ingest (rows/s and MB/s from the monitor reports, checkpoint time,
+backpressure; equality vs position deletes and file counts from table
+metadata); 5. table state; conclusions and open items. A suite where two
+engines on one format return different rows is marked **INVALID**.
+
+Before sharing it, add a short **run notes** section with anything that changes
+how to read the numbers (compaction state, restarts, generator changes), as in
+`bench-results/QUERYBENCH-SUMMARY-20261103-v3r3.md`. `bench-results/` is
+git-ignored: `git add -f` to commit the summary.
+
+- **Check:** both suites are listed, and the ingest section has numbers (not "ingest_stats.py failed").
+- **If it fails:** `no runs under querybench-results/...` = wrong `CDC_DB_SUFFIX` / `SESSION_SUFFIX`. The ingest step needs the run's commit history, which both formats keep 12 h.
 
 ## Step 12: Stop / teardown
 
 ```bash
-# The same teardown the watcher does after a completed test (use it after a failed one):
+# What the watcher does after a completed test (use it after a failed one):
 SUITE=hot ./querybench/run.sh stop
-#   generator -> 0, writers suspended, monitor -> 0, DuckDB deleted, Trino -> 0 (release kept)
-#   STOP_GENERATOR=0 / SUSPEND_WRITERS=0 / STOP_DUCKDB=0 / STOP_TRINO=0 keep one of them
-```
+#   generator -> 0, writers and iceberg-maintain suspended, monitor -> 0, DuckDB deleted, Trino -> 0
 
-To remove everything (the S3 data and the Glue tables stay):
-
-```bash
-./build-deploy-generic.sh cleanup        # asks "yes"; deletes both FlinkDeployments via the *-deployed.yaml files
-kubectl get configmap -n emr-flink -o name | grep -E 'flink-cdc-(paimon|iceberg)-.*config-map' \
-  | xargs -r kubectl delete -n emr-flink # leftover HA ConfigMaps
+# Remove everything (the S3 data and Glue tables stay; Step 13 removes those):
+./ingest-deploy/build-deploy-generic.sh cleanup       # asks "yes"; deletes both writer FlinkDeployments
+./iceberg-compaction/run-maintain.sh down
+kubectl get configmap -n emr-flink -o name | grep -E '(flink-cdc-(paimon|iceberg)|iceberg-maintain)-.*config-map' \
+  | xargs -r kubectl delete -n emr-flink
 ./mysql-data-generator/deploy-data-generator.sh stop
 kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 ./engine-deploy/deploy-duckdb-cdc.sh down
-./engine-deploy/deploy-trino.sh down     # helm uninstall + cache PVCs
-for t in customers products orders order_items; do
-  JOB=iceberg-compact-${t//_/-} ./iceberg-compaction/run-compaction.sh clean
-done
+./engine-deploy/deploy-trino.sh down                  # helm uninstall + cache PVCs
 ```
 
-- **Check:** `./querybench/run.sh status` shows no writers, generator `0/0`, DuckDB not answering, and 0 Trino workers. `kubectl get pods -n emr-flink` lists only the operator, plus anything unrelated.
-- **Time:** about 2–5 min (estimate).
-- **If it fails:** a suspended writer that never stops makes `run.sh stop` time out after 600 s. Delete the FlinkDeployment instead.
+- **Check:** `./querybench/run.sh status`: no writers, generator `0/0`, DuckDB not answering, 0 Trino workers.
+- **Note:** suspended jobs do not expire snapshots, so the old files of both formats stay on S3 until the writers commit again or the set is removed.
 
 ## Step 13: Clean up old table sets
 
-The data of an old set stays in Glue and S3 until you remove it. Its settings
-can never be reused (Step 4). Set `OLD` to its suffix, e.g. `_v3`. **Never** use
-the current one. `OLD=` (empty) means the original unsuffixed v2 set.
+An old set stays in Glue and S3 until removed. Set `OLD` to its suffix (never
+the current one; `OLD=` empty is the original unsuffixed v2 set):
 
 ```bash
-OLD=_v3
-# 1. Nothing uses it: no FlinkDeployment writes it, and no summary still needs its results
-kubectl get flinkdeployment -n emr-flink -o yaml | grep -A1 GLUE_DATABASE
-# 2. Keep the table definitions
+OLD=_v3r3
+# 1. nothing writes it
+kubectl get flinkdeployment -n emr-flink -o yaml | grep -A1 -E 'GLUE_DATABASE|--db'
+# 2. keep the table definitions, then drop the databases (and their tables)
 for db in flink_paimon_db$OLD flink_iceberg_db$OLD; do aws glue get-tables --database-name $db > glue-backup-$db.json; done
-# 3. Glue (drops the tables with the databases)
 aws glue delete-database --name flink_paimon_db$OLD
 aws glue delete-database --name flink_iceberg_db$OLD
-# 4. S3. Keep the TRAILING SLASH: without it, ".../cdc-paimon" also matches cdc-paimon_v3r1/
+# 3. S3. Keep the TRAILING SLASH: without it OLD=_v3 also matches _v3r1, _v3r3, ...
 for p in paimon-warehouse/flink_paimon_db$OLD.db/ paimon-warehouse/iceberg/flink_paimon_db$OLD/ \
          iceberg-warehouse/flink_iceberg_db$OLD.db/ \
-         flink/cdc-paimon$OLD/ flink/cdc-iceberg$OLD/ flink/logs/cdc-paimon$OLD/ flink/logs/cdc-iceberg$OLD/; do
+         flink/cdc-paimon$OLD/ flink/cdc-iceberg$OLD/ flink/iceberg-maintain$OLD/ \
+         flink/logs/cdc-paimon$OLD/ flink/logs/cdc-iceberg$OLD/; do
   aws s3 rm --recursive "s3://$BUCKET_NAME/$p"
 done
 #    optional: querybench-pins/cdc-session${OLD//_/-}*/ and querybench-results/cdc-session${OLD//_/-}*/
 #    (never with OLD= empty: "cdc-session*" then matches every session)
 ```
 
-**The bucket is versioned.** `aws s3 rm` only writes delete markers, and the
-bytes stay as noncurrent versions until a lifecycle rule expires them. To
-reclaim the space, add a rule for each deleted prefix (or one for the whole
-bucket). Nothing in this pipeline reads noncurrent versions.
+**The bucket is versioned**: `aws s3 rm` writes delete markers and the bytes
+stay as noncurrent versions until a lifecycle rule expires them. Add a rule
+per deleted prefix (`NoncurrentVersionExpiration`, `ExpiredObjectDeleteMarker`),
+merged into the existing configuration (`put-bucket-lifecycle-configuration`
+replaces all rules).
 
-```bash
-aws s3api get-bucket-versioning --bucket $BUCKET_NAME
-aws s3api get-bucket-lifecycle-configuration --bucket $BUCKET_NAME > lifecycle-current.json   # merge into this:
-# put-bucket-lifecycle-configuration REPLACES the whole configuration, so include the existing rules.
-cat > lifecycle.json <<EOF
-{"Rules": [{
-  "ID": "expire-noncurrent-iceberg-warehouse-flink_iceberg_db$OLD", "Status": "Enabled",
-  "Filter": {"Prefix": "iceberg-warehouse/flink_iceberg_db$OLD.db/"},
-  "NoncurrentVersionExpiration": {"NoncurrentDays": 1},
-  "Expiration": {"ExpiredObjectDeleteMarker": true},
-  "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
-}]}
-EOF
-aws s3api put-bucket-lifecycle-configuration --bucket $BUCKET_NAME --lifecycle-configuration file://lifecycle.json
-```
-
-- **Check:**
-  - `aws glue get-database --name flink_iceberg_db$OLD` returns `EntityNotFoundException`.
-  - `aws s3 ls s3://$BUCKET_NAME/iceberg-warehouse/flink_iceberg_db$OLD.db/` is empty.
-  - `aws s3api list-object-versions --bucket $BUCKET_NAME --prefix <p> --max-items 5` eventually returns nothing.
-- **Time:** the Glue deletes take seconds. `s3 rm` takes minutes to an hour, depending on object count. Lifecycle expiry is asynchronous and usually takes 1–2 days (estimate).
-- **If it fails:** if the space is not reclaimed, the bucket has no rule for those prefixes. Check that the rule covers them and that `Status` is `Enabled`.
+- **Check:** `aws glue get-database --name flink_iceberg_db$OLD` → `EntityNotFoundException`; `aws s3 ls` of each prefix is empty.
+- **Time:** Glue seconds; `s3 rm` minutes to an hour; lifecycle expiry 1–2 days (estimate).
 
 ---
 
@@ -643,13 +600,26 @@ aws s3api put-bucket-lifecycle-configuration --bucket $BUCKET_NAME --lifecycle-c
 
 ## How rendering works
 
-`build-deploy-generic.sh render` replaces, with `sed`, exactly these
+`ingest-deploy/build-deploy-generic.sh render` replaces, with `sed`, exactly these
 placeholders: `AWS_REGION` (default `us-west-2`), `AWS_ACCOUNT_ID`,
 `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`, `EMR_VERSION` (7.14.0), `IMAGE_TAG`
 (the same as `EMR_VERSION`), `ICEBERG_FORMAT_VERSION` (2|3, default 3),
-`CDC_DB_SUFFIX`, `PAIMON_DV_BITMAP64`, `MYSQL_HOST`, `MYSQL_USER`,
-`MYSQL_ENV_SECRET_NAME` (`flink-cdc-mysql-env`), `JM_NODEPOOL`
-(`driver-nodepool`) and `TM_NODEPOOL` (`executor-memorynodepool`).
+`CDC_DB_SUFFIX`, `PAIMON_DV_BITMAP64`, `MYSQL_PORT`, `MYSQL_DATABASE`,
+`MYSQL_ENV_SECRET_NAME` (`mysql-credentials`), `JM_NODEPOOL`
+(`driver-nodepool`), `TM_NODEPOOL` (`executor-memorynodepool`), and the write
+and upload settings below.
+
+| Setting (`.bench-env`) | Default | Where it lands |
+|---|---|---|
+| `PAIMON_WRITE_ONLY` | `false` | Paimon `INSERT` hint `write-only`. `true` = no inline compaction and no snapshot expiry in the writer |
+| `PAIMON_WRITE_BUFFER_SPILLABLE` | `true` | hint `write-buffer-spillable` |
+| `PAIMON_WRITE_BUFFER_SIZE` | unset: 64mb dimension / 128mb fact (= Iceberg's `write.target-file-size-bytes`) | hint `write-buffer-size`, one value for every table when set |
+| `S3A_MULTIPART_SIZE` / `S3A_MULTIPART_THRESHOLD` / `S3A_ACTIVE_BLOCKS` | `16M` / `16M` / `6` | Paimon catalog `s3.multipart.*`, `s3.fast.upload.active.blocks` (disk buffer in `/tmp/s3a-paimon`) |
+| `ICEBERG_S3_MULTIPART_SIZE_BYTES` / `ICEBERG_S3_MULTIPART_THREADS` | derived: `S3A_MULTIPART_SIZE` in bytes / `S3A_ACTIVE_BLOCKS` × 4 | Iceberg catalog `s3.multipart.part-size-bytes` / `num-threads` |
+
+The hints apply to existing tables, so no new `CDC_DB_SUFFIX` is needed; a
+change takes `./ingest-deploy/build-deploy-generic.sh build` (uploads the SQL) and a writer
+delete + create (Step 5).
 `PAIMON_DV_BITMAP64` is derived, not a setting: it is `true` exactly when the
 format is 3, because the v3 DV export needs 64-bit DVs. `MYSQL_PASSWORD` is
 never substituted: the pods pull it from the Secret through `envFrom`, so no
@@ -659,7 +629,7 @@ credential lands in a file.
 
 | Setting | Value |
 |---|---|
-| JobManager | 1 replica, HA in `s3://<bucket>/flink/cdc-<format><suffix>/ha/`, 8 Gi / 4 cpu, `driver-nodepool` (on-demand) |
+| JobManager | 1 replica, HA in `s3://<bucket>/flink/cdc-<format><suffix>/ha/`, 8 Gi / 4 cpu, metaspace 512m, `driver-nodepool` (on-demand) |
 | TaskManager | 32 Gi / 8 cpu, 4 slots, `executor-memorynodepool` (on-demand). The pods carry `karpenter.sh/do-not-disrupt: "true"` |
 | Parallelism | 32 (`job.parallelism` and `--parallelism 32`), `pipeline.max-parallelism: 128` |
 | Chaining | `pipeline.operator-chaining.enabled: true`, `pipeline.object-reuse: true` |
@@ -686,8 +656,8 @@ variables: change them in both manifests together.
 
 **Asymmetries kept on purpose:**
 
-- **Write layout:** Paimon has 32 bucket writers per table. Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
-- **Maintenance:** Paimon compacts and expires inline, in the writer. Iceberg relies on the external compaction Job (`iceberg-compaction/`), which also runs `expire_snapshots` (12 h, keep 5).
+- **Write layout:** Paimon has fixed buckets: 32 per date partition on `orders` / `order_items`, 8 on `customers`, 4 per category on `products` (from the next table set; `_v3r3` has 32 everywhere). Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
+- **Maintenance:** Paimon compacts and expires inline, in the writer. Iceberg relies on the separate FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), which rewrites and expires snapshots (12 h, keep 5) every 10 writer commits, and only while the writers commit.
 - **Changelog:** Paimon `changelog-producer = none`, because nothing reads a changelog and Iceberg writes none.
 - **Catalog access:** Paimon uses the Hive metastore client on Glue (`aws.glue.enabled: "true"`, the one `flinkConfiguration` difference). Iceberg uses its own `GlueCatalog` with `S3FileIO`.
 
@@ -719,7 +689,7 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 | Symptom | Cause / fix |
 |---|---|
 | `NoSuchFileException: /tmp/pyflink/.../flink-cdc-executor.py` | Either the `jarURI` object is missing (re-run `build`), or the CR was `kubectl apply`'d over an existing one (EMR stages `jarURI` on CREATE only). Delete the FlinkDeployment and create it again |
-| JobManager `CreateContainerConfigError` | The `flink-cdc-mysql-env` Secret is missing (Step 0) |
+| JobManager `CreateContainerConfigError` | The `mysql-credentials` Secret is missing (Step 0) |
 | New set's JobManager recovers an old job graph | Leftover HA ConfigMaps `flink-cdc-{paimon,iceberg}-*config-map`. Delete them (Step 4) |
 | Paimon: `NoAuthWithAWSException` on the warehouse | The catalog lacks `s3.aws.credentials.provider = ...WebIdentityTokenFileCredentialsProvider`. paimon-s3 ignores `hadoop-conf-dir` (fixed in `01-catalog-setup.sql`) |
 | Iceberg: `NoClassDefFoundError .../hc/core5/http/ClassicHttpRequest` | Iceberg 1.12's default `apache` HTTP client isn't in EMR's SDK bundle. Use `http-client.type = urlconnection` plus the url-connection-client jar (both are in place) |
@@ -729,23 +699,32 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 | Job cycles RUNNING → RESTARTING for no visible reason | Karpenter consolidation evicting a TaskManager (`failover-strategy: full` restarts all). Check that `karpenter.sh/do-not-disrupt` is on the running TaskManager pods |
 | `AWSGlueClientFactory - No region info found ... us-east-1` + `401` on the JobManager | Noise. The job reaches RUNNING anyway. Look elsewhere for a restart cause |
 | Operator CRD delete hangs | A CR is stuck on its finalizer. `kubectl patch flinkdeployment <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":null}}'` |
-| Generator rate low, no errors printed | MySQL 1213 / 1205 errors are retried silently. Read `errors=` against `batches=`. About 34% batch errors is the measured norm on this source |
-| Source tables regrow after a shrink | The generator pods still use the old `[MIN, MAX]` id range. Restart the StatefulSet |
-| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` | A known Paimon 2.1 v3 export issue. The arm records `ERROR` and the run continues |
+| Generator rate low, no errors printed | MySQL 1213 / 1205 errors are retried silently. Read `errors=` against `batches=` (about 34% batch errors was measured with 8 pods on db.m5.2xlarge; not re-measured on r6i.4xlarge) |
+| Generator rate falls over hours (e.g. ~85K → ~30K rows/s) | The source outgrew the buffer pool (37.5M → ~491M rows in ~4 h at 50% inserts on db.m5.2xlarge). Shrink it (Step 4a) and/or size RDS up (Step 0) |
+| Source tables regrow below the cutoff after a shrink | The generator pods still use the old `[MIN, MAX]` id range. Restart the StatefulSet |
+| DuckDB pod Pending, no node | `driver-nodepool` must allow `24xlarge` (and 12/16xlarge); a cluster-side patch, not in the repo (Step 0) |
+| Every Trino pin fails in the runner pod (fixed 2026-11-02) | Kubernetes service links set `TRINO_PORT=tcp://...`, which overrode the port. It is now `QB_TRINO_PORT`, and the Jobs set `enableServiceLinks: false` |
+| Trino `FOR VERSION AS OF` fails on Paimon's export (fixed 2026-11-02) | Paimon's snapshot ids are small integers; Trino needs `FOR VERSION AS OF BIGINT '<id>'` |
+| A Trino setup error says only `command terminated with exit code 1` | Fixed 2026-11-02: `qb_trino_try` now prints the Trino CLI's own error line |
+| Spark compaction (removed; history, 2026-11-02) | Parallel GC's full-GC stalls dropped S3 streams ("Premature end of Content-Length"), and a rewrite that rewrote nothing still "committed". Both were fixed before the Spark job was replaced by the Flink one |
+| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` (runs up to `_v3r3`) | The Paimon 2.1 v3 export issue; the arm now reads native Paimon instead |
 | A Glue `metadata_location` 404s mid-scan | Paimon's export and Iceberg keep only 3 previous metadata files. The benchmark reads pinned copies, so don't read live Glue paths during a test |
 | `run.sh start` refuses: Trino version | Run `./engine-deploy/deploy-trino.sh up` (Trino 484), or set `TRINO_VERSION_CHECK=0` |
-| Snapshot test refused at the compaction gate | A Job failed, is missing, or a write followed it. See Step 10 |
+| `iceberg-maintain` RESTARTING, `OutOfMemoryError: Java heap space` in `Rewrite` | A large equality-delete backlog (it started late). TaskManager is 32 Gi by default (`TM_MEMORY`); start it with the writers (Step 5) |
+| Writers restart-loop with `Access denied for user 'cdcuser'` | The Secret does not hold cdcuser's current password (e.g. after a rotation): fix the Secret, then delete + create the writers |
+| Paimon JobManager exits 239, `OutOfMemoryError: Metaspace` | JobManager metaspace; both manifests set `jobmanager.memory.jvm-metaspace.size: 512m` |
 | After a failed test everything is still running | By design, the watcher only tears down after `runner-exit=0`. Fix it and re-run, or `SUITE=hot ./querybench/run.sh stop` |
 | Monitor pod stuck with no logs | First boot pip-installs pyiceberg and pyarrow (about 2 min) |
 | Monitor or engines can't assume role | The role's trust policy must cover `system:serviceaccount:emr-flink:<sa>`, and `starrocks-sa` must carry the role-arn annotation |
 
 ## Resources created
 
-- 1 RDS MySQL 8.0 instance (binlog, CDC user) and 2 Secrets (`flink-cdc-mysql-env`, `mysql-credentials`)
-- ECR `emr-flink-cdc-paimon:7.14.0` and `duckdb-cdc-server:2.0.0`, both multi-arch
+- 1 RDS MySQL 8.0.45 instance, db.r6i.4xlarge, 500 GB gp3 / 64,000 IOPS (binlog, CDC user), and 1 Secret (`mysql-credentials`)
+- ECR `emr-flink-cdc-paimon:7.14.0` and `duckdb-cdc-server:2.0.0`, both multi-arch; `trino-cdc:484-paimon-2.1.0` once the in-progress Paimon Trino image is pushed
 - EMR Flink operator 7.14.0 (Helm), the `ebs-sc` StorageClass, and Kyverno with the `flink-cdc-single-az` ClusterPolicy
 - 2 FlinkDeployments (`flink-cdc-paimon`, `flink-cdc-iceberg`), each 1 JobManager + 8 TaskManagers
 - StatefulSet `mysql-upsert-loadgen` (4 pods)
 - Deployment `flink-cdc-monitor`
-- Deployment `duckdb-warm-cdc`, Helm release `trino` (with per-pod gp3-fast cache volumes), Jobs `cdc-qb-runner` / `cdc-qb-watch` / `iceberg-compact-*`
-- Per table set: 2 Glue DBs × 4 tables; S3 warehouse, export, Flink state and log prefixes; `querybench-pins/` and `querybench-results/` session prefixes
+- Deployment `duckdb-warm-cdc` (81 cpu / 342 GiB, one m5.24xlarge), Helm release `trino` (9 workers + coordinator, per-pod gp3-fast cache volumes of 56 Gi), Jobs `cdc-qb-runner` / `cdc-qb-watch`
+- FlinkDeployment `iceberg-maintain` (Iceberg compaction, [iceberg-compaction/](iceberg-compaction/README.md))
+- Per table set: 2 Glue DBs × 4 tables; S3 warehouse, export, Flink state and log prefixes; `querybench-pins/` and `querybench-results/` session prefixes (job-monitor reports under `monitor/`)

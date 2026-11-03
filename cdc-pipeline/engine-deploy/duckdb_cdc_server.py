@@ -9,28 +9,31 @@ tables need it:
     iceberg_scan() of its own pinned metadata.json, so the server resolves no
     ${TABLE}, has no /pin, and needs no table names in its environment;
   - a finished job returns every result row (`rows`, up to MAX_RESULT_ROWS,
-    fields |-joined, NULL as "NULL", like StarRocks' mysql -N -B), so the
+    fields |-joined, NULL as "NULL", like `mysql -N -B` output), so the
     summary can compare all rows across arms, not only the first;
   - /health reports `started_at`, so the client can tell that the server was
     restarted under a query (an OOM kill on uncompacted equality deletes:
     the container restarts and its memory caches are gone).
 DuckDB 2.0 (2026-11-02; DUCKDB_IMAGE, the source-built image, or the PyPI
 wheel): extensions that are STATICALLY_LINKED (the image links iceberg, httpfs,
-aws, avro) or already installed (the image's cache_httpfs) are LOADed without
-an INSTALL, so the pod needs no extension download; profile_query reads
+aws, avro) or already installed (the image's cache_httpfs and its self-built,
+unsigned paimon, hence allow_unsigned_extensions) are LOADed without an INSTALL,
+so the pod needs no extension download; profile_query reads
 EXPLAIN (ANALYZE, FORMAT JSON) (2.0 draws the text plan in boxes, "Table Scan",
 which the 1.5 regex no longer matched); results stream, so execute and fetch
 stay under one try and one timer (attempt). Python >= 3.11.
-Iceberg v3 (ICEBERG_FORMAT_VERSION=3): a query of an arm in
-SKIP_PUFFIN_VERIFICATION_ARMS (default: paimon on v3, none on v2) runs with
-iceberg_unsafe_skip_puffin_verification = true, every other with false: Paimon's
-Iceberg export writes its deletion-vector index files as bare blobs, not Puffin
-containers, which DuckDB otherwise rejects. The setting is global, which is safe
-here because one query runs at a time (the lock). The job and /health report it.
-Everything below this paragraph is the throughput server's own description.
+Arms: `iceberg` sends iceberg_scan() of a pinned metadata.json copy; `paimon`
+sends paimon_scan('<table path>', snapshot_from_id=N), the NATIVE Paimon
+extension (paimon-cpp has its own S3 client: it reads the `paimon_irsa`
+secret below, not httpfs, so cache_httpfs does not cache the paimon arm).
+SKIP_PUFFIN_VERIFICATION_ARMS (default none) still sets
+iceberg_unsafe_skip_puffin_verification per arm; it existed for Paimon's
+Iceberg export, which is no longer read.
 
 Original: Warm DuckDB query server: the DuckDB side of a warm-vs-warm comparison with
-StarRocks. Runs in a long-lived pod.
+StarRocks. Runs in a long-lived pod. (History: StarRocks was the other engine until
+2026-11-02, Trino since. The StarRocks references below record why each cache and
+timing setting was chosen then; the settings themselves still apply.)
 
 One process and ONE connection for the pod's life, like a StarRocks FE/BE that is
 already up: extensions, the S3 secret, Parquet footers and the cache_httpfs block
@@ -101,10 +104,12 @@ BLOCK = int(ENV.get("CACHE_BLOCK_BYTES") or 262144)
 SECRET_TTL_S = 20 * 60                      # IRSA sessions last ~1h
 ICEBERG_FORMAT_VERSION = int(ENV.get("ICEBERG_FORMAT_VERSION") or 3)
 _skip = ENV.get("SKIP_PUFFIN_VERIFICATION_ARMS")
-SKIP_PUFFIN_ARMS = set((_skip if _skip is not None else ("paimon" if ICEBERG_FORMAT_VERSION >= 3 else "")).split())
+SKIP_PUFFIN_ARMS = set((_skip or "").split())
 DUCKDB_MAJOR = int(duckdb.__version__.split(".")[0])
 
-con = duckdb.connect()
+# allow_unsigned_extensions: the image's paimon extension is built from source
+# (paimon-cpp with bitmap64 deletion vectors), so it carries no DuckDB signature.
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 lock = threading.Lock()                     # one query at a time
 jobs = {}
 secret_at = 0.0
@@ -115,15 +120,18 @@ def run(cmd):
 
 
 def load_extensions():
-    """LOAD httpfs, iceberg, cache_httpfs. INSTALL only what is neither linked
+    """LOAD httpfs, iceberg, cache_httpfs, paimon. INSTALL only what is neither linked
     into the build nor installed already: on the source-built image (DUCKDB_IMAGE)
     iceberg/httpfs/aws/avro are STATICALLY_LINKED and cache_httpfs is installed
-    at build time, so nothing is fetched; on the pip fallback they download
-    from extensions.duckdb.org / community as before. Returns {name: how}."""
+    at build time (paimon is built from source and installed), so nothing is
+    fetched; on the pip fallback they download from extensions.duckdb.org /
+    community as before (community paimon 0.1.3 cannot read bitmap64 deletion
+    vectors: scans of the CDC tables fail). Returns {name: how}."""
     mode = {n: (m, inst) for n, m, inst in con.execute(
         "SELECT extension_name, install_mode, installed FROM duckdb_extensions()").fetchall()}
     how = {}
-    for ext, repo in (("httpfs", ""), ("iceberg", ""), ("cache_httpfs", " FROM community")):
+    for ext, repo in (("httpfs", ""), ("iceberg", ""), ("cache_httpfs", " FROM community"),
+                     ("paimon", " FROM community")):
         m, inst = mode.get(ext, (None, False))
         if m == "STATICALLY_LINKED":
             how[ext] = "static"
@@ -201,6 +209,10 @@ def refresh_secret(force=False):
                "--query", "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]", "--output", "text"])
     ak, sk, st = out.split()
     con.execute("CREATE OR REPLACE SECRET irsa (TYPE s3, KEY_ID '%s', SECRET '%s', SESSION_TOKEN '%s', REGION '%s')"
+                % (ak, sk, st, REGION))
+    # The native Paimon arm: paimon-cpp's own S3 client reads only TYPE paimon
+    # secrets (engine-deploy/duckdb-image/README.md), refreshed with the same keys.
+    con.execute("CREATE OR REPLACE SECRET paimon_irsa (TYPE paimon, KEY_ID '%s', SECRET '%s', SESSION_TOKEN '%s', REGION '%s')"
                 % (ak, sk, st, REGION))
     secret_at = time.time()
 

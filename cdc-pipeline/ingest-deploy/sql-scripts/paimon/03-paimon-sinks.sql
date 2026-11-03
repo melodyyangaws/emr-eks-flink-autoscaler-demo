@@ -111,7 +111,11 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    'bucket' = '32',
+    -- 8 buckets, not 32 (2026-11-04): at 32 the _v3r3 table held 1.71 GiB live in
+    -- ~55 MiB buckets, each a writer, a DV index file and an LSM per checkpoint;
+    -- 8 gives ~220 MiB buckets (Paimon's guidance: ~200 MiB-1 GiB). Fixed at CREATE
+    -- TABLE: takes a new CDC_DB_SUFFIX. Iceberg has no buckets (hash distribution).
+    'bucket' = '8',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -135,7 +139,7 @@ CREATE TABLE IF NOT EXISTS customers (
     -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
     -- Iceberg's write.target-file-size-bytes.
     'target-file-size' = '64mb',
-    'write-buffer-size' = '128mb',
+    'write-buffer-size' = '64mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
     -- 'compaction.max.file-num' was removed from all four tables: no such option
@@ -213,7 +217,10 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    'bucket' = '32',
+    -- 4 buckets per category, not 32 (2026-11-04): 8 categories x 32 = 256 buckets of
+    -- ~4 MiB live each on _v3r3 (1.10 GiB; ~44K small files on S3). 4 gives ~35 MiB
+    -- buckets and still 32 bucket writers in all. New CDC_DB_SUFFIX to take effect.
+    'bucket' = '4',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -237,7 +244,7 @@ CREATE TABLE IF NOT EXISTS products (
     -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
     -- Iceberg's write.target-file-size-bytes.
     'target-file-size' = '64mb',
-    'write-buffer-size' = '128mb',
+    'write-buffer-size' = '64mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
@@ -308,7 +315,7 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 128 MB on the fact tables (64 MB on customers/products), paired with
     -- Iceberg's write.target-file-size-bytes.
     'target-file-size' = '128mb',
-    'write-buffer-size' = '256mb',
+    'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
@@ -377,7 +384,7 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- 128 MB on the fact tables (64 MB on customers/products), paired with
     -- Iceberg's write.target-file-size-bytes.
     'target-file-size' = '128mb',
-    'write-buffer-size' = '256mb',
+    'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
     'num-sorted-run.compaction-trigger' = '4',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.

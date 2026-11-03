@@ -50,7 +50,7 @@ export SESSION_SUFFIX="${SESSION_SUFFIX:-}"
 export ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}"
 [[ "$ICEBERG_FORMAT_VERSION" =~ ^[23]$ ]] || { echo "ICEBERG_FORMAT_VERSION must be 2 or 3, got '${ICEBERG_FORMAT_VERSION}' (.bench-env)" >&2; exit 1; }
 # The live set is whatever .bench-env sets (CDC_DB_SUFFIX=_v3r1 there now). Only
-# when nothing sets it does this fall back to _v3, as build-deploy-generic.sh and
+# when nothing sets it does this fall back to _v3, as ingest-deploy/build-deploy-generic.sh and
 # deploy-monitor.sh do; an explicit CDC_DB_SUFFIX= is the unsuffixed v2 set.
 export CDC_DB_SUFFIX="${CDC_DB_SUFFIX-_v3}"
 [[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || { echo "CDC_DB_SUFFIX must be empty or like _v3, got '${CDC_DB_SUFFIX}' (.bench-env)" >&2; exit 1; }

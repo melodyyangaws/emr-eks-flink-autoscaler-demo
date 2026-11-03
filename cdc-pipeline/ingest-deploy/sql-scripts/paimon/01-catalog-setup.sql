@@ -20,13 +20,18 @@ CREATE CATALOG paimon_catalog WITH (
     'lock.enabled' = 'false',
     'metastore' = 'hive',
     's3.region' = '${AWS_REGION}',
-    -- Paimon 2.1 opens s3:// through its paimon-s3 plugin (PluginFileIO ->
-    -- HadoopCompliantFileIO), an isolated S3A that takes only these s3.*
-    -- options, never hadoop-conf-dir. Without this it uses Hadoop's default
-    -- chain, which has no IRSA provider: NoAuthWithAWSException on the warehouse
-    -- (first v3 deploy, 2026-11-02). The plugin bundles the STS module the
-    -- web-identity provider needs.
     's3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider',
+    -- S3A upload shape. Paimon's S3FileIO builds its S3AFileSystem from a bare
+    -- Configuration (EMR's core-site.xml never applies), so these are passed as
+    -- catalog options: S3FileIO maps 's3.*' to 'fs.s3a.*'. multipart.size is the
+    -- block cut point (S3A floor 5M, clamped up silently); 'disk' buffering keeps
+    -- queued blocks off the task heap. Iceberg's catalog gets the same shape
+    -- (01-catalog-setup.sql there). Values: build-deploy-generic.sh.
+    's3.multipart.size' = '${S3A_MULTIPART_SIZE:16M}',
+    's3.multipart.threshold' = '${S3A_MULTIPART_THRESHOLD:16M}',
+    's3.fast.upload.active.blocks' = '${S3A_ACTIVE_BLOCKS:6}',
+    's3.fast.upload.buffer' = 'disk',
+    's3.buffer.dir' = '/tmp/s3a-paimon',
     'hive-conf-dir' = '/glue/confs/hive/conf',
     'hadoop-conf-dir' = '/glue/confs/hadoop/conf',
     'warehouse' = '${PAIMON_WAREHOUSE}',

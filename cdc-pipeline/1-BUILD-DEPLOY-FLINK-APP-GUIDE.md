@@ -5,13 +5,13 @@
 Two FlinkDeployments on EMR on EKS 7.14.0 read the same MySQL binlog and write the
 same four tables: `flink-cdc-paimon` to Apache Paimon 2.1.0 and `flink-cdc-iceberg`
 to Apache Iceberg (Flink runtime 1.12.0). A generic PyFlink executor
-(`flink-cdc-executor.py`) runs the SQL in `sql-scripts/`. You can change a pipeline
+(`ingest-deploy/flink-cdc-executor.py`) runs the SQL in `ingest-deploy/sql-scripts/`. You can change a pipeline
 by editing SQL on S3, with no image rebuild.
 
 > **Three things here are easy to get wrong. Read them before Step 1:**
 >
 > 1. The **SQL scripts** and the **executor itself** both come from S3, uploaded by
->    `./build-deploy-generic.sh build`. A local edit changes nothing until it is
+>    `./ingest-deploy/build-deploy-generic.sh build`. A local edit changes nothing until it is
 >    uploaded. See [The executor script comes from S3](#the-executor-script-comes-from-s3).
 > 2. Re-deploying is **delete, clear the HA ConfigMaps, apply**. A bare
 >    `kubectl apply` over a live FlinkDeployment is not enough. See
@@ -19,8 +19,12 @@ by editing SQL on S3, with no image rebuild.
 > 3. Table options apply **at CREATE TABLE only**. New sink settings need a fresh
 >    table set, which means a new `CDC_DB_SUFFIX`.
 
-Run every command in this guide from `cdc-pipeline/`. The scripts use paths relative
-to it (`docker/`, `sql-scripts/`, `k8s/`, `flink-cdc-executor.py`).
+**This is the reference for the writers.** The step-by-step run (settings, table
+set, writers, generator, tests, summary, teardown) is [README.md](README.md);
+this guide adds the details behind its Steps 2-5. Run commands from
+`cdc-pipeline/`. `ingest-deploy/build-deploy-generic.sh` changes into its own
+directory, so its relative paths (`docker/`, `sql-scripts/`, `k8s/`, the
+templates and their renders) are inside `ingest-deploy/`.
 
 ---
 
@@ -37,7 +41,7 @@ to it (`docker/`, `sql-scripts/`, `k8s/`, `flink-cdc-executor.py`).
 │          Generic Flink CDC Executor (PyFlink)               │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │  1. Load SQL scripts from S3                         │   │
-│  │  2. Substitute environment variables (${MYSQL_HOST}) │   │
+│  │  2. Substitute environment variables (${MYSQL_PORT}) │   │
 │  │  3. Parse SQL into statements                        │   │
 │  │  4. Execute in sequence                              │   │
 │  └──────────────────────────────────────────────────────┘   │
@@ -60,24 +64,23 @@ to it (`docker/`, `sql-scripts/`, `k8s/`, `flink-cdc-executor.py`).
 
 ```
 cdc-pipeline/
-  ├── .bench-env                       ← Table set + account values (sources .bench-env.local)
-  ├── docker/
-  │   └── Dockerfile.cdc-paimon        ← Image: EMR 7.14 Flink + MySQL CDC + Paimon 2.1 + Iceberg 1.12
-  ├── mysql-data-generator/
-  │   ├── deploy-data-generator.sh     ← Manages the upsert load generator
-  │   ├── mysql-upsert-loadgen.yaml    ← StatefulSet, 4 pods, batched upserts (no DELETEs)
-  │   └── find-rds-ceiling.sh          ← Ramps upsert replicas to find the RDS write ceiling
-  ├── flink-cdc-executor.py            ← Generic SQL executor (the job's jarURI)
-  ├── sql-scripts/
-  │   ├── common/02-cdc-sources.sql    ← MySQL CDC sources (copied into each format dir on S3)
-  │   ├── paimon/{01-catalog-setup,03-paimon-sinks,04-cdc-pipelines}.sql
-  │   └── iceberg/{01-catalog-setup,03-iceberg-sinks,04-cdc-pipelines}.sql
-  ├── flink-cdc-paimon-sql.yaml        ← FlinkDeployment template (Paimon)
-  ├── flink-cdc-iceberg-sql.yaml       ← FlinkDeployment template (Iceberg)
-  ├── build-deploy-generic.sh          ← build | render | deploy | all | cleanup | monitor
-  ├── k8s/                             ← ebs-sc StorageClass, Kyverno single-AZ policy
-  ├── iceberg-compaction/              ← Iceberg compaction Jobs (run before the snapshot test)
-  └── engine-deploy/                   ← Query engines: DuckDB warm server, Trino
+  ├── .bench-env, .bench-env.local     ← settings + account values (README Step 1)
+  ├── ingest-deploy/                   ← the Flink CDC writers
+  │   ├── build-deploy-generic.sh      ← build | render | deploy | all | cleanup | monitor
+  │   ├── flink-cdc-executor.py        ← generic SQL executor (the jobs' jarURI)
+  │   ├── flink-cdc-paimon-sql.yaml    ← FlinkDeployment template (Paimon)
+  │   ├── flink-cdc-iceberg-sql.yaml   ← FlinkDeployment template (Iceberg)
+  │   ├── docker/Dockerfile.cdc-paimon ← image: EMR 7.14 Flink + MySQL CDC + Paimon 2.1 + Iceberg 1.12
+  │   ├── sql-scripts/
+  │   │   ├── common/02-cdc-sources.sql      ← MySQL CDC sources (copied into each format dir on S3)
+  │   │   ├── paimon/{01-catalog-setup,03-paimon-sinks,04-cdc-pipelines}.sql
+  │   │   └── iceberg/{01-catalog-setup,03-iceberg-sinks,04-cdc-pipelines}.sql
+  │   └── k8s/                         ← ebs-sc StorageClass, Kyverno single-AZ policy
+  ├── iceberg-compaction/              ← iceberg-maintain: continuous Iceberg compaction (maintain.py)
+  ├── mysql-data-generator/            ← upsert load generator (StatefulSet)
+  ├── monitoring/                      ← job monitor
+  ├── engine-deploy/                   ← query engines: DuckDB warm server, Trino
+  └── querybench/                      ← hot + snapshot query tests, summary
 ```
 
 ---
@@ -177,43 +180,24 @@ AWS-documented path for the EMR chart.
 
 ## Step 2 — Set the environment
 
-```bash
-cd cdc-pipeline
-
-# Account values (from .bench-env.local) + the table set:
-#   NAMESPACE=emr-flink, ICEBERG_FORMAT_VERSION=3, CDC_DB_SUFFIX=_v3r1
-source .bench-env
-
-# MYSQL_HOST, MYSQL_USER (needed by render/deploy, not by build)
-source mysql-cdc-env.sh
-
-# Which jobs each action touches: paimon | iceberg | both (default)
-export LAKEHOUSE_FORMAT=both
-```
-
-`.bench-env` sources `.bench-env.local` (git-ignored), which holds `AWS_REGION`,
-`AWS_ACCOUNT_ID`, `BUCKET_NAME` and `EMR_EXECUTION_ROLE_ARN`. Without that file, set
-them yourself:
-
-```bash
-export AWS_REGION=us-west-2
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export BUCKET_NAME=emr-on-eks-test-${AWS_ACCOUNT_ID}-${AWS_REGION}
-export EMR_EXECUTION_ROLE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role
-```
+Settings come from `.bench-env` and the git-ignored `.bench-env.local`
+([README Step 1](README.md#step-1-settings-bench-env-bench-envlocal)).
+`build-deploy-generic.sh` reads the environment, so `source .bench-env` first.
+`LAKEHOUSE_FORMAT` (`paimon` | `iceberg` | `both`, default `both`) selects which
+jobs `build`, `render`, `deploy` and `all` touch.
 
 ### Which table set a run writes
 
 | Variable | Default | Effect |
 |---|---|---|
 | `ICEBERG_FORMAT_VERSION` | `3` | Iceberg sink `format-version` and Paimon `metadata.iceberg.format-version`. Must be `2` or `3` |
-| `CDC_DB_SUFFIX` | If unset: the value in `.bench-env` (`_v3r1` now), else `_v3` | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). Must be empty or match `_[a-z0-9]+` |
+| `CDC_DB_SUFFIX` | If unset: the value in `.bench-env`, else `_v3` | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). Must be empty or match `_[a-z0-9]+` |
 | `PAIMON_DV_BITMAP64` | Derived, not a setting: `true` if and only if `ICEBERG_FORMAT_VERSION=3` | Paimon `deletion-vectors.bitmap64` |
 
 An explicit `CDC_DB_SUFFIX=` (set but empty) selects the original unsuffixed v2 set:
 
 ```bash
-ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./build-deploy-generic.sh render
+ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./ingest-deploy/build-deploy-generic.sh render
 ```
 
 Table sets never share tables or Flink state, so one set never restores another's
@@ -226,24 +210,19 @@ line.
 
 ## Step 3 — Create the MySQL secret
 
-`build-deploy-generic.sh` does not create it. Create `flink-cdc-mysql-env` (key
-`MYSQL_PASSWORD`) as in
-[0-MYSQL-SETUP-GUIDE.md, Step 8](./0-MYSQL-SETUP-GUIDE.md#step-8-create-the-kubernetes-secrets),
-then check it:
-
-```bash
-kubectl get secret flink-cdc-mysql-env -n emr-flink
-```
-
-The manifests read it at pod start with `envFrom: secretRef`. No password is
-substituted into any file, including the git-ignored `*-deployed.yaml`.
+`build-deploy-generic.sh` does not create it. The writers and the generator share
+one Secret, `mysql-credentials` (keys `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`),
+created as in [README Step 0](README.md#step-0-prerequisites) /
+[0-MYSQL-SETUP-GUIDE.md, Step 8](./0-MYSQL-SETUP-GUIDE.md#step-8-create-the-kubernetes-secret).
+The manifests load it with `envFrom: secretRef`; no credential is substituted into
+any file, including the git-ignored `*-deployed.yaml`.
 
 ---
 
 ## Step 4 — Build the image and upload the scripts
 
 ```bash
-./build-deploy-generic.sh build
+./ingest-deploy/build-deploy-generic.sh build
 ```
 
 `build` needs `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME` and
@@ -260,7 +239,7 @@ needs no MySQL values. It does the following:
 3. Joins the two per-arch images into **one manifest-list tag**,
    `emr-flink-cdc-paimon:7.14.0` (`IMAGE_TAG`, default `EMR_VERSION`), and deletes
    the temporary `-buildstage-<arch>` tags.
-4. Uploads `flink-cdc-executor.py` and `sql-scripts/` to S3 (see
+4. Uploads `ingest-deploy/flink-cdc-executor.py` and `ingest-deploy/sql-scripts/` to S3 (see
    [Step 5](#step-5--upload-sql-or-executor-changes-without-a-rebuild)).
 
 Both architectures are the default because `executor-memorynodepool` provisions
@@ -301,7 +280,7 @@ A failed check prints `ERROR: ...` and fails the pod. The script then prints the
 
 ### What the image contains
 
-`docker/Dockerfile.cdc-paimon` builds on
+`ingest-deploy/docker/Dockerfile.cdc-paimon` builds on
 `public.ecr.aws/emr-on-eks/flink/emr-7.14.0-flink:latest` (Flink 1.20.0-amzn-8,
 Corretto 17) and adds:
 
@@ -332,13 +311,13 @@ The tag `7.14.0` is rebuilt in place, so both manifests set
 commands do the same upload without rebuilding the image:
 
 ```bash
-aws s3 cp flink-cdc-executor.py s3://${BUCKET_NAME}/flink/scripts/
-aws s3 sync sql-scripts/common/ s3://${BUCKET_NAME}/flink/sql-scripts/common/ --delete
+aws s3 cp ingest-deploy/flink-cdc-executor.py s3://${BUCKET_NAME}/flink/scripts/
+aws s3 sync ingest-deploy/sql-scripts/common/ s3://${BUCKET_NAME}/flink/sql-scripts/common/ --delete
 for f in paimon iceberg; do
-  aws s3 sync sql-scripts/$f/ s3://${BUCKET_NAME}/flink/sql-scripts/$f/ --delete
+  aws s3 sync ingest-deploy/sql-scripts/$f/ s3://${BUCKET_NAME}/flink/sql-scripts/$f/ --delete
   # each job reads only its own dir (--sql-dir .../<format>/), so the shared
   # sources file is copied into it, after the sync (sync --delete removes it)
-  aws s3 cp sql-scripts/common/02-cdc-sources.sql s3://${BUCKET_NAME}/flink/sql-scripts/$f/
+  aws s3 cp ingest-deploy/sql-scripts/common/02-cdc-sources.sql s3://${BUCKET_NAME}/flink/sql-scripts/$f/
 done
 ```
 
@@ -352,23 +331,23 @@ submission, so re-deploy ([Step 7](#step-7--re-deploy-after-a-change)).
 1. Render the manifests without applying them:
 
    ```bash
-   ./build-deploy-generic.sh render
+   ./ingest-deploy/build-deploy-generic.sh render
    ```
 
    `render` needs the four AWS values plus `MYSQL_HOST` and `MYSQL_USER`. It also:
 
-   - creates the `ebs-sc` StorageClass (`k8s/ebs-sc-storageclass.yaml`) if missing
+   - creates the `ebs-sc` StorageClass (`ingest-deploy/k8s/ebs-sc-storageclass.yaml`) if missing
    - installs Kyverno with Helm if missing, and applies the `flink-cdc-single-az`
-     ClusterPolicy (`k8s/kyverno-flink-az-affinity.yaml`)
+     ClusterPolicy (`ingest-deploy/k8s/kyverno-flink-az-affinity.yaml`)
    - creates the Glue database `flink_iceberg_db<suffix>`. The Paimon database is
-     created by `CREATE DATABASE IF NOT EXISTS` in `sql-scripts/paimon/01-catalog-setup.sql`.
-   - writes `flink-cdc-paimon-deployed.yaml` and `flink-cdc-iceberg-deployed.yaml`
+     created by `CREATE DATABASE IF NOT EXISTS` in `ingest-deploy/sql-scripts/paimon/01-catalog-setup.sql`.
+   - writes `ingest-deploy/flink-cdc-paimon-deployed.yaml` and `ingest-deploy/flink-cdc-iceberg-deployed.yaml`
      (git-ignored)
 
 2. Check the configuration block the script prints:
 
    ```
-   DB/state suffix:  _v3r1
+   DB/state suffix:  _v3r4
    Paimon DV 64-bit: true
    Iceberg format:    v3
    ```
@@ -376,20 +355,20 @@ submission, so re-deploy ([Step 7](#step-7--re-deploy-after-a-change)).
    And check the rendered table-set values:
 
    ```bash
-   grep -nA1 -E 'name: (GLUE_DATABASE|ICEBERG_FORMAT_VERSION|PAIMON_DV_BITMAP64)$' flink-cdc-*-deployed.yaml
+   grep -nA1 -E 'name: (GLUE_DATABASE|ICEBERG_FORMAT_VERSION|PAIMON_DV_BITMAP64)$' ingest-deploy/flink-cdc-*-deployed.yaml
    ```
 
 3. Apply **both manifests in one call**:
 
    ```bash
    kubectl apply -n emr-flink \
-     -f flink-cdc-paimon-deployed.yaml \
-     -f flink-cdc-iceberg-deployed.yaml
+     -f ingest-deploy/flink-cdc-paimon-deployed.yaml \
+     -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
    ```
 
    With `scan.startup.mode = initial`, the job that starts first snapshots a smaller
    MySQL table and gets a head start on the binlog. One `kubectl apply` makes the two
-   snapshot phases overlap. `./build-deploy-generic.sh deploy` applies Paimon, waits,
+   snapshot phases overlap. `./ingest-deploy/build-deploy-generic.sh deploy` applies Paimon, waits,
    then applies Iceberg (about 30 s apart). That is fine when you are not comparing
    the two formats.
 
@@ -423,8 +402,8 @@ placeholders:
 | `${ICEBERG_FORMAT_VERSION}` | see [Step 2](#which-table-set-a-run-writes) |
 | `${CDC_DB_SUFFIX}` | see Step 2. Used in `GLUE_DATABASE` (hardcoded per manifest as `flink_<format>_db${CDC_DB_SUFFIX}`) and in every state and log path |
 | `${PAIMON_DV_BITMAP64}` | derived from `ICEBERG_FORMAT_VERSION` |
-| `${MYSQL_HOST}`, `${MYSQL_USER}` | required (not for `build`) |
-| `${MYSQL_ENV_SECRET_NAME}` | `flink-cdc-mysql-env` |
+| `${MYSQL_PORT}`, `${MYSQL_DATABASE}` | `3306`, `ecommerce` (`.bench-env`). Host, user and password are not rendered: the pods read them from Secret `mysql-credentials` (`envFrom`) |
+| `${MYSQL_ENV_SECRET_NAME}` | `mysql-credentials` |
 | `${JM_NODEPOOL}` / `${TM_NODEPOOL}` | `driver-nodepool` / `executor-memorynodepool` |
 
 The script stops if a `${...}` placeholder is left, or if any env `value: ""` is
@@ -451,7 +430,7 @@ empty.
    executor changed ([Step 5](#step-5--upload-sql-or-executor-changes-without-a-rebuild)).
 
    ```bash
-   ./build-deploy-generic.sh render
+   ./ingest-deploy/build-deploy-generic.sh render
    ```
 
 2. Delete both FlinkDeployments:
@@ -484,11 +463,11 @@ empty.
 
    ```bash
    kubectl apply -n emr-flink \
-     -f flink-cdc-paimon-deployed.yaml \
-     -f flink-cdc-iceberg-deployed.yaml
+     -f ingest-deploy/flink-cdc-paimon-deployed.yaml \
+     -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
    ```
 
-To stop one job and keep the other, `./build-deploy-generic.sh cleanup paimon` (or
+To stop one job and keep the other, `./ingest-deploy/build-deploy-generic.sh cleanup paimon` (or
 `iceberg`) prompts for `yes`, then deletes that rendered FlinkDeployment. Clear its
 HA ConfigMap before you apply it again.
 
@@ -500,8 +479,8 @@ The first v3 deploy on EMR 7.14 needed three fixes. All three are in the repo no
 
 | Job | Symptom | Fix |
 |---|---|---|
-| Iceberg | `GlueCatalog.initialize` fails with `NoClassDefFoundError ...thirdparty/org/apache/hc/core5/http/ClassicHttpRequest`. Iceberg 1.12's default `apache` HTTP client is the SDK's Apache5 client, which EMR 7.14's SDK bundle (2.44.5) does not ship | `'http-client.type' = 'urlconnection'` in `sql-scripts/iceberg/01-catalog-setup.sql`, plus `url-connection-client-2.44.5.jar` in the image |
-| Paimon | `NoAuthWithAWSException` on the warehouse. Paimon 2.1 opens `s3://` through the `paimon-s3` plugin, an isolated S3A that reads only `s3.*` catalog options and never `hadoop-conf-dir`, so it had no IRSA provider | `'s3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider'` in `sql-scripts/paimon/01-catalog-setup.sql` |
+| Iceberg | `GlueCatalog.initialize` fails with `NoClassDefFoundError ...thirdparty/org/apache/hc/core5/http/ClassicHttpRequest`. Iceberg 1.12's default `apache` HTTP client is the SDK's Apache5 client, which EMR 7.14's SDK bundle (2.44.5) does not ship | `'http-client.type' = 'urlconnection'` in `ingest-deploy/sql-scripts/iceberg/01-catalog-setup.sql`, plus `url-connection-client-2.44.5.jar` in the image |
+| Paimon | `NoAuthWithAWSException` on the warehouse. Paimon 2.1 opens `s3://` through the `paimon-s3` plugin, an isolated S3A that reads only `s3.*` catalog options and never `hadoop-conf-dir`, so it had no IRSA provider | `'s3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider'` in `ingest-deploy/sql-scripts/paimon/01-catalog-setup.sql` |
 | both | A node runs a stale copy of the rebuilt `7.14.0` tag | `imagePullPolicy: Always` in both templates |
 
 The same run found that Paimon's Iceberg export deleted its previous `metadata.json`
@@ -512,7 +491,7 @@ fixed by `metadata.iceberg.previous-versions-max = 3` in the table settings belo
 
 ## Sink table settings: Paimon vs Iceberg
 
-`sql-scripts/{paimon,iceberg}/03-*-sinks.sql` pair every setting both formats have.
+`ingest-deploy/sql-scripts/{paimon,iceberg}/03-*-sinks.sql` pair every setting both formats have.
 They apply to **newly created tables only** (`CREATE TABLE IF NOT EXISTS` leaves an
 existing table alone), so they take effect with a fresh `CDC_DB_SUFFIX`.
 
@@ -584,7 +563,7 @@ Notes on the less obvious ones:
 
 ## The executor script comes from S3
 
-`flink-cdc-executor.py` is the `job.jarURI`:
+`ingest-deploy/flink-cdc-executor.py` is the `job.jarURI`:
 
 ```yaml
 job:
@@ -622,8 +601,8 @@ or `--sql-dir`, `--pattern` (default `*.sql`), `--mode streaming|batch`,
 is available as `${VAR}` or `${VAR:default}` in the SQL.
 
 ```bash
-python flink-cdc-executor.py --sql-file setup.sql,pipelines.sql
-python flink-cdc-executor.py --sql-dir s3://my-bucket/flink-sql/ --mode streaming --parallelism 8
+python ingest-deploy/flink-cdc-executor.py --sql-file setup.sql,pipelines.sql
+python ingest-deploy/flink-cdc-executor.py --sql-dir s3://my-bucket/flink-sql/ --mode streaming --parallelism 8
 ```
 
 ---
@@ -631,12 +610,12 @@ python flink-cdc-executor.py --sql-dir s3://my-bucket/flink-sql/ --mode streamin
 ## Deployment Commands
 
 ```bash
-./build-deploy-generic.sh build              # image (Kaniko, both archs) + upload executor and SQL
-./build-deploy-generic.sh render             # render *-deployed.yaml, do not apply (benchmark runs)
-./build-deploy-generic.sh deploy             # render + apply, Paimon then Iceberg (~30 s apart)
-./build-deploy-generic.sh all                # build + deploy
-./build-deploy-generic.sh monitor paimon     # FlinkDeployment + pods (or iceberg)
-./build-deploy-generic.sh cleanup [paimon|iceberg]   # prompts, deletes the rendered FlinkDeployment(s)
+./ingest-deploy/build-deploy-generic.sh build              # image (Kaniko, both archs) + upload executor and SQL
+./ingest-deploy/build-deploy-generic.sh render             # render *-deployed.yaml, do not apply (benchmark runs)
+./ingest-deploy/build-deploy-generic.sh deploy             # render + apply, Paimon then Iceberg (~30 s apart)
+./ingest-deploy/build-deploy-generic.sh all                # build + deploy
+./ingest-deploy/build-deploy-generic.sh monitor paimon     # FlinkDeployment + pods (or iceberg)
+./ingest-deploy/build-deploy-generic.sh cleanup [paimon|iceberg]   # prompts, deletes the rendered FlinkDeployment(s)
 ```
 
 `LAKEHOUSE_FORMAT` (`paimon` | `iceberg` | `both`, default `both`) selects which
@@ -670,7 +649,7 @@ kubectl logs -l app=flink-cdc-paimon,component=jobmanager -n emr-flink -c flink-
 kubectl describe pod -l app=flink-cdc-paimon,component=jobmanager -n emr-flink   # secret / image errors
 ```
 
-Common causes: the `flink-cdc-mysql-env` secret is missing
+Common causes: the `mysql-credentials` secret is missing
 (`CreateContainerConfigError`), the binlog is not enabled, the CDC user lacks
 permissions, or the IAM role is denied on S3 or Glue.
 
@@ -740,15 +719,16 @@ the JM log names the cause.
 ## Next Steps
 
 - **Generate source changes**: [Data Generator Guide](./2-DATA-GEN-GUIDE.md), the upsert
-  load generator (inserts and upserts only; no DELETE events since the mixed generator
-  was removed on 2026-11-02).
+  load generator: inserts, upserts and, since 2026-11-03, DELETEs on orders /
+  order_items. The mixed generator was removed on 2026-11-02.
 - **Monitor the pipelines**: [Monitor Guide](./3-MONITOR.md)
+- **Compact the Iceberg tables**: [iceberg-compaction/README.md](./iceberg-compaction/README.md)
 - **Query the tables**: [Query benchmark, DuckDB vs Trino](./querybench/README.md);
-  Athena in [README Step 4](./README.md#step-4--olap-query-layer-athena)
+  Athena (v2 sets only) in [README, Athena](./README.md#athena)
 
 ---
 
-**Last Updated**: 2026-11-02
+**Last Updated**: 2026-11-04
 **EMR Version**: 7.14.0 (Flink operator chart 7.14.0, see Step 1)
 **Flink Version**: 1.20.0-amzn-8 (Java 17)
 **Paimon Version**: 2.1.0

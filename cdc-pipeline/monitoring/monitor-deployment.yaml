@@ -33,8 +33,18 @@ data:
   # keep it a multiple of POLL_INTERVAL for the counter and rate-meter fallbacks.
   MONITOR_DURATION: "120"
   POLL_INTERVAL: "20"
-  REPEAT_INTERVAL: "60"
+  # Pause between cycles. The two pipelines are sampled in parallel, so a
+  # cycle is MONITOR_DURATION plus the table reads (~1 min): 15 s gives about
+  # 10 reports per format per 30 min, the hot test's ingest window.
+  REPEAT_INTERVAL: "15"
   RUN_MODE: "continuous"
+  # Every report JSON is also copied here (best-effort; a failed upload is
+  # logged and the report stays in /tmp/reports). /tmp/reports is an emptyDir
+  # and the query benchmark's teardown scales this Deployment to 0, so without
+  # the copy the reports are lost. querybench/run.sh summary reads them back by
+  # time window. The IRSA role behind starrocks-sa may write the bucket
+  # (iam simulate-principal-policy s3:PutObject: allowed). Empty = local only.
+  REPORT_S3_URI: "s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}${SESSION_SUFFIX}/monitor/"
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -91,7 +91,7 @@ Check the banner it prints. `Glue DBs:` must name the databases the Flink jobs w
 CDC_DB_SUFFIX= bash ./monitoring/deploy-monitor.sh  # the v2 set
 ```
 
-`build-deploy-generic.sh` resolves it the same way, so with an unchanged `.bench-env`
+`ingest-deploy/build-deploy-generic.sh` resolves it the same way, so with an unchanged `.bench-env`
 the monitor and the jobs agree. The suffix also selects the Paimon warehouse path the
 monitor reads: `paimon-warehouse/flink_paimon_db<suffix>.db/<table>/`.
 
@@ -129,7 +129,7 @@ kubectl delete configmap flink-cdc-monitor-config flink-cdc-monitor-code -n emr-
 ```
 
 `deploy-monitor.sh` has no stop action. The monitor is independent of the pipelines
-and the load generator: `./build-deploy-generic.sh cleanup` does not stop it, and
+and the load generator: `./ingest-deploy/build-deploy-generic.sh cleanup` does not stop it, and
 stopping it does not affect them.
 
 ---

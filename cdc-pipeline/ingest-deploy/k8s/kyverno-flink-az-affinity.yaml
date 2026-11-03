@@ -1,0 +1,108 @@
+# Keep every pod of an EMR on EKS Flink job in a single Availability Zone.
+#
+# ============================================================================
+# Why this stays a nodeSelector and NOT the podAffinity from the example
+# ============================================================================
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flink-cdc-single-az
+  annotations:
+    policies.kyverno.io/title: Pin EMR on EKS Flink job pods to one AZ
+    policies.kyverno.io/category: EMR on EKS / Flink
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Colocates all pods of an EMR on EKS Flink job (JobManager + TaskManagers,
+      grouped by eks-subscription.amazonaws.com/emr.internal.id — the Flink
+      equivalent of Spark's emr-containers.amazonaws.com/job.id) into a single
+      Availability Zone, using a nodeSelector so Karpenter provisions nodes in
+      the right zone instead of deadlocking on a pod affinity it cannot satisfy.
+spec:
+  # Mutate only — never block a pod.
+  background: false
+  rules:
+  - name: colocate-flink-job-pods-in-one-zone
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          operations:
+          - CREATE
+          namespaces:
+          - emr-flink
+          selector:
+            matchExpressions:
+            - key: emr-containers.amazonaws.com/component
+              operator: In
+              values:
+              - flink.jobmanager
+              - flink.taskmanager
+            - key: component
+              operator: In
+              values:
+              - jobmanager
+              - taskmanager
+    mutate:
+      patchStrategicMerge:
+        spec:
+          nodeSelector:
+            # Both nodepools (driver-nodepool for JMs, executor-memorynodepool
+            # for TMs) have capacity in this zone on this cluster. Keep it
+            # aligned with wherever the JobManagers actually land; if they are
+            # already running elsewhere, set this to their zone rather than
+            # forcing a restart.
+            topology.kubernetes.io/zone: us-west-2a
+
+---
+# Verification policy. The mutate above pins every job pod to one fixed zone, so
+# all pods of a job are colocated by construction — but only if it actually
+# fired, and a skipped mutate rule fails open with no error. This policy reports
+# (never blocks) any Flink job pod that ended up outside the pinned zone, turning
+# that silent failure into something visible in `kubectl get policyreport`.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flink-cdc-single-az-audit
+  annotations:
+    policies.kyverno.io/title: Audit that each Flink job's pods share one AZ
+    policies.kyverno.io/category: EMR on EKS / Flink
+    policies.kyverno.io/subject: Pod
+spec:
+  # Background scans re-evaluate existing pods, which is the only time the
+  # per-job identifier label is reliably present.
+  background: true
+  rules:
+  - name: audit-flink-job-pods-share-one-zone
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - emr-flink
+          selector:
+            matchExpressions:
+            # Keying on the per-job identifier IS correct here: this rule only
+            # reports, and it runs in background scans after EMR has stamped it.
+            - key: eks-subscription.amazonaws.com/emr.internal.id
+              operator: Exists
+            - key: emr-containers.amazonaws.com/component
+              operator: In
+              values:
+              - flink.jobmanager
+              - flink.taskmanager
+    validate:
+      # Report only. Blocking here would kill a running job over a topology fact
+      # that is already unchangeable by the time it becomes observable.
+      failureAction: Audit
+      message: >-
+        This Flink job pod is not pinned to us-west-2a, so its job's pods may be
+        split across AZs: cross-AZ transfer is then billed in both directions and
+        any paimon-vs-iceberg comparison taken from this run measures network
+        topology rather than storage format. Check the pod's
+        eks-subscription.amazonaws.com/emr.internal.id label to see which job.
+      pattern:
+        spec:
+          nodeSelector:
+            topology.kubernetes.io/zone: us-west-2a

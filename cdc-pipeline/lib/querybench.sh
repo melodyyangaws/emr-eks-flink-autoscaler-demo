@@ -13,38 +13,38 @@
 #                    iceberg_scan() of a COPY of the Iceberg table's pinned metadata.json
 #   trino:iceberg    Trino (engine-deploy/deploy-trino.sh), catalog `iceberg`
 #                    (Glue), <ICEBERG_DB>.<t> FOR VERSION AS OF the pinned snapshot id
-#   duckdb:paimon    iceberg_scan() of a COPY of Paimon's Iceberg export
-#                    metadata.json (vN.metadata.json, version-hint.text), with
-#                    iceberg_unsafe_skip_puffin_verification on (the server's
-#                    SKIP_PUFFIN_VERIFICATION_ARMS, default paimon on v3)
-#   trino:paimon     the same Iceberg connector over Paimon's export: its
-#                    hive-catalog export registers each table in the Paimon Glue
-#                    DB as table_type=ICEBERG, so <PAIMON_DB>.<t> FOR VERSION AS OF
-#                    the export's snapshot id (no native Paimon connector exists
-#                    for Trino 484)
+#   duckdb:paimon    the server's NATIVE Paimon extension (polardb/duckdb-paimon on
+#                    paimon-cpp, bitmap64 DVs; duckdb-image/README.md):
+#                    paimon_scan('<warehouse>/<PAIMON_DB>.db/<t>', snapshot_from_id=N)
+#   trino:paimon     the NATIVE Paimon connector (paimon-trino 2.1.0 ported to 484,
+#                    image trino-cdc:484-paimon-2.1.0), catalog QB_TRINO_PAIMON_CATALOG
+#                    (`paimon`, filesystem metastore on the warehouse):
+#                    paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT 'N' (scan.snapshot-id)
 # One pin.sh call pins both formats; both engines of a format read the same
-# snapshot (DuckDB the copied metadata.json, Trino its snapshot id). The two
-# formats are pinned at the same moment, not at the same binlog point: the
-# export lags native Paimon by about a checkpoint, so iceberg vs paimon rows
-# are a pipeline gap, not a failure (summarize.py). An arm that cannot read a
-# table (duckdb:paimon on the v3 set: "Manifest ... missing required Avro
-# key-value metadata field 'schema'", a Paimon 2.1 export bug) records ERROR
-# per query and the run goes on.
+# snapshot (Iceberg: the copied metadata.json / its snapshot id; Paimon: native
+# snapshot N from <table>/snapshot/LATEST, no copy: a snapshot's files stay until
+# it expires, >= 12 h). Paimon's Iceberg export is NOT read any more (it listed
+# only top-LSM-level files until a full compaction, and DuckDB could not read its
+# v3 manifests). The two formats are pinned at the same moment, not the same binlog
+# point, so iceberg vs paimon rows can differ by about a checkpoint (summarize.py).
+# An arm that cannot read a table records ERROR per query and the run goes on.
 #
 # Placeholders in querybench/hot/*.sql and querybench/snapshot/*.sql
 # (qb_render; any other ${...} left after rendering stops the run):
 #   ${CUSTOMERS} ${PRODUCTS} ${ORDERS} ${ORDER_ITEMS}
 #       the table at its pinned version, per engine and arm (qb_table_expr):
-#         duckdb  iceberg_scan('<copied metadata.json of that format>')
-#         trino   <TRINO_CATALOG>.<ICEBERG_DB|PAIMON_DB>.<table> FOR VERSION AS OF <snapshot id>
+#         duckdb  iceberg: iceberg_scan('<copied metadata.json>')
+#                 paimon:  paimon_scan('<table path>', snapshot_from_id=<N>)
+#         trino   iceberg: <TRINO_CATALOG>.<ICEBERG_DB>.<table> FOR VERSION AS OF BIGINT '<snapshot id>'
+#                 paimon:  <QB_TRINO_PAIMON_CATALOG>.<PAIMON_DB>.<table> FOR VERSION AS OF BIGINT '<N>'
 #       An alias may follow (`FROM ${ORDERS} o`, `${ORDERS} AS o`): Trino's
 #       grammar (aliasedRelation: relationPrimary (AS? identifier)?, with
 #       relationPrimary: qualifiedName queryPeriod?) takes it after the
 #       version clause.
 #   ${ORDERS_PART} ${ORDER_ITEMS_PART}
 #       the partition column (STRING, 'YYYY-MM-DD'), per arm: iceberg
-#       order_dt / created_dt (sql-scripts/iceberg/03-iceberg-sinks.sql),
-#       paimon order_date_str / created_date_str (the export keeps Paimon's names)
+#       order_dt / created_dt (ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql),
+#       paimon order_date_str / created_date_str (ingest-deploy/sql-scripts/paimon/03-paimon-sinks.sql)
 #   ${HOT_DT} ${HOT_FROM} ${HOT_TO}            hot window (UTC, 'YYYY-MM-DD HH:MM:SS')
 #   ${SNAPSHOT_DT} ${S_FROM} ${S_TO}           snapshot partition and the slice inside it
 #                                              (S_FROM/S_TO: bounds on orders.order_date)
@@ -75,10 +75,6 @@ ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-s3://${BUCKET_NAME}/iceberg-warehouse}";
 # flink_{paimon,iceberg}_db<CDC_DB_SUFFIX>: set by common.sh.
 PAIMON_DB="${PAIMON_DB:-flink_paimon_db${CDC_DB_SUFFIX:-}}"
 ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${CDC_DB_SUFFIX:-}}"
-# Paimon's Iceberg export ('metadata.iceberg.storage' = 'hive-catalog' in
-# 03-paimon-sinks.sql): <warehouse>/iceberg/<db>/<table>/metadata/vN.metadata.json
-# plus version-hint.text. N is Paimon's own snapshot id.
-PMNICE_ROOT="${PMNICE_ROOT:-${PAIMON_WAREHOUSE}/iceberg/${PAIMON_DB}}"
 FLINK_JOBS="${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}"
 GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}"
 DUCKDB_NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
@@ -90,6 +86,8 @@ TRINO_CONTAINER="${TRINO_CONTAINER:-trino-coordinator}"
 TRINO_WORKER_DEPLOY="${TRINO_WORKER_DEPLOY:-trino-worker}"
 TRINO_WORKERS="${TRINO_WORKERS:-3}"
 TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
+# The native Paimon connector's catalog (engine-deploy/trino-values.yaml `paimon`).
+QB_TRINO_PAIMON_CATALOG="${QB_TRINO_PAIMON_CATALOG:-paimon}"
 TRINO_USER="${TRINO_USER:-cdcbench}"
 # Not TRINO_PORT: Kubernetes service links set TRINO_PORT=tcp://<ip>:8080 in every pod
 # of the namespace (Service "trino"), and the runner then called
@@ -160,9 +158,9 @@ qb_engine_label() { case "$1" in duckdb) echo duckdb_warm ;; *) echo "$1" ;; esa
 qb_run_meta() {
     echo "iceberg_format_version=${ICEBERG_FORMAT_VERSION:-3}"
     echo "cdc_db_suffix=${CDC_DB_SUFFIX:-} iceberg_db=${ICEBERG_DB} paimon_db=${PAIMON_DB} engines=$(qb_engines | tr ' ' ',') formats=$(qb_formats | tr ' ' ',')"
-    local sp="${SKIP_PUFFIN_VERIFICATION_ARMS-$([[ "${ICEBERG_FORMAT_VERSION:-3}" == 3 ]] && echo paimon)}"
+    local sp="${SKIP_PUFFIN_VERIFICATION_ARMS-}"
     echo "duckdb_image=${DUCKDB_IMAGE:-pip duckdb==${DUCKDB_VERSION:-2.0.0}} duckdb_cpu=${DUCKDB_CPU:-27} duckdb_pod_memory=${DUCKDB_POD_MEMORY:-114Gi} duckdb_skip_puffin_verification_arms=${sp// /,}"
-    echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_workers=${TRINO_WORKERS}"
+    echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_paimon_catalog=${QB_TRINO_PAIMON_CATALOG} trino_workers=${TRINO_WORKERS} paimon_reader=native"
 }
 
 # The partition column of <table> in the files <arm> reads (overridable).
@@ -178,8 +176,9 @@ qb_part_col() {   # <iceberg|paimon> <table>
 
 # The table expression for one engine, arm and table, at its pin. Pins are
 # the QB_PIN_* variables pin.sh prints (eval'd by the caller):
-#   QB_PIN_META_<ICEBERG|PAIMON>_<TABLE>   the copied metadata.json (DuckDB)
-#   QB_PIN_SNAP_<ICEBERG|PAIMON>_<TABLE>   its snapshot id (Trino)
+#   QB_PIN_META_ICEBERG_<TABLE>   the copied metadata.json (DuckDB)
+#   QB_PIN_META_PAIMON_<TABLE>    the native table path (DuckDB paimon_scan)
+#   QB_PIN_SNAP_<ICEBERG|PAIMON>_<TABLE>   the snapshot id (both engines for paimon)
 # Without a pin both are an error: DuckDB's live metadata.json is deleted by
 # the writer mid-scan (memory note: pinned metadata on every arm), and an
 # unpinned Trino read is a different version from DuckDB's.
@@ -190,46 +189,69 @@ qb_table_expr() {   # <duckdb|trino> <iceberg|paimon> <table>
     case "$e" in
         duckdb)
             v="QB_PIN_META_${A}_${T}"
-            [[ -n "${!v:-}" ]] || { qb_log "no ${v}: DuckDB reads only pinned metadata (run pin.sh first)"; return 1; }
-            echo "iceberg_scan('${!v}')" ;;
+            [[ -n "${!v:-}" ]] || { qb_log "no ${v}: DuckDB reads only pinned tables (run pin.sh first)"; return 1; }
+            if [[ "$arm" == paimon ]]; then
+                local s="QB_PIN_SNAP_${A}_${T}"
+                [[ "${!s:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${s}: DuckDB reads Paimon only at the pinned snapshot"; return 1; }
+                echo "paimon_scan('${!v}', snapshot_from_id=${!s})"
+            else
+                echo "iceberg_scan('${!v}')"
+            fi ;;
         trino)
             v="QB_PIN_SNAP_${A}_${T}"
             [[ "${!v:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${v}: Trino reads only the pinned snapshot (run pin.sh first)"; return 1; }
-            echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'" ;;
+            if [[ "$arm" == paimon ]]; then
+                echo "${QB_TRINO_PAIMON_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'"
+            else
+                echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'"
+            fi ;;
         *) return 1 ;;
     esac
 }
 
 # ── Pins ────────────────────────────────────────────────────────────────────
 # Pin every table of each format in QB_PIN_FORMATS (default: FORMATS) at its
-# CURRENT version: copy the current metadata.json to a key this run owns
-# (s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/<format>/<table>/), and read its
-# snapshot id:
-#   iceberg  Glue metadata_location; the id = its current-snapshot-id
-#   paimon   the export's version-hint.text -> vN.metadata.json; the id = N
-#            (Paimon's snapshot id, which the export reuses) when N is in that
-#            metadata's `snapshots`, else its current-snapshot-id (logged)
-# Prints shell exports: QB_PIN_META_<FMT>_<T>, QB_PIN_SNAP_<FMT>_<T>,
-# QB_PIN_COMMIT_MS_<FMT>_<T> (the pinned snapshot's commit time),
-# QB_PIN_FORMAT_VERSION_<FMT>_<T>, and for paimon QB_PIN_PAIMON_VERSION_<T> (N).
+# CURRENT version:
+#   iceberg  copy Glue's metadata_location to a key this run owns
+#            (s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/iceberg/<table>/; the writer
+#            deletes old metadata files) and take its current-snapshot-id
+#   paimon   the NATIVE snapshot N in <warehouse>/<db>.db/<table>/snapshot/LATEST,
+#            checked against snapshot-N (its commit time and record count); no copy:
+#            a Paimon snapshot's files stay until the snapshot expires (>= 12 h)
+# Prints shell exports: QB_PIN_META_<FMT>_<T> (iceberg: copied metadata.json;
+# paimon: the table path), QB_PIN_SNAP_<FMT>_<T>, QB_PIN_COMMIT_MS_<FMT>_<T>
+# (the pinned snapshot's commit time), QB_PIN_FORMAT_VERSION_ICEBERG_<T>.
 # Read-only on the tables; needs the aws CLI and s3:PutObject on the bucket.
 # With QB_TABLE_STATE_OUT set, appends one TSV line per format and table: the
 # pinned snapshot's id, commit time and summary totals (records, data files,
-# delete files, equality / position deletes, bytes; for Paimon native: its
-# snapshot's totalRecordCount and commitKind), the state the times depend on.
+# delete files, equality / position deletes, bytes; for Paimon: its snapshot's
+# totalRecordCount and commitKind), the state the times depend on.
 qb_pin_tables() {   # <tag>
     ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}" QB_PIN_FORMATS="${QB_PIN_FORMATS:-$(qb_formats)}" QB_TABLES="$QB_TABLES" \
-    PMNICE_ROOT="$PMNICE_ROOT" QB_PIN_PREFIX="$QB_PIN_PREFIX" PAIMON_WAREHOUSE="$PAIMON_WAREHOUSE" \
+    QB_PIN_PREFIX="$QB_PIN_PREFIX" PAIMON_WAREHOUSE="$PAIMON_WAREHOUSE" \
     PAIMON_DB="$PAIMON_DB" ICEBERG_DB="$ICEBERG_DB" python3 - "$1" <<'EOF'
 import json, os, subprocess, sys, time
 E = os.environ
 tag, bucket, region = sys.argv[1], E["BUCKET_NAME"], E["AWS_REGION"]
-pmn_root, prefix = E["PMNICE_ROOT"].rstrip("/"), E["QB_PIN_PREFIX"].strip("/")
+prefix, pwh = E["QB_PIN_PREFIX"].strip("/"), E["PAIMON_WAREHOUSE"].rstrip("/")
 def aws(*a):
     return subprocess.run(["aws", "--region", region, *a], check=True, capture_output=True, text=True).stdout
 STATE_KEYS = ("total-records", "total-data-files", "total-delete-files", "total-equality-deletes",
               "total-position-deletes", "total-files-size")
 out, state = [], []
+def pin_paimon(t):
+    """The native Paimon snapshot N (snapshot/LATEST, checked against snapshot-N)."""
+    root = "%s/%s.db/%s" % (pwh, E["PAIMON_DB"], t)
+    n = aws("s3", "cp", root + "/snapshot/LATEST", "-").strip()
+    if not n.isdigit():
+        sys.exit("no snapshot/LATEST under %s (is it a Paimon table?)" % root)
+    ps = json.loads(aws("s3", "cp", "%s/snapshot/snapshot-%s" % (root, n), "-"))
+    ts = ps.get("timeMillis", "")
+    state.append(["paimon", t, n, ts, ps.get("totalRecordCount", ""), "", "", "", "", "",
+                  "commitKind=%s" % ps.get("commitKind", "?")])
+    T = t.upper()
+    out.extend(["QB_PIN_META_PAIMON_%s=%s" % (T, root), "QB_PIN_SNAP_PAIMON_%s=%s" % (T, n),
+                "QB_PIN_COMMIT_MS_PAIMON_%s=%s" % (T, ts)])
 def pin(fmt, t, loc, want_sid=None):
     """Copy <loc>; returns (pinned s3 uri, snapshot id, commit ms)."""
     key = "%s/%s/%s/%s/%s" % (prefix, tag, fmt, t, loc.rsplit("/", 1)[1])
@@ -267,18 +289,7 @@ for t in E["QB_TABLES"].split():
                     sys.exit("no metadata_location on %s.%s" % (E["ICEBERG_DB"], t))
                 pin("iceberg", t, loc)
             if "paimon" in FORMATS:
-                v = aws("s3", "cp", "%s/%s/metadata/version-hint.text" % (pmn_root, t), "-").strip()
-                if not v.isdigit():
-                    sys.exit("no version-hint.text under %s/%s/metadata (metadata.iceberg.storage unset?)" % (pmn_root, t))
-                pin("paimon", t, "%s/%s/metadata/v%s.metadata.json" % (pmn_root, t, v), int(v))
-                out.append("QB_PIN_PAIMON_VERSION_%s=%s" % (t.upper(), v))
-                try:   # the native Paimon snapshot N (record only)
-                    ps = json.loads(aws("s3", "cp", "%s/%s.db/%s/snapshot/snapshot-%s" % (
-                        E["PAIMON_WAREHOUSE"].rstrip("/"), E["PAIMON_DB"], t, v), "-"))
-                    state.append(["paimon_native", t, v, ps.get("timeMillis", ""), ps.get("totalRecordCount", ""),
-                                  "", "", "", "", "", ps.get("commitKind", "")])
-                except subprocess.CalledProcessError:
-                    state.append(["paimon_native", t, v, "", "", "", "", "", "", "", "snapshot file gone"])
+                pin_paimon(t)
             break
         except subprocess.CalledProcessError as e:
             del out[mark[0]:], state[mark[1]:]
@@ -323,8 +334,8 @@ qb_commit_ms() {   # <iceberg|paimon> <table>
 }
 
 # ── Windows ─────────────────────────────────────────────────────────────────
-# Hot: HOT_WINDOW_SECONDS (300) ending HOT_LAG_SECONDS (300) before now, on
-# whole minutes, inside one day (moved back to end at midnight if it would
+# Hot: HOT_WINDOW_SECONDS (30) ending HOT_LAG_SECONDS (300) before now; the end
+# on a whole minute, inside one day (moved back to end at midnight if it would
 # cross it). Each bound can be pinned with the same-named variable. ESTIMATE,
 # not measured: size it from the first run's H* row counts.
 qb_utc_minus_sec() {   # "<YYYY-MM-DD HH:MM:SS>" <seconds> (BSD date first, GNU second)
@@ -332,7 +343,7 @@ qb_utc_minus_sec() {   # "<YYYY-MM-DD HH:MM:SS>" <seconds> (BSD date first, GNU 
       || date -u -d "@$(( $(date -u -d "$1" +%s) - $2 ))" '+%Y-%m-%d %H:%M:%S'
 }
 qb_resolve_hot() {
-    local w="${HOT_WINDOW_SECONDS:-300}" lag="${HOT_LAG_SECONDS:-300}" to
+    local w="${HOT_WINDOW_SECONDS:-30}" lag="${HOT_LAG_SECONDS:-300}" to
     [[ "$w" =~ ^[1-9][0-9]*$ && "$lag" =~ ^[0-9]+$ ]] || qb_die "HOT_WINDOW_SECONDS / HOT_LAG_SECONDS must be whole seconds"
     if [[ -n "${HOT_TO:-}" ]]; then to="$HOT_TO"
     else to=$(qb_utc_minus_sec "$(date -u '+%Y-%m-%d %H:%M:%S')" "$lag"); to="${to:0:16}:00"; fi
@@ -479,7 +490,7 @@ qb_resolve_snapshot_slice() {
     fi
     # Every format's span, intersected (both CDC jobs replicate the same rows).
     # Read on qb_setup_engine, else on the other engine; a format no engine can
-    # read (duckdb:paimon on v3, and no Trino) is left out, and logged.
+    # read is left out, and logged.
     for arm in $(qb_formats); do
         for tc in ${SNAPSHOT_SLICE_COLUMNS:-orders:order_date}; do
             t="${tc%%:*}" col="${tc#*:}" r=""
@@ -614,7 +625,9 @@ qb_median() {
 
 # One long-format CSV per engine and run, the same columns for both engines
 # (= throughput-benchmark's).
-QB_CSV_HEADER="stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes"
+# cold_ms: pass 0's time when COLD_PASS=1 (snapshot: the first pass after the
+# caches were emptied); median_ms is then the median of the other passes.
+QB_CSV_HEADER="stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes,cold_ms"
 qb_csv_init() { mkdir -p "$(dirname "$1")"; [[ -f "$1" ]] || echo "$QB_CSV_HEADER" > "$1"; }
 
 # ── Writers and generator ───────────────────────────────────────────────────
@@ -650,6 +663,47 @@ qb_stop_writers() {
         [[ -z "$busy" ]] && { qb_log "writers stopped: $(qb_writer_state "$FLINK_JOBS")"; return 0; }
         (( $(date +%s) < deadline )) || qb_die "writers still running after 600s:${busy}"
         qb_log "waiting for writers to stop:${busy}"
+        sleep 15
+    done
+}
+
+# Completion time (epoch ms) of the newest completed checkpoint's TRIGGER of writer
+# <job>, from its JobManager's REST API (kubectl exec; empty if not RUNNING / unknown).
+qb_writer_last_checkpoint_ms() {   # <flinkdeployment>
+    local j="$1" id jm
+    id=$(kubectl get flinkdeployment "$j" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.jobId}' 2>/dev/null)
+    jm=$(kubectl get pods -n "$NAMESPACE" -l "app=${j},component=jobmanager" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [[ -n "$id" && -n "$jm" ]] || return 0
+    kubectl exec -n "$NAMESPACE" "$jm" -c flink-main-container -- \
+        curl -s --max-time 20 "http://localhost:8081/jobs/${id}/checkpoints" 2>/dev/null \
+        | python3 -c 'import json, sys
+try:
+    c = (json.load(sys.stdin).get("latest") or {}).get("completed") or {}
+    print(c.get("trigger_timestamp") or "")
+except Exception:
+    print("")'
+}
+
+# Wait until every RUNNING writer (FLINK_JOBS) has COMPLETED a checkpoint triggered at
+# least WRITER_CATCHUP_MARGIN_S (60) after <since> (the moment the generator stopped):
+# its commit then covers the binlog tail, so suspending the writer leaves its tables
+# equal to MySQL. Without it a last-state suspend keeps the tail uncommitted (it is
+# replayed on resume); on 2026-11-02 that left both formats ~55 s behind MySQL and a
+# MySQL-gated compaction correctly refused to commit. Gives up after
+# WRITER_CATCHUP_TIMEOUT_S (900) with a warning and status 1.
+qb_wait_writers_committed() {   # <since epoch s>
+    local since="$1" margin="${WRITER_CATCHUP_MARGIN_S:-60}" j pending ts
+    local deadline=$(( $(date +%s) + ${WRITER_CATCHUP_TIMEOUT_S:-900} ))
+    while :; do
+        pending=""
+        for j in $FLINK_JOBS; do
+            [[ "$(kubectl get flinkdeployment "$j" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.state}' 2>/dev/null)" == RUNNING ]] || continue
+            ts=$(qb_writer_last_checkpoint_ms "$j")
+            [[ "$ts" =~ ^[0-9]+$ ]] && (( ts >= (since + margin) * 1000 )) || pending+=" ${j}"
+        done
+        [[ -z "$pending" ]] && { qb_log "writers committed a checkpoint >= ${margin}s after the generator stopped"; return 0; }
+        (( $(date +%s) < deadline )) || { qb_log "WARNING: no checkpoint >= ${margin}s after the generator stopped within ${WRITER_CATCHUP_TIMEOUT_S:-900}s:${pending}"; return 1; }
+        qb_log "waiting for a checkpoint after the generator stopped:${pending}"
         sleep 15
     done
 }
@@ -771,8 +825,8 @@ qb_pins_dump() { local v; for v in $(compgen -v | grep '^QB_PIN_' | sort); do ec
 # (FOR VERSION AS OF, alias included, as the SQL writes `${ORDERS} AS o`). A
 # coordinator whose view of the table is older than the pin ("Snapshot ... not
 # found") is retried for up to 5 min. Iceberg: anything else stops the run.
-# Paimon (the export, a separate code path): logged as a WARNING, and the
-# arm's queries then record the error, so the run goes on.
+# Paimon (the native connector, catalog QB_TRINO_PAIMON_CATALOG): logged as a
+# WARNING, and the arm's queries then record the error, so the run goes on.
 qb_trino_check_pins() {
     local arm t r try tries
     for arm in $(qb_formats); do
@@ -786,7 +840,7 @@ qb_trino_check_pins() {
             done
             [[ "$r" == 0$'\t'* ]] && continue
             if [[ "$arm" == paimon ]]; then
-                qb_log "WARNING: Trino cannot read ${PAIMON_DB}.${t} (Paimon's export) at its pinned snapshot: ${r#*$'\t'}; trino:paimon queries will record the error"
+                qb_log "WARNING: Trino cannot read ${QB_TRINO_PAIMON_CATALOG}.${PAIMON_DB}.${t} (native Paimon) at its pinned snapshot: ${r#*$'\t'}; trino:paimon queries will record the error"
             else
                 qb_die "Trino cannot read ${ICEBERG_DB}.${t} at its pinned snapshot: ${r#*$'\t'}"
             fi
@@ -794,7 +848,7 @@ qb_trino_check_pins() {
     done
 }
 
-# ── Snapshot gates (snapshot.sh; run.sh checks the compaction gate up front) ─
+# ── Snapshot gates (snapshot.sh) ─
 # Each prints "<name>=<UTC time>" lines for the .pins file on stdout.
 
 # Every engine in ENGINES up, waiting up to ENGINE_GATE_TIMEOUT_S (1800):
@@ -819,51 +873,3 @@ qb_engines_gate() {
     done
 }
 
-# The compaction gate: for every COMPACT_TABLES table, the Job
-# iceberg-compact-<table> (../iceberg-compaction/run-compaction.sh) has
-# SUCCEEDED, was created at or after COMPACT_NOT_BEFORE (epoch s; run.sh sets
-# it when it submits the Jobs, so an older Job never counts), and the table's
-# current snapshot is that compaction's `replace` commit (committed after the
-# Job started): the compacted snapshot is what gets pinned and measured, and a
-# write after it would void that. <wait>=1 waits (up to COMPACT_GATE_TIMEOUT_S,
-# 21600) while a Job is missing or running; 0 refuses at once. A failed Job
-# always refuses. ICEBERG_REQUIRE_COMPACTION=0 skips the gate (the uncompacted
-# tables are measured, and the pins say so).
-qb_compaction_gate() {   # <wait 0|1>
-    if [[ "${ICEBERG_REQUIRE_COMPACTION:-1}" == 0 ]]; then
-        echo "compaction_gate=skipped (ICEBERG_REQUIRE_COMPACTION=0: the tables are measured as they are)"; return 0
-    fi
-    local wait_="$1" deadline=$(( $(date +%s) + ${COMPACT_GATE_TIMEOUT_S:-21600} )) t job st pending out cur
-    while :; do
-        pending="" out=""
-        for t in ${COMPACT_TABLES:-customers products orders order_items}; do
-            job="iceberg-compact-${t//_/-}"
-            st=$(kubectl get job "$job" -n "$NAMESPACE" -o json 2>/dev/null | python3 -c '
-import json, sys, datetime as d
-j = json.load(sys.stdin); s = j.get("status", {})
-ep = lambda v: int(d.datetime.strptime(v, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc).timestamp()) if v else 0
-state = "succeeded" if s.get("succeeded") else "failed" if s.get("failed") else "running"
-print(state, ep(j["metadata"].get("creationTimestamp")), ep(s.get("startTime")), s.get("completionTime") or "-")' 2>/dev/null || echo "missing 0 0 -")
-            set -- $st
-            if [[ "$1" != missing ]] && (( $2 < ${COMPACT_NOT_BEFORE:-0} )); then set -- missing 0 0 -; fi
-            case "$1" in
-                failed)  qb_die "snapshot test refused: compaction Job ${job} FAILED (kubectl logs job/${job} -n ${NAMESPACE}); fix it and rerun" ;;
-                missing) pending+=" ${job}: not submitted${COMPACT_NOT_BEFORE:+ since $(date -u -r "$COMPACT_NOT_BEFORE" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$COMPACT_NOT_BEFORE" '+%H:%M:%SZ')};" ;;
-                running) pending+=" ${job}: running;" ;;
-                succeeded)
-                    cur=$(qb_iceberg_current "$t") || qb_die "cannot read ${ICEBERG_DB}.${t}'s current snapshot"
-                    set -- $st $cur
-                    [[ "$5" == replace ]] && (( $6 >= $3 * 1000 )) \
-                        || qb_die "snapshot test refused: ${ICEBERG_DB}.${t}'s current snapshot is '${5}' at ${6} ms, not the compaction's replace commit after ${job} started (a write after it, or a no-op compaction); recompact, or ICEBERG_REQUIRE_COMPACTION=0 to measure it as is"
-                    out+="compaction_${t}=${job} completed ${4}, current snapshot replace@${6}"$'\n' ;;
-            esac
-        done
-        if [[ -z "$pending" ]]; then
-            printf '%s' "$out"; echo "gate_compaction_finished_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')"; return 0
-        fi
-        [[ "$wait_" == 1 ]] || qb_die "snapshot test refused: compaction not complete:${pending} (start it with COMPACT_BEFORE_SNAPSHOT=true, or wait)"
-        (( $(date +%s) < deadline )) || qb_die "snapshot test refused: compaction not complete after ${COMPACT_GATE_TIMEOUT_S:-21600}s:${pending}"
-        qb_log "snapshot test waits for compaction:${pending}"
-        sleep 60
-    done
-}

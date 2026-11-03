@@ -11,6 +11,9 @@
 ###############################################################################
 
 set -e
+# Every path below (sql-scripts/, k8s/, docker/, the templates and their
+# *-deployed.yaml renders) is relative to this directory, cdc-pipeline/ingest-deploy/.
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Color output
 RED='\033[0;31m'
@@ -70,7 +73,7 @@ export ICEBERG_FORMAT_VERSION=${ICEBERG_FORMAT_VERSION:-3}
 # the unsuffixed v2 set.
 if [[ -z "${CDC_DB_SUFFIX+set}" ]]; then
     CDC_DB_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${CDC_DB_SUFFIX+set}" ]] || exit 1; printf %s "$CDC_DB_SUFFIX"' \
-                      _ "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
+                      _ "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
 fi
 export CDC_DB_SUFFIX
 
@@ -93,7 +96,11 @@ check_env_vars() {   # [build]
         "BUCKET_NAME"
         "EMR_EXECUTION_ROLE_ARN"
     )
-    [[ "${1:-}" == build ]] || required_vars+=("MYSQL_HOST" "MYSQL_USER")
+    # MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD are not needed here: the writers read
+    # them from Secret ${MYSQL_ENV_SECRET_NAME} (envFrom). Port and database are rendered.
+    export MYSQL_PORT="${MYSQL_PORT:-3306}" MYSQL_DATABASE="${MYSQL_DATABASE:-ecommerce}"
+    [[ "$MYSQL_PORT" =~ ^[0-9]+$ ]] || error "MYSQL_PORT must be a number (got '${MYSQL_PORT}')"
+    [[ "$MYSQL_DATABASE" =~ ^[A-Za-z0-9_]+$ ]] || error "MYSQL_DATABASE must be a plain identifier (got '${MYSQL_DATABASE}')"
 
     local missing_vars=()
     for var in "${required_vars[@]}"; do
@@ -118,6 +125,43 @@ check_env_vars() {   # [build]
         warn "v2 tables. For the original v2 set use ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX="
     fi
 
+    # Paimon write path, as INSERT hints (04-cdc-pipelines.sql), so they apply to
+    # existing tables too. Buffer defaults pair with Iceberg's target file size
+    # (64 MiB dimension / 128 MiB fact tables, 03-iceberg-sinks.sql).
+    # PAIMON_WRITE_ONLY=true turns off inline compaction AND snapshot expiry: files
+    # and snapshots then pile up until something compacts the tables; say so with
+    # any result. PAIMON_WRITE_BUFFER_SIZE (e.g. 256mb) overrides every table;
+    # unset, the dimension tables get 64mb and the fact tables 128mb.
+    export PAIMON_WRITE_ONLY="${PAIMON_WRITE_ONLY:-false}"
+    export PAIMON_WRITE_BUFFER_SPILLABLE="${PAIMON_WRITE_BUFFER_SPILLABLE:-true}"
+    export PAIMON_WRITE_BUFFER_SIZE_DIM="${PAIMON_WRITE_BUFFER_SIZE:-64mb}"
+    export PAIMON_WRITE_BUFFER_SIZE_FACT="${PAIMON_WRITE_BUFFER_SIZE:-128mb}"
+    local v
+    for v in PAIMON_WRITE_ONLY PAIMON_WRITE_BUFFER_SPILLABLE; do
+        [[ "${!v}" == true || "${!v}" == false ]] || error "$v must be true or false (got '${!v}')"
+    done
+    [[ "$PAIMON_WRITE_BUFFER_SIZE_DIM" =~ ^[0-9]+(kb|mb|gb)$ ]] || \
+        error "PAIMON_WRITE_BUFFER_SIZE must be a Paimon MemorySize like '256mb' (got '${PAIMON_WRITE_BUFFER_SIZE}')"
+    # S3A upload shape for Paimon's S3FileIO (catalog options in
+    # sql-scripts/paimon/01-catalog-setup.sql). Paimon builds its S3AFileSystem
+    # from a bare Configuration, so EMR's core-site.xml never applies; without
+    # these, hadoop-aws's own defaults do. Same defaults as throughput-benchmark.
+    export S3A_MULTIPART_SIZE="${S3A_MULTIPART_SIZE:-16M}"
+    export S3A_MULTIPART_THRESHOLD="${S3A_MULTIPART_THRESHOLD:-16M}"
+    export S3A_ACTIVE_BLOCKS="${S3A_ACTIVE_BLOCKS:-6}"
+    for v in S3A_MULTIPART_SIZE S3A_MULTIPART_THRESHOLD; do
+        [[ "${!v}" =~ ^[0-9]+[KMG]$ ]] || error "$v must be a Hadoop size like '16M' (got '${!v}')"
+    done
+    [[ "$S3A_ACTIVE_BLOCKS" =~ ^[0-9]+$ ]] || error "S3A_ACTIVE_BLOCKS must be an integer (got '${S3A_ACTIVE_BLOCKS}')"
+    # The same upload shape for Iceberg's S3FileIO, DERIVED so the formats cannot
+    # drift (a fair-comparison variable): part size in bytes; one pool per JVM,
+    # so active blocks x 4 slots per TaskManager.
+    local n="${S3A_MULTIPART_SIZE%?}" u="${S3A_MULTIPART_SIZE: -1}"
+    case "$u" in K) n=$(( n * 1024 )) ;; M) n=$(( n * 1024 * 1024 )) ;; G) n=$(( n * 1024 * 1024 * 1024 )) ;; esac
+    export ICEBERG_S3_MULTIPART_SIZE_BYTES="${ICEBERG_S3_MULTIPART_SIZE_BYTES:-$n}"
+    export ICEBERG_S3_MULTIPART_THREADS="${ICEBERG_S3_MULTIPART_THREADS:-$(( S3A_ACTIVE_BLOCKS * 4 ))}"
+    (( ICEBERG_S3_MULTIPART_SIZE_BYTES >= 5 * 1024 * 1024 )) || \
+        error "S3A_MULTIPART_SIZE must be >= 5M (S3A and S3FileIO floor; got ${S3A_MULTIPART_SIZE})"
 
     if [[ ${#missing_vars[@]} -gt 0 ]]; then
         error "Missing required environment variables: ${missing_vars[*]}"
@@ -132,7 +176,7 @@ display_config() {
     echo "  AWS Region:       $AWS_REGION"
     echo "  AWS Account ID:   $AWS_ACCOUNT_ID"
     echo "  S3 Bucket:        $BUCKET_NAME"
-    echo "  MySQL Host:       $MYSQL_HOST"
+    echo "  MySQL:            ${MYSQL_DATABASE} on port ${MYSQL_PORT}; host/user/password from Secret ${MYSQL_ENV_SECRET_NAME:-mysql-credentials}"
     echo "  Namespace:        ${NAMESPACE:-emr-flink}"
     echo "  EMR Version:      ${EMR_VERSION}"
     echo "  Lakehouse Format: ${LAKEHOUSE_FORMAT}"
@@ -141,6 +185,8 @@ display_config() {
     if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
         echo "  Paimon Warehouse: s3://${BUCKET_NAME}/paimon-warehouse/"
         echo "  Paimon Database:  flink_paimon_db${CDC_DB_SUFFIX}"
+        echo "  Paimon write:     write-only=${PAIMON_WRITE_ONLY} spillable=${PAIMON_WRITE_BUFFER_SPILLABLE} buffer=${PAIMON_WRITE_BUFFER_SIZE_DIM}/${PAIMON_WRITE_BUFFER_SIZE_FACT} (dim/fact)"
+        echo "  S3A upload:       multipart ${S3A_MULTIPART_SIZE} (threshold ${S3A_MULTIPART_THRESHOLD}), ${S3A_ACTIVE_BLOCKS} active blocks/stream, disk buffer"
         echo "  Paimon DV 64-bit: ${PAIMON_DV_BITMAP64}"
     fi
 
@@ -646,11 +692,20 @@ generate_flink_deployment() {
         -e "s|\${ICEBERG_FORMAT_VERSION}|${ICEBERG_FORMAT_VERSION}|g" \
         -e "s|\${CDC_DB_SUFFIX}|${CDC_DB_SUFFIX}|g" \
         -e "s|\${PAIMON_DV_BITMAP64}|${PAIMON_DV_BITMAP64}|g" \
-        -e "s|\${MYSQL_HOST}|${MYSQL_HOST}|g" \
-        -e "s|\${MYSQL_USER}|${MYSQL_USER}|g" \
-        -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-flink-cdc-mysql-env}|g" \
+        -e "s|\${MYSQL_PORT}|${MYSQL_PORT}|g" \
+        -e "s|\${MYSQL_DATABASE}|${MYSQL_DATABASE}|g" \
+        -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-mysql-credentials}|g" \
         -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
         -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-executor-memorynodepool}|g" \
+        -e "s|\${PAIMON_WRITE_ONLY}|${PAIMON_WRITE_ONLY}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SPILLABLE}|${PAIMON_WRITE_BUFFER_SPILLABLE}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SIZE_DIM}|${PAIMON_WRITE_BUFFER_SIZE_DIM}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SIZE_FACT}|${PAIMON_WRITE_BUFFER_SIZE_FACT}|g" \
+        -e "s|\${S3A_MULTIPART_SIZE}|${S3A_MULTIPART_SIZE}|g" \
+        -e "s|\${S3A_MULTIPART_THRESHOLD}|${S3A_MULTIPART_THRESHOLD}|g" \
+        -e "s|\${S3A_ACTIVE_BLOCKS}|${S3A_ACTIVE_BLOCKS}|g" \
+        -e "s|\${ICEBERG_S3_MULTIPART_SIZE_BYTES}|${ICEBERG_S3_MULTIPART_SIZE_BYTES}|g" \
+        -e "s|\${ICEBERG_S3_MULTIPART_THREADS}|${ICEBERG_S3_MULTIPART_THREADS}|g" \
         "$template_file" > "$output_file"
 
     # Fail loudly on an unsubstituted or empty placeholder. Left alone, an empty
@@ -762,9 +817,9 @@ main() {
             # gets a head start on the binlog. Render first, then apply both
             # manifests in one kubectl call so their snapshot phases overlap:
             #
-            #   ./build-deploy-generic.sh render
-            #   kubectl apply -n emr-flink -f flink-cdc-paimon-deployed.yaml \
-            #                              -f flink-cdc-iceberg-deployed.yaml
+            #   ./ingest-deploy/build-deploy-generic.sh render
+            #   kubectl apply -n emr-flink -f ingest-deploy/flink-cdc-paimon-deployed.yaml \
+            #                              -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
             check_env_vars
             display_config
             create_ebs_storage_class
@@ -780,8 +835,8 @@ main() {
 
             info "Manifests rendered but NOT applied. Apply both at once with:"
             echo "  kubectl apply -n ${NAMESPACE:-emr-flink} \\"
-            [[ "$format" == "paimon"  || "$format" == "both" ]] && echo "    -f flink-cdc-paimon-deployed.yaml \\"
-            [[ "$format" == "iceberg" || "$format" == "both" ]] && echo "    -f flink-cdc-iceberg-deployed.yaml"
+            [[ "$format" == "paimon"  || "$format" == "both" ]] && echo "    -f ingest-deploy/flink-cdc-paimon-deployed.yaml \\"
+            [[ "$format" == "iceberg" || "$format" == "both" ]] && echo "    -f ingest-deploy/flink-cdc-iceberg-deployed.yaml"
             ;;
 
         deploy)
@@ -876,7 +931,7 @@ main() {
             echo ""
             echo "Required environment variables:"
             echo "  AWS_REGION, AWS_ACCOUNT_ID, BUCKET_NAME,"
-            echo "  EMR_EXECUTION_ROLE_ARN, MYSQL_HOST, MYSQL_USER (not for build; MYSQL_PASSWORD comes from the Secret)"
+            echo "  EMR_EXECUTION_ROLE_ARN (MySQL host/user/password come from Secret mysql-credentials)"
             echo ""
             echo "Optional:"
             echo "  EMR_VERSION            (default: 7.14.0; image tag and emrReleaseLabel)"

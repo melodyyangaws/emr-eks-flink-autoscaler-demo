@@ -830,69 +830,50 @@ export MYSQL_HOST=$(aws rds describe-db-instances \
     --output text \
     --region $AWS_REGION)
 
-export MYSQL_PORT=3306
-export MYSQL_DATABASE=ecommerce
-export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
-
-# Save to a file for easy reuse
-cat > mysql-cdc-env.sh <<EOF
-export MYSQL_HOST=$MYSQL_HOST
-export MYSQL_PORT=3306
-export MYSQL_DATABASE=ecommerce
-export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
-EOF
-
-chmod +x mysql-cdc-env.sh
-echo $MYSQL_HOST
+# The endpoint is account-specific: keep it in the git-ignored .bench-env.local.
+# MYSQL_PORT / MYSQL_DATABASE / MYSQL_USER are already in .bench-env.
+echo "export MYSQL_HOST=$MYSQL_HOST" >> .bench-env.local
 ```
 
-`mysql-cdc-env.sh` is git-ignored. Do not put a real password in it. The copy on the
-benchmark laptop stores none: it reads `MYSQL_PASSWORD` from a Kubernetes Secret
-when you source it.
+No file holds the password. It goes into the one Kubernetes Secret (Step 8).
 
 ---
 
-## Step 8: Create the Kubernetes Secrets
+## Step 8: Create the Kubernetes Secret
 
-The generators and the Flink jobs read the CDC password from **two different
-secrets** in `emr-flink`. Neither secret is ever written into a manifest, rendered
-or not.
+The upsert generator and both Flink jobs share **one** Secret in `emr-flink`,
+`mysql-credentials`. No password is ever written into a file or a manifest,
+rendered or not.
 
-| Secret | Keys | Read by | Created by |
-|---|---|---|---|
-| `mysql-credentials` | `hostname`, `username`, `password` | the upsert load generator (`secretKeyRef`) | `deploy-data-generator.sh deploy`, on first run, from `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` in your shell |
-| `flink-cdc-mysql-env` | `MYSQL_PASSWORD` | both FlinkDeployments (`envFrom: secretRef`) | you, by hand (below) |
+| Secret | Keys | Read by |
+|---|---|---|
+| `mysql-credentials` | `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD` | both FlinkDeployments (`envFrom: secretRef`, every key becomes an env var of the same name) and the generator (`secretKeyRef` per key) |
 
-1. Create the Flink secret before you deploy either pipeline:
+The keys must be env-var names because the Flink pods load the Secret with
+`envFrom`: the EMR operator's pod-template merge adds an empty `value: ""` next
+to any `valueFrom`, which the API rejects, so `secretKeyRef` cannot be used there.
+Create it once, from a prompt (never a file or shell history):
 
-   ```bash
-   kubectl create secret generic flink-cdc-mysql-env \
-       --namespace emr-flink \
-       --from-literal=MYSQL_PASSWORD="${MYSQL_PASSWORD}" \
-       --dry-run=client -o yaml | kubectl apply -f -
-   ```
+```bash
+source .bench-env                                   # MYSQL_HOST (.bench-env.local), MYSQL_USER
+read -rs -p 'cdcuser password: ' MYSQL_PASSWORD; echo
+kubectl create secret generic mysql-credentials -n emr-flink \
+  --from-literal=MYSQL_HOST="$MYSQL_HOST" --from-literal=MYSQL_USER="$MYSQL_USER" \
+  --from-literal=MYSQL_PASSWORD="$MYSQL_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
+unset MYSQL_PASSWORD
+```
 
-   The key must be `MYSQL_PASSWORD`. `envFrom` maps every key to an env var of the
-   same name, so the key name is the env var the job reads. `MYSQL_HOST` and
-   `MYSQL_USER` are rendered into the manifests as plain values. To use a different
-   secret name, set `MYSQL_ENV_SECRET_NAME` before rendering.
+Check: `kubectl get secret mysql-credentials -n emr-flink -o jsonpath='{.data}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'`
+prints `['MYSQL_HOST', 'MYSQL_PASSWORD', 'MYSQL_USER']` (key names only).
 
-2. Check that both secrets exist (the generator one appears after the first
-   generator deploy):
+If it is missing, a JobManager does not report a credential error: it sits in
+`CreateContainerConfigError` (`secret "mysql-credentials" not found` shows only
+in `kubectl describe pod`) while the FlinkDeployment looks like `RECONCILING` /
+`DEPLOYED`. `deploy-data-generator.sh` refuses to deploy without it.
 
-   ```bash
-   kubectl get secret mysql-credentials flink-cdc-mysql-env -n emr-flink
-   ```
-
-If `flink-cdc-mysql-env` is missing, the JobManager pod does not report a credential
-error. It sits in `CreateContainerConfigError` (`secret "flink-cdc-mysql-env" not
-found` shows only in `kubectl describe pod`), and the FlinkDeployment still shows a
-healthy-looking `RECONCILING` / `DEPLOYED`.
-
-`deploy-data-generator.sh` does not refresh an existing `mysql-credentials`. After a
-password change, delete it and re-run the deploy, or recreate it by hand.
+After a password change (`ALTER USER`), update this one Secret, then delete +
+create the writers and restart the generator
+(`kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink`).
 
 ---
 
@@ -967,7 +948,7 @@ FLUSH PRIVILEGES;
 ✅ **Database schema deployed** (4 tables)
 ✅ **Sample data loaded** for testing
 ✅ **CDC readiness verified**
-✅ **Secrets created**: `mysql-credentials` (generators), `flink-cdc-mysql-env` (Flink)
+✅ **Secret created**: `mysql-credentials` (generator and Flink jobs)
 
 Your MySQL database is now ready to be the source for Flink CDC! 🎉
 

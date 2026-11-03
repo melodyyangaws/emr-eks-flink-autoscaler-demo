@@ -81,6 +81,27 @@
 # their previous write. Paimon gets the identical stream and simply dedups the
 # repeats in its write buffer — that asymmetry is intended. See the env-var
 # comments for the derivation of the defaults.
+#
+# Why some rows are DELETEs (DELETE_RATIO), and only on orders / order_items
+# ----------------------------------------------------------------------------
+# Since the row-at-a-time mixed generator was removed (2026-11-02) nothing
+# emitted DELETE events, so neither sink's delete path was exercised by a real
+# -D. DELETE_RATIO of each orders / order_items batch is now a multi-row
+# DELETE ... WHERE pk IN (...) of existing keys. Flink CDC turns each deleted row
+# into a -D; the Iceberg upsert writer turns that into a delete of the key — a
+# POSITION delete (DV on v3) if it wrote the key earlier in the same checkpoint,
+# else an EQUALITY delete — and Paimon into a delete record that the merge drops.
+#
+# The foreign keys (orders_ibfk_1 orders->customers, order_items_ibfk_1/2
+# order_items->orders/products, re-added by the 2026-11-02 shrink) have no ON
+# DELETE clause, i.e. RESTRICT. So:
+#   - order_items is a leaf: deleted freely.
+#   - orders: the order's items are deleted first, in the same transaction.
+#     Orders whose id is a multiple of FK_PARENT_MOD are never deleted, and the
+#     orders FK sample that new order_items draw from is taken ONLY from those
+#     ids — so an insert can never reference an order another thread deleted.
+#   - customers / products: never deleted. See the DELETE_RATIO note in the
+#     script for why.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -218,6 +239,54 @@ data:
     # one statement are LAST_INSERT_ID(), +step, +2*step, ...
     AUTOINC_STEP  = 1
 
+    # ── Deletes ─────────────────────────────────────────────────────────────
+    # DELETE_RATIO of the rows of every orders / order_items batch are deletes
+    # of existing keys, issued as one extra statement (a transaction for orders)
+    # after the batch's upsert. They are drawn like the writes: RECENT_KEY_RATIO
+    # of them from this thread's recent-key buffer (same-checkpoint -> Iceberg
+    # position delete / DV), the rest via pick_key() (hot window / cold tail ->
+    # equality delete). Because deletes split recent/older in the same
+    # proportion as writes, the stream's position-delete share stays where
+    # RECENT_KEY_RATIO put it (~50%); the simulation confirms it.
+    #
+    # Why 0.05. Large enough to be a visible event class (~3.75% of all rows,
+    # since orders + order_items are 75% of the mix, plus the deleted orders'
+    # items), small enough not to change what the benchmark mostly measures.
+    # Offline simulation (ratio 0.6 / 20s / runs of 8, items modelled at the
+    # source's 1.5 per pre-existing order): delete events 5.3-5.8% of all row
+    # events (own deletes ~3.5%, items ~2%), position-delete share 0.47-0.50 at
+    # 1,000-2,000 rows/s per thread against 0.48-0.52 without deletes.
+    # And it roughly balances the inserts: with UPSERT_RATIO 0.9 only ~4-5% of
+    # rows are new inserts, so 5% deletes keeps the fact tables near their
+    # current size instead of growing out of the buffer pool (the reason
+    # UPSERT_RATIO went to 0.9). Some deleted ids are later re-inserted by a
+    # pick_key() upsert, so the net effect is closer to flat than to shrinking.
+    #
+    # Why never customers / products. Their FKs are RESTRICT and they have
+    # children. The only rows provably unreferenced would be this thread's own
+    # fresh inserts (~4% of their rows), so a "safe" dimension delete is just
+    # insert-then-delete churn of rows nobody reads, and anything else needs a
+    # child-index probe per key or risks errno 1451 rolling the batch back.
+    # The CDC/sink delete path is identical for every table, so deleting from
+    # the two fact tables already exercises it; real e-commerce systems
+    # soft-delete customers and products (an update) anyway.
+    DELETE_RATIO   = float(os.environ.get('DELETE_RATIO', '0.05'))
+    DELETE_TABLES  = ('order_items', 'orders')
+    # Orders with order_id % FK_PARENT_MOD == 0 are the FK-parent pool: the
+    # orders sample that order_items inserts draw from comes only from them,
+    # and they are never deleted. A residue rather than "the newest N at
+    # startup" because it is the same set in every pod regardless of when each
+    # pod started; 16 keeps 15/16 of orders deletable.
+    FK_PARENT_MOD  = max(1, int(os.environ.get('FK_PARENT_MOD', '16')))
+    # An order with more items than this is skipped rather than deleted. Every
+    # earlier run drew order_items' parents from the newest 20,000 orders, so a
+    # few tens of thousands of orders carry most of the ~19M items (the source
+    # averages ~1.5 items per order, but very unevenly). Deleting one of those
+    # would turn a 250-key delete into a transaction over thousands of item rows,
+    # holding their locks against the order_items upserts. The count is one
+    # covering read of idx_order_id per batch.
+    ORDER_DELETE_MAX_ITEMS = int(os.environ.get('ORDER_DELETE_MAX_ITEMS', '20'))
+
     CITIES = ['Seattle', 'Portland', 'San Francisco', 'Los Angeles', 'Phoenix',
               'Denver', 'Austin', 'Houston', 'Dallas', 'Chicago', 'New York', 'Miami']
     STATES = ['WA', 'OR', 'CA', 'AZ', 'CO', 'TX', 'IL', 'NY', 'MA', 'FL']
@@ -231,9 +300,13 @@ data:
     # ── Shared counters ─────────────────────────────────────────────────────
     _lock = threading.Lock()
     # `recent` is a SUBSET of `upserts` (a re-write of an existing key is an
-    # upsert to MySQL), so upserts + inserts == rows still holds.
-    STATS = {'rows': 0, 'upserts': 0, 'inserts': 0, 'recent': 0, 'batches': 0,
-             'errors': 0}
+    # upsert to MySQL). `deletes` is the keys put in DELETE statements, so
+    # upserts + inserts + deletes == rows (an order skipped for having too many
+    # items is in none of them, so rows can run slightly under BATCH_ROWS). `deleted` is the rows MySQL actually
+    # removed (rowcount): deletes that found their row, plus the order_items
+    # removed together with their orders — each one a -D in the binlog.
+    STATS = {'rows': 0, 'upserts': 0, 'inserts': 0, 'recent': 0, 'deletes': 0,
+             'deleted': 0, 'batches': 0, 'errors': 0}
     PER_TABLE = {}
 
     def bump(table, rows, upserts, inserts, recent):
@@ -244,6 +317,13 @@ data:
             STATS['recent'] += recent
             STATS['batches'] += 1
             PER_TABLE[table] = PER_TABLE.get(table, 0) + rows
+
+    def bump_delete(table, requested, deleted):
+        with _lock:
+            STATS['rows'] += requested
+            STATS['deletes'] += requested
+            STATS['deleted'] += deleted
+            PER_TABLE[table] = PER_TABLE.get(table, 0) + requested
 
     def bump_error():
         with _lock:
@@ -294,8 +374,16 @@ data:
         cust = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT product_id FROM products ORDER BY product_id DESC LIMIT 20000")
         prod = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT order_id FROM orders ORDER BY order_id DESC LIMIT 20000")
+        # Orders only from the never-deleted FK-parent pool (see FK_PARENT_MOD):
+        # an order_items insert referencing an order some thread just deleted
+        # would fail errno 1452 and roll back its whole 5,000-row statement.
+        # Still a backward PK range scan; it reads ~FK_PARENT_MOD x 20,000 ids.
+        # (An int from the env, inlined: no params means no %-substitution.)
+        cur.execute(f"SELECT order_id FROM orders WHERE MOD(order_id, {FK_PARENT_MOD}) = 0"
+                    " ORDER BY order_id DESC LIMIT 20000")
         ordr = [r[0] for r in cur.fetchall()]
+        # Customers and products are never deleted, so their samples need no
+        # such filter.
         # The recent-key buffer derives a statement's new ids from
         # LAST_INSERT_ID() and the increment, so read the increment rather than
         # assume 1. The lock mode is printed for the record: for a multi-row
@@ -357,7 +445,7 @@ data:
             return rnd.randint(lo, min(hi, max_id))
         return rnd.randint(min_id, max_id)
 
-    def plan_keys(id_range, n, rnd, recent=None):
+    def plan_keys(id_range, n, rnd, recent=None, table=None):
         """Plan a batch's primary keys: existing ids ASCENDING, then inserts.
 
         The ordering is not cosmetic, it is the deadlock fix. InnoDB takes a row
@@ -373,7 +461,15 @@ data:
         values above every existing key, so placing them at the end keeps the
         statement monotonic in key order too.
 
-        The batch is planned in two parts:
+        On a DELETE_TABLES table, DELETE_RATIO x n of the n rows are deletes
+        (planned first; executed by delete_batch() as a separate statement):
+        RECENT_KEY_RATIO of them from the recent-key buffer, the rest via
+        pick_key(). On orders, ids that are multiples of FK_PARENT_MOD are never
+        chosen for deletion (the FK-parent pool). Delete keys are distinct from
+        each other AND from the batch's upsert keys, and are sorted ascending
+        too, for the same lock-order reason.
+
+        The write rows are then planned in two parts:
           1. RECENT_KEY_RATIO x n rows (stochastically rounded) re-write keys
              from this thread's recent-key buffer for the table — the rows that
              become Iceberg position deletes. If the buffer has fewer distinct
@@ -389,26 +485,47 @@ data:
         a few times and becomes an insert if it keeps colliding (a handful per
         batch at most — the hot slice is ~1M keys per pod).
 
-        Returns (sorted existing keys, n_insert, n_recent).
+        Returns (sorted existing keys, n_insert, n_recent, sorted delete keys,
+        n_recent_deletes).
         """
-        seen = set()
+        nd = int(n * DELETE_RATIO + rnd.random()) if table in DELETE_TABLES else 0
+        protect = FK_PARENT_MOD if table == 'orders' else 0
+        seen, dels = set(), set()
+        pool = []
         if recent is not None and RECENT_RATIO > 0:
-            want = int(n * RECENT_RATIO + rnd.random())
-            seen.update(recent.sample(want, rnd))
+            # One draw serves both deletes and re-writes, so the two split the
+            # recent keys in proportion to their share of the batch.
+            pool = recent.sample(int(n * RECENT_RATIO + rnd.random()), rnd)
+            rnd.shuffle(pool)   # set order of ints follows their low bits
+        want_dr = int(nd * RECENT_RATIO + rnd.random())
+        for k in pool:
+            if len(dels) < want_dr and not (protect and k % protect == 0):
+                dels.add(k)
+            else:
+                seen.add(k)
+        n_del_recent = len(dels)
+        while len(dels) < nd:
+            for _try in range(8):
+                k = pick_key(id_range, rnd)
+                if k not in seen and k not in dels and not (protect and k % protect == 0):
+                    dels.add(k)
+                    break
+            else:
+                break       # give up; the row goes to the write path below
         n_recent = len(seen)
         ni = 0
-        for _ in range(n - n_recent):
+        for _ in range(n - len(dels) - n_recent):
             if rnd.random() >= UPSERT_RATIO:
                 ni += 1
                 continue
             for _try in range(8):
                 k = pick_key(id_range, rnd)
-                if k not in seen:
+                if k not in seen and k not in dels:
                     seen.add(k)
                     break
             else:
                 ni += 1
-        return sorted(seen), ni, n_recent
+        return sorted(seen), ni, n_recent, sorted(dels), n_del_recent
 
     class RecentKeys:
         """Keys one worker thread wrote to one table, with commit timestamps.
@@ -443,6 +560,24 @@ data:
             self.keys.extend(keys)
             self._trim()
 
+        def discard(self, keys):
+            """Forget deleted keys so they are not re-written as upserts.
+
+            Rebuilds the live part of the lists: O(buffer), a few ms at the
+            50,000 cap, once per delete statement. Without it a recent
+            "re-write" of a deleted key would take the INSERT path and quietly
+            undo the delete.
+            """
+            if not keys:
+                return
+            self._trim()
+            drop = set(keys)
+            live = [(t, k) for t, k in zip(self.ts[self.head:], self.keys[self.head:])
+                    if k not in drop]
+            self.ts = [t for t, _ in live]
+            self.keys = [k for _, k in live]
+            self.head = 0
+
         def sample(self, k, rnd):
             """Up to k DISTINCT live keys, uniform over live entries."""
             self._trim()
@@ -464,15 +599,18 @@ data:
         return ''.join(rnd.choice(string.ascii_lowercase) for _ in range(n))
 
     # ── Batch builders ──────────────────────────────────────────────────────
-    # Each returns (sql, params, existing_keys, n_insert, n_recent); recent is
-    # this thread's RecentKeys for the table (None = no recent re-writes).
-    # n_recent of the existing keys are re-writes from it. Upsert rows carry an
+    # Each returns (sql, params, existing_keys, n_insert, n_recent, delete_keys,
+    # n_recent_deletes); recent is this thread's RecentKeys for the table (None
+    # = no recent re-writes). n_recent of the existing keys are re-writes from
+    # it. delete_keys (empty except on DELETE_TABLES) are executed separately
+    # by delete_batch() after the upsert. Upsert rows carry an
     # explicit existing PK so MySQL takes the ON DUPLICATE KEY UPDATE path;
     # insert rows pass NULL for the AUTO_INCREMENT PK so MySQL assigns a new one.
 
     def batch_orders(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni, nr = plan_keys(ranges['orders'], n, rnd, recent)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['orders'], n, rnd, recent,
+                                            'orders')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -497,11 +635,12 @@ data:
             " total_amount=VALUES(total_amount), payment_method=VALUES(payment_method),"
             " shipping_address=VALUES(shipping_address)"
         )
-        return sql, params, keys, ni, nr
+        return sql, params, keys, ni, nr, dels, ndr
 
     def batch_order_items(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni, nr = plan_keys(ranges['order_items'], n, rnd, recent)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['order_items'], n, rnd, recent,
+                                            'order_items')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -522,11 +661,12 @@ data:
             " ON DUPLICATE KEY UPDATE quantity=VALUES(quantity),"
             " unit_price=VALUES(unit_price)"
         )
-        return sql, params, keys, ni, nr
+        return sql, params, keys, ni, nr, dels, ndr
 
     def batch_customers(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni, nr = plan_keys(ranges['customers'], n, rnd, recent)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['customers'], n, rnd, recent,
+                                            'customers')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s,%s,%s,%s)")
             # email carries a UNIQUE KEY. Always generate a globally unique value
@@ -554,11 +694,12 @@ data:
             " phone=VALUES(phone), address=VALUES(address), city=VALUES(city),"
             " state=VALUES(state), zip_code=VALUES(zip_code)"
         )
-        return sql, params, keys, ni, nr
+        return sql, params, keys, ni, nr, dels, ndr
 
     def batch_products(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni, nr = plan_keys(ranges['products'], n, rnd, recent)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['products'], n, rnd, recent,
+                                            'products')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -577,7 +718,7 @@ data:
             " price=VALUES(price), stock_quantity=VALUES(stock_quantity),"
             " description=VALUES(description)"
         )
-        return sql, params, keys, ni, nr
+        return sql, params, keys, ni, nr, dels, ndr
 
     # Table mix, weighted to resemble the shape of the existing data (order_items
     # is the largest table, customers/products the smallest). The weights decide
@@ -615,6 +756,55 @@ data:
         run[1] -= 1
         return _builders[run[0]], _names[run[0]]
 
+    def delete_batch(conn, cur, name, dels):
+        """Delete `dels` (sorted, distinct) from `name`.
+
+        Returns (keys actually put in the DELETE, rows removed incl. items).
+
+        One transaction at READ COMMITTED, whatever the server default:
+          - RC takes no gap locks for these searches. Under REPEATABLE READ a
+            key that is already gone (a cold draw on a hole, or a key another
+            thread deleted) leaves a gap lock, and for orders the child delete
+            through idx_order_id would gap-lock the range above the highest
+            referenced order_id, blocking every new order_items insert behind it.
+          - orders: orders with more than ORDER_DELETE_MAX_ITEMS items are
+            dropped from the list first (a plain non-locking read). Then the
+            remaining orders' items go (the FKs are RESTRICT, not CASCADE), then
+            the orders, so the parent delete never sees a child. No new item can
+            reference a deletable order in between: inserts only use
+            FK_PARENT_MOD orders, which are never deleted.
+        A deadlock or lock-wait timeout rolls back both statements together;
+        the caller retries the whole call, which is idempotent.
+        """
+        ph = ",".join(["%s"] * len(dels))
+        conn.start_transaction(isolation_level='READ COMMITTED')
+        try:
+            removed = 0
+            if name == 'orders':
+                cur.execute(f"SELECT order_id, COUNT(*) FROM order_items"
+                            f" WHERE order_id IN ({ph}) GROUP BY order_id", dels)
+                heavy = {o for o, c in cur.fetchall() if c > ORDER_DELETE_MAX_ITEMS}
+                if heavy:
+                    dels = [o for o in dels if o not in heavy]
+                if not dels:
+                    conn.commit()
+                    return dels, 0
+                ph = ",".join(["%s"] * len(dels))
+                cur.execute(f"DELETE FROM order_items WHERE order_id IN ({ph})", dels)
+                removed += max(0, cur.rowcount)
+                cur.execute(f"DELETE FROM orders WHERE order_id IN ({ph})", dels)
+            else:
+                cur.execute(f"DELETE FROM order_items WHERE order_item_id IN ({ph})", dels)
+            removed += max(0, cur.rowcount)
+            conn.commit()
+            return dels, removed
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
     def worker(idx, ranges, cust, prod, ordr, rate, stop_at):
         rnd = random.Random(os.getpid() * 1000 + idx)
         conn = connect()
@@ -640,8 +830,8 @@ data:
 
             builder, name = pick_table(rnd, run)
             buf = recent.get(name)
-            sql, params, keys, ni, nr = builder(rnd, ranges, cust, prod, ordr,
-                                                BATCH_ROWS, buf)
+            sql, params, keys, ni, nr, dels, ndr = builder(rnd, ranges, cust, prod,
+                                                           ordr, BATCH_ROWS, buf)
             nu = len(keys)
             # Deadlock (1213) and lock-wait timeout (1205) roll back the WHOLE
             # multi-row statement, so dropping the batch costs BATCH_ROWS rows off
@@ -653,9 +843,9 @@ data:
             for attempt in range(4):
                 try:
                     cur.execute(sql, params)
-                    # nu + ni is BATCH_ROWS except when plan_keys() turned a
-                    # colliding draw into an insert — it is always the real
-                    # number of rows in the statement.
+                    # nu + ni is BATCH_ROWS minus the batch's delete keys —
+                    # always the real number of rows in the statement, whatever
+                    # plan_keys() did with colliding draws.
                     bump(name, nu + ni, nu, ni, nr)
                     # Only COMMITTED rows enter the buffer (autocommit: the
                     # statement returning means its locks are released), with
@@ -685,6 +875,33 @@ data:
                     if e.errno not in (1213, 1205):
                         print(f"[w{idx}] {name}: {e}", flush=True)
                     break
+
+            # Deletes: a separate statement after the upsert (a transaction for
+            # orders), same retry policy. 1451 (child row exists) is retried
+            # too: it can only come from a race the FK-parent pool rules out,
+            # and if it ever shows up it is visible in errors= and the log.
+            for attempt in range(4 if dels else 0):
+                try:
+                    done, removed = delete_batch(conn, cur, name, dels)
+                    bump_delete(name, len(done), removed)
+                    if buf is not None:
+                        buf.discard(done)
+                    break
+                except mysql.connector.Error as e:
+                    bump_error()
+                    if e.errno in (1213, 1205, 1451) and attempt < 3:
+                        continue
+                    if e.errno in (2006, 2013, 2055):
+                        try:
+                            cur.close(); conn.close()
+                        except Exception:
+                            pass
+                        conn = connect()
+                        cur = conn.cursor()
+                        break
+                    if e.errno not in (1213, 1205):
+                        print(f"[w{idx}] {name} delete: {e}", flush=True)
+                    break
         try:
             cur.close(); conn.close()
         except Exception:
@@ -701,6 +918,9 @@ data:
               f"  buffer {RECENT_BUFFER}/table/thread  table run {TABLE_RUN} batches"
               f"  (upsert ratio applies to the other {1 - RECENT_RATIO:.2f})",
               flush=True)
+        print(f"  deletes     : ratio {DELETE_RATIO} of {'/'.join(DELETE_TABLES)} rows"
+              f"  (orders: items first, ids %{FK_PARENT_MOD}==0 kept as FK parents;"
+              f" customers/products never)", flush=True)
         print(f"  table mix   : " + ", ".join(f"{n}={w}%" for _, n, w in MIX), flush=True)
         print("=" * 70, flush=True)
 
@@ -733,7 +953,9 @@ data:
             print(f"[{int(now - t0):5d}s] rows={snap['rows']:,} "
                   f"inst={inst:,.0f}/s avg={avg:,.0f}/s "
                   f"upserts={snap['upserts']:,} inserts={snap['inserts']:,} "
-                  f"recent={snap['recent']:,} batches={snap['batches']:,} errors={snap['errors']} | {mix}",
+                  f"recent={snap['recent']:,} deletes={snap['deletes']:,} "
+                  f"deleted={snap['deleted']:,} batches={snap['batches']:,} "
+                  f"errors={snap['errors']} | {mix}",
                   flush=True)
 
         print("load generation finished", flush=True)
@@ -783,7 +1005,7 @@ spec:
   # that 32 pods (128 connections) reached. Throughput here is set by BATCH_ROWS
   # (rows per commit), not by how many clients are connected.
   #
-  # Pod count is deliberately NOT the throughput knob. find-rds-ceiling.sh swept
+  # Pod count is deliberately NOT the throughput knob. A replica ramp swept
   # 8/16/24/32/40 replicas against db.m5.2xlarge (500GB gp3, 12,000 IOPS):
   #
   #   replicas  conns  target    achieved  errors   write_iops  rds_cpu
@@ -879,13 +1101,13 @@ spec:
         # command-line argument or a literal in this manifest.
         - name: MYSQL_HOST
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: hostname }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_HOST }
         - name: MYSQL_USER
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: username }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_USER }
         - name: MYSQL_PASSWORD
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: password }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_PASSWORD }
         - name: MYSQL_DATABASE
           value: "ecommerce"
         # 8 pods x 100,000 = 800,000 rows/sec of TARGET. RATE is a token-bucket
@@ -988,6 +1210,18 @@ spec:
         # old one-draw-per-batch behaviour.
         - name: TABLE_RUN_BATCHES
           value: "8"
+        # 2026-11-03. Share of every orders / order_items batch that is a DELETE
+        # of existing keys (customers / products are never deleted: their FKs are
+        # RESTRICT and they have children). Stream-wide ~3.75% of rows, plus the
+        # items deleted with their orders. Roughly matches the ~4-5% insert share
+        # so the fact tables stay near their size. The deletes are drawn
+        # recent/older like the writes, so the Iceberg position-delete share stays
+        # ~50% (simulation: 0.47-0.50 at 1,000-2,000 rows/s per thread, about one
+        # point under the same run without deletes). FK handling, the
+        # FK_PARENT_MOD pool and ORDER_DELETE_MAX_ITEMS are explained in the
+        # script's Deletes note. 0 turns deletes off. Not yet measured on RDS.
+        - name: DELETE_RATIO
+          value: "0.05"
         # 0.6 -> 0.95, and the window 50,000 -> 2,000,000. Together these took
         # aggregate throughput from ~15,000 rows/s to ~58,300 (3.9x). Both move
         # the same direction, for two different reasons:

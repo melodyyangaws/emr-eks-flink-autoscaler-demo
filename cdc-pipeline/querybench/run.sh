@@ -5,8 +5,8 @@
 # run down when the test ends. Run from cdc-pipeline/.
 #
 #   SUITE=hot      ./querybench/run.sh start   hot test (hot-interleave.sh), writers + generator LIVE
-#   SUITE=snapshot ./querybench/run.sh start   snapshot test (snapshot.sh): writers stopped, Iceberg
-#                                              compacted, both engines from a cold start
+#   SUITE=snapshot ./querybench/run.sh start   snapshot test (snapshot.sh): writers stopped, both
+#                                              engines from a cold start
 #   ENGINES=duckdb|trino SUITE=... start       one engine only (default: "duckdb trino")
 #   FORMATS=iceberg|paimon SUITE=... start     one storage format only (default: both)
 #   ./querybench/run.sh logs [watch]           follow the runner (watch: the watcher)
@@ -17,7 +17,8 @@
 #   SUITE=hot ./querybench/run.sh render       DRY RUN: render the Job manifests, the step and
 #                                              every query for all four arms with sample
 #                                              values; no cluster or AWS call
-#   ./querybench/run.sh summary                newest hot + snapshot run of the session ->
+#   ./querybench/run.sh summary                newest hot + snapshot run of the session, plus the
+#                                              Flink ingest over its window (ingest_stats.py) ->
 #                                              bench-results/QUERYBENCH-SUMMARY-<session>.md
 #
 # Results: the runner uploads its bench-results/ to
@@ -29,13 +30,12 @@
 #      throughput-benchmark's qb-runner runs (same cluster and bucket);
 #   1. waits for the old cdc-qb-watch to finish its shutdown, then deletes it;
 #   2. snapshot: scales the generator to 0, waits WRITER_DRAIN_S (180) for the
-#      writers to commit the binlog tail, suspends both writers, resolves
+#      writers to read the binlog tail and until each completed a checkpoint >= 60 s
+#      after the generator stopped (qb_wait_writers_committed; refuses otherwise),
+#      suspends both writers, resolves
 #      SNAPSHOT_DT (newest closed date in both fact tables of every format);
-#   2b. snapshot with iceberg in FORMATS, COMPACT_BEFORE_SNAPSHOT=true: SUBMITS one Iceberg compaction
-#      Job per COMPACT_TABLES table (../iceberg-compaction/run-compaction.sh, in
-#      the background); the runner waits for them. Otherwise it checks the
-#      compaction gate now and refuses if a Job is missing, running or failed
-#      (ICEBERG_REQUIRE_COMPACTION=0 skips the gate);
+#      The Iceberg tables are measured as the writers and iceberg-maintain left
+#      them (no pre-test compaction; the summary reports their file/delete counts);
 #   3. engines up: duckdb-warm-cdc (engine-deploy/deploy-duckdb-cdc.sh up if it
 #      does not answer /health) and Trino (engine-deploy/deploy-trino.sh up if
 #      fewer than TRINO_WORKERS workers are active);
@@ -49,13 +49,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
-PASS_VARS="STAMP SESSION_SUFFIX RUNS WARMUP ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS
+PASS_VARS="STAMP SESSION_SUFFIX RUNS WARMUP SNAPSHOT_RUNS ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS HOT_LAG_SECONDS HOT_COMMIT_MARGIN_S HOT_COMMIT_TABLES HOT_REPIN
 STABLE_CHECKS WAIT_COMMIT_S LOOKUP_ORDER_ID LOOKUP_ORDER_DT QB_QUERY_WRITERS
-SNAPSHOT_DT S_FROM S_TO SNAPSHOT_SLICE_MINUTES SNAPSHOT_SLICE_MARGIN_S COMPACT_BEFORE_SNAPSHOT COMPACT_TABLES
-WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB STOP_COMPACTION_CRON CRON_NAME
+SNAPSHOT_DT S_FROM S_TO SNAPSHOT_SLICE_MINUTES SNAPSHOT_SLICE_MARGIN_S
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB STOP_COMPACTION_CRON
 HOT_QUERY_TIMEOUT_S SNAPSHOT_QUERY_TIMEOUT_S MAX_RESULT_ROWS
-COMPACT_NOT_BEFORE ICEBERG_REQUIRE_COMPACTION COMPACT_GATE_TIMEOUT_S ENGINE_GATE_TIMEOUT_S
+ENGINE_GATE_TIMEOUT_S
 QB_RESULTS_PREFIX_RUN TRINO_VERSION TRINO_WORKERS TRINO_USER TRINO_CATALOG CLEAR_COORDINATOR"
 # Passed even when set to an empty value: the pod's .bench-env has non-empty
 # defaults for them (the v3 set), so `CDC_DB_SUFFIX= ...` must reach the pod as such.
@@ -192,40 +192,35 @@ trino_up() {
     qb_trino_ready || die "Trino: fewer than ${TRINO_WORKERS} active workers after up"
 }
 
+# The CDC job monitor (monitoring/, Deployment flink-cdc-monitor) during a hot
+# test: its reports (CDC events/s in and out, checkpoints, backpressure, source
+# lag) feed the summary's ingest section. The watcher's teardown scales it to
+# 0, so each hot start brings it back: deploy-monitor.sh when it does not exist,
+# else scale to 1. A monitor configured for another table set, or without the
+# S3 report copy (REPORT_S3_URI, from before it existed), is redeployed.
+# MONITOR_UP=0 leaves it alone. Never fails the start.
+monitor_up() {
+    local m="${CDC_MONITOR:-flink-cdc-monitor}" db uri
+    [[ "${MONITOR_UP:-1}" == 0 ]] && { echo "  MONITOR_UP=0: job monitor left as it is"; return 0; }
+    db=$(kubectl get configmap flink-cdc-monitor-config -n "$NAMESPACE" -o jsonpath='{.data.ICEBERG_GLUE_DB}' 2>/dev/null || true)
+    uri=$(kubectl get configmap flink-cdc-monitor-config -n "$NAMESPACE" -o jsonpath='{.data.REPORT_S3_URI}' 2>/dev/null || true)
+    if ! kubectl get deployment "$m" -n "$NAMESPACE" >/dev/null 2>&1 || [[ "$db" != "$ICEBERG_DB" || -z "$uri" ]]; then
+        echo "  job monitor: (re)deploying (db '${db:-none}', report copy '${uri:-none}'; want ${ICEBERG_DB} + S3)"
+        CDC_DB_SUFFIX="$CDC_DB_SUFFIX" SESSION_SUFFIX="$SESSION_SUFFIX" "${CDC_DIR}/monitoring/deploy-monitor.sh" >/dev/null \
+            || warn "job monitor deploy failed: the summary will have no checkpoint / backpressure / events-consumed rows"
+    elif kubectl scale "deployment/${m}" -n "$NAMESPACE" --replicas=1 >/dev/null; then
+        echo "  job monitor: ${m} scaled to 1 (reports to ${uri})"
+    else
+        warn "could not scale ${m} to 1: the summary will have no job-monitor rows"
+    fi
+}
+
 suite_step() {
     case "$SUITE" in
         hot)      echo './querybench/hot-interleave.sh' ;;
         snapshot) echo './querybench/snapshot.sh' ;;
         *)        die "set SUITE=hot or SUITE=snapshot" ;;
     esac
-}
-
-# Submit one Iceberg compaction Job per COMPACT_TABLES table, all at once, in the
-# background (run-compaction.sh creates the Job and then only follows its log),
-# and wait just until each Job object exists: from then on the Jobs run in the
-# cluster whether or not this laptop stays up. COMPACT_NOT_BEFORE (now) makes
-# the gate ignore any older iceberg-compact-* Job.
-submit_compaction() {
-    local t job i n ts
-    export COMPACT_NOT_BEFORE; COMPACT_NOT_BEFORE=$(date -u +%s)
-    mkdir -p "${CDC_DIR}/bench-results"
-    for t in ${COMPACT_TABLES:-customers products orders order_items}; do
-        job="iceberg-compact-${t//_/-}"
-        echo "  submitting Iceberg compaction ${ICEBERG_DB}.${t} as Job ${job} (log: bench-results/${job}-${STAMP}.submit.log)"
-        ICEBERG_DB="$ICEBERG_DB" ICEBERG_TABLE="$t" JOB="$job" \
-            nohup "${CDC_DIR}/iceberg-compaction/run-compaction.sh" > "${CDC_DIR}/bench-results/${job}-${STAMP}.submit.log" 2>&1 &
-    done
-    for (( i = 0; i < 60; i++ )); do
-        n=0
-        for t in ${COMPACT_TABLES:-customers products orders order_items}; do
-            job="iceberg-compact-${t//_/-}"
-            ts=$(kubectl get job "$job" -n "$NAMESPACE" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)
-            [[ -n "$ts" ]] && (( $(python3 -c 'import sys, datetime as d; print(int(d.datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc).timestamp()))' "$ts") >= COMPACT_NOT_BEFORE )) && n=$((n + 1))
-        done
-        (( n == $(wc -w <<<"${COMPACT_TABLES:-customers products orders order_items}") )) && { echo "  compaction Jobs submitted; the runner waits for them"; return 0; }
-        sleep 5
-    done
-    die "the compaction Jobs were not all created within 5 min (see bench-results/iceberg-compact-*-${STAMP}.submit.log)"
 }
 
 cmd_start() {
@@ -244,27 +239,22 @@ cmd_start() {
     wait_for_runner                                                          # 0
     wait_for_watcher; delete_job "$WATCHER"                                  # 1
     if [[ "$SUITE" == snapshot ]]; then                                      # 2
-        "${CDC_DIR}/iceberg-compaction/run-compaction.sh" cron-suspend       # no live rewrite racing the snapshot one
-        qb_stop_generator; qb_stop_writers
+        "${CDC_DIR}/iceberg-compaction/run-maintain.sh" suspend   # tables fixed for the pins
+        gen_stopped_at=$(date +%s)
+        qb_stop_generator
+        qb_wait_writers_committed "$gen_stopped_at" || die "a writer did not commit after the generator stopped (see above): its tables would not match MySQL"
+        qb_stop_writers
         qb_resolve_snapshot_dt; export SNAPSHOT_DT="$QB_SNAPSHOT_DT"
         echo "  snapshot partition: ${SNAPSHOT_DT}"
-        if ! qb_has_format iceberg; then                                     # 2b
-            echo "  FORMATS=paimon: no Iceberg compaction (Paimon compacts in its writer)"
-        elif [[ "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]]; then
-            submit_compaction
-            # TODO(paimon-compaction): no one-off FULL compaction of the Paimon
-            # tables exists. Paimon's Iceberg export lists only top-LSM-level
-            # files, so the paimon arms may read fewer rows than native Paimon
-            # (both paimon arms read the same export, so they still agree with
-            # each other). A batch Flink job running CALL sys.compact(`table` =>
-            # '<db>.<t>', compact_strategy => 'full') per table would close it.
-        else
-            ( qb_compaction_gate 0 ) || die "the snapshot test cannot start"
-        fi
     fi
     if [[ "$SUITE" == hot ]]; then                                           # 2c
         wait_writers_up "${WRITERS_UP_S:-900}"                               # writers 15 min up before the engines
-        "${CDC_DIR}/iceberg-compaction/run-compaction.sh" cron-resume        # hourly compaction during the hot test
+        if kubectl get flinkdeployment iceberg-maintain -n "$NAMESPACE" >/dev/null 2>&1; then   # continuous compaction during the hot test
+            "${CDC_DIR}/iceberg-compaction/run-maintain.sh" resume     # patch only: an apply over a live CR empties usrlib
+        else
+            "${CDC_DIR}/iceberg-compaction/run-maintain.sh" up
+        fi
+        monitor_up                                                           # job-monitor reports for the summary
     fi
     for e in $ENGINES; do                                                    # 3
         case "$e" in duckdb) duckdb_up ;; trino) trino_up ;; esac
@@ -304,7 +294,7 @@ cmd_render() {
         T=$(qb_upper "$t")
         for v in "QB_PIN_SNAP_ICEBERG_${T}=8000000000000000101" "QB_PIN_SNAP_PAIMON_${T}=101" \
                  "QB_PIN_META_ICEBERG_${T}=s3://${BUCKET_NAME}/${QB_PIN_PREFIX}/SAMPLE/iceberg/${t}/00001-x.metadata.json" \
-                 "QB_PIN_META_PAIMON_${T}=s3://${BUCKET_NAME}/${QB_PIN_PREFIX}/SAMPLE/paimon/${t}/v101.metadata.json"; do
+                 "QB_PIN_META_PAIMON_${T}=${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/${t}"; do
             n="${v%%=*}"; [[ -n "${!n:-}" ]] || export "$v"
         done
     done
@@ -335,12 +325,44 @@ cmd_status() {
     echo "== jobs:";      kubectl get jobs "$RUNNER" "$WATCHER" qb-runner qb-watch -n "$NAMESPACE" --no-headers 2>/dev/null | awk '{print "  " $1, $2}' || true
 }
 
+# Flink ingest over the run's window, from the tables' commit history
+# (ingest_stats.py, read-only boto3; needs the snapshots still retained, 12 h on
+# Paimon): the hot suite's pins -5 min .. last pin, else the writers' last
+# 30 min before the snapshot run. Sets INGEST_JSON, or INGEST_ERR (the summary
+# then says why). Never fails the summary. Through `uv` when present, which
+# brings fastavro + zstd for Paimon's Avro manifests (file counts); plain
+# python3 otherwise (rows and commits only). INGEST=0 skips it.
+summary_ingest() {   # <work dir> <hot stamp> <snapshot stamp> <json out>
+    local w="$1" hot="$2" snap="$3" out="$4" pins="" win py err host
+    INGEST_JSON="" INGEST_ERR=""
+    [[ "${INGEST:-1}" == 0 ]] && { INGEST_ERR="skipped (INGEST=0)"; return 0; }
+    pins=$(ls "$w"/hot/hot-interleave-*.pins 2>/dev/null | tail -1 || true)
+    if [[ -n "$hot" && -n "$pins" ]]; then win=(--pins "$pins")
+    elif [[ -n "$snap" ]]; then win=(--before "$snap")
+    else INGEST_ERR="no hot .pins file and no snapshot run to take a window from"; return 0; fi
+    if command -v uv >/dev/null 2>&1; then
+        py=(uv run --quiet --no-project --python 3.12 --with boto3 --with fastavro --with zstandard --with backports.zstd python)
+    else py=(python3); fi
+    host="${MYSQL_HOST:-}"   # .bench-env.local
+    err="$w/ingest.err"
+    if "${py[@]}" "${HERE}/ingest_stats.py" --bucket "$BUCKET_NAME" --iceberg-db "$ICEBERG_DB" --paimon-db "$PAIMON_DB" \
+           "${win[@]}" --monitor-prefix "${QB_RESULTS_PREFIX}/monitor/" ${host:+--rds-host "$host"} \
+           --flink-manifests "${CDC_DIR}/ingest-deploy/flink-cdc-paimon-deployed.yaml" "${CDC_DIR}/ingest-deploy/flink-cdc-iceberg-deployed.yaml" \
+           --generator-manifest "${CDC_DIR}/mysql-data-generator/mysql-upsert-loadgen.yaml" \
+           --out "$out" 2> "$err" && [[ -s "$out" ]]; then
+        INGEST_JSON="$out"; log "ingest: $(tail -1 "$err" | sed "s|${REPO_DIR}/||g" | cut -c1-300)"
+    else
+        INGEST_ERR="ingest_stats.py failed: $(grep -v '^\s*$' "$err" | tail -1 | cut -c1-200)"
+        warn "$INGEST_ERR (the summary goes on without it)"
+    fi
+}
+
 # Newest hot and snapshot run of the session from S3 (HOT_STAMP= / SNAPSHOT_STAMP=
 # pick others; SUMMARY_DIR=<local dir with hot/ and/or snapshot/> skips S3) -> the Markdown summary.
 cmd_summary() {
     local S T hot snap session out
     S="s3://${BUCKET_NAME}/${QB_RESULTS_PREFIX}"
-    T=$(mktemp -d); trap 'rm -rf "${T:?}"' EXIT
+    T=$(mktemp -d); trap "rm -rf '${T}'" EXIT   # T is local: expand it now, not at exit
     latest() { aws s3 ls "${S}/" 2>/dev/null | sed -n "s|.* PRE \([0-9]\{8\}T[0-9]\{6\}Z\)-${1}/\$|\1|p" | sort | tail -1; }
     if [[ -n "${SUMMARY_DIR:-}" ]]; then
         cp -R "${SUMMARY_DIR}/." "$T/"; hot="${HOT_STAMP:-}"; snap="${SNAPSHOT_STAMP:-}"
@@ -354,10 +376,21 @@ cmd_summary() {
     session="${SESSION:-$(echo "${hot:-${snap:-$(date -u +%Y%m%d)}}" | cut -c1-8)${CDC_SET_TAG}${SESSION_SUFFIX}}"
     out="${CDC_DIR}/bench-results/QUERYBENCH-SUMMARY-${session}.md"
     mkdir -p "${CDC_DIR}/bench-results"
+    # Raw ingest numbers go to S3 next to the run's other results (throughput's
+    # pattern: bench-results/ keeps only the final .md; everything the summary
+    # was computed from is in S3, so another laptop can reproduce or re-read it).
+    ingest_json="$T/QUERYBENCH-INGEST-${session}.json"
+    summary_ingest "$T" "$hot" "$snap" "$ingest_json"
     python3 "${HERE}/summarize.py" --work "$T" --session "$session" ${hot:+--hot "$hot"} ${snap:+--snapshot "$snap"} \
-        --iceberg-format-version "$ICEBERG_FORMAT_VERSION" --warmup "${WARMUP:-1}" --out "$out"
+        --iceberg-format-version "$ICEBERG_FORMAT_VERSION" --warmup "${WARMUP:-1}" \
+        ${INGEST_JSON:+--ingest "$INGEST_JSON"} ${INGEST_ERR:+--ingest-error "$INGEST_ERR"} --out "$out"
     [[ -z "${AWS_ACCOUNT_ID:-}" ]] || sed -i.bak -e "s/${BUCKET_NAME}/<bucket>/g" -e "s/${AWS_ACCOUNT_ID}/<id>/g" "$out"
     rm -f "$out.bak"
+    if [[ -s "$ingest_json" ]]; then
+        aws s3 cp --only-show-errors "$ingest_json" "${S}/${session}-summary/QUERYBENCH-INGEST-${session}.json" \
+            && log "ingest data: s3://${BUCKET_NAME}/${QB_RESULTS_PREFIX}/${session}-summary/QUERYBENCH-INGEST-${session}.json" \
+            || warn "could not upload the ingest JSON to S3 (kept only in $T, which is removed on exit)"
+    fi
     log "summary: ${out#${REPO_DIR}/} (bench-results/ is git-ignored: git add -f to commit it)"
 }
 

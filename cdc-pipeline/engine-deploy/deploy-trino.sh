@@ -42,8 +42,22 @@ TRINO_CHART_VERSION="${TRINO_CHART_VERSION:-1.45.0}"
 # The chart archive by URL (index: https://trinodb.github.io/charts), not by
 # repo name: no `helm repo add` needed, and no dependence on the local repo cache.
 TRINO_CHART="${TRINO_CHART:-https://github.com/trinodb/charts/releases/download/trino-${TRINO_CHART_VERSION}/trino-${TRINO_CHART_VERSION}.tgz}"
+# Image: trinodb/trino:${TRINO_VERSION} + the native Paimon connector, built by
+# trino-image/build-trino-image.sh (see trino-image/Dockerfile). TRINO_IMAGE=
+# (empty) = the stock trinodb/trino:${TRINO_VERSION}, and then no paimon catalog
+# (its connector is not in the stock image; the server would not start).
+TRINO_IMAGE="${TRINO_IMAGE-${AWS_ACCOUNT_ID:+${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/trino-cdc:${TRINO_VERSION}-paimon-2.1.0}}"
+if [[ -n "$TRINO_IMAGE" ]]; then
+    TRINO_IMAGE_REPOSITORY="${TRINO_IMAGE%:*}" TRINO_IMAGE_TAG="${TRINO_IMAGE##*:}"
+    TRINO_PAIMON_CATALOG="${TRINO_PAIMON_CATALOG:-1}"
+else
+    TRINO_IMAGE_REPOSITORY=trinodb/trino TRINO_IMAGE_TAG="$TRINO_VERSION"
+    TRINO_PAIMON_CATALOG=0
+fi
+[[ "$TRINO_IMAGE_TAG" == "$TRINO_VERSION" || "$TRINO_IMAGE_TAG" == "${TRINO_VERSION}-"* ]] \
+    || die "TRINO_IMAGE tag ${TRINO_IMAGE_TAG} is not Trino ${TRINO_VERSION}"
 TRINO_SERVICE_ACCOUNT="${TRINO_SERVICE_ACCOUNT:-starrocks-sa}"   # = duckdb-cdc.yaml: IRSA role reading Glue + both warehouses
-TRINO_NODEPOOL="${TRINO_NODEPOOL:-driver-nodepool}"              # = duckdb-cdc.yaml / StarRocks' BEs (on-demand, m5 allowed)
+TRINO_NODEPOOL="${TRINO_NODEPOOL:-driver-nodepool}"              # = duckdb-cdc.yaml (on-demand, m5 allowed)
 
 TRINO_WORKERS="${TRINO_WORKERS:-3}"
 TRINO_WORKER_CPU="${TRINO_WORKER_CPU:-9}"
@@ -86,7 +100,7 @@ TRINO_COORD_MAX_MEM_PER_NODE="$(( TRINO_COORD_HEAP_MIB * TRINO_QMEM_PCT / 100 ))
 TRINO_COORD_HEADROOM="$(( TRINO_COORD_HEAP_MIB * TRINO_HEADROOM_PCT / 100 ))MB"
 TRINO_QUERY_MAX_MEMORY="$(( TRINO_WORKERS * (TRINO_WORKER_HEAP_MIB * TRINO_QMEM_PCT / 100) ))MB"
 
-TPL_VARS="TRINO_VERSION TRINO_CHART_VERSION AWS_REGION TRINO_SERVICE_ACCOUNT TRINO_NODEPOOL
+TPL_VARS="TRINO_VERSION TRINO_CHART_VERSION TRINO_IMAGE_REPOSITORY TRINO_IMAGE_TAG PAIMON_WAREHOUSE AWS_REGION TRINO_SERVICE_ACCOUNT TRINO_NODEPOOL
 TRINO_WORKERS TRINO_WORKER_CPU TRINO_WORKER_MEMORY_GI TRINO_WORKER_INSTANCE_SIZE TRINO_WORKER_HEAP
 TRINO_WORKER_MAX_MEM_PER_NODE TRINO_WORKER_HEADROOM TRINO_COORD_CPU TRINO_COORD_MEMORY_GI
 TRINO_COORD_INSTANCE_SIZE TRINO_COORD_HEAP TRINO_COORD_MAX_MEM_PER_NODE TRINO_COORD_HEADROOM
@@ -136,7 +150,10 @@ wait_ready() {   # coordinator + deployments rolled out, then TRINO_WORKERS acti
 cmd_render() {
     # shellcheck disable=SC2086
     render "${HERE}/trino-values.yaml" "$VALUES_OUT" $TPL_VARS || die "could not render trino-values.yaml"
-    log "rendered ${VALUES_OUT##*/} (chart ${TRINO_CHART_VERSION}, Trino ${TRINO_VERSION}; workers ${TRINO_WORKERS} x ${TRINO_WORKER_CPU} cpu / ${TRINO_WORKER_MEMORY_GI}Gi, heap ${TRINO_WORKER_HEAP}, max-memory-per-node ${TRINO_WORKER_MAX_MEM_PER_NODE}, query.max-memory ${TRINO_QUERY_MAX_MEMORY})"
+    if [[ "$TRINO_PAIMON_CATALOG" != 1 ]]; then
+        sed -i.bak '/# BEGIN paimon/,/# END paimon/d' "$VALUES_OUT" && rm -f "${VALUES_OUT}.bak"
+    fi
+    log "rendered ${VALUES_OUT##*/} (chart ${TRINO_CHART_VERSION}, image ${TRINO_IMAGE_REPOSITORY}:${TRINO_IMAGE_TAG}, paimon catalog $([[ $TRINO_PAIMON_CATALOG == 1 ]] && echo on || echo off); workers ${TRINO_WORKERS} x ${TRINO_WORKER_CPU} cpu / ${TRINO_WORKER_MEMORY_GI}Gi, heap ${TRINO_WORKER_HEAP}, max-memory-per-node ${TRINO_WORKER_MAX_MEM_PER_NODE}, query.max-memory ${TRINO_QUERY_MAX_MEMORY})"
 }
 
 cmd_up() {
@@ -164,6 +181,10 @@ cmd_status() {
     sql "SELECT node_id, coordinator, state FROM system.runtime.nodes ORDER BY coordinator DESC, node_id" 2>/dev/null | tr -d '"' | sed 's/^/  /' || true
     echo "iceberg schemas (flink_*):"
     sql "SHOW SCHEMAS FROM iceberg" 2>/dev/null | tr -d '"' | grep '^flink_' | sed 's/^/  /' || echo "  (none / catalog error)"
+    if [[ "$TRINO_PAIMON_CATALOG" == 1 ]]; then
+        echo "paimon schemas (flink_*):"
+        sql "SHOW SCHEMAS FROM paimon" 2>/dev/null | tr -d '"' | grep '^flink_' | sed 's/^/  /' || echo "  (none / catalog error)"
+    fi
     echo "cache (/cache) per pod:"
     for p in $(kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/instance=${RELEASE}" -o name); do
         echo "  ${p#pod/}: $(kubectl exec -n "$NAMESPACE" "$p" -- du -sh /cache 2>/dev/null | cut -f1)"

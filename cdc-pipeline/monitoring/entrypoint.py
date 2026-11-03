@@ -9,9 +9,10 @@ import sys
 import time
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from flink_cdc_monitor import FlinkCDCMonitor
+from flink_cdc_monitor import FlinkCDCMonitor, upload_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,10 @@ MONITOR_DURATION = int(os.environ.get("MONITOR_DURATION", "60"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 REPEAT_INTERVAL = int(os.environ.get("REPEAT_INTERVAL", "300"))
 REPORT_OUTPUT_DIR = os.environ.get("REPORT_OUTPUT_DIR", "/tmp/reports")
+# s3://<bucket>/<prefix>/: each report is also copied there (best-effort), so
+# it survives the pod. Empty = local only. deploy-monitor.sh sets it to the
+# query benchmark's results prefix, .../cdc-session<set tag>/monitor/.
+REPORT_S3_URI = os.environ.get("REPORT_S3_URI", "")
 RUN_MODE = os.environ.get("RUN_MODE", "continuous")
 
 
@@ -78,6 +83,7 @@ def save_report(monitor, report, output_dir):
     with open(filepath, "w") as f:
         f.write(monitor.to_json(report))
     log.info("Report saved to %s", filepath)
+    upload_report(filepath, REPORT_S3_URI)
     return filepath
 
 
@@ -91,19 +97,17 @@ def run_single_cycle():
     iceberg_monitor = build_monitor(
         ICEBERG_FLINK_URL, ICEBERG_GLUE_DB, ICEBERG_WAREHOUSE, CDC_TABLES, catalog_type="glue")
 
-    paimon_report = paimon_monitor.generate_report(
-        label="paimon-cdc",
-        monitor_duration=MONITOR_DURATION,
-        poll_interval=POLL_INTERVAL,
-    )
-    save_report(paimon_monitor, paimon_report, REPORT_OUTPUT_DIR)
-
-    iceberg_report = iceberg_monitor.generate_report(
-        label="iceberg-cdc",
-        monitor_duration=MONITOR_DURATION,
-        poll_interval=POLL_INTERVAL,
-    )
-    save_report(iceberg_monitor, iceberg_report, REPORT_OUTPUT_DIR)
+    # Both pipelines over the SAME wall-clock window, in parallel: one after
+    # the other, each format was sampled only every other ~2.5 min and never
+    # at the same moment as the other, which made the reports a poor pair.
+    def one(monitor, label):
+        r = monitor.generate_report(label=label, monitor_duration=MONITOR_DURATION, poll_interval=POLL_INTERVAL)
+        save_report(monitor, r, REPORT_OUTPUT_DIR)
+        return r
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fp = ex.submit(one, paimon_monitor, "paimon-cdc")
+        fi = ex.submit(one, iceberg_monitor, "iceberg-cdc")
+        paimon_report, iceberg_report = fp.result(), fi.result()
 
     log.info("")
     log.info("=" * 70)
@@ -122,6 +126,7 @@ def main():
     log.info("  Paimon  : %s  db=%s", PAIMON_FLINK_URL, PAIMON_GLUE_DB)
     log.info("  Iceberg : %s  db=%s", ICEBERG_FLINK_URL, ICEBERG_GLUE_DB)
     log.info("  Tables  : %s", CDC_TABLES)
+    log.info("  Reports : %s%s", REPORT_OUTPUT_DIR, " + " + REPORT_S3_URI if REPORT_S3_URI else " (no S3 copy)")
     log.info("  Mode    : %s", RUN_MODE)
     log.info("  Duration: %ds  Poll: %ds  Repeat: %ds", MONITOR_DURATION, POLL_INTERVAL, REPEAT_INTERVAL)
 

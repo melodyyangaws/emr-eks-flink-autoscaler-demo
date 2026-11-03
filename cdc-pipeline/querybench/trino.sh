@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The Trino side of the CDC query tests, the counterpart of duckdb-warm.sh:
 # runs a suite on Trino (engine-deploy/deploy-trino.sh: coordinator + workers,
-# catalog `iceberg` = the Glue Iceberg catalog), on the pinned snapshot of each
-# table, ids from pin.sh (the same pins DuckDB reads as copied metadata.json):
-#   arm iceberg   iceberg.<ICEBERG_DB>.<t> FOR VERSION AS OF <snapshot id>
-#   arm paimon    iceberg.<PAIMON_DB>.<t> FOR VERSION AS OF <export snapshot id>
-#                 (Paimon's hive-catalog export registers the tables in Glue
-#                 as table_type=ICEBERG; Trino 484 has no Paimon connector)
+# catalogs `iceberg` = Glue Iceberg, `paimon` = the native Paimon connector of
+# image trino-cdc:484-paimon-2.1.0), on the pinned snapshot of each table, ids
+# from pin.sh (the same pins DuckDB reads):
+#   arm iceberg   iceberg.<ICEBERG_DB>.<t> FOR VERSION AS OF BIGINT '<snapshot id>'
+#   arm paimon    paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<Paimon snapshot N>'
+#                 (QB_TRINO_PAIMON_CATALOG; the connector maps it to scan.snapshot-id)
 # FORMATS=iceberg|paimon|both (default both). An arm that cannot read its
 # tables records ERROR per query; the other arm still runs.
 #
@@ -240,7 +240,8 @@ run_suite_passes() {   # suite arm rendered-dir rows-file
             python3 - "$j" "$name" "$pass" "$WARMUP" "$q" "$n" "$s" "$QUERIES_CSV" "$arm" 2>>"$LOG" <<'EOF'
 import csv, json, os, sys
 j, name, p, w, q, n, suite, qcsv, arm = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
-tag = "warm-up" if p < w else "run %d" % (p - w + 1)
+cold = os.environ.get("COLD_PASS") == "1" and p == 0
+tag = "cold" if cold else "warm-up" if p < w else "run %d" % (p - w + 1)
 print("  %-7s %-30s %-8s %9s ms exec (%s elapsed, %s queued, %s cpu)  %s  first_row=%s%s" % (
       arm, name, tag, j.get("exec_ms", "-"), j.get("elapsed_ms", "-"), j.get("queued_ms", "-"), j.get("cpu_ms", "-"),
       j["status"], (j.get("first_row") or "")[:80], ("  error=" + j["error"]) if j.get("error") else ""), file=sys.stderr)
@@ -252,8 +253,11 @@ with open(qcsv, "a", newline="") as fh:
     if new:
         wr.writerow(cols)
     wr.writerow([arm, suite, p, name] + ["" if j.get(k) is None else j.get(k) for k in cols[4:]])
-if j["status"] == "OK" and p >= w:
+if j["status"] == "OK" and cold:
+    open("%s/%s.cold" % (q, n), "w").write("%d\n" % j["exec_ms"])
+elif j["status"] == "OK" and p >= w:
     open("%s/%s.times" % (q, n), "a").write("%d\n" % j["exec_ms"])
+if j["status"] == "OK" and (cold or p >= w):
     open("%s/%s.last" % (q, n), "w").write(json.dumps(j))
 EOF
             if [[ "$st" != OK ]]; then
@@ -267,14 +271,15 @@ EOF
     n=0
     for f in $files; do
         n=$((n + 1)); name=$(qb_query_name "$f")
-        local med="" st="OK" rr=0 sb="" srr=""
+        local med="" st="OK" rr=0 sb="" srr="" cms=""
         [[ -f "${q}/${n}.times" ]] && med=$(qb_median < "${q}/${n}.times")
+        [[ -f "${q}/${n}.cold" ]] && cms=$(<"${q}/${n}.cold")
         [[ -f "${q}/${n}.bad" ]] && st=$(<"${q}/${n}.bad")
         [[ -z "$med" && "$st" == OK ]] && st=ERROR
         if [[ -f "${q}/${n}.last" ]]; then
             rr=$(jget result_rows < "${q}/${n}.last"); sb=$(jget physical_input_bytes < "${q}/${n}.last"); srr=$(jget physical_input_rows < "${q}/${n}.last")
         fi
-        echo "${STAMP},trino,${arm},${s},${name},${st},${med},${rr},${srr},${sb}" >> "$rows"
+        echo "${STAMP},trino,${arm},${s},${name},${st},${med},${rr},${srr},${sb},${cms}" >> "$rows"
         if [[ -f "${q}/${n}.last" ]]; then
             echo "${arm},${s},${name},$(jget first_row < "${q}/${n}.last")" >> "${CSV%.csv}-firstrows.csv"
             python3 - "${q}/${n}.last" "$arm" "$s" "$name" >> "$ROWS_TSV" <<'EOF'

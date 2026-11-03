@@ -14,9 +14,8 @@ fi
 unset _cdc_env_dir
 
 export NAMESPACE=emr-flink
-
 export ICEBERG_FORMAT_VERSION=3
-export CDC_DB_SUFFIX=_v3r2
+export CDC_DB_SUFFIX=_v3r3
 
 # SESSION_SUFFIX names one round of query results: they go to
 # s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
@@ -25,7 +24,7 @@ export CDC_DB_SUFFIX=_v3r2
 # Empty or suffix represent the test round like -r2. 
 export SESSION_SUFFIX=""
 
-# The CDC tables, as flink-cdc-{paimon,iceberg}-sql.yaml write them. The query
+# The CDC tables, as ingest-deploy/flink-cdc-{paimon,iceberg}-sql.yaml write them. The query
 # benchmark reads the Iceberg tables only (querybench/README.md); FLINK_JOBS is
 # what it stops for the snapshot test.
 export PAIMON_WAREHOUSE="s3://${BUCKET_NAME}/paimon-warehouse"
@@ -46,11 +45,37 @@ export TRINO_CHART_VERSION=1.45.0
 # ThinLTO) at every start: a different build, so a different timing baseline.
 export DUCKDB_IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/duckdb-cdc-server:2.0.0"
 
+# MySQL CDC source (0-MYSQL-SETUP-GUIDE.md). MYSQL_HOST is account-specific and
+# lives in .bench-env.local. No password here or in any env file: the Flink jobs
+# and the generator share ONE k8s Secret - mysql-credentials (keys MYSQL_HOST, MYSQL_USER,
+# MYSQL_PASSWORD: env-var names, because the Flink pods load it with envFrom).
+export MYSQL_PORT=3306
+export MYSQL_DATABASE=ecommerce
+export MYSQL_USER=cdcuser
+export MYSQL_ENV_SECRET_NAME=mysql-credentials
+
 # The MySQL load generator the hot test needs running and the snapshot test
 # stops (scaled to 0). deploy-data-generator.sh scale brings it back.
 export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen"
 
-# The snapshot test submits these Iceberg compaction Jobs and measures the
-# compacted tables; ICEBERG_REQUIRE_COMPACTION=0 (one run) measures them as they are.
-export COMPACT_BEFORE_SNAPSHOT=true
-export COMPACT_TABLES="customers products orders order_items"
+# Paimon write path (INSERT hints, apply to existing tables) and the S3A upload
+# shape (catalog options; Iceberg's S3FileIO gets the derived equivalent), read
+# by ingest-deploy/build-deploy-generic.sh. Defaults shown = Paimon's own write path and
+# throughput-benchmark's upload shape. PAIMON_WRITE_ONLY=true disables Paimon's
+# inline compaction AND snapshot expiry. PAIMON_WRITE_BUFFER_SIZE unset gives
+# 64mb (dimension) / 128mb (fact), = Iceberg's target file sizes. Changing any
+# of them needs a writer redeploy.
+export PAIMON_WRITE_ONLY=false
+export PAIMON_WRITE_BUFFER_SPILLABLE=true
+# export PAIMON_WRITE_BUFFER_SIZE=256mb
+export S3A_MULTIPART_SIZE=16M S3A_MULTIPART_THRESHOLD=16M S3A_ACTIVE_BLOCKS=6
+
+export TRINO_WORKERS=9
+export TRINO_CACHE_VOLUME=56Gi
+export DUCKDB_CPU=81 DUCKDB_THREADS=81
+export DUCKDB_POD_MEMORY=342Gi DUCKDB_MEMORY_LIMIT=252147MiB CACHE_MEM_BYTES=66099546684
+export DUCKDB_MAX_TEMP_SIZE=540GB DUCKDB_INSTANCE_SIZE=24xlarge
+
+# Hot query window: 30 s ending HOT_LAG_SECONDS (300) before the test starts,
+# as the throughput benchmark uses.
+export HOT_WINDOW_SECONDS=30

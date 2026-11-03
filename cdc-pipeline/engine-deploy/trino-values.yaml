@@ -9,9 +9,12 @@
 # coordinator of ${TRINO_COORD_CPU} cpu / ${TRINO_COORD_MEMORY_GI}Gi that schedules no splits.
 # The memory numbers below are computed by deploy-trino.sh (see its header).
 
+# Default: trinodb/trino:${TRINO_VERSION} + the native Paimon plugin
+# (trino-image/Dockerfile, ECR trino-cdc:<version>-paimon-2.1.0); TRINO_IMAGE=
+# (empty) = stock trinodb/trino:${TRINO_VERSION}, without the paimon catalog.
 image:
-  repository: trinodb/trino
-  tag: "${TRINO_VERSION}"                 # pinned: the chart's appVersion, but explicit
+  repository: ${TRINO_IMAGE_REPOSITORY}
+  tag: "${TRINO_IMAGE_TAG}"               # pinned: the chart's appVersion, but explicit
 
 server:
   workers: ${TRINO_WORKERS}
@@ -21,7 +24,7 @@ server:
     query:
       maxMemory: "${TRINO_QUERY_MAX_MEMORY}"    # cluster-wide user memory = workers x worker max-memory-per-node
 
-# One catalog only: drop the chart's default tpch/tpcds.
+# iceberg (Glue) + paimon (native Paimon reader): drop the chart's default tpch/tpcds.
 catalogs:
   tpch: null
   tpcds: null
@@ -33,6 +36,20 @@ catalogs:
     fs.native-s3.enabled=true
     s3.region=${AWS_REGION}
     fs.cache.enabled=true
+  # BEGIN paimon (deploy-trino.sh drops this block when TRINO_PAIMON_CATALOG=0)
+  # paimon-trino with Paimon's FILESYSTEM catalog on the warehouse path, not the
+  # Flink jobs' hive/Glue one: the export re-registers the Glue entries as
+  # table_type=ICEBERG, and the filesystem layout (<warehouse>/<db>.db/<table>)
+  # is the same one the Glue catalog writes. Read-only use; S3 through Trino's
+  # native file system (AWS SDK default chain = IRSA web identity).
+  paimon: |
+    connector.name=paimon
+    warehouse=${PAIMON_WAREHOUSE}
+    metastore=filesystem
+    fs.s3.enabled=true
+    s3.region=${AWS_REGION}
+    fs.cache.enabled=true
+  # END paimon
 
 # node.id: the 484 image dropped run-trino, which used to set it (484 release
 # notes, Docker section); pod name = node id in system.runtime.nodes.

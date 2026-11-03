@@ -18,6 +18,7 @@ import time
 import json
 import logging
 import statistics
+import threading
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -31,6 +32,15 @@ from tabulate import tabulate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+# boto3.client() on the default session is not thread-safe, and entrypoint.py
+# samples both pipelines in parallel threads: create clients under this lock.
+_BOTO_LOCK = threading.Lock()
+
+
+def s3_client(region: str = None):
+    with _BOTO_LOCK:
+        return boto3.client("s3", region_name=region) if region else boto3.client("s3")
 
 
 @dataclass
@@ -106,6 +116,9 @@ class PipelineReport:
     total_records_processed: int = 0
     total_bytes_processed: int = 0
     avg_checkpoint_duration_ms: float = 0.0
+    max_checkpoint_duration_ms: int = 0
+    # Share of the window's samples in which a vertex reported backpressure HIGH.
+    backpressured_sample_ratio: float = 0.0
     checkpoint_count: int = 0
     total_new_snapshots: int = 0
     total_new_data_files: int = 0
@@ -391,7 +404,9 @@ class FlinkCDCMonitor:
         warehouse = self.catalog_config["warehouse"].rstrip("/")
         path = warehouse.replace("s3://", "").replace("s3a://", "")
         bucket, _, prefix = path.partition("/")
-        s3 = boto3.client("s3", region_name=self.catalog_config.get("s3.region", "us-west-2"))
+        s3 = getattr(self, "_s3", None)
+        if s3 is None:
+            s3 = self._s3 = s3_client(self.catalog_config.get("s3.region", "us-west-2"))
         return s3, bucket, f"{prefix}/{self.glue_database}.db/{table_name}".lstrip("/")
 
     @staticmethod
@@ -627,6 +642,9 @@ class FlinkCDCMonitor:
                         if s.last_checkpoint_duration_ms > 0]
         if cp_durations:
             report.avg_checkpoint_duration_ms = statistics.mean(cp_durations)
+            report.max_checkpoint_duration_ms = max(cp_durations)
+        if flink_snapshots:
+            report.backpressured_sample_ratio = sum(1 for s in flink_snapshots if s.is_backpressured) / len(flink_snapshots)
         # Checkpoint counts: DELTA over the window, not the absolute totals.
         # counts.failed is cumulative for the job's life (see 3-MONITOR.md), so
         # its raw value stays non-zero long after the job has recovered.
@@ -864,6 +882,8 @@ class FlinkCDCMonitor:
             "total_records_processed": report.total_records_processed,
             "total_bytes_processed": report.total_bytes_processed,
             "avg_checkpoint_duration_ms": round(report.avg_checkpoint_duration_ms, 2),
+            "max_checkpoint_duration_ms": report.max_checkpoint_duration_ms,
+            "backpressured_sample_ratio": round(report.backpressured_sample_ratio, 3),
             "checkpoint_count": report.checkpoint_count,
             "failed_checkpoints_in_window": report.failed_checkpoints,
             "total_new_snapshots": report.total_new_snapshots,
@@ -899,3 +919,21 @@ class FlinkCDCMonitor:
                     "bytes_delta": e.total_size_bytes - s.total_size_bytes,
                 }
         return json.dumps(d, indent=2)
+
+
+def upload_report(path: str, s3_uri: str) -> bool:
+    """Best-effort copy of a saved report to s3_uri (a prefix ending in /),
+    so the reports outlive the pod (/tmp/reports is an emptyDir and the
+    benchmark's teardown scales the monitor to 0). querybench/ingest_stats.py
+    reads them back by time window. A failure is logged, never raised."""
+    if not s3_uri:
+        return False
+    try:
+        bucket, _, prefix = s3_uri[len("s3://"):].partition("/")
+        key = prefix.rstrip("/") + "/" + path.rsplit("/", 1)[-1] if prefix else path.rsplit("/", 1)[-1]
+        s3_client().upload_file(path, bucket, key)
+        log.info("Report uploaded to s3://%s/%s", bucket, key)
+        return True
+    except Exception as e:
+        log.warning("Report upload to %s failed (kept locally): %s", s3_uri, e)
+        return False

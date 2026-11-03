@@ -35,8 +35,9 @@ DUCKDB_FALLBACK_IMAGE="${DUCKDB_FALLBACK_IMAGE:-python:3.12-slim}"
 if [[ -n "$DUCKDB_IMAGE" ]]; then DUCKDB_POD_IMAGE="$DUCKDB_IMAGE" DUCKDB_FROM_IMAGE=1
 else DUCKDB_POD_IMAGE="$DUCKDB_FALLBACK_IMAGE" DUCKDB_FROM_IMAGE=0; fi
 ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}"
-# Default: the Paimon arm on v3 (see duckdb_cdc_server.py); set (even empty) to override.
-SKIP_PUFFIN_VERIFICATION_ARMS="${SKIP_PUFFIN_VERIFICATION_ARMS-$(if [[ "$ICEBERG_FORMAT_VERSION" == 3 ]]; then echo paimon; fi)}"
+# Default none: the paimon arm reads native Paimon (paimon_scan), not the export
+# whose bare DV blobs needed iceberg_unsafe_skip_puffin_verification.
+SKIP_PUFFIN_VERIFICATION_ARMS="${SKIP_PUFFIN_VERIFICATION_ARMS-}"
 DUCKDB_CPU="${DUCKDB_CPU:-27}"
 DUCKDB_THREADS="${DUCKDB_THREADS:-27}"
 DUCKDB_MEMORY_LIMIT="${DUCKDB_MEMORY_LIMIT:-84049MiB}"

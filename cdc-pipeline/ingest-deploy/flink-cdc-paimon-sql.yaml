@@ -2,7 +2,7 @@ apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
   namespace: emr-flink
-  name: flink-cdc-iceberg
+  name: flink-cdc-paimon
 spec:
   flinkVersion: v1_20
   executionRoleArn: ${EMR_EXECUTION_ROLE_ARN}
@@ -13,15 +13,23 @@ spec:
   emrReleaseLabel: "emr-${EMR_VERSION}-flink-latest"
 
   flinkConfiguration:
-    # No aws.glue.enabled here: that EMR switch exists for the Paimon job's
-    # Hive-metastore catalog. Iceberg reaches Glue through its own GlueCatalog
-    # ('catalog-impl' in sql-scripts/iceberg/01-catalog-setup.sql) — the one
-    # intended flinkConfiguration difference between the two manifests.
+    # Paimon only: EMR's Glue integration provides /glue/confs/{hive,hadoop}/conf
+    # for paimon_catalog's 'metastore' = 'hive' (sql-scripts/paimon/01-catalog-
+    # setup.sql). The Iceberg job talks to Glue through Iceberg's own GlueCatalog
+    # and does not set it — the one intended flinkConfiguration difference.
+    aws.glue.enabled: "true"
     # Region from the AWS_REGION placeholder, never hardcoded: the Paimon
     # manifest used to pin us-west-2 here while the Iceberg one was templated.
     aws.region: ${AWS_REGION}
+    # table.catalog-store.kind: glue
     # S3 Configuration
     fs.s3a.endpoint.region: ${AWS_REGION}
+    # # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
+    # job.autoscaler.scale-down.interval: "0"
+    # # restart with local-recovery is still needed
+    # # in order to redistribute states, update DAG etc by adaptive-scheduler
+    # job.autoscaler.restart.time-tracking.enabled: "true"
+    # Autoscaler parameters
     job.autoscaler.scaling.enabled: "false"
     job.autoscaler.enabled: "false"
     # job.autoscaler.stabilization.interval: "1m"
@@ -48,9 +56,9 @@ spec:
     # Survive transient checkpoint failures during the initial snapshot instead of
     # failing the job. The snapshot phase reads 491M rows / 102 GiB from RDS, and a
     # checkpoint taken mid-snapshot has to persist large per-split backfill state; a
-    # single timeout there is normal and is not a reason to restart 264 tasks. The
+    # single timeout there is normal and is not a reason to restart 408 tasks. The
     # default is 0, meaning the very first failed checkpoint kills the job. Interval
-    # itself stays at 60s — it is a fair-comparison variable and must match Paimon.
+    # itself stays at 60s — it is a fair-comparison variable and must match Iceberg.
     execution.checkpointing.tolerable-failed-checkpoints: "10"
     execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
     # hashmap, not RocksDB + changelog + EBS local recovery (2026-11-02). The
@@ -69,30 +77,39 @@ spec:
     # as do the Glue database names below, so each table set (the v3 default,
     # or the unsuffixed v2 set) starts from its own state and never restores a
     # checkpoint, savepoint or HA pointer written against the other's tables.
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg${CDC_DB_SUFFIX}/checkpoints/
-    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-iceberg${CDC_DB_SUFFIX}/savepoints/
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/savepoints/
     # Restart Strategy
-    # 'full', not 'region' — kept in lockstep with the Paimon job, where region
-    # failover let Source: mysql_src_customers[1] subtask 0 die alone while the
-    # other 15 stayed RUNNING. Each source subtask is its own pipelined region, so
-    # region failover had nothing to cascade to; 407/408 tasks healthy is not a job
-    # failure, so the restart strategy never fired and every checkpoint aborted with
-    # "Not all required tasks are currently running" for 65 minutes. Changed here
-    # too because failover policy is a fair-comparison variable: the two jobs must
-    # recover identically or the Paimon-vs-Iceberg timings are not comparable.
+    # 'full', not 'region'. region restarts only the failed pipelined region, and
+    # on this graph each of the 16 source subtasks is its own region — so when
+    # Source: mysql_src_customers[1] subtask 0 died, region failover had nothing
+    # to cascade to and the other 15 subtasks were left RUNNING. 407 of 408 tasks
+    # healthy is not a job failure to Flink, so the restart strategy below never
+    # fired and the orphan was never replaced. Every subsequent checkpoint then
+    # aborted at trigger time:
+    #   "Checkpoint triggering task Source: mysql_src_customers[1] (1/16) ... is not
+    #    being executed at the moment. Aborting checkpoint. Failure reason: Not all
+    #    required tasks are currently running."
+    # Aborted-at-trigger checkpoints are not counted as FAILED, so
+    # tolerable-failed-checkpoints: "10" never fired either. Net effect: 0
+    # checkpoints committed in 65 minutes, job pinned at RUNNING, no error surfaced.
+    # Reproduced twice on independent from-scratch deployments (subtask 0 both
+    # times, attempt 1 then attempt 0, failure-cause None in both). 'full' makes a
+    # single lost source subtask restart the whole graph, which for a CDC job that
+    # cannot checkpoint without all 16 sources is the only correct behaviour.
     jobmanager.execution.failover-strategy: full
     # exponential-delay, not fixed-delay. fixed-delay's attempts counter is
     # GLOBAL, while failover-strategy: region files one restart request per
     # failed task — so a single TaskManager going away takes the whole graph's
-    # budget with it. Observed exactly that: TM-1-4 shut down and the JM logged
-    # "Restarting job." 200 times inside 20 MILLISECONDS, blew through
-    # maxNumberRestartAttempts=100, and the job died with "Recovery is suppressed
-    # by FixedDelayRestartBackoffTimeStrategy". No raise to that number is safe —
-    # it scales with task count (264 here), not with how many real faults
-    # happened. exponential-delay has no attempt cap, so one TM loss costs one
-    # backoff instead of the entire budget, and repeated faults back off instead
-    # of hot-looping. reset-backoff-threshold returns to the initial delay once
-    # the job has been healthy for a while, which is what a long load test needs.
+    # budget with it. Observed exactly that on the Iceberg job: one TM shut down
+    # and the JM logged "Restarting job." 200 times inside 20 MILLISECONDS, blew
+    # through maxNumberRestartAttempts=100, and the job died with "Recovery is
+    # suppressed by FixedDelayRestartBackoffTimeStrategy". No raise to that number
+    # is safe — it scales with task count (408 here), not with how many real
+    # faults happened. exponential-delay has no attempt cap, so one TM loss costs
+    # one backoff instead of the entire budget, and repeated faults back off
+    # instead of hot-looping. reset-backoff-threshold returns to the initial delay
+    # once the job has been healthy for a while, which a long load test needs.
     restart-strategy.type: exponential-delay
     restart-strategy.exponential-delay.initial-backoff: "10s"
     restart-strategy.exponential-delay.max-backoff: "2min"
@@ -109,22 +126,23 @@ spec:
     jobmanager.adaptive-scheduler.combined-restart.enabled: "false"
     jobmanager.adaptive-scheduler.resource-wait-timeout: "10m"
     # Scheduler
-    # 'default', not 'adaptive' — kept in lockstep with the Paimon job. Adaptive
-    # tracks desired vs available parallelism instead of requiring every declared
-    # task to be deployed, which is how a subtask ended up FAILED with the job still
-    # reporting RUNNING and failure-cause None. Autoscaling is off here
-    # (job.autoscaler.*.enabled: "false"), so adaptive buys nothing. The default
-    # scheduler declares the full task graph up front and fails loudly instead.
+    # 'default', not 'adaptive'. The adaptive scheduler is what allowed a subtask to
+    # sit in FAILED while its siblings stayed RUNNING and the job stayed RUNNING: it
+    # tracks desired vs available parallelism rather than requiring every declared
+    # task to be deployed, and it logged no "switched to FAILED" transition for the
+    # orphan at all (failure-cause came back None from /jobs). Autoscaling is off
+    # here anyway (job.autoscaler.*.enabled: "false"), so adaptive buys nothing and
+    # costs the all-tasks-running invariant that checkpointing depends on. The
+    # default scheduler declares the full 408-task graph up front and fails the job
+    # if it cannot keep it deployed — which is what we want to see, loudly, instead
+    # of a silent stall. Keep in sync with Iceberg: this is a fair-comparison knob.
     jobmanager.scheduler: default
     taskmanager.numberOfTaskSlots: "4"
-    # TaskManager heap. This job is where the OOM was observed: three
-    # "OutOfMemoryError: Java heap space" hits inside the CDC deserializer
-    # (RowDataDebeziumDeserializeSchema -> TemporalConversions.toLocalDateTime ->
-    # Instant.parse), first on Source: mysql_src_customers (1/16) and then on Calc
-    # and ConstraintEnforcer subtasks. Each one killed a TaskManager, which is what
-    # produced the 62 "The TaskExecutor is shutting down" and 50 "Connection
-    # unexpectedly closed by remote task manager" exceptions and left the job
-    # running at 146/264 tasks with 12 failed checkpoints.
+    # TaskManager heap. The CDC deserializer OOMed at the previous sizing
+    # ("OutOfMemoryError: Java heap space" inside RowDataDebeziumDeserializeSchema
+    # -> TemporalConversions.toLocalDateTime -> Instant.parse), which took the TM
+    # down and cascaded into "The TaskExecutor is shutting down" and
+    # "Connection unexpectedly closed by remote task manager" on every peer.
     #
     # Raising taskManager.resource.memory alone does NOT mostly go to heap. Flink
     # derives, from a 16Gi process size: metaspace 256Mi + jvm-overhead 1Gi off the
@@ -139,6 +157,11 @@ spec:
     # 0.1, not 0.2 (2026-11-02): managed memory was RocksDB's, and the state
     # backend is now hashmap, so it only moves ~3Gi more into task heap.
     taskmanager.memory.managed.fraction: "0.1"
+    # JobManager metaspace: 512m, not Flink's 256m default. The Paimon JM died with
+    # "OutOfMemoryError: Metaspace" (exit 239) after ~20 min on 2026-11-03 (_v3r3):
+    # its Glue/Hive metastore client and the Iceberg-export commit path load classes
+    # per commit. Kept identical in both manifests (fair-comparison variable).
+    jobmanager.memory.jvm-metaspace.size: "512m"
     # Parallelism
     parallelism.default: "4"
     pipeline.max-parallelism: "128"
@@ -151,7 +174,7 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cdc-iceberg${CDC_DB_SUFFIX}/ha/
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/ha/
     replicas: 1
     resource:
       memory: 8Gi
@@ -166,21 +189,63 @@ spec:
           envFrom:
           - secretRef:
               name: ${MYSQL_ENV_SECRET_NAME}
+          # MYSQL_HOST, MYSQL_USER and MYSQL_PASSWORD come from the Secret above
+          # (envFrom: every key is an env var); do not repeat them in env, where a
+          # rendered value would silently win over the Secret.
           env:
-          - name: MYSQL_HOST
-            value: "${MYSQL_HOST}"
-          - name: MYSQL_USER
-            value: "${MYSQL_USER}"
-          - name: ICEBERG_WAREHOUSE
-            value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
+          - name: MYSQL_PORT
+            value: "${MYSQL_PORT}"
+          - name: MYSQL_DATABASE
+            value: "${MYSQL_DATABASE}"
+          - name: PAIMON_WAREHOUSE
+            value: "s3://${BUCKET_NAME}/paimon-warehouse/"
           - name: AWS_REGION
             value: "${AWS_REGION}"
+          # Set for the v1 SDK's DefaultAwsRegionProviderChain, which reads
+          # AWS_DEFAULT_REGION where the v2 SDK reads AWS_REGION. Harmless and
+          # worth keeping, but do NOT read it as a fix for this log sequence:
+          #   AWSGlueClientFactory - No region info found, using SDK default
+          #     region: us-east-1
+          #   EC2MetadataUtils - Unable to retrieve the requested metadata
+          #     (/latest/dynamic/instance-identity/document)
+          #   com.amazonaws.AmazonServiceException: Unauthorized (Status Code: 401)
+          # That claim was tested and is false. With BOTH AWS_REGION and
+          # AWS_DEFAULT_REGION confirmed present in the resolved JM and TM
+          # container env (verified with `env | grep ^AWS_`), the sequence still
+          # appeared. The legacy EMR Glue client resolves its region from the
+          # Hadoop/Hive Configuration it is handed, not from the process
+          # environment, so no env var can suppress it. The 401 is IMDSv2 being
+          # unreachable from the pod (hop limit / IRSA-only networking).
+          #
+          # It is also NOT a failure. The job reaches RUNNING 808/808 with these
+          # lines present, and they do not appear in steady-state TM logs at all
+          # (0 hits across all 8 TMs). Treat this as noise and look elsewhere for
+          # a restart cause — see the note on Karpenter consolidation in the
+          # taskManager nodeSelector below, which is what actually restarts this
+          # job. To silence it properly you would set the region in Hadoop conf
+          # (e.g. a hive-site/core-site property the Glue factory reads), not here.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
           # CDC_DB_SUFFIX keeps a v3 (or any other) run in its own database:
           # an existing table cannot change format version.
           - name: GLUE_DATABASE
-            value: "flink_iceberg_db${CDC_DB_SUFFIX}"
+            value: "flink_paimon_db${CDC_DB_SUFFIX}"
+          # Write path (INSERT hints) and S3A upload shape (catalog options);
+          # set in build-deploy-generic.sh check_env_vars.
+          - name: PAIMON_WRITE_ONLY
+            value: "${PAIMON_WRITE_ONLY}"
+          - name: PAIMON_WRITE_BUFFER_SPILLABLE
+            value: "${PAIMON_WRITE_BUFFER_SPILLABLE}"
+          - name: PAIMON_WRITE_BUFFER_SIZE_DIM
+            value: "${PAIMON_WRITE_BUFFER_SIZE_DIM}"
+          - name: PAIMON_WRITE_BUFFER_SIZE_FACT
+            value: "${PAIMON_WRITE_BUFFER_SIZE_FACT}"
+          - name: S3A_MULTIPART_SIZE
+            value: "${S3A_MULTIPART_SIZE}"
+          - name: S3A_MULTIPART_THRESHOLD
+            value: "${S3A_MULTIPART_THRESHOLD}"
+          - name: S3A_ACTIVE_BLOCKS
+            value: "${S3A_ACTIVE_BLOCKS}"
           # Table-format knobs, rendered by build-deploy-generic.sh and
           # substituted into the sink DDL by the executor. All are set on both
           # JobManagers so the manifests stay in lockstep; each SQL reads only
@@ -189,11 +254,16 @@ spec:
           # empty value becomes = '' in CREATE TABLE.
           #  - ICEBERG_FORMAT_VERSION (2|3): Iceberg sink format-version, and
           #    Paimon's metadata.iceberg.format-version.
+          #  - PAIMON_DV_BITMAP64 (true|false): derived from the format version
+          #    (true iff 3); StarRocks' native Paimon reader cannot decode
+          #    64-bit deletion vectors, so a v2 run gets false.
           - name: ICEBERG_FORMAT_VERSION
             value: "${ICEBERG_FORMAT_VERSION}"
+          - name: PAIMON_DV_BITMAP64
+            value: "${PAIMON_DV_BITMAP64}"
           # Binlog client id ranges for the four mysql-cdc sources. These are
           # substituted into 02-cdc-sources.sql, which the JobManager parses, and
-          # they must not overlap the Paimon job's 54xx ranges — both pipelines
+          # they must not overlap the Iceberg job's 64xx ranges — both pipelines
           # read the same RDS instance, and MySQL evicts whichever binlog client
           # connected first when a second one reuses its id. See the server-id
           # note in sql-scripts/common/02-cdc-sources.sql.
@@ -202,13 +272,13 @@ spec:
           # hands one id per source subtask, so a range narrower than the
           # parallelism makes subtasks share ids and evict each other.
           - name: CDC_SERVER_ID_CUSTOMERS
-            value: "6401-6432"
+            value: "5401-5432"
           - name: CDC_SERVER_ID_PRODUCTS
-            value: "6441-6472"
+            value: "5441-5472"
           - name: CDC_SERVER_ID_ORDERS
-            value: "6481-6512"
+            value: "5481-5512"
           - name: CDC_SERVER_ID_ORDER_ITEMS
-            value: "6521-6552"
+            value: "5521-5552"
   taskManager:
     resource:
       memory: 32Gi
@@ -242,7 +312,7 @@ spec:
       - "-py"
       - "/opt/flink/usrlib/flink-cdc-executor.py"
       - "--sql-dir"
-      - "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/"
+      - "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/"
       - "--checkpoint-interval"
       - "60s"
       - "--parallelism"
@@ -252,7 +322,7 @@ spec:
 
   monitoringConfiguration:
     s3MonitoringConfiguration:
-      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-iceberg${CDC_DB_SUFFIX}
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon${CDC_DB_SUFFIX}
     sideCarResources:
       limits:
         cpuLimit: 500m

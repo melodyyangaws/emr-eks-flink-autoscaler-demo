@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hot suite over the LIVE CDC tables, warm DuckDB vs Trino on Iceberg and on
-# Paimon's Iceberg export (ENGINES x FORMATS: up to four arms), engines
+# native Paimon (ENGINES x FORMATS: up to four arms), engines
 # INTERLEAVED pass by pass on the same pinned table versions. Adapted from
 # throughput-benchmark/querybench/hot-interleave.sh.
 #
@@ -9,7 +9,7 @@
 # 0. The queried writers RUNNING (QB_QUERY_WRITERS: flink-cdc-<format> per
 #    format in FORMATS; once a minute, STABLE_CHECKS=10 times); the generator's
 #    state is logged (a stopped generator = not a writers-live run).
-# 1. The window: HOT_WINDOW_SECONDS (300) ending HOT_LAG_SECONDS (300) before now.
+# 1. The window: HOT_WINDOW_SECONDS (30) ending HOT_LAG_SECONDS (300) before now.
 # 2. Waits until every format's fact tables (HOT_COMMIT_TABLES: orders
 #    order_items) have committed a snapshot at least HOT_COMMIT_MARGIN_S (60)
 #    after HOT_TO, up to WAIT_COMMIT_S (1800). Not "same row count in both
@@ -27,7 +27,7 @@
 #    one more pass older each time. HOT_REPIN=run keeps the first pin for every
 #    pass. Either is safe for expiry: the Paimon sinks keep snapshots 12 h
 #    (snapshot.time-retained 12h, num-retained min 5 / max 1000,
-#    sql-scripts/paimon/03-paimon-sinks.sql), as the Iceberg tables do, so the
+#    ingest-deploy/sql-scripts/paimon/03-paimon-sinks.sql), as the Iceberg tables do, so the
 #    files a pin lists outlive a run.
 # 5. Medians of the timed passes -> duckdb_warm-<STAMP>.csv / trino-<STAMP>.csv;
 #    every pass's CSVs (-p<N>), the last pass's rows; hot-interleave-<STAMP>.pins.
@@ -152,7 +152,7 @@ for eng in ("duckdb_warm", "trino"):
             status = bad[0] if bad else ("OK" if med != "" else "MISSING")
             last = rs[-1]
             w.write(",".join([base, last["engine"], arm, "hot", q, status, str(med), last["result_rows"],
-                              last.get("scan_rows", ""), last.get("scan_bytes", "")]) + "\n")
+                              last.get("scan_rows", ""), last.get("scan_bytes", ""), ""]) + "\n")
             total += 1
             if status != "OK":
                 notok.append("%s:%s:%s=%s" % ("duckdb" if eng == "duckdb_warm" else eng, arm, q, status))

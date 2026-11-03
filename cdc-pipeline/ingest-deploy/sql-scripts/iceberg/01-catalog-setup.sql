@@ -34,12 +34,11 @@ CREATE CATALOG iceberg_catalog WITH (
     'catalog-name' = 'iceberg_glue_catalog',
     'catalog-database' = '${GLUE_DATABASE:flink_iceberg_db}',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
-    -- urlconnection, not Iceberg 1.12's default 'apache': that type builds the
-    -- SDK's Apache5HttpClient, whose relocated httpcore5 classes are not in
-    -- EMR 7.14's AWS SDK v2 bundle (2.44.5), and GlueCatalog.initialize then
-    -- fails with NoClassDefFoundError ...thirdparty/org/apache/hc/core5/http/
-    -- ClassicHttpRequest (first v3 deploy, 2026-11-02).
     'http-client.type' = 'urlconnection',
+    -- Same upload shape as the Paimon catalog's S3A options: part size in bytes
+    -- (= S3A_MULTIPART_SIZE), upload pool = S3A_ACTIVE_BLOCKS x 4 slots per TM.
+    's3.multipart.part-size-bytes' = '${ICEBERG_S3_MULTIPART_SIZE_BYTES:16777216}',
+    's3.multipart.num-threads' = '${ICEBERG_S3_MULTIPART_THREADS:24}',
     'format-version' = '${ICEBERG_FORMAT_VERSION:3}'
 );
 

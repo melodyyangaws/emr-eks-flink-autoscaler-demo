@@ -8,9 +8,11 @@
 # natively (Kaniko cannot cross-build) and pushes a per-arch tag; the two are
 # then joined into ${IMAGE_TAG} with the ECR API. No S3.
 # Settings come from cdc-pipeline/.bench-env (AWS_ACCOUNT_ID, AWS_REGION,
-# NAMESPACE). COMPILE_JOBS (default 30): parallel C++ compile jobs in each
+# NAMESPACE). COMPILE_JOBS (default 60): parallel C++ compile jobs in each
 # arch build (make -j); the pod gets COMPILE_JOBS cpu and 2*COMPILE_JOBS+8 GiB,
-# so 30 cpu / 68 GiB lands on an 8xlarge node.
+# so 60 cpu / 128 GiB lands on a 16xlarge node (64 vCPU / 256 GiB). The pods are
+# pinned to NODEPOOL (default executor-memorynodepool: on-demand allowed, m-family
+# 4/8/12/16xlarge on amd64 and arm64, EC2NodeClass memoryec2 = 200Gi root disk).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../lib/common.sh
@@ -19,9 +21,12 @@ source "${HERE}/../../lib/common.sh"
 
 REPO=duckdb-cdc-server
 IMAGE_TAG=2.0.0
-COMPILE_JOBS="${COMPILE_JOBS:-30}"
+COMPILE_JOBS="${COMPILE_JOBS:-60}"
+NODEPOOL="${NODEPOOL:-executor-memorynodepool}"
+ARCHES="${ARCHES:-amd64 arm64}"   # one arch (e.g. ARCHES=amd64) to iterate; the manifest list needs both
+LOG_DIR="${LOG_DIR:-/tmp}"        # full pod logs land here: the node may be gone soon after the pod ends
 IMAGE="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}"
-TIMEOUT_S=14400   # the cap per arch build; measured 34 min arm64 / 43 min amd64 at COMPILE_JOBS=8 (README.md)
+TIMEOUT_S=14400   # the cap per arch build (times in README.md)
 
 aws ecr describe-repositories --repository-names "$REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
     || aws ecr create-repository --repository-name "$REPO" --region "$AWS_REGION" >/dev/null
@@ -43,7 +48,7 @@ metadata:
 spec:
   restartPolicy: Never
   serviceAccountName: image-builder-sa
-  nodeSelector: {kubernetes.io/arch: ${arch}, karpenter.sh/capacity-type: on-demand}
+  nodeSelector: {kubernetes.io/arch: ${arch}, karpenter.sh/capacity-type: on-demand, karpenter.sh/nodepool: ${NODEPOOL}}
   containers:
   - name: kaniko
     image: gcr.io/kaniko-project/executor:v1.23.2
@@ -51,30 +56,44 @@ spec:
            "--destination=${IMAGE}:${IMAGE_TAG}-${arch}", "--build-arg=COMPILE_JOBS=${COMPILE_JOBS}",
            "--cache=false", "--snapshot-mode=redo", "--use-new-run"]
     env: [{name: AWS_REGION, value: "${AWS_REGION}"}]
-    # Kaniko compiles in its own root filesystem, i.e. on the node's disk.
+    # Kaniko compiles in its own root filesystem, i.e. on the node's disk (200Gi
+    # root volume): the wheel and the paimon-cpp dependency builds need ~150Gi.
     resources:
-      requests: {cpu: "${COMPILE_JOBS}", memory: $(( COMPILE_JOBS * 2 + 8 ))Gi, ephemeral-storage: 80Gi}
-      limits:   {cpu: "${COMPILE_JOBS}", memory: $(( COMPILE_JOBS * 2 + 8 ))Gi, ephemeral-storage: 80Gi}
+      requests: {cpu: "${COMPILE_JOBS}", memory: $(( COMPILE_JOBS * 2 + 8 ))Gi, ephemeral-storage: 150Gi}
+      limits:   {cpu: "${COMPILE_JOBS}", memory: $(( COMPILE_JOBS * 2 + 8 ))Gi, ephemeral-storage: 150Gi}
     volumeMounts: [{name: context, mountPath: /workspace}]
   volumes: [{name: context, configMap: {name: duckdb-cdc-image-context}}]
 EOF
     log "${arch}: building (kubectl logs -f ${pod} -n ${NAMESPACE})"
-    local deadline=$(( SECONDS + TIMEOUT_S ))
+    local deadline=$(( SECONDS + TIMEOUT_S )) logf streaming=""
+    logf="${LOG_DIR}/${pod}-$(date -u +%Y%m%dT%H%M%SZ).log"
     while (( SECONDS < deadline )); do
         phase=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        # Stream the whole log to a local file from the start: once the pod ends,
+        # Karpenter can remove its node and `kubectl logs` has nothing left.
+        if [[ -z "$streaming" && "$phase" =~ ^(Running|Succeeded|Failed)$ ]]; then
+            kubectl logs -f "$pod" -n "$NAMESPACE" > "$logf" 2>&1 &
+            streaming=$!; log "${arch}: log -> ${logf}"
+        fi
         case "$phase" in
-            Succeeded) log "${arch}: pushed ${IMAGE}:${IMAGE_TAG}-${arch}"; return 0 ;;
-            Failed) kubectl logs "$pod" -n "$NAMESPACE" --tail=40 >&2 || true; die "${arch} build failed" ;;
+            Succeeded|Failed)
+                wait "$streaming" 2>/dev/null || true
+                # if the stream was cut, take the full log again while it is still there
+                kubectl logs "$pod" -n "$NAMESPACE" > "${logf}.tmp" 2>/dev/null \
+                    && [[ $(wc -c < "${logf}.tmp") -ge $(wc -c < "$logf") ]] && mv "${logf}.tmp" "$logf" || rm -f "${logf}.tmp"
+                if [[ "$phase" == Succeeded ]]; then log "${arch}: pushed ${IMAGE}:${IMAGE_TAG}-${arch}"; return 0; fi
+                tail -n 40 "$logf" >&2; die "${arch} build failed (full log: ${logf})" ;;
         esac
         sleep 30
     done
     die "${arch} build timed out after ${TIMEOUT_S}s"
 }
 
-# Both arches build at the same time, on separate nodes.
-build amd64 & a=$!
-build arm64 & b=$!
-wait $a && wait $b || die "a build failed"
+# The arches build at the same time, on separate nodes.
+pids=()
+for arch in $ARCHES; do build "$arch" & pids+=($!); done
+for p in "${pids[@]}"; do wait "$p" || die "a build failed"; done
+[[ "$ARCHES" == "amd64 arm64" ]] || { log "built ${ARCHES} only: no manifest list"; exit 0; }
 
 # Join the two per-arch images into one manifest list under ${IMAGE_TAG}.
 entries=""

@@ -1,14 +1,14 @@
-###############################################################################
-# Flink CDC image — MySQL to Paimon / Iceberg on EMR on EKS 7.14
+###########################################################################################################################################
+# Flink CDC image — Ingest MySQL data to Paimon / Iceberg on S3 with EMR on EKS 7.14
 #
 # This image includes:
 # - Flink 1.20 from EMR 7.14 (1.20.0-amzn-8), Amazon Corretto 17
 # - Flink CDC MySQL connector for full snapshot + incremental binlog sync
 # - Apache Paimon 2.1 (Flink bundle, S3 filesystem, Hive/Glue catalog)
-# - Apache Iceberg 1.12 Flink runtime (replaces EMR's bundled 1.10.1-amzn-1)
+# - Apache Iceberg 1.12 Flink runtime (replaces EMR's bundled 1.10.1-amzn-1) to support format-version v3 tables with deletion vectors
 # - AWS Glue Data Catalog integration (EMR's Glue Hive client for Paimon,
 #   Iceberg's GlueCatalog for Iceberg)
-###############################################################################
+###########################################################################################################################################
 ARG EMR_VERSION=7.14.0
 ARG ICEBERG_VERSION=1.12.0
 

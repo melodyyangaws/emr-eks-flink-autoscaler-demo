@@ -10,16 +10,20 @@
 # measure raw ingest only and show neither effect. RECENT_KEY_RATIO of each
 # batch re-writes keys the same thread wrote seconds earlier, so about half of
 # the Iceberg writer's deletes are position deletes (DVs on v3) — a design
-# target, see 2-DATA-GEN-GUIDE.md for how to measure it.
+# target, see 2-DATA-GEN-GUIDE.md for how to measure it. DELETE_RATIO (0.05) of
+# every orders / order_items batch is a DELETE of existing keys (an order's
+# items first, in the same transaction: the FKs are RESTRICT); customers and
+# products are never deleted.
 #
 # The target rate is RATE_PER_POD x replicas (manifest: 80,000 x 4). That is a
 # token-bucket ceiling set deliberately out of reach, so the pods run flat out
 # and the achieved rate (the `inst=` counter in the pod logs) is the real limit
-# of MySQL plus the driver. It emits no DELETE events.
+# of MySQL plus the driver.
 #
 # The row-at-a-time INSERT/UPDATE/DELETE "mixed" generator
 # (mysql-data-generator.yaml, Deployment mysql-data-generator) was removed on
-# 2026-11-02; it is recoverable from git history. A trailing `upsert` argument
+# 2026-11-02; it is recoverable from git history. From then until DELETE_RATIO
+# was added (2026-11-03) the benchmark had no DELETE events. A trailing `upsert` argument
 # and WORKLOAD=upsert are still accepted so older commands keep working.
 ###############################################################################
 
@@ -50,6 +54,17 @@ info() {
 }
 
 # Configuration
+# MYSQL_HOST / MYSQL_USER from .bench-env (+ .bench-env.local); a value already
+# in the environment wins.
+_gen_env="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.bench-env"
+if [[ -f "$_gen_env" ]]; then
+    _keep_host="${MYSQL_HOST:-}" _keep_user="${MYSQL_USER:-}"
+    # shellcheck source=../.bench-env
+    source "$_gen_env" >/dev/null 2>&1 || true
+    MYSQL_HOST="${_keep_host:-${MYSQL_HOST:-}}" MYSQL_USER="${_keep_user:-${MYSQL_USER:-}}"
+    unset _keep_host _keep_user
+fi
+unset _gen_env
 NAMESPACE=${NAMESPACE:-emr-flink}
 ACTION=${1:-help}
 
@@ -95,43 +110,18 @@ if [[ "$NAMESPACE" != "emr-flink" ]]; then
     warn "Edit $MANIFEST if you really need a different namespace."
 fi
 
-# Check if MySQL credentials secret exists
+# The ONE MySQL Secret, shared with the Flink writers (they load it with envFrom,
+# so its keys are env-var names). Created by hand, from a prompt (README Step 0);
+# this script never writes it, so no password passes through here.
 check_mysql_secret() {
-    if ! kubectl get secret mysql-credentials -n "$NAMESPACE" &>/dev/null; then
-        [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]] && \
-            error "Secret mysql-credentials not found. Set MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD and re-run"
-        create_mysql_secret
-    fi
+    local keys
+    keys=$(kubectl get secret mysql-credentials -n "$NAMESPACE" -o jsonpath='{.data}' 2>/dev/null \
+        | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin))))' 2>/dev/null) \
+        || error "Secret mysql-credentials not found in ${NAMESPACE}: create it first (README Step 0)"
+    for k in MYSQL_HOST MYSQL_USER MYSQL_PASSWORD; do
+        [[ " $keys " == *" $k "* ]] || error "Secret mysql-credentials has no key $k (keys: ${keys}): see README Step 0"
+    done
     log "✓ MySQL credentials secret found"
-}
-
-
-# Create Kubernetes secret for MySQL credentials
-create_mysql_secret() {
-    local namespace=${NAMESPACE:-emr-flink}
-
-    log "Creating Kubernetes secret for MySQL credentials..."
-
-    # Check if namespace exists
-    if ! kubectl get namespace "$namespace" &>/dev/null; then
-        log "Creating namespace: $namespace"
-        kubectl create namespace "$namespace" || error "Failed to create namespace"
-    fi
-
-    # Delete existing secret if it exists
-    if kubectl get secret mysql-credentials -n "$namespace" &>/dev/null; then
-        warn "Secret already exists, deleting..."
-        kubectl delete secret mysql-credentials -n "$namespace"
-    fi
-
-    # Create new secret
-    kubectl create secret generic mysql-credentials \
-        --from-literal=hostname="$MYSQL_HOST" \
-        --from-literal=username="$MYSQL_USER" \
-        --from-literal=password="$MYSQL_PASSWORD" \
-        --namespace "$namespace" || error "Failed to create Kubernetes secret"
-
-    log "✓ Kubernetes secret created: mysql-credentials"
 }
 
 # Deploy data generator
@@ -150,7 +140,8 @@ deploy_generator() {
     info "RECENT_KEY_RATIO 0.6: that share of each batch re-writes keys the same thread"
     info "wrote in the last RECENT_KEY_MAX_AGE_S (20) s, targeting ~50% Iceberg position"
     info "deletes. UPSERT_RATIO 0.9 splits the rest: 90% update hot/cold keys, 10% are"
-    info "new inserts. No DELETE events are emitted."
+    info "new inserts. DELETE_RATIO 0.05 of orders / order_items rows are DELETEs"
+    info "(an order's items first); customers and products are never deleted."
     echo ""
     info "The per-pod counter line is the authoritative rate — rolled-back batches"
     info "show up as a shortfall there rather than as an error:"
@@ -202,14 +193,19 @@ status_generator() {
         # Pick the fields one by one: the counter line carries upserts=,
         # inserts=, recent= and batches= between them, so a single
         # 'inst=… avg=… errors=…' pattern never matched and the whole line was
-        # printed instead. recent= is absent on pods that predate it.
-        local inst avg_s errs batches rows recent share=""
+        # printed instead. recent= and deletes= are absent on pods that
+        # predate them.
+        local inst avg_s errs batches rows recent deletes share=""
         rows=$(counter_field "$line" rows);  inst=$(counter_field "$line" inst)
         avg_s=$(counter_field "$line" avg);  errs=$(counter_field "$line" errors)
         batches=$(counter_field "$line" batches)
         recent=$(counter_field "$line" recent)
+        deletes=$(counter_field "$line" deletes)
         [[ -n "$recent" && -n "$rows" && "$rows" -gt 0 ]] && \
             share=" recent=$(( 100 * recent / rows ))%"
+        # One decimal: at DELETE_RATIO 0.05 the share is ~3.7%.
+        [[ -n "$deletes" && -n "$rows" && "$rows" -gt 0 ]] && \
+            share="$share deletes=$(( 1000 * deletes / rows / 10 )).$(( 1000 * deletes / rows % 10 ))%"
         if [[ -n "$inst" && -n "$avg_s" ]]; then
             printf '  %-42s inst=%s/s avg=%s/s errors=%s batches=%s%s\n' \
                 "$(basename "$p")" "$inst" "$avg_s" "${errs:-?}" "${batches:-?}" "$share"
@@ -373,19 +369,46 @@ configure_recent_mix() {
     log "✓ Recent-key mix updated. Pods will restart automatically."
 }
 
+# Set DELETE_RATIO: the share of every orders / order_items batch that is a
+# multi-row DELETE of existing keys (orders take their items with them, in the
+# same transaction). customers and products are never deleted, so the
+# stream-wide delete share is ~0.75 x this, plus the deleted orders' items.
+# 0 turns deletes off. Above ~0.05 the fact tables shrink: only ~4-5% of rows
+# are new inserts at UPSERT_RATIO 0.9.
+configure_delete_mix() {
+    local delete_ratio=${2:-0.05}
+
+    log "Configuring deletes..."
+    log "  Delete ratio   : ${delete_ratio} (of orders / order_items rows)"
+    if ! awk -v a="$delete_ratio" 'BEGIN { exit !(a >= 0 && a < 1) }'; then
+        error "DELETE_RATIO must be in [0, 1)"
+    fi
+    if awk -v a="$delete_ratio" 'BEGIN { exit !(a > 0.1) }'; then
+        warn "DELETE_RATIO > 0.1: deletes then clearly outpace inserts and orders /"
+        warn "order_items shrink for as long as the generator runs."
+    fi
+
+    kubectl set env "$KIND"/"$DEPLOYMENT" \
+        DELETE_RATIO="$delete_ratio" \
+        -n "$NAMESPACE" || error "Failed to update configuration"
+
+    log "✓ Delete mix updated. Pods will restart automatically."
+}
+
 # Show help
 show_help() {
     echo "MySQL Data Generator Management Tool (upsert load generator)"
     echo ""
-    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|recent-mix|help} [upsert]"
+    echo "Usage: $0 {deploy|stop|status|logs|scale|config|upsert-mix|recent-mix|delete-mix|help} [upsert]"
     echo ""
     echo "Manages StatefulSet mysql-upsert-loadgen (mysql-upsert-loadgen.yaml):"
     echo "batched INSERT ... ON DUPLICATE KEY UPDATE on a skewed hot-key window, so"
     echo "Iceberg accumulates equality-delete files while Paimon compacts them in the"
     echo "background. Target rate = RATE_PER_POD x replicas (manifest: 80,000 x 4), a"
     echo "deliberately unreachable ceiling; read the achieved rate from 'status'."
-    echo "Emits no DELETE events. (The mixed INSERT/UPDATE/DELETE generator was"
-    echo "removed on 2026-11-02; a trailing 'upsert' argument is still accepted.)"
+    echo "DELETE_RATIO of orders / order_items rows are DELETEs (customers/products"
+    echo "never). (The mixed INSERT/UPDATE/DELETE generator was removed on"
+    echo "2026-11-02; a trailing 'upsert' argument is still accepted.)"
     echo ""
     echo "Commands:"
     echo "  deploy      - Deploy generator pods"
@@ -397,6 +420,7 @@ show_help() {
     echo "  upsert-mix  - Set UPSERT_RATIO, HOT_KEY_RATIO, HOT_KEY_WINDOW"
     echo "                [, RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S]"
     echo "  recent-mix  - Set RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S only"
+    echo "  delete-mix  - Set DELETE_RATIO (orders / order_items only)"
     echo "  help        - Show this help message"
     echo ""
     echo "Examples:"
@@ -410,6 +434,8 @@ show_help() {
     echo "  ./deploy-data-generator.sh recent-mix 0.6 20"
     echo "        # share of rows re-writing a key written <20s ago -> Iceberg"
     echo "        # position deletes (DVs on v3); target ~50% at 0.6, measure it"
+    echo "  ./deploy-data-generator.sh delete-mix 0.05"
+    echo "        # 5% of orders / order_items rows are DELETEs; 0 turns them off"
     echo "  ./deploy-data-generator.sh stop"
     echo ""
     echo "Environment variables:"
@@ -446,6 +472,9 @@ main() {
             ;;
         recent-mix)
             configure_recent_mix "$@"
+            ;;
+        delete-mix)
+            configure_delete_mix "$@"
             ;;
         help|*)
             show_help

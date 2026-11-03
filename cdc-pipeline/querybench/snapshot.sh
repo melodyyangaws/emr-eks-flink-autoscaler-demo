@@ -1,28 +1,21 @@
 #!/usr/bin/env bash
 # Snapshot suite over the STOPPED CDC tables, warm DuckDB vs Trino on the
-# compacted Iceberg tables and on Paimon's Iceberg export (ENGINES x FORMATS),
-# from a cold start, every arm of a format on the same pinned snapshot per
-# table (run.sh's runner step). One phase for both formats: the Paimon tables
-# do not change while the writers are stopped, so pinning them after the
-# Iceberg compaction gate costs nothing.
+# Iceberg tables (as the writers and iceberg-maintain left them) and on Paimon's
+# Iceberg export (ENGINES x FORMATS), from a cold start, every arm of a format
+# on the same pinned snapshot per table (run.sh's runner step).
 #
-#   1. gate: the CDC writers stopped (suspended here if not already); with
-#      iceberg in FORMATS, the Iceberg compaction completed (qb_compaction_gate: every COMPACT_TABLES
-#      Job iceberg-compact-<t> SUCCEEDED and the table's current snapshot is its
-#      replace commit; waits for it when run.sh submitted it,
-#      COMPACT_BEFORE_SNAPSHOT=true, else refuses at once;
-#      ICEBERG_REQUIRE_COMPACTION=0 skips it); every engine in ENGINES up
+#   1. gate: the CDC writers stopped (suspended here if not already); every engine in ENGINES up
 #      (qb_engines_gate: duckdb-warm-cdc busy=false, Trino with TRINO_WORKERS
 #      active workers);
-#   2. pin: the four tables of every format, AFTER the gate, so the compacted
-#      Iceberg snapshot is pinned; Trino checked to read every pin (a paimon
+#   2. pin: the four tables of every format, after the gate; Trino checked to read every pin (a paimon
 #      table it cannot read is a WARNING, its queries record the error);
 #   3. the S4 slice [S_FROM, S_TO) on the pinned tables, unless set (untimed,
 #      on qb_setup_engine, before the cold start);
 #   4. cold start: clear-caches.sh (DuckDB server restarted,
 #      deploy-trino.sh clear-cache);
-#   5. each engine in ENGINES order (default duckdb, then trino): warm-up +
-#      timed passes;
+#   5. each engine in ENGINES order (default duckdb, then trino): SNAPSHOT_RUNS (3)
+#      passes, no warm-up; the first is timed as cold (cold_ms), median_ms is
+#      the median of the rest;
 #   6. uploads bench-results/ (QB_RESULTS_PREFIX_RUN, set by run.sh).
 # SNAPSHOT_DT comes from run.sh (exported). By hand, set it, or it is resolved.
 #
@@ -62,12 +55,6 @@ qb_log "=== snapshot: dt=${QB_SNAPSHOT_DT}, engines ${ENGINE_LIST}, formats $(qb
 # 1. gate
 qb_stop_writers || qb_die "the writers could not be stopped"
 echo "gate_writers_stopped_at=$(now) writers=$(qb_writer_state "$FLINK_JOBS") generator=$(qb_generator_state)" >> "$PINS"
-if qb_has_format iceberg; then
-    g=$(qb_compaction_gate "$([[ "${COMPACT_BEFORE_SNAPSHOT:-false}" == true ]] && echo 1 || echo 0)") || exit 1
-    echo "$g" >> "$PINS"
-else
-    echo "compaction_gate=not needed (FORMATS=paimon: Paimon compacts in its writer)" >> "$PINS"
-fi
 g=$(qb_engines_gate) || exit 1
 echo "$g" >> "$PINS"
 # 2. pin, after the gate
@@ -85,7 +72,10 @@ qb_log "snapshot slice (S4, orders.order_date): [${S_FROM}, ${S_TO}) (${QB_S_HOW
 "${HERE}/clear-caches.sh" || qb_die "could not clear the caches"
 echo "caches_cleared_at=$(now)" >> "$PINS"
 # 5. the passes. The second engine starts cold too: neither shares a cache
-# with the other, and clear-caches.sh emptied both.
+# with the other, and clear-caches.sh emptied both. SNAPSHOT_RUNS (3) passes,
+# no warm-up: pass 0 is timed as cold (cold_ms), the rest give median_ms.
+export WARMUP=0 RUNS="${SNAPSHOT_RUNS:-3}" COLD_PASS=1
+echo "passes=${RUNS} (pass 0 cold, timed; median of the other $((RUNS - 1)))" >> "$PINS"
 for e in $ENGINE_LIST; do
     case "$e" in
         duckdb) "${HERE}/duckdb-warm.sh" run; r=$? ;;

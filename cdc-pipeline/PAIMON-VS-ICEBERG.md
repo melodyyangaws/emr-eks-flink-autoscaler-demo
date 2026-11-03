@@ -239,7 +239,7 @@ SELECT * FROM customers /*+ OPTIONS(
 ### 5. Compaction
 
 #### Paimon
-**Automatic compaction, retain snapshots for 12 hours** (as in `sql-scripts/paimon/03-paimon-sinks.sql`):
+**Automatic compaction, retain snapshots for 12 hours** (as in `ingest-deploy/sql-scripts/paimon/03-paimon-sinks.sql`):
 ```sql
 CREATE TABLE orders (...) WITH (
     'num-sorted-run.compaction-trigger' = '4',
@@ -258,16 +258,17 @@ stores it and ignores it.)
 - No manual intervention needed
 
 #### Iceberg
-**Manual or scheduled compaction:**
-```sql
--- Call compaction procedure (Spark/Flink)
-CALL iceberg_catalog.system.rewrite_data_files(
-    table => 'orders',
-    strategy => 'binpack',
-    options => map('target-file-size-bytes','536870912') --default to 512MB
-```
-**Retain snapshots for 12 hours** (as in `sql-scripts/iceberg/03-iceberg-sinks.sql`;
-applied when snapshots are expired, here by the compaction Job)
+**A separate compaction job.** Here: one continuous FlinkDeployment, `iceberg-maintain`
+(`iceberg-compaction/maintain.py`, Iceberg 1.12's Flink `TableMaintenance` with
+`RewriteDataFiles` + `ExpireSnapshots`), on the writers' image. It is triggered by the
+tables' own commits: every 10 writer commits it rewrites the data files (partial
+progress, target 64 / 128 MiB) and expires snapshots (12 h, keep 5). A rewrite reloads
+the table's whole equality-delete set, so it must start with the writers: started late
+on 2026-11-03 it faced ~35M deletes on `customers`, needed a 32 Gi TaskManager, and
+completed passes on `products` only. With the writers suspended nothing triggers it.
+
+**Retain snapshots for 12 hours** (as in `ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql`;
+applied when snapshots are expired, here by the compaction job)
 ```sql
 CREATE TABLE orders (...) WITH (
     'history.expire.max-snapshot-age-ms' = '43200000',
@@ -450,9 +451,13 @@ from source) and StarRocks 4.1.7.
 | **Athena engine v3** | Not supported (Iceberg v2 only) | Not supported |
 
 **Net result:** on v3, the only engine in this stack that read native Iceberg was
-DuckDB, and **no engine read Paimon**. StarRocks has since been removed from the CDC
+DuckDB, and none of these read Paimon. StarRocks has since been removed from the CDC
 pipeline. The query benchmark now runs DuckDB and Trino
-([querybench/README.md](./querybench/README.md)).
+([querybench/README.md](./querybench/README.md)). Neither has a native Paimon
+reader (no Paimon connector in the DuckDB image, none for Trino 484): both
+"paimon" arms read **Paimon's Iceberg export** through an Iceberg reader. Trino 484
+reads that v3 export (verified 2026-11-02, `_v3r2` hot test); DuckDB 2.0 still
+fails on it with the `schema` error above.
 
 ### Paimon's Iceberg export: behaviours to know
 
@@ -461,7 +466,7 @@ pipeline. The query benchmark now runs DuckDB and Trino
   `deletion-vectors.enabled = true`, `deletion-vectors.bitmap64 = true`,
   `metadata.iceberg.format-version = 3`. `bitmap64` takes effect at CREATE TABLE
   only (existing 32-bit DV index files are not rewritten), and it breaks StarRocks'
-  native Paimon reader. That is why `build-deploy-generic.sh` derives
+  native Paimon reader. That is why `ingest-deploy/build-deploy-generic.sh` derives
   `PAIMON_DV_BITMAP64` from the format version (true for v3, false for v2) instead of
   exposing it as a setting. On a v2 export Paimon writes no DVs and lists only files
   at the top LSM level, so v2 readers see a stale, read-optimized view until a full
@@ -493,12 +498,12 @@ These differences remain by design. Report them next to every result:
 | Difference | Paimon | Iceberg |
 |---|---|---|
 | Writer parallelism | 32 writers per table (`bucket = 32`) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
-| Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; `iceberg-compaction/` Jobs run before the snapshot test |
-| Snapshot expiry timing | continuous, in the writer (`snapshot.expire.execution-mode = async`) | only when the compaction Job runs, with the same 12 h rule |
+| Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; a separate continuous FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), every 10 writer commits while the writers run |
+| Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only when `iceberg-maintain` runs, with the same 12 h / keep-5 rule. Neither expires while its writer is suspended |
 | Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |
 | Glue integration | EMR's Glue Hive metastore client (`aws.glue.enabled: "true"`, the one intended `flinkConfiguration` difference) | Iceberg's own `GlueCatalog` |
 | Schema details | `TIMESTAMP(6)`; partition columns `order_date_str`, `created_date_str` | `TIMESTAMP(3)`; partition columns `order_dt`, `created_dt` |
-| Paimon-only knobs | write buffers (128/256 MB, spillable), `num-sorted-run.compaction-trigger = 4`, `sink.writer-coordinator.enabled` | — |
+| Paimon-only knobs | write buffers (64/128 MB, spillable; = Iceberg target file size; `INSERT` hints), `num-sorted-run.compaction-trigger = 4`, `sink.writer-coordinator.enabled` | — |
 
 ---
 
@@ -607,7 +612,7 @@ rows**. Merge-on-read must read and apply all of it on every query.
 ### Regenerating
 
 The 2026-09 numbers cannot be regenerated as they were: the StarRocks harness
-(`sql-scripts/starrocks/bench-server-side.sh`) was removed with StarRocks and is in git
+(`ingest-deploy/sql-scripts/starrocks/bench-server-side.sh`) was removed with StarRocks and is in git
 history only. The current equivalents:
 
 ```bash

@@ -7,23 +7,26 @@ StatefulSet `mysql-upsert-loadgen`, 4 replicas) is the only CDC source for this
 pipeline. Each pod runs a Python script that writes batched
 `INSERT … ON DUPLICATE KEY UPDATE` statements against the `ecommerce` database
 (`customers`, `products`, `orders`, `order_items`), so the binlog carries `+I` events
-for new keys and `-U`/`+U` pairs for existing ones. `deploy-data-generator.sh` manages it.
+for new keys and `-U`/`+U` pairs for existing ones. On `orders` and `order_items` a
+small share of each batch is a multi-row `DELETE`, which shows up as `-D` events.
+`deploy-data-generator.sh` manages it.
 
 | | |
 |---|---|
 | Manifest | `mysql-upsert-loadgen.yaml` |
 | Kubernetes kind | **StatefulSet**, 4 replicas |
-| Statements | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows/statement (manifest: 5000) |
+| Statements | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows per batch (manifest: 5000); on `orders` / `order_items`, `DELETE_RATIO` of those rows go to a `DELETE … WHERE pk IN (…)` instead |
 | Rate | measure it — `RATE_PER_POD` is 80,000, a deliberately unreachable token-bucket ceiling |
-| DELETE events | none |
+| DELETE events | `DELETE_RATIO` 0.05 of `orders` / `order_items` rows (~3.75% of all rows, plus the items deleted with their orders); never `customers` / `products`. Added 2026-11-03, not yet measured on RDS |
 | Iceberg position deletes | **design target ~50%** of the Iceberg writer's deletes (`RECENT_KEY_RATIO`), not yet measured; ~2% before 2026-11-02 |
 | Use it for | the Paimon-vs-Iceberg storage benchmark and the hot query test |
 
 > **The mixed generator is gone.** The row-at-a-time INSERT/UPDATE/DELETE generator
 > (`mysql-data-generator.yaml`, Deployment `mysql-data-generator`, ~400 rows/s) was
 > removed on 2026-11-02; it is recoverable from git history. It was the only source of
-> DELETE events, so **the benchmark has no DELETE events**: everything it measures comes
-> from inserts and upserts.
+> DELETE events, so from 2026-11-02 until `DELETE_RATIO` was added to the upsert
+> generator (2026-11-03) the benchmark had no DELETE events. Results from that period
+> measure inserts and upserts only. See [Deletes](#deletes-and-foreign-keys).
 
 > **`RATE_PER_POD` is not a throughput claim.** It is set
 > far above anything the instance has delivered (4 x 80,000 = 320,000 rows/s of
@@ -65,8 +68,8 @@ is rejected.
    them on the first deploy, and reuses an existing one after that:
 
    ```bash
-   cd cdc-pipeline
-   source mysql-cdc-env.sh          # MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD
+   cd cdc-pipeline                  # MYSQL_HOST / MYSQL_USER come from .bench-env(.local);
+                                    # the password from Secret mysql-credentials
    ```
 
 2. One time only, and only if the older Deployment version was ever applied
@@ -108,7 +111,7 @@ kubectl logs -l app=mysql-upsert-loadgen -n emr-flink --tail=40 | grep '^\['
 Each pod prints a counter line every `REPORT_SECONDS` (15):
 
 ```
-[  120s] rows=1,234,567 inst=8,104/s avg=7,910/s upserts=… inserts=… recent=… batches=… errors=… | <per-table rows>
+[  120s] rows=1,234,567 inst=8,104/s avg=7,910/s upserts=… inserts=… recent=… deletes=… deleted=… batches=… errors=… | <per-table rows>
 ```
 
 - Quote **`inst=`** (the last 15 s), summed across the pods, after the pods have
@@ -129,6 +132,14 @@ Each pod prints a counter line every `REPORT_SECONDS` (15):
   at 0.6), because a buffer that runs short hands its rows to the normal path.
   `status` prints it as a percentage. It says nothing yet about Iceberg: for that,
   see [Measure the position-delete share](#measure-the-position-delete-share).
+- **`deletes=`** counts the keys put into `DELETE` statements, so
+  `upserts= + inserts= + deletes= = rows=`, and `rows=`/`inst=` include deletes.
+  **`deleted=`** counts the rows MySQL actually removed (`rowcount`): the deletes
+  that found their row, plus the `order_items` removed together with their orders.
+  Each of those is one `-D` in the binlog. `deleted=` can be above `deletes=` (an
+  order's items) or below it (a key already gone). `status` prints `deletes=` as a
+  share of `rows=` (~3.7% at the manifest values). Failed delete transactions count
+  in `errors=` like failed upserts. `batches=` counts upsert statements only.
 
 `RATE_PER_POD` is a token-bucket ceiling set far above anything the instance has
 delivered (4 x 80,000 = 320,000 rows/s of *target*), so the bucket never binds and
@@ -203,10 +214,15 @@ returns. Too high, and part of the window goes unwritten. If you scale with a ba
 
 # only the recent-key knobs: ratio, max age in seconds
 ./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
+
+# only DELETE_RATIO (orders / order_items); 0 turns deletes off
+./mysql-data-generator/deploy-data-generator.sh delete-mix 0.05
 ```
 
-`config` changes *how fast*. `upsert-mix` and `recent-mix` change *what is being
-measured*. `recent-mix` warns if the age is 60 s or more (the checkpoint interval).
+`config` changes *how fast*. `upsert-mix`, `recent-mix` and `delete-mix` change *what
+is being measured*. `recent-mix` warns if the age is 60 s or more (the checkpoint
+interval). `delete-mix` rejects values outside `[0, 1)` and warns above 0.1, where
+deletes clearly outpace the ~4–5% inserts and the fact tables shrink.
 
 Both commands are `kubectl set env`, which starts a rolling restart. The StatefulSet
 replaces pods one at a time in descending ordinal order, so for 4 pods the cluster
@@ -231,6 +247,7 @@ but not this file: check the live values with
 | `RECENT_KEY_RATIO` | 0.6 | share of **all** rows that re-write a key this thread wrote within `RECENT_KEY_MAX_AGE_S`. Design target ~50% Iceberg position deletes; 0 disables it. Added 2026-11-02 |
 | `RECENT_KEY_MAX_AGE_S` | 20 | well under the 60 s checkpoint interval |
 | `TABLE_RUN_BATCHES` | 8 | consecutive batches a thread spends on one table; long-run mix unchanged. 1 = the old one draw per batch |
+| `DELETE_RATIO` | 0.05 | share of every `orders` / `order_items` batch that is deleted instead of written; `customers` / `products` are never deleted. 0 turns deletes off. Added 2026-11-03 |
 | `HOT_KEY_RATIO` | 0.6 | share of upserts drawn from the hot window |
 | `HOT_KEY_WINDOW` | 5000000 | sized to the buffer pool, about 16 GB of rows |
 | `POD_COUNT` | 4 | must equal `replicas` |
@@ -242,12 +259,14 @@ but not this file: check the live values with
 
 The Python defaults (used only when a variable is unset) are `HOT_KEY_RATIO=0.95`
 and `HOT_KEY_WINDOW=2000000`. The manifest overrides both. The new knobs have the
-same defaults in Python as in the manifest, plus `RECENT_KEY_BUFFER=50000` (entries
-per table per thread, not in the manifest). The startup banner prints all of them on
-the `recent keys :` line.
+same defaults in Python as in the manifest. Three more exist only in Python:
+`RECENT_KEY_BUFFER=50000` (entries per table per thread), `FK_PARENT_MOD=16` and
+`ORDER_DELETE_MAX_ITEMS=20` (see [Deletes](#deletes-and-foreign-keys)). The startup
+banner prints them on the `recent keys :` and `deletes     :` lines.
 
-Stream-wide, the manifest values give at most 60% recent re-writes, 20% hot/cold
-upserts and 20% inserts. A batch never lists the same primary key twice: duplicates
+Stream-wide, the manifest values give at most 60% recent re-writes, 36% hot/cold
+upserts and 4% inserts, with 5% of the `orders` / `order_items` rows (75% of the
+mix) turned into deletes. A batch never lists the same primary key twice: duplicates
 are dropped from the recent draw and redrawn in the normal path.
 
 ### How keys are picked
@@ -376,14 +395,105 @@ checkpoints that run long, and both of those lower the share. Measure it and adj
 
 **Side effects to expect (not yet measured):**
 
-- **Inserts.** Fewer rows are new inserts (about 20% of rows instead of 50%), so the
-  source tables grow more slowly.
+- **Inserts.** Fewer rows are new inserts (about 4–5% of rows at `UPSERT_RATIO` 0.9,
+  instead of 50%), so the source tables grow far more slowly. On the fact tables,
+  the deletes roughly offset them.
 - **Write cost.** More rows are updates, and an update writes undo and redo for the
   old image, so achieved rows/s may move either way. Re-written rows are hot in the
   buffer pool, so they add no read I/O.
 - **Paimon.** Paimon gets the identical stream and collapses the repeats in its
   write buffer. That asymmetry is intended. Its committed row counts per checkpoint
   can come out lower than Iceberg's for the same source rows.
+
+#### Deletes and foreign keys
+
+**What.** `DELETE_RATIO` (0.05) of the rows of every `orders` and `order_items` batch
+are deletes of existing keys. They run as one extra multi-row statement right after
+the batch's upsert: `DELETE … WHERE pk IN (…)`, with sorted keys, for the same lock
+order reason as the upsert. The delete keys are distinct from each other and from the
+batch's upsert keys. Like the writes, `RECENT_KEY_RATIO` of them come from the
+thread's recent-key buffer, and the rest come through `pick_key()` (hot window or
+cold tail). Deleted keys are then removed from the buffer, so a later "recent
+re-write" cannot quietly re-insert them.
+
+**Why 0.05.** Deletes become a visible event class: about 3.75% of all rows,
+because the two fact tables are 75% of the mix, plus the items deleted with their
+orders. That is small enough not to change what the benchmark mostly measures. It
+also roughly balances the ~4–5% inserts left at `UPSERT_RATIO` 0.9, so the fact
+tables stay near their size instead of outgrowing the buffer pool again. The
+buffer pool problem is why `UPSERT_RATIO` went to 0.9.
+
+**Foreign keys.** The three FKs re-added by the 2026-11-02 shrink
+(`orders_ibfk_1` orders→customers, `order_items_ibfk_1` / `_2`
+order_items→orders/products) have **no `ON DELETE` clause, so they are RESTRICT**
+(see `shrink_10pct_drop_old_and_add_fks` and the DDL in
+[0-MYSQL-SETUP-GUIDE.md](./0-MYSQL-SETUP-GUIDE.md)). Each table is handled as
+follows:
+
+| Table | Deleted? | How the FKs hold |
+|---|---|---|
+| `order_items` | yes | a leaf: nothing references it |
+| `orders` | yes, except ids that are multiples of `FK_PARENT_MOD` (16) | One `READ COMMITTED` transaction. First a non-locking `SELECT order_id, COUNT(*) FROM order_items … GROUP BY order_id` drops orders with more than `ORDER_DELETE_MAX_ITEMS` (20) items, then `DELETE FROM order_items WHERE order_id IN (…)`, then `DELETE FROM orders WHERE order_id IN (…)`. The orders FK sample that new `order_items` rows draw their parent from is taken **only** from the `order_id % 16 = 0` pool, which is never deleted, so no insert can reference a deleted order. The pool is a residue rather than "the newest 20,000 at startup", so it is the same set in every pod whatever its start time |
+| `customers`, `products` | **never** | They have children under RESTRICT. The only rows provably unreferenced are the thread's own fresh inserts, so a "safe" delete there is just insert-then-delete churn, and anything else needs a child probe per key or risks errno 1451 rolling back the batch. The CDC and sink delete path is the same for every table, so the fact tables already exercise it. Real shops soft-delete customers and products, which is an update. Because nothing is deleted, the `customers` / `products` FK samples need no filter |
+
+Why `READ COMMITTED` for the delete transaction only: under the server's default
+REPEATABLE READ, a key that is already gone leaves a gap lock. For `orders`, the
+child delete through `idx_order_id` would gap-lock the range above the highest
+referenced `order_id` and block new `order_items` inserts behind it. RC takes no
+gap locks for these searches. The upserts keep the server default.
+
+Why `ORDER_DELETE_MAX_ITEMS`: every earlier run drew `order_items` parents from the
+newest 20,000 orders. A small set of orders therefore carries most of the items,
+although the source averages only ~1.5 items per order. Deleting one of those would
+turn a 250-key delete into a transaction over thousands of item rows.
+
+**Re-inserts are allowed.** A later `pick_key()` upsert that lands on a deleted id
+takes the INSERT path of `ON DUPLICATE KEY UPDATE` and re-creates the row at that id,
+with FK values from the protected samples, so it is FK-legal. That is the same thing
+that happens today when a cold draw hits a hole. In the fake-DB test about 7% of
+deleted ids came back this way. Its tables were small enough that the hot window
+covered them, so treat that as an upper bound. It makes the net shrink smaller, and it is a
+realistic delete-then-recreate pattern for the sinks. A deleted order's items are not
+re-created.
+
+**What the sinks do with a `-D`:**
+
+- **Iceberg** (upsert mode). The writer turns a `-D` into a delete of the key. It
+  becomes a **position delete (a DV on v3)** if the writer wrote that key earlier in
+  the same checkpoint, which is the case for recent-buffer deletes, and an **equality
+  delete** otherwise. The writer then drops the key from its in-checkpoint map. A
+  delete adds no data row, so `added-records` does not move.
+- **Paimon** (primary-key table). A `-D` becomes a delete record in the LSM. The merge
+  drops the key, either in the write buffer if it is still there or at compaction.
+  With deletion vectors on, compaction marks the old row in the data file.
+
+**Effect on the position-delete share.** Deletes split recent and older keys in the
+same proportion as writes, so the share stays near 50%. The items deleted with old
+orders are almost always equality deletes. Simulation (same model as above, plus
+deletes; items modelled at 1.5 per pre-existing order):
+
+| rows/s per thread | 500 | 1,000 | 1,500 | 2,000 | 3,000 |
+|---|---:|---:|---:|---:|---:|
+| position share, `DELETE_RATIO` 0 | 0.43 | 0.48 | 0.49 | 0.52 | 0.53 |
+| position share, `DELETE_RATIO` 0.05 | 0.42 | 0.47 | 0.49 | 0.50 | 0.52 |
+| delete events / all row events, 0.05 | 4.8% | 5.6% | 5.8% | 5.7% | 5.3% |
+
+At 0.05, about 3.5 points of those delete events are the batch's own deletes and
+about 2 points are items. At `DELETE_RATIO` 0.1 the share was 0.40–0.51 and deletes
+were ~11% of events. **These are design targets, not measurements.** A real run's item
+count per deleted order is unknown (the cap is 20), so expect `deleted=` / `deletes=`
+anywhere from ~1 to ~2.
+
+**Risks, not yet measured:**
+
+- **Rate.** There is one extra round trip, plus a 4-statement transaction for
+  `orders`, per fact-table batch, so expect a few percent off `inst=`.
+- **Locks.** Deletes take X locks on hot keys like upserts do, and in the same
+  ascending order. A child delete locks `order_items` rows in `order_id` order, not
+  `order_item_id` order, so it can still deadlock with an item upsert. That shows
+  up as retried 1213s in `errors=`.
+- **Table size.** Watch `COUNT(*)` on `orders` / `order_items`. If they shrink
+  noticeably, lower `DELETE_RATIO`.
 
 #### Measure the position-delete share
 
@@ -434,7 +544,7 @@ also reducing `THREADS` x `replicas`.
 > The *shape* still holds: adding replicas past saturation buys lock contention, not
 > throughput.
 
-A replica ramp (`mysql-data-generator/find-rds-ceiling.sh`) found the aggregate rate
+A replica ramp (a ramp script, removed 2026-11-04; it is in git history) found the aggregate rate
 peaked near **32 replicas at ~69,000 rows/s and then declined**:
 
 | replicas | target | achieved | % of target | RDS CPU | write IOPS |
@@ -451,12 +561,8 @@ of 12,000. The instance was IOPS-saturated, and the reads came from the cold tai
 missing the buffer pool. Fixing the key distribution took throughput from about 15,000
 to about 58,300 rows/s at the same 8 replicas and moved the bottleneck to CPU.
 
-Re-run the ramp before quoting a ceiling:
-
-```bash
-# hold_seconds, then replica steps; results in ./bench-results/rds-ceiling-<UTC>.csv
-./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
-```
+These numbers predate the current instance; to measure today's ceiling, step the
+generator with `deploy-data-generator.sh scale N upsert` and read `status`.
 
 ---
 
@@ -476,12 +582,14 @@ SELECT
 SELECT MAX(updated_at), UTC_TIMESTAMP() FROM orders;
 ```
 
-With the generator running, the counts should grow only by the insert share,
-`(1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO)`: about 4–5% of the row rate at the
-manifest values. Equivalently, the growth should match the pods' `inserts=`. If a
-shrunk table grows much faster, the pods are running with a stale `MIN`
-([Step 3](#step-3--restart-the-pods-after-a-source-shrink)). The growth should not
-exceed `inserts=`. If it does, the ids derived for recent re-writes are wrong and
+With the generator running, `customers` and `products` should grow only by the
+insert share, `(1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO)`: about 4–5% of their
+row rate at the manifest values. `orders` and `order_items` lose `deleted=` on top
+of that, so they should stay roughly flat or shrink slowly. In total, the change in
+the sum of the four counts should be about `inserts= − deleted=`, plus the few
+re-inserts of deleted ids. If a shrunk table grows much faster, the pods are running
+with a stale `MIN` ([Step 3](#step-3--restart-the-pods-after-a-source-shrink)). If
+the growth clearly exceeds that, the ids derived for recent re-writes are wrong and
 those re-writes are taking the insert path.
 
 ### **2. Check Flink CDC Ingestion**
@@ -591,7 +699,7 @@ TaskManager pool). Throughput: see [Rates seen](#rates-seen).
 
 ```
 1. Generator pods (StatefulSet mysql-upsert-loadgen)
-   ↓ SQL: INSERT … ON DUPLICATE KEY UPDATE (no DELETEs)
+   ↓ SQL: INSERT … ON DUPLICATE KEY UPDATE; DELETE … WHERE pk IN (…) on orders / order_items
 2. MySQL RDS
    ↓ Binlog events
 3. Flink CDC Connector
@@ -651,8 +759,8 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 # Recent re-writes (Iceberg position deletes): ratio, max age s (rolling restart)
 ./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
 
-# Find the RDS ceiling: hold_seconds, then replica steps
-./mysql-data-generator/find-rds-ceiling.sh 300 8 16 24 32 40
+# Deletes on orders / order_items: ratio, 0 = off (rolling restart)
+./mysql-data-generator/deploy-data-generator.sh delete-mix 0.05
 ```
 
 The manifest values are in [Current manifest values](#current-manifest-values).
@@ -662,11 +770,13 @@ The manifest values are in [Current manifest values](#current-manifest-values).
 ## Summary
 
 ✅ **One generator**: StatefulSet `mysql-upsert-loadgen`, 4 pods, rate is measured
-   not configured. The mixed INSERT/UPDATE/DELETE generator was removed 2026-11-02,
-   so the benchmark has no DELETE events
+   not configured. The mixed INSERT/UPDATE/DELETE generator was removed 2026-11-02;
+   since 2026-11-03 the upsert generator emits DELETEs itself (`DELETE_RATIO`)
 ✅ **Deployed in**: `emr-flink` namespace, run from `cdc-pipeline/`
 ✅ **Purpose**: the storage-format benchmark and the hot query test
-✅ **Operations**: batched `ON DUPLICATE KEY UPDATE` on 4 tables
+✅ **Operations**: batched `ON DUPLICATE KEY UPDATE` on 4 tables; 5% of
+   `orders` / `order_items` rows are multi-row `DELETE`s (FKs are RESTRICT: an
+   order's items go first; `customers` / `products` are never deleted)
 ✅ **Keys**: hot window sharded per pod; cold tail drawn from the live
    `[MIN(id), MAX(id)]`, read at pod start (restart the pods after a shrink);
    60% of rows re-write a key written < 20 s earlier by the same thread, so that

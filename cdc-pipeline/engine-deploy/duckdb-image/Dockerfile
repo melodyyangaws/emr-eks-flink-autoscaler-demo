@@ -8,16 +8,19 @@
 #              v2.0.0), the extension sources at the commits the v2.0.0 tag pins,
 #              and every vcpkg dependency.
 #   py-build   the duckdb Python wheel (scikit-build-core, Release).
-#   runtime    python slim + the wheel + awscli; LOADs iceberg and httpfs, so
-#              an image that cannot never gets pushed.
+#   paimon-build  the Paimon extension (polardb/duckdb-paimon) as a LOADABLE
+#              extension, compiled against the same DuckDB tree, with paimon-cpp
+#              moved to a commit that reads bitmap64 deletion vectors.
+#   runtime    python slim + the wheel + awscli + cache_httpfs + paimon; LOADs
+#              iceberg, httpfs and paimon, so an image that cannot never gets pushed.
 #
 # Builds natively on linux/amd64 and linux/arm64 (the triplet follows
 # `uname -m`), so it works under Kaniko (one pod per arch, like
-# cdc-pipeline/build-deploy-generic.sh) and under `docker buildx` alike. It uses
+# cdc-pipeline/ingest-deploy/build-deploy-generic.sh) and under `docker buildx` alike. It uses
 # no BuildKit-only syntax (no RUN --mount), because Kaniko ignores it.
 #
-# Parallelism: COMPILE_JOBS parallel C++ compile jobs (make -j; default 30, an
-# 8xlarge node). DuckDB's unity build needs ~1.5-2 GiB per job.
+# Parallelism: COMPILE_JOBS parallel C++ compile jobs (make -j; default 60, a
+# 16xlarge node). DuckDB's unity build needs ~1.5-2 GiB per job.
 
 ARG PYTHON_VERSION=3.12
 # trixie (GCC 14), not bookworm (GCC 12): GCC 12 rejects httpfs 77392a72's
@@ -26,7 +29,7 @@ ARG PYTHON_VERSION=3.12
 # the suite, so the binaries' glibc matches.
 ARG DEBIAN_SUITE=trixie
 
-###############################################################################
+#################################################################################
 FROM python:${PYTHON_VERSION}-${DEBIAN_SUITE} AS deps
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 
@@ -47,7 +50,7 @@ ARG EXTENSIONS="iceberg;httpfs;aws;avro"
 # duckdb-python needs CMake >= 3.29; 3.x rather than 4.x because some vcpkg ports
 # still declare cmake_minimum_required < 3.5, which CMake 4 rejects.
 ARG CMAKE_VERSION=3.31.6
-ARG COMPILE_JOBS=30
+ARG COMPILE_JOBS=60
 
 # ARGs end with their stage; py-build (FROM deps) reads these ENVs.
 # VCPKG_FORCE_SYSTEM_BINARIES: required on arm64 (vcpkg ships no aarch64
@@ -147,6 +150,62 @@ RUN triplet="$(cat /opt/vcpkg-triplet)" \
  && ls -l /out/wheels
 
 ###############################################################################
+FROM deps AS paimon-build
+# The community binary (paimon 0.1.3 = duckdb-paimon 6762e34b + paimon-cpp
+# 53f9c86d) cannot read bitmap64 deletion vectors ("Size not match" on every scan
+# of our tables, deletion-vectors.bitmap64=true). paimon-cpp cecd6cd0 (#423,
+# 2026-10-13) added them; duckdb-paimon still pins 53f9c86d, so the submodule is
+# moved here. duckdb-paimon's own duckdb submodule is d54cbbe3 = our tree, so the
+# extension is configured on /src/duckdb-python/external/duckdb directly (no
+# second DuckDB checkout) and links curl/openssl from deps' /opt/vcpkg_installed.
+ARG DUCKDB_PAIMON_COMMIT=6762e34b3f805f00511e5a21c6a04c9c9a904f35
+ARG PAIMON_CPP_COMMIT=cecd6cd05a5b72b2c71c5b311e0f8212aba0b2c0
+# Shallow fetch of one commit each (ExternalProject's PATCH_COMMAND needs a git
+# repo). The one source patch, for API drift 53f9c86d -> cecd6cd0:
+# Options::MANIFEST_FORMAT was removed from paimon/defs.h (2e6935f, #263);
+# paimon-cpp still parses the "manifest.format" key itself.
+# And one build patch: duckdb-paimon installs paimon-cpp and aws-c-* into lib64,
+# but CMake on Debian does not search lib64 (FIND_LIBRARY_USE_LIB64_PATHS is off
+# when /etc/debian_version exists), so aws-c-cal's configure could not find
+# aws-c-common's package config ("Could not find a package configuration file
+# provided by aws-c-common", 2026-11-03). DuckDB's CI builds on manylinux (RHEL),
+# where it does. lib64 -> lib in its CMakeLists.txt.
+WORKDIR /src/duckdb-paimon
+RUN fetch() { git init -q "$1" && git -C "$1" fetch -q --depth 1 "$2" "$3" \
+              && git -C "$1" checkout -q FETCH_HEAD && test "$(git -C "$1" rev-parse HEAD)" = "$3"; } \
+ && fetch . https://github.com/polardb/duckdb-paimon.git "${DUCKDB_PAIMON_COMMIT}" \
+ && rm -rf third_party/paimon-cpp \
+ && fetch third_party/paimon-cpp https://github.com/apache/paimon-cpp.git "${PAIMON_CPP_COMMIT}" \
+ && sed -i 's/paimon::Options::MANIFEST_FORMAT/"manifest.format"/' src/paimon_storage/paimon_catalog.cpp \
+ && grep -q '"manifest.format"' src/paimon_storage/paimon_catalog.cpp \
+ && sed -i 's#/lib64#/lib#g; s#CMAKE_INSTALL_LIBDIR=lib64#CMAKE_INSTALL_LIBDIR=lib#' CMakeLists.txt \
+ && ! grep -n lib64 CMakeLists.txt
+# Two steps so the paimon-cpp sub-build (Arrow, Parquet, ORC, Avro, protobuf, TBB,
+# aws-c-*; its own ninja at full width) does not run next to DuckDB's unity build.
+# OSS off (we only read S3); no shell, no unittests: only the .duckdb_extension.
+# On failure, print the ExternalProject logs: CMake itself only says "Stopping
+# after outputting logs" and the real error is in <step>-{configure,build}-err.log.
+RUN triplet="$(cat /opt/vcpkg-triplet)" \
+ && cmake -G Ninja -S /src/duckdb-python/external/duckdb -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DOVERRIDE_GIT_DESCRIBE="${DDB_TAG}" \
+        -DDUCKDB_EXTENSION_CONFIGS=/src/duckdb-paimon/extension_config.cmake \
+        -DEXTENSION_STATIC_BUILD=1 -DBUILD_SHELL=0 -DBUILD_UNITTESTS=0 -DENABLE_UNITTEST_CPP_TESTS=FALSE \
+        -DPAIMON_ENABLE_OSS=OFF \
+        -DVCPKG_BUILD=1 \
+        -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+        -DVCPKG_TARGET_TRIPLET="${triplet}" -DVCPKG_HOST_TRIPLET="${triplet}" \
+        -DVCPKG_MANIFEST_DIR=/src/duckdb-paimon \
+        -DVCPKG_INSTALLED_DIR=/opt/vcpkg_installed -DVCPKG_MANIFEST_INSTALL=OFF \
+ && { cmake --build build --target paimon_cpp_ep -j "${COMPILE_JOBS}" \
+      && cmake --build build --target paimon_loadable_extension -j "${COMPILE_JOBS}" \
+      || { find build -name '*-err.log' -size +0 -print0 | xargs -0 -r tail -n 40; exit 1; }; } \
+ && mkdir -p /out \
+ && cp "$(find build -name paimon.duckdb_extension -print -quit)" /out/ \
+ && ls -l /out && tail -c 512 /out/paimon.duckdb_extension | strings \
+ && rm -rf build
+
+###############################################################################
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_SUITE} AS runtime
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ARG DUCKDB_TAG=v2.0.0
@@ -162,18 +221,24 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1
 
 COPY --from=py-build /out/wheels/ /tmp/wheels/
+COPY --from=paimon-build /out/paimon.duckdb_extension /tmp/paimon.duckdb_extension
 
+# paimon is self-built, so unsigned: it goes where INSTALL would put it
+# (~/.duckdb/extensions/v2.0.0/<platform>), and LOAD needs a connection with
+# allow_unsigned_extensions=true (duckdb_cdc_server.py connects with it).
 # AWSCLI_SPEC is pinned (awscli==...); hadolint cannot see through the ARG.
 # hadolint ignore=DL3013
 RUN pip install --no-cache-dir /tmp/wheels/duckdb-*.whl "${AWSCLI_SPEC}" \
  && rm -rf /tmp/wheels \
  && for ext in ${PREFETCH_COMMUNITY_EXTENSIONS}; do \
-        python3 -c "import duckdb; duckdb.sql(\"INSTALL ${ext} FROM community; LOAD ${ext};\")"; \
+        python3 -c "import duckdb; c=duckdb.connect(); c.execute('INSTALL ${ext} FROM community'); c.execute('LOAD ${ext}')"; \
     done \
- && python3 -c "import duckdb; print(duckdb.sql('SELECT version()').fetchone()); duckdb.sql('LOAD iceberg; LOAD httpfs;')"
+ && d="$(python3 -c "import duckdb, os; c=duckdb.connect(); print(os.path.expanduser('~/.duckdb/extensions/%s/%s' % (c.execute('SELECT library_version FROM pragma_version()').fetchone()[0], c.execute('SELECT platform FROM pragma_platform()').fetchone()[0])))")" \
+ && mkdir -p "$d" && mv /tmp/paimon.duckdb_extension "$d/" && echo "paimon -> $d" \
+ && python3 -c "import duckdb; c=duckdb.connect(config={'allow_unsigned_extensions': 'true'}); print(c.execute('SELECT version()').fetchone()); c.execute('LOAD iceberg'); c.execute('LOAD httpfs'); c.execute('LOAD paimon'); print(c.execute(\"SELECT extension_name, loaded, install_mode, extension_version FROM duckdb_extensions() WHERE extension_name IN ('iceberg', 'httpfs', 'cache_httpfs', 'paimon')\").fetchall())"
 
 LABEL org.opencontainers.image.title="duckdb-cdc-server" \
-      org.opencontainers.image.description="DuckDB ${DUCKDB_TAG} from source, iceberg/httpfs/aws/avro statically linked (Python)" \
+      org.opencontainers.image.description="DuckDB ${DUCKDB_TAG} from source, iceberg/httpfs/aws/avro statically linked, paimon loadable (Python)" \
       org.opencontainers.image.source="https://github.com/duckdb/duckdb/tree/${DUCKDB_TAG}"
 WORKDIR /opt/bench
 CMD ["python3", "-u", "/opt/bench/duckdb_cdc_server.py"]
