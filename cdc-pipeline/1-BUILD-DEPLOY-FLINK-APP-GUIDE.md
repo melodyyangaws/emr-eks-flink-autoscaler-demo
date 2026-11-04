@@ -212,7 +212,7 @@ line.
 
 `build-deploy-generic.sh` does not create it. The writers and the generator share
 one Secret, `mysql-credentials` (keys `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`),
-created as in [README Step 0](README.md#step-0-prerequisites) /
+created as in [README Step 0](README.md#step-0-one-time-setup) /
 [0-MYSQL-SETUP-GUIDE.md, Step 8](./0-MYSQL-SETUP-GUIDE.md#step-8-create-the-kubernetes-secret).
 The manifests load it with `envFrom: secretRef`; no credential is substituted into
 any file, including the git-ignored `*-deployed.yaml`.
@@ -508,7 +508,7 @@ existing table alone), so they take effect with a fresh `CDC_DB_SUFFIX`.
 | Changelog | `changelog-producer = none` (nothing reads one, and Iceberg writes none) | none written |
 | Iceberg format version | `metadata.iceberg.format-version = ${ICEBERG_FORMAT_VERSION}` | `format-version = ${ICEBERG_FORMAT_VERSION}` |
 
-Paimon-only settings without an Iceberg counterpart: `bucket = 32`,
+Paimon-only settings without an Iceberg counterpart: dynamic buckets (no `bucket` option; `bucket = 32` until 2026-11-04),
 `deletion-vectors.enabled = true`, `deletion-vectors.bitmap64 = ${PAIMON_DV_BITMAP64}`,
 `write-buffer-size` / `write-buffer-spillable`, `num-sorted-run.compaction-trigger = 4`,
 `snapshot.expire.execution-mode = async`, `sink.writer-coordinator.enabled = true`,

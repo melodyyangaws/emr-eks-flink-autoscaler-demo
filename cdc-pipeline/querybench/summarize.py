@@ -216,22 +216,23 @@ def suite_section(suite, d, stamp):
             "%s: %s on %d of %d queries" % (HEAD[ea], "/".join(sorted({s for _, s in v})), len(v), len(queries))
             for ea, v in st["bad"].items()) + ".\n")
 
-    pairs = [("Engine on %s: Trino vs DuckDB" % f, a, b) for f, a, b in
-             [(f, ("trino", f), ("duckdb_warm", f)) for f in FORMATS]]
-    pairs += [("Format on %s: %s vs Iceberg" % (ENGINE[e], "Paimon" if NATIVE[0] else "Paimon's export"), (e, "paimon"), (e, "iceberg"))
-              for e in ("duckdb_warm", "trino")]
+    # (what is compared, engine column, format column, arm A, arm B)
+    pfmt = "paimon" if NATIVE[0] else "paimon (export)"
+    pairs = [("engine", "Trino vs DuckDB", f if f != "paimon" else pfmt, ("trino", f), ("duckdb_warm", f)) for f in FORMATS]
+    pairs += [("format", ENGINE[e], "%s vs iceberg" % pfmt, (e, "paimon"), (e, "iceberg")) for e in ("duckdb_warm", "trino")]
     geo_lines = []
-    for name, a, b in pairs:
+    for what, eng, fmt, a, b in pairs:
         if a not in arms or b not in arms:
             continue
         rs = [secs(a, q) / secs(b, q) for q in queries if secs(a, q) and secs(b, q)]
         g = math.exp(sum(math.log(x) for x in rs) / len(rs)) if rs else None
         st["geo"][(a, b)] = (g, len(rs))
         if rs:
-            geo_lines.append("| %s | **%.2f** | %d |" % (name, g, len(rs)))
+            geo_lines.append("| %s | %s | **%.2f** | %d |" % (eng, fmt, g, len(rs)))
     if geo_lines:
-        main.append("Geometric mean of time A / time B over the queries both ran OK:\n")
-        main += ["| comparison | A / B | queries |", "|---|---:|---:|"] + geo_lines + [""]
+        main.append("Geometric mean of time A / time B over the queries both ran OK "
+                    "(A is the first one named in the \"vs\" column; > 1 = A slower):\n")
+        main += ["| engine | format | A / B | queries |", "|---|---|---:|---:|"] + geo_lines + [""]
 
     # ── details: Trino's server-side breakdown (timed passes)
     det.append("<details><summary>%s: Trino server-side breakdown, data scanned, result equality</summary>\n" % suite)
@@ -728,7 +729,7 @@ def main():
          "(cdc-pipeline/querybench/); both engines of a format read the same pinned snapshot per table.\n" % paimon_name()]
     L += config_table(meta, ing, sts, fv)
     L += ["Known write-side differences (table settings are otherwise paired; querybench/README.md): Paimon writes "
-          "orders/order_items with 32 writers (one per bucket), Iceberg's hash distribution sends each date partition "
+          "orders/order_items with one writer per bucket (32 fixed buckets up to _v3r3/_v3r1, dynamic buckets after), Iceberg's hash distribution sends each date partition "
           "to ONE writer; Paimon compacts and expires snapshots inline, Iceberg only in its compaction job.\n", "---\n"]
     L += ["## 1. Headline\n"] + ["- " + b for b in (hb or ["No suite results."])] + [""]
     L += ["## 2. Query latency\n"] + lat

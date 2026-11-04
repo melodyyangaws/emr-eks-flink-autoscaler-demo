@@ -4,8 +4,7 @@ MySQL RDS → Flink CDC (EMR on EKS) → **Apache Paimon** and **Apache Iceberg*
 (AWS Glue catalog), written side by side from the same binlog, then read by
 **DuckDB** and **Trino** in a hot and a snapshot query benchmark.
 
-This file is the end-to-end runbook (state as of **2026-11-04**; last full run
-`_v3r3`, summary `bench-results/QUERYBENCH-SUMMARY-20261103-v3r3.md`). The
+This file is the end-to-end runbook, the ingest and query benchamrk result can be found in the summary [bench-results/QUERYBENCH-SUMMARY-x.md](bench-results/). The
 detailed guides it links to:
 [0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md) ·
 [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md) ·
@@ -17,15 +16,36 @@ detailed guides it links to:
 [querybench/README.md](querybench/README.md) ·
 [PAIMON-VS-ICEBERG.md](PAIMON-VS-ICEBERG.md)
 
-## Quick start: what to ask your AI assistant
+## Quick start: Ask your AI assistant
 
-Clone the repo, `cd cdc-pipeline`, start the AI assistant, and ask in plain language, for example:
+Clone the repo, `cd cdc-pipeline`, then open a GenAI assistant such as Kiro or Claude Code:
+```bash
+git clone git@github.com:melodyyangaws/emr-eks-flink-autoscaler-demo.git
+cd emr-eks-flink-autoscaler-demo/throughput-benchmark
+# start the GenAI tool
+claude
+```
 
-- "Follow the README runbook on my existing EKS cluster `demo`, using the table set in `.bench-env`"
-- "Start a new table set `_v3r4` and deploy both writers in one apply, with Iceberg compaction"
-- "Start the upsert generator and report the achieved rate"
-- "Run the hot test, then the snapshot test, and write the summary"
-- "Tear the run down and clean up the old table set `_v3r3` (after moving to `_v3r4`)"
+- Ask to start the test from end to end (write CDC data + Query performance for Paimon & Iceberg OFT):
+> follow the README to run a full CDC test
+
+- Run the test on an existing EKS cluster named`demo`:
+> "Follow the README to run the CDC test on my EKS cluster `demo`"
+
+- Rerun a new test session with a different DB suffix, without removing CDC assets in S3 & Glue generated previously 
+> Start a new test round with the suffix `round2`
+
+- Only benchmark writer's throughput
+> test CDC throughput to write Iceberg vs Paimon tables, monitor and summarize the result
+
+- Hot query performance against Iceberg vs Paimon
+> run hot query test
+
+- Check the test progress at any time:
+> what's the current progress?
+
+- Clean up
+> Tear the run down and clean up the old s3 and glue table set `_round2`
 
 ## Stack
 
@@ -110,9 +130,83 @@ git-ignored, and every run overwrites them. Edit the templates instead.
 
 ---
 
+## Prerequisites
+
+Everything below must exist before the end-to-end test (Steps 4-11). Most of it
+is one-time setup per account / cluster, done in Step 0, Step 2, Step 3 and
+[0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md); the check block at the end
+verifies all of it read-only.
+
+**AWS account and IAM**
+
+| Item | Requirement |
+|---|---|
+| EMR on EKS execution role (`EMR_EXECUTION_ROLE_ARN`, e.g. `emr-on-eks-test-execution-role`) | Trusts `system:serviceaccount:emr-flink:*` through the cluster's OIDC provider; Glue (databases, tables) and S3 read/write on `BUCKET_NAME`. Used by the Flink jobs, the compaction job and, through `starrocks-sa`, the monitor, DuckDB, Trino and the query Jobs |
+| Image-build role (on `image-builder-sa`) | Push to ECR (`emr-flink-cdc-paimon`, `duckdb-cdc-server`, `trino-cdc`: policy `FlinkCDCImagePush`) and read `s3://$BUCKET_NAME/flink/build/` |
+| Your laptop credentials | EKS access (kubectl), Glue, S3 (the bucket), ECR describe, RDS describe, CloudWatch read (the summary's RDS CPU) |
+| On-demand EC2 capacity | About **400 vCPU** at peak (estimate): 16 writer TaskManagers × 8 cpu + 2 JobManagers, the compaction job (8 + 2), DuckDB on one m5.24xlarge (96), Trino on 9 × m5.4xlarge + a coordinator, the generator and runner pods. Check the account's on-demand vCPU quota |
+
+**EKS cluster**
+
+| Item | Requirement |
+|---|---|
+| Cluster | `kubectl` points at it (same VPC as the RDS instance) |
+| Karpenter NodePools | `driver-nodepool` (on-demand; JobManagers, generator, DuckDB, Trino, runner) allowing `12xlarge`, `16xlarge` and `24xlarge`, `limits.cpu` ≥ 512 (a cluster-side patch, not in the repo); `executor-memorynodepool` (TaskManagers, compaction), x86 + Graviton, so every image is multi-arch |
+| Namespace `emr-flink` | Registered for EMR on EKS |
+| cert-manager + EMR Flink operator **7.14.0** | [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md, Step 1](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md); README Step 2 |
+| ServiceAccounts | `starrocks-sa` (historical name) and `image-builder-sa`, each annotated with its IRSA role (Step 0) |
+| StorageClass `gp3-fast` | From this repo's `throughput-benchmark/` (the engine scripts apply it); `ebs-sc` and the Kyverno single-AZ policy are applied by `render` itself |
+
+**Storage and images**
+
+| Item | Requirement |
+|---|---|
+| S3 bucket `BUCKET_NAME` | Versioned; holds the warehouses, Flink state and logs, pins, results, monitor reports (Step 13 for cleanup) |
+| ECR images (multi-arch) | `emr-flink-cdc-paimon:7.14.0` (Step 3a), `duckdb-cdc-server:2.0.0` with the `paimon` extension (Step 3b), `trino-cdc:484-paimon-2.1.0` with the Paimon connector (`engine-deploy/trino-image/build-trino-image.sh`) |
+| Executor + SQL on S3 | `s3://$BUCKET_NAME/flink/scripts/flink-cdc-executor.py` and `flink/sql-scripts/{paimon,iceberg}/`, uploaded by `build` (Step 3a) after any change |
+
+**MySQL source** ([0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md))
+
+| Item | Requirement |
+|---|---|
+| RDS MySQL 8.0 | In the EKS VPC, its security group open to the nodes on 3306; `binlog_format = ROW`, binlog retention long enough for a run; here **db.r6i.4xlarge**, 8.0.45, 500 GB gp3 / 64,000 IOPS |
+| CDC user `cdcuser` | `SELECT`, `REPLICATION SLAVE`, `REPLICATION CLIENT` on schema `ecommerce` (`customers`, `products`, `orders`, `order_items`, with data) |
+| Secret `mysql-credentials` | In `emr-flink`, keys `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, created from a prompt (Step 0); read by the writers (`envFrom`) and the generator. No file holds the password |
+
+**Laptop and repo**
+
+| Item | Requirement |
+|---|---|
+| Tools | `bash`, `git`, `kubectl`, `helm`, AWS CLI v2, `python3`, `uv` (the summary's ingest stats) |
+| Repo | This repository, including `throughput-benchmark/` next to `cdc-pipeline/` |
+| Settings | `.bench-env` (in git: table set, sizes, write settings) and `.bench-env.local` (git-ignored: `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`, `MYSQL_HOST`), Step 1 |
+
+**Check everything (read-only)**
+
+```bash
+source .bench-env
+kubectl get ns emr-flink >/dev/null && echo "namespace ok"
+helm list -n emr-flink | grep -q 'flink-kubernetes-operator-7.14.0' && echo "operator 7.14.0 ok"
+kubectl get sa starrocks-sa image-builder-sa -n emr-flink -o yaml | grep -c role-arn          # 2
+kubectl get secret mysql-credentials -n emr-flink -o jsonpath='{.data}' \
+  | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'                         # 3 MYSQL_* keys
+kubectl get nodepool driver-nodepool executor-memorynodepool -o name                          # both
+kubectl get nodepool driver-nodepool -o jsonpath='{.spec.limits}{"\n"}'                       # cpu >= 512
+kubectl get storageclass gp3-fast -o name
+for r in "emr-flink-cdc-paimon 7.14.0" "duckdb-cdc-server 2.0.0" "trino-cdc 484-paimon-2.1.0"; do
+  set -- $r; aws ecr describe-images --repository-name $1 --image-ids imageTag=$2 \
+    --query 'imageDetails[0].imageTags' --output text >/dev/null && echo "image $1:$2 ok"; done
+aws s3 ls "s3://$BUCKET_NAME/flink/scripts/flink-cdc-executor.py" >/dev/null && echo "executor on S3 ok"
+aws s3api get-bucket-versioning --bucket "$BUCKET_NAME" --query Status --output text         # Enabled
+aws rds describe-db-instances --query "DBInstances[?Endpoint.Address=='$MYSQL_HOST'].[DBInstanceClass,EngineVersion,DBInstanceStatus]" --output text
+for t in bash git kubectl helm aws python3 uv; do command -v $t >/dev/null || echo "missing: $t"; done
+```
+
+---
+
 # Runbook
 
-Run every command from `cdc-pipeline/`. Each step says what it does, how to
+Check the [Prerequisites](#prerequisites) first. Run every command from `cdc-pipeline/`. Each step says what it does, how to
 check it, how long it takes and the usual failure. **(measured)** times are
 from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
 
@@ -120,7 +214,7 @@ from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
 
 | # | Step | Command (short) | Time |
 |---|---|---|---|
-| 0 | Prerequisites (once per cluster) | ServiceAccounts, Secret `mysql-credentials` | minutes |
+| 0 | One-time setup (once per cluster; see [Prerequisites](#prerequisites)) | ServiceAccounts, Secret `mysql-credentials` | minutes |
 | 1 | Settings | `.bench-env`, `.bench-env.local` | 1 min |
 | 2 | EMR Flink operator 7.14.0 (once) | `helm install ...` | ~5 min |
 | 3 | Images (after a Dockerfile/SQL/executor change) | `./ingest-deploy/build-deploy-generic.sh build` | 20–40 min |
@@ -135,7 +229,7 @@ from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
 | 12 | Teardown | `SUITE=hot ./querybench/run.sh stop` | 2–5 min |
 | 13 | Clean up the old table set | Glue + S3 removal | minutes–1 h |
 
-## Step 0: Prerequisites
+## Step 0: One-time setup
 
 | Item | Requirement |
 |---|---|
@@ -656,7 +750,7 @@ variables: change them in both manifests together.
 
 **Asymmetries kept on purpose:**
 
-- **Write layout:** Paimon has fixed buckets: 32 per date partition on `orders` / `order_items`, 8 on `customers`, 4 per category on `products` (from the next table set; `_v3r3` has 32 everywhere). Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
+- **Write layout:** Paimon uses dynamic buckets (no `bucket` option, from the next table set; `_v3r1` / `_v3r3` have 32 fixed buckets): it opens a bucket per ~2M rows, each bucket one writer. Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
 - **Maintenance:** Paimon compacts and expires inline, in the writer. Iceberg relies on the separate FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), which rewrites and expires snapshots (12 h, keep 5) every 10 writer commits, and only while the writers commit.
 - **Changelog:** Paimon `changelog-producer = none`, because nothing reads a changelog and Iceberg writes none.
 - **Catalog access:** Paimon uses the Hive metastore client on Glue (`aws.glue.enabled: "true"`, the one `flinkConfiguration` difference). Iceberg uses its own `GlueCatalog` with `S3FileIO`.

@@ -72,6 +72,15 @@
 --   storage, hive-client-class, hive-conf-dir, format-version (2 or 3),
 --   manifest-compression
 --
+-- Buckets: no 'bucket' option (2026-11-04), so every table uses Paimon's
+-- default for primary-key tables, DYNAMIC bucket mode ('bucket' = '-1'):
+-- Paimon assigns keys to buckets itself and opens a new bucket when one holds
+-- 'dynamic-bucket.target-row-num' rows (default 2,000,000), so the bucket count
+-- follows the data instead of a fixed guess. Every primary key includes the
+-- table's partition column, so no key ever moves across partitions (the case
+-- dynamic mode handles with a global index). Iceberg has no buckets at all
+-- (write.distribution-mode = hash). Like every option here: new tables only.
+--
 -- Table options are applied at CREATE TABLE only (CREATE TABLE IF NOT EXISTS
 -- is a no-op for an existing table). The live flink_paimon_db tables have
 -- drifted from this file (they are 'bucket' = '-1', and several sizes differ);
@@ -95,8 +104,6 @@ USE ${GLUE_DATABASE:flink_paimon_db};
 -- Table: customers (Dimension Table — unpartitioned)
 -- ============================================================================
 -- Low cardinality, frequent updates (address/phone changes).
--- 32 buckets, like every table here. Smaller write buffer (128mb) than the fact
--- tables to save memory.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
     customer_name VARCHAR,
@@ -111,11 +118,6 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
-    -- 8 buckets, not 32 (2026-11-04): at 32 the _v3r3 table held 1.71 GiB live in
-    -- ~55 MiB buckets, each a writer, a DV index file and an LSM per checkpoint;
-    -- 8 gives ~220 MiB buckets (Paimon's guidance: ~200 MiB-1 GiB). Fixed at CREATE
-    -- TABLE: takes a new CDC_DB_SUFFIX. Iceberg has no buckets (hash distribution).
-    'bucket' = '8',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -217,10 +219,6 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    -- 4 buckets per category, not 32 (2026-11-04): 8 categories x 32 = 256 buckets of
-    -- ~4 MiB live each on _v3r3 (1.10 GiB; ~44K small files on S3). 4 gives ~35 MiB
-    -- buckets and still 32 bucket writers in all. New CDC_DB_SUFFIX to take effect.
-    'bucket' = '4',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -282,8 +280,7 @@ CREATE TABLE IF NOT EXISTS products (
 -- Table: orders (Fact Table — partitioned by date)
 -- ============================================================================
 -- High write volume, mostly inserts + status updates.
--- 32 buckets, like every table here. Larger write buffer (256mb) for sustained
--- throughput.
+-- Larger write buffer (128mb, = Iceberg's fact-table target file size).
 CREATE TABLE IF NOT EXISTS orders (
     order_id INT,
     customer_id INT,
@@ -296,7 +293,6 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
-    'bucket' = '32',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -353,7 +349,7 @@ CREATE TABLE IF NOT EXISTS orders (
 -- Table: order_items (Fact Table — partitioned by date)
 -- ============================================================================
 -- Highest write volume (multiple items per order), append-heavy.
--- 4 buckets for parallelism. Largest write buffer.
+-- Write buffer 128mb, as orders.
 CREATE TABLE IF NOT EXISTS order_items (
     order_item_id INT,
     order_id INT,
@@ -365,7 +361,6 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_date_str VARCHAR,
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
-    'bucket' = '32',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.

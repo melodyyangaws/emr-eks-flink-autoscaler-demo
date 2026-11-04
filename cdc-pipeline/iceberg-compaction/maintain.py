@@ -158,6 +158,19 @@ def cmd_maintain(a):
         f"expire={a.expire_hours}h/keep{a.expire_retain_last}"
     )
 
+    # Started together with the writers (README Step 5), the tables may not exist
+    # yet: the writers create them in their first minutes. Wait instead of failing
+    # (a failed PythonDriver entry point is never retried by the operator).
+    cat = catalog.loadCatalog()
+    for t in a.tables:
+        ident = J.org.apache.iceberg.catalog.TableIdentifier.parse(f"{a.db}.{t}")
+        deadline = time.time() + a.wait_tables_s
+        while not cat.tableExists(ident):
+            if time.time() > deadline:
+                raise RuntimeError(f"{a.db}.{t} does not exist after {a.wait_tables_s}s")
+            log(f"{t}: table not created yet, waiting")
+            time.sleep(30)
+
     for t in a.tables:
         target_bytes = a.target_bytes.get(t, a.target_bytes_default)
         loader = J.org.apache.iceberg.flink.TableLoader.fromCatalog(
@@ -242,6 +255,8 @@ def main():
                      help="ExpireSnapshots: drop snapshots older than this (the writers' history.expire rule)")
     ap.add_argument("--expire-retain-last", type=int, default=5)
     ap.add_argument("--job-name", default="iceberg-maintenance")
+    ap.add_argument("--wait-tables-s", type=int, default=1800,
+                     help="maintain: wait up to this long for the writers to create the tables")
     a = ap.parse_args()
     # Merge the built-in per-table defaults under whatever --target-bytes gave explicitly.
     merged = dict(TARGET_BYTES_DEFAULT)

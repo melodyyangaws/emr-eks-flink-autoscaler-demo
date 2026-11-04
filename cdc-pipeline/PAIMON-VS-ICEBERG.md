@@ -497,7 +497,7 @@ These differences remain by design. Report them next to every result:
 
 | Difference | Paimon | Iceberg |
 |---|---|---|
-| Writer parallelism | 32 writers per table (`bucket = 32`) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
+| Writer parallelism | dynamic buckets (`bucket = -1`, the default: a bucket per ~2M rows, one writer each; until 2026-11-04 fixed `bucket = 32`) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
 | Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; a separate continuous FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), every 10 writer commits while the writers run |
 | Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only when `iceberg-maintain` runs, with the same 12 h / keep-5 rule. Neither expires while its writer is suspended |
 | Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |

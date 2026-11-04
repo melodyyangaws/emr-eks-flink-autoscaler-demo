@@ -399,10 +399,11 @@ changelog (`changelog-producer = none`). New settings apply to new tables
 only (a fresh `CDC_DB_SUFFIX`). Differences kept on purpose; state them with
 every result:
 
-- **Writer parallelism:** Paimon writes the fact tables with 32 writers;
+- **Writer parallelism:** Paimon writes each table with one writer per bucket
+  (32 fixed buckets up to `_v3r1` / `_v3r3`; dynamic buckets, ~2M rows each, after);
   Iceberg's `hash` distribution sends each date partition to one writer. At
-  the source-limited ~52K rows/s (2026-11-02) both keep up; above that the
-  single Iceberg writer is the expected ceiling.
+  the source-limited rate (~52K rows/s 2026-11-02, ~105K 2026-11-03) both keep up;
+  above that the single Iceberg writer is the expected ceiling.
 - **Compaction:** Paimon compacts inline (deletion vectors); Iceberg only in
   the separate `iceberg-maintain` job, which may not keep up (2026-11-03: it
   completed passes on `products` only).
