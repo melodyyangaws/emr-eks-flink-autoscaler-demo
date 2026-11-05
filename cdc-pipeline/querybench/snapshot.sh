@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Snapshot suite over the STOPPED CDC tables, warm DuckDB vs Trino on the
-# Iceberg tables (as the writers and iceberg-maintain left them) and on Paimon's
-# Iceberg export (ENGINES x FORMATS), from a cold start, every arm of a format
+# Iceberg tables and on Paimon (both compacted once by the hot test's watcher,
+# compaction/run.sh run both) (ENGINES x FORMATS), from a cold start, every arm of a format
 # on the same pinned snapshot per table (run.sh's runner step).
 #
 #   1. gate: the CDC writers stopped (suspended here if not already); every engine in ENGINES up

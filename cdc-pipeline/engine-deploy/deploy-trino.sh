@@ -3,7 +3,7 @@
 # Service trino:8080 in NAMESPACE), reading the Iceberg tables through Glue.
 #
 #   ./engine-deploy/deploy-trino.sh render          write trino-values-deployed.yaml only (no cluster change)
-#   ./engine-deploy/deploy-trino.sh up              wait until the writers have run 15 min (TRINO_AFTER_WRITERS_S),
+#   ./engine-deploy/deploy-trino.sh up              wait until the writers have run 30 min (TRINO_AFTER_WRITERS_S),
 #                                                   helm upgrade --install, wait for all workers, print version()
 #   ./engine-deploy/deploy-trino.sh status          pods, version, active nodes, SHOW SCHEMAS FROM iceberg, cache use
 #   ./engine-deploy/deploy-trino.sh clear-cache     empty /cache on every node and restart them (cold start)
@@ -78,7 +78,7 @@ TRINO_CACHE_PAGE_SIZE="${TRINO_CACHE_PAGE_SIZE:-1MB}"           # Trino's defaul
 READY_GRACE="${READY_GRACE:-1200}"
 # up waits until the writers have been RUNNING this long (wait_writers_up in
 # lib/common.sh): their start-up and first snapshot get the nodes to themselves.
-TRINO_AFTER_WRITERS_S="${TRINO_AFTER_WRITERS_S:-${WRITERS_UP_S:-900}}"
+TRINO_AFTER_WRITERS_S="${TRINO_AFTER_WRITERS_S:-${WRITERS_UP_S:-1800}}"
 CLEAR_COORDINATOR="${CLEAR_COORDINATOR:-1}"                     # clear-cache restarts the coordinator too (its metadata cache)
 TRINO_USER="${TRINO_USER:-cdcbench}"
 

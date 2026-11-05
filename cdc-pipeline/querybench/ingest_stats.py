@@ -127,8 +127,16 @@ def iceberg_last_write_ms(db, before_ms):
 # ── Paimon ─────────────────────────────────────────────────────────────────
 def paimon_snapshots(bucket, db, t):
     pre = f"paimon-warehouse/{db}.db/{t}/snapshot/"
-    lo = int(s3.get_object(Bucket=bucket, Key=pre + "EARLIEST")["Body"].read())
     hi = int(s3.get_object(Bucket=bucket, Key=pre + "LATEST")["Body"].read())
+    try:
+        lo = int(s3.get_object(Bucket=bucket, Key=pre + "EARLIEST")["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        # Paimon writes the EARLIEST hint only when it expires a snapshot; a
+        # write-only table (no inline expiry) has none: the lowest listed id.
+        ids = [int(o["Key"].rsplit("-", 1)[1])
+               for p in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=pre + "snapshot-")
+               for o in p.get("Contents", [])]
+        lo = min(ids) if ids else hi
 
     def one(i):
         try:
@@ -251,9 +259,12 @@ def monitor_reports(bucket, prefix, t0, t1):
         res[fmt] = {
             "reports": len(rs), "first_start": rs[0].get("start_time"), "last_end": rs[-1].get("end_time"),
             "sampled_s": round(sum(r.get("duration_seconds") or 0 for r in rs)),
-            # the monitor's headline "Throughput (rows/s)" and its bytes/s
-            "rows_per_s_median": med(vals("throughput_records_per_sec")),
-            "rows_per_s_max": max(vals("throughput_records_per_sec"), default=None),
+            # ingest rows/s = the sources' rate meter (the monitor's headline
+            # "Throughput (rows/s)"; older reports' headline was committed rows/s,
+            # so read the meter key, present in both), and committed bytes/s
+            "rows_per_s_median": med(vals("meter_records_per_sec")),
+            "rows_per_s_max": max(vals("meter_records_per_sec"), default=None),
+            "committed_rows_per_s_median": med(vals("commit_records_per_sec")),
             "bytes_per_s_median": med(vals("throughput_bytes_per_sec")),
             "bytes_per_s_max": max(vals("throughput_bytes_per_sec"), default=None),
             "checkpoint_ms_median": med(vals("avg_checkpoint_duration_ms")),

@@ -152,7 +152,9 @@ class FlinkCDCExecutor:
             lines.append(line)
 
         sql_content = '\n'.join(lines)
-        sql_content = re.sub(r'/\*.*?\*/', '', sql_content, flags=re.DOTALL)
+        # Block comments go, but not /*+ ... */ hints: stripping those dropped the
+        # Paimon INSERT OPTIONS (write-only, write-buffer-*) until 2026-11-05.
+        sql_content = re.sub(r'/\*(?!\+).*?\*/', '', sql_content, flags=re.DOTALL)
 
         statements = []
         current_statement = []

@@ -6,14 +6,14 @@
 -- Required environment variables:
 --   MYSQL_DATABASE: Database name (default: ecommerce)
 --   GLUE_DATABASE: target Paimon database (default: flink_paimon_db; the
---     manifest sets flink_paimon_db + CDC_DB_SUFFIX)
+--     manifest sets flink_paimon_db + SESSION_SUFFIX)
 --
 -- Note: These are long-running streaming INSERT statements
 --
 -- Write-path options are INSERT hints, not table properties: the sinks are
 -- CREATE TABLE IF NOT EXISTS, so a hint is the only way to change them on an
 -- existing table (none is an immutable option). Buffer: 64mb dimension, 128mb
--- fact tables, the same as Iceberg's write.target-file-size-bytes per table:
+-- fact tables, 2 x each table's target file size (32 / 64 MiB):
 --   write-only=true            no inline compaction AND no snapshot expiry in the
 --                              writer; small files and snapshots accumulate until a
 --                              separate compaction runs (state it with any result)

@@ -4,10 +4,11 @@ then compares the Paimon and Iceberg CDC pipelines side by side.
 
 Ported from throughput-benchmark/monitoring/flink_cid_monitor.py and extended
 from its one table to the four CDC tables. Metric collection:
-  1. Headline rows/s from the tables' own commit history: rows each commit
-     added / time between commits, summed over the tables
-  2. Fallbacks: the sources' numRecordsOutPerSecond rate meter, then the
-     source numRecordsOut counter delta (operator-scoped, restart-aware)
+  1. Headline "Throughput (rows/s)": the sources' numRecordsOutPerSecond rate
+     meter (median over the window), the INGEST rate: both jobs read the same CDC
+     stream. Fallback: the source numRecordsOut counter delta (restart-aware)
+  2. Committed rows/s from the tables' own commit history (rows each commit
+     added / time between commits), per table and summed: what each format wrote
   3. Table stats: Iceberg snapshot summaries (Glue catalog), Paimon snapshot
      and manifest metadata (S3)
   4. Checkpoint statistics
@@ -77,6 +78,17 @@ class FlinkMetricsSnapshot:
     failed_checkpoints: int = 0
     last_checkpoint_duration_ms: int = 0
     is_backpressured: bool = False
+    # From /vertices/<id>/backpressure: the highest subtask backPressuredRatio
+    # of the CDC source vertices, and the highest subtask busyRatio of the
+    # writer vertices (0..1; None when the job had no RUNNING vertices).
+    source_bp_max_ratio: Optional[float] = None
+    writer_busy_max_ratio: Optional[float] = None
+    # Highest subtask busyRatio (busyTimeMsPerSecond / 1000) of the source
+    # vertices, from the same /backpressure response (None: no data).
+    source_busy_max_ratio: Optional[float] = None
+    # Highest source-subtask currentFetchEventTimeLag (Flink CDC MySQL reader
+    # gauge, ms); None when unregistered or -1 (no binlog event seen yet).
+    source_fetch_lag_max_ms: Optional[float] = None
     # Sum of the source subtasks' numRecordsOutPerSecond: Flink's own rate meter
     # (a smoothed per-second rate), unaffected by the REST counter cache.
     records_out_per_sec: float = 0.0
@@ -95,8 +107,8 @@ class PipelineReport:
     end_time: str = ""
     table_snapshots_start: dict = field(default_factory=dict)
     table_snapshots_end: dict = field(default_factory=dict)
-    # Headline rows/s: commit_records_per_sec when the window saw a commit,
-    # else meter_records_per_sec, else counter_records_per_sec (see generate_report).
+    # Headline rows/s (ingest): meter_records_per_sec, else counter_records_per_sec
+    # (see generate_report). Committed rows/s is commit_records_per_sec.
     throughput_records_per_sec: float = 0.0
     throughput_source: str = ""
     # Rows the tables committed / time between commits (the last commit before
@@ -119,6 +131,14 @@ class PipelineReport:
     max_checkpoint_duration_ms: int = 0
     # Share of the window's samples in which a vertex reported backpressure HIGH.
     backpressured_sample_ratio: float = 0.0
+    # Median over the window's samples of the sources' max backPressuredRatio
+    # and of the writers' max busyRatio, as ms per second (None: no samples).
+    source_backpressured_ms_per_s: Optional[float] = None
+    writer_busy_max_ms_per_s: Optional[float] = None
+    # Median of the sources' max busyRatio (ms per second) and of the sources'
+    # max currentFetchEventTimeLag (ms); None without samples.
+    source_busy_max_ms_per_s: Optional[float] = None
+    source_fetch_lag_max_ms: Optional[float] = None
     checkpoint_count: int = 0
     total_new_snapshots: int = 0
     total_new_data_files: int = 0
@@ -293,23 +313,78 @@ class FlinkCDCMonitor:
             "latest_size": latest.get("state_size", 0) if latest else 0,
         }
 
-    def _check_backpressure(self, details: dict) -> bool:
-        """Check backpressure using already-fetched job details."""
+    def _check_backpressure(self, details: dict):
+        """(any vertex HIGH, sources' max backPressuredRatio, writers' max busyRatio,
+        sources' max busyRatio), from the job details already fetched; the ratios
+        are None without data."""
         if not details:
-            return False
+            return False, None, None, None
+        high, src, wrt, src_busy = False, [], [], []
         for vertex in details.get("vertices", []):
             vid = vertex["id"]
             bp_data = self._get(f"/jobs/{details['jid']}/vertices/{vid}/backpressure")
-            if bp_data and bp_data.get("backpressureLevel") == "HIGH":
-                return True
-        return False
+            if not bp_data:
+                continue
+            if bp_data.get("backpressureLevel") == "HIGH":
+                high = True
+            subs = bp_data.get("subtasks") or []
+            name = vertex.get("name", "")
+            if name.startswith("Source"):
+                src += [float(x.get("backPressuredRatio", x.get("ratio", 0)) or 0) for x in subs]
+                src_busy += [float(x.get("busyRatio", 0) or 0) for x in subs]
+            elif "Writer" in name and "Committer" not in name:
+                wrt += [float(x.get("busyRatio", 0) or 0) for x in subs]
+        return (high, (max(src) if src else None), (max(wrt) if wrt else None),
+                (max(src_busy) if src_busy else None))
+
+    def _source_fetch_lag_ms(self, details: dict) -> Optional[float]:
+        """Max over the source subtasks of the MySQL CDC reader gauge
+        currentFetchEventTimeLag (ms). Operator-scoped, so its id is
+        "Source__<operator>.currentFetchEventTimeLag" on the subtasks endpoint
+        regardless of chaining. Ids are resolved once per job (cached only once
+        found; the gauge registers when the reader starts). Values < 0 (-1 =
+        no binlog event seen yet) are ignored; None when nothing valid."""
+        if not details:
+            return None
+        job_id = details["jid"]
+        cache = getattr(self, "_fetch_lag_cache", {})
+        ids_by_vertex = cache.get(job_id)
+        if ids_by_vertex is None:
+            pattern = re.compile(r"^Source__.*\.currentFetchEventTimeLag$")
+            ids_by_vertex = {}
+            for vertex in details.get("vertices", []):
+                if not vertex.get("name", "").startswith("Source"):
+                    continue
+                ids = [m["id"] for m in self._get(f"/jobs/{job_id}/vertices/{vertex['id']}/subtasks/metrics") or []
+                       if pattern.match(m["id"])]
+                if ids:
+                    ids_by_vertex[vertex["id"]] = ids
+            if not ids_by_vertex:
+                return None
+            cache[job_id] = ids_by_vertex
+            self._fetch_lag_cache = cache
+        lags = []
+        for vid, ids in ids_by_vertex.items():
+            data = self._get(
+                f"/jobs/{job_id}/vertices/{vid}/subtasks/metrics"
+                f"?get={','.join(quote(i, safe='') for i in ids)}&agg=max"
+            )
+            for m in data or []:
+                try:
+                    v = float(m.get("max", m.get("value")))
+                except (TypeError, ValueError):
+                    continue
+                if v >= 0:
+                    lags.append(v)
+        return max(lags) if lags else None
 
     def capture_flink_snapshot(self, job_id: str) -> FlinkMetricsSnapshot:
         """Capture all Flink metrics in a single pass — one job details call reused."""
         details = self.get_job_details(job_id)
         vertex_metrics = self.get_vertex_metrics(job_id, details=details)
         cp_stats = self.get_checkpoint_stats(job_id)
-        bp = self._check_backpressure(details)
+        bp, src_bp, wrt_busy, src_busy = self._check_backpressure(details)
+        fetch_lag = self._source_fetch_lag_ms(details)
         return FlinkMetricsSnapshot(
             timestamp=time.time(),
             records_in=vertex_metrics.get("records_in", 0),
@@ -319,6 +394,10 @@ class FlinkCDCMonitor:
             failed_checkpoints=cp_stats.get("failed", 0),
             last_checkpoint_duration_ms=cp_stats.get("latest_duration_ms", 0),
             is_backpressured=bp,
+            source_bp_max_ratio=src_bp,
+            writer_busy_max_ratio=wrt_busy,
+            source_busy_max_ratio=src_busy,
+            source_fetch_lag_max_ms=fetch_lag,
             records_out_per_sec=vertex_metrics.get("rate_out", 0.0),
             job_state=(details or {}).get("state", ""),
         )
@@ -645,6 +724,14 @@ class FlinkCDCMonitor:
             report.max_checkpoint_duration_ms = max(cp_durations)
         if flink_snapshots:
             report.backpressured_sample_ratio = sum(1 for s in flink_snapshots if s.is_backpressured) / len(flink_snapshots)
+            sb = [s.source_bp_max_ratio for s in flink_snapshots if s.source_bp_max_ratio is not None]
+            wb = [s.writer_busy_max_ratio for s in flink_snapshots if s.writer_busy_max_ratio is not None]
+            report.source_backpressured_ms_per_s = statistics.median(sb) * 1000 if sb else None
+            report.writer_busy_max_ms_per_s = statistics.median(wb) * 1000 if wb else None
+            sbusy = [s.source_busy_max_ratio for s in flink_snapshots if s.source_busy_max_ratio is not None]
+            slag = [s.source_fetch_lag_max_ms for s in flink_snapshots if s.source_fetch_lag_max_ms is not None]
+            report.source_busy_max_ms_per_s = statistics.median(sbusy) * 1000 if sbusy else None
+            report.source_fetch_lag_max_ms = statistics.median(slag) if slag else None
         # Checkpoint counts: DELTA over the window, not the absolute totals.
         # counts.failed is cumulative for the job's life (see 3-MONITOR.md), so
         # its raw value stays non-zero long after the job has recovered.
@@ -727,15 +814,12 @@ class FlinkCDCMonitor:
             if sample_dt > 0:
                 report.throughput_bytes_per_sec = report.total_new_bytes_in_tables / sample_dt
 
-        if report.commit_records_per_sec > 0:
-            report.throughput_records_per_sec, report.throughput_source = report.commit_records_per_sec, "commits"
-        elif report.meter_records_per_sec > 0:
-            report.throughput_records_per_sec, report.throughput_source = report.meter_records_per_sec, "rate meter"
+        if report.meter_records_per_sec > 0:
+            report.throughput_records_per_sec, report.throughput_source = report.meter_records_per_sec, "source rate meter"
         else:
             report.throughput_records_per_sec, report.throughput_source = report.counter_records_per_sec, "counter"
-        log.info("Throughput %s: %.0f rows/s (%s) | per table %s | restarts %d",
+        log.info("Throughput %s: %.0f rows/s (%s) | restarts %d",
                  label, report.throughput_records_per_sec, report.throughput_source,
-                 {t: round(r) for t, r in report.table_commit_records_per_sec.items()},
                  report.restarts_in_window)
         log.info("Monitoring complete: %s", label)
         return report
@@ -757,6 +841,15 @@ class FlinkCDCMonitor:
                 return f"{b / (1 << 10):.2f} KB"
             return f"{b} B"
 
+        def bp_share(r):
+            # no RUNNING sample at all -> "-" (not a 0% that looks healthy)
+            if r.source_backpressured_ms_per_s is None and r.writer_busy_max_ms_per_s is None:
+                return "-"
+            return f"{r.backpressured_sample_ratio:.0%}"
+
+        def ms_or_dash(v):
+            return "-" if v is None else f"{v:,.0f}"
+
         def delta_pct(a_val, b_val):
             if a_val == 0:
                 return "N/A"
@@ -774,18 +867,22 @@ class FlinkCDCMonitor:
              f"{report_a.throughput_records_per_sec:,.0f} ({report_a.throughput_source})",
              f"{report_b.throughput_records_per_sec:,.0f} ({report_b.throughput_source})",
              delta_pct(report_a.throughput_records_per_sec, report_b.throughput_records_per_sec)],
-        ]
-        # Per-table committed rows/s: where one format falls behind on one
-        # table (order_items carries most of the upsert load).
-        for t in dict.fromkeys(list(report_a.table_commit_records_per_sec)
-                               + list(report_b.table_commit_records_per_sec)):
-            ra = report_a.table_commit_records_per_sec.get(t, 0.0)
-            rb = report_b.table_commit_records_per_sec.get(t, 0.0)
-            rows.append([f"  ↳ {t} (committed rows/s)", f"{ra:,.0f}", f"{rb:,.0f}", delta_pct(ra, rb)])
-        rows += [
-            ["Source rate meter (rows/s)",
-             f"{report_a.meter_records_per_sec:,.0f}", f"{report_b.meter_records_per_sec:,.0f}",
-             delta_pct(report_a.meter_records_per_sec, report_b.meter_records_per_sec)],
+            ["Backpressure (sources, share of samples HIGH)",
+             bp_share(report_a), bp_share(report_b), ""],
+            ["  ↳ sources backpressured (ms/s, max subtask)",
+             ms_or_dash(report_a.source_backpressured_ms_per_s),
+             ms_or_dash(report_b.source_backpressured_ms_per_s), ""],
+            ["  ↳ busiest writer (busy ms/s, max subtask)",
+             ms_or_dash(report_a.writer_busy_max_ms_per_s),
+             ms_or_dash(report_b.writer_busy_max_ms_per_s), ""],
+            ["  ↳ busiest source (busy ms/s, max subtask)",
+             ms_or_dash(report_a.source_busy_max_ms_per_s),
+             ms_or_dash(report_b.source_busy_max_ms_per_s), ""],
+            ["  ↳ source fetch lag (ms, max subtask)",
+             ms_or_dash(report_a.source_fetch_lag_max_ms),
+             ms_or_dash(report_b.source_fetch_lag_max_ms), ""],
+            # Committed rows/s (table commits, per table) stays in the JSON
+            # (commit_records_per_sec; querybench/ingest_stats.py), not in this table.
             ["Restarts in window",
              report_a.restarts_in_window, report_b.restarts_in_window, ""],
             ["Records Processed (counter)",
@@ -884,6 +981,14 @@ class FlinkCDCMonitor:
             "avg_checkpoint_duration_ms": round(report.avg_checkpoint_duration_ms, 2),
             "max_checkpoint_duration_ms": report.max_checkpoint_duration_ms,
             "backpressured_sample_ratio": round(report.backpressured_sample_ratio, 3),
+            "source_backpressured_ms_per_s": (round(report.source_backpressured_ms_per_s, 1)
+                                              if report.source_backpressured_ms_per_s is not None else None),
+            "writer_busy_max_ms_per_s": (round(report.writer_busy_max_ms_per_s, 1)
+                                         if report.writer_busy_max_ms_per_s is not None else None),
+            "source_busy_max_ms_per_s": (round(report.source_busy_max_ms_per_s, 1)
+                                         if report.source_busy_max_ms_per_s is not None else None),
+            "source_fetch_lag_max_ms": (round(report.source_fetch_lag_max_ms, 1)
+                                        if report.source_fetch_lag_max_ms is not None else None),
             "checkpoint_count": report.checkpoint_count,
             "failed_checkpoints_in_window": report.failed_checkpoints,
             "total_new_snapshots": report.total_new_snapshots,

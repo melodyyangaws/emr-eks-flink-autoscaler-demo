@@ -37,9 +37,9 @@ scaled to 0). Use the steps below to start, check or remove an engine by hand.
 
 ```bash
 ./engine-deploy/deploy-trino.sh render        # 1. trino-values-deployed.yaml only; no cluster call
-./engine-deploy/deploy-trino.sh up            # 2. wait for the writers (15 min), helm upgrade --install, wait, print version()
+./engine-deploy/deploy-trino.sh up            # 2. wait for the writers (30 min), helm upgrade --install, wait, print version()
 ./engine-deploy/deploy-trino.sh status        # 3. check
-./engine-deploy/deploy-trino.sh sql "SELECT count(*) FROM iceberg.flink_iceberg_db_v3r1.orders"   # 4. smoke test
+./engine-deploy/deploy-trino.sh sql "SELECT count(*) FROM iceberg.flink_iceberg_db<suffix>.orders"   # 4. smoke test
 ./engine-deploy/deploy-trino.sh clear-cache   # cold start (querybench does it itself)
 ./engine-deploy/deploy-trino.sh down          # remove the release and leftover cache PVCs
 ```
@@ -47,8 +47,8 @@ scaled to 0). Use the steps below to start, check or remove an engine by hand.
 1. **render** fills `trino-values.yaml` (envsubst over the computed sizing)
    into `trino-values-deployed.yaml` and logs the shape (workers, heap,
    max-memory-per-node, `query.max-memory`). Use it to check a sizing change.
-2. **up** first waits until every writer in `FLINK_JOBS` has been RUNNING for
-   `TRINO_AFTER_WRITERS_S` (default `WRITERS_UP_S`, 900 s) since its current
+2. **up** first waits until both writers (`flink-cdc-paimon`, `flink-cdc-iceberg`) have been RUNNING for
+   `TRINO_AFTER_WRITERS_S` (default `WRITERS_UP_S`, 1800 s) since its current
    job start (a restart resets it), so the writers start up without Trino on
    the nodes (`wait_writers_up` in `lib/common.sh`, shared with `run.sh start`).
    Suspended writers are skipped, a writer that is not deployed stops `up`, and

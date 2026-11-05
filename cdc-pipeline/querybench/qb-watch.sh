@@ -4,7 +4,7 @@
 # starts it as the Job cdc-qb-watch right after the runner. Adapted from
 # throughput-benchmark/querybench/qb-watch.sh.
 #
-# Every WATCH_INTERVAL_S (600) it reads the runner's log; the test is over when
+# Every WATCH_INTERVAL_S (300) it reads the runner's log; the test is over when
 # the runner prints "status: runner-exit=", or its Job or pod is gone or failed.
 #
 # Only a COMPLETED test is torn down: "status: runner-exit=0". Any other end (a
@@ -12,10 +12,10 @@
 # writers, job monitor, DuckDB and Trino RUNNING and prints a report: why it
 # ended, the runner's last error lines and what is still up. A setup error then
 # costs a fix and a re-run, not a new MySQL snapshot. Tear down by hand with
-# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-7 below).
+# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-6 below).
 #
 #   ./querybench/qb-watch.sh            watch (the cdc-qb-watch Job runs this)
-#   ./querybench/qb-watch.sh teardown   steps 1-7 now, no watching (run.sh stop)
+#   ./querybench/qb-watch.sh teardown   steps 1-6 now, no watching (run.sh stop)
 #
 # Teardown steps:
 #   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it) and waits
@@ -30,16 +30,18 @@
 #      this pod has no helm, so not deploy-trino.sh down; the release stays,
 #      the cache volumes go with their pods, and run.sh start scales them back
 #      and runs deploy-trino.sh up;
-#   6. suspends the Iceberg compaction FlinkDeployment iceberg-maintain
-#      (iceberg-compaction/run-maintain.sh; STOP_COMPACTION_CRON=0 leaves it;
-#      a hot run.sh start resumes it);
-#   7. deletes the runner's ConfigMap and Secret.
+#   6. deletes the runner's ConfigMap and Secret.
+#
+# After a COMPLETED hot test (not on `teardown`), once the writers' TaskManagers
+# are gone, it compacts both formats once for the snapshot test:
+# `compaction/run.sh run both` (COMPACT_AFTER_HOT=0 skips it). The snapshot start
+# waits for this watcher, so the snapshot test reads the compacted tables.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
 case "$SUITE" in hot|snapshot) ;; *) qb_die "qb-watch needs SUITE=hot|snapshot, got '${SUITE}'" ;; esac
-WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-600}"
+WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-300}"
 WATCH_RUNNER=cdc-qb-runner
 DUCK="$DUCKDB_NAME"
 MONITOR="${CDC_MONITOR:-flink-cdc-monitor}"
@@ -100,23 +102,42 @@ elif trino_down; then
 else
     qb_log "WARNING: could not scale Trino to 0 (engine-deploy/deploy-trino.sh down by hand)"
 fi
-if [[ "${STOP_COMPACTION_CRON:-1}" == 0 ]]; then
-    qb_log "STOP_COMPACTION_CRON=0: flinkdeployment/iceberg-maintain left as is"
-elif kubectl get flinkdeployment iceberg-maintain -n "$NAMESPACE" >/dev/null 2>&1; then
-    kubectl patch flinkdeployment iceberg-maintain -n "$NAMESPACE" --type merge -p '{"spec":{"job":{"state":"suspended"}}}' >/dev/null \
-        && qb_log "flinkdeployment/iceberg-maintain suspended (a hot run.sh start resumes it)" \
-        || qb_log "WARNING: could not suspend flinkdeployment/iceberg-maintain"
-fi
+}
+
+# Step 6, apart: after the compaction, which reads the same bundle and .bench-env.local.
+delete_runner_config() {
 kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
     && qb_log "${WATCH_RUNNER}'s ConfigMap and Secret deleted" \
     || qb_log "WARNING: could not delete ${WATCH_RUNNER}'s ConfigMap/Secret"
 }
 
+# The one-off compaction before the snapshot test: both formats, every table,
+# with the writers stopped (compaction/run.sh refuses while a writer still has
+# TaskManagers, so wait for them to go first). A failure leaves each table as
+# its last committed run left it; the snapshot start still waits for this
+# watcher, then pins whatever is committed.
+compact_once() {
+    local j deadline=$(( $(date +%s) + 600 ))
+    for j in $FLINK_JOBS; do
+        while kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep -q "^${j}-taskmanager-"; do
+            (( $(date +%s) < deadline )) || { qb_log "WARNING: ${j} TaskManagers still up after 600 s: no compaction"; return 1; }
+            sleep 15
+        done
+    done
+    qb_log "one-off compaction before the snapshot test: compaction/run.sh run both"
+    if "${HERE}/../compaction/run.sh" run both; then
+        qb_log "compaction done (results under ${QB_RESULTS_PREFIX}/compaction/)"
+    else
+        qb_log "WARNING: compaction failed (above); the snapshot test will read the tables as last committed"
+        return 1
+    fi
+}
+
 # What is still up after a failed test, one line each (read-only).
 report_running() {
     local d st
-    for d in ${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}; do
+    for d in $FLINK_JOBS; do
         st=$(kubectl get flinkdeployment "$d" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.state}/{.spec.job.state}' 2>/dev/null || true)
         qb_log "  writer ${d}: ${st:-not deployed}"
     done
@@ -133,6 +154,7 @@ report_running() {
 if [[ "${1:-}" == teardown ]]; then
     qb_log "teardown requested (${SUITE})"
     teardown
+    delete_runner_config
     echo "status: qb-teardown-done $(date -u)"
     exit 0
 fi
@@ -150,6 +172,10 @@ qb_log "${SUITE} test over: ${why}"
 if [[ "$why" == "status: runner-exit=0"* ]]; then
     qb_log "${SUITE} test completed: tearing the run down"
     teardown
+    if [[ "$SUITE" == hot && "${COMPACT_AFTER_HOT:-1}" != 0 ]]; then
+        compact_once || echo "status: qb-watch-compaction-failed $(date -u)"
+    fi
+    delete_runner_config
     echo "status: qb-watch-done $(date -u)"
 else
     qb_log "${SUITE} test did NOT complete (${why}): leaving everything RUNNING, no teardown"

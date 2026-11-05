@@ -6,7 +6,7 @@
 --
 -- Environment variables:
 --   GLUE_DATABASE: target Iceberg database (default: flink_iceberg_db; the
---     manifest sets flink_iceberg_db + CDC_DB_SUFFIX)
+--     manifest sets flink_iceberg_db + SESSION_SUFFIX)
 --   MYSQL_DATABASE: source database (default: ecommerce)
 -- ============================================================================
 

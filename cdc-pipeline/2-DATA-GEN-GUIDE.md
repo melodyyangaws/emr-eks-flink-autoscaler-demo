@@ -506,7 +506,7 @@ anywhere from ~1 to ~2.
 
    ```bash
    source .bench-env
-   DB=flink_iceberg_db${CDC_DB_SUFFIX}
+   DB=flink_iceberg_db${SESSION_SUFFIX}
    for T in customers products orders order_items; do
      LOC=$(aws glue get-table --database-name "$DB" --name "$T" \
              --query 'Table.Parameters.metadata_location' --output text)
@@ -604,15 +604,14 @@ monitor ([3-MONITOR.md](./3-MONITOR.md)).
 
 ### **3. Check Lakehouse Data (S3)**
 
-The databases carry the table-set suffix (`CDC_DB_SUFFIX` in `.bench-env`, `_v3r1`
-now):
+The databases carry the table-set suffix (`SESSION_SUFFIX` in `.bench-env`):
 
 ```bash
 source .bench-env
 # Paimon: <warehouse>/<db>.db/<table>/
-aws s3 ls s3://${BUCKET_NAME}/paimon-warehouse/flink_paimon_db${CDC_DB_SUFFIX}.db/orders/snapshot/ | tail -3
+aws s3 ls s3://${BUCKET_NAME}/paimon-warehouse/flink_paimon_db${SESSION_SUFFIX}.db/orders/snapshot/ | tail -3
 # Iceberg (GlueCatalog default location): <warehouse>/<db>.db/<table>/metadata/
-aws s3 ls s3://${BUCKET_NAME}/iceberg-warehouse/flink_iceberg_db${CDC_DB_SUFFIX}.db/orders/metadata/ | tail -3
+aws s3 ls s3://${BUCKET_NAME}/iceberg-warehouse/flink_iceberg_db${SESSION_SUFFIX}.db/orders/metadata/ | tail -3
 ```
 
 New `snapshot-N` and `*.metadata.json` objects should appear about once a minute (one
@@ -622,7 +621,7 @@ per 60 s checkpoint).
 
 Athena reads Iceberg v2 only, so it cannot read the v3 table set. Query it with the
 DuckDB and Trino arms of [querybench/](./querybench/README.md). On a v2 set
-(`ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX=`), Athena reads `flink_iceberg_db`
+(`ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX=`), Athena reads `flink_iceberg_db`
 directly ([README Step 4](./README.md#step-4--olap-query-layer-athena)):
 
 ```sql

@@ -12,7 +12,6 @@ detailed guides it links to:
 [3-MONITOR.md](3-MONITOR.md) ·
 [engine-deploy/README.md](engine-deploy/README.md) ·
 [engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md) ·
-[iceberg-compaction/README.md](iceberg-compaction/README.md) ·
 [querybench/README.md](querybench/README.md) ·
 [PAIMON-VS-ICEBERG.md](PAIMON-VS-ICEBERG.md)
 
@@ -61,7 +60,7 @@ claude
 | Table format | Iceberg format **v3** by default (`ICEBERG_FORMAT_VERSION=3`). Paimon exports Iceberg v3 metadata with the same version |
 | Query engines | DuckDB **2.0.0**, a source-built image `duckdb-cdc-server:2.0.0` (multi-arch); Trino **484** (chart 1.45.0). StarRocks was removed on 2026-11-02 |
 | Engine size | Tripled on 2026-11-02, both about **81 cpu / 342 GiB**: DuckDB one pod of 81 cpu / 342 GiB on an m5.24xlarge; Trino 9 workers × 9 cpu / 38 GiB (one per m5.4xlarge) + a 4 cpu coordinator. Total cache stays about 450 GiB (DuckDB 450 GiB disk; Trino 9 × 56 Gi × 90%). Before: DuckDB 27 cpu / 114 GiB, Trino 3 workers |
-| Iceberg compaction | One continuous FlinkDeployment `iceberg-maintain` ([iceberg-compaction/](iceberg-compaction/README.md): `maintain.py`, Iceberg 1.12's `TableMaintenance`): rewrite + snapshot expiry every 10 writer commits, started with the writers. The Spark job (2026-11-02) and the Java hourly/merge app (2026-11-03) were removed |
+| Compaction | **During ingest and the hot test:** Paimon inline, in the writer (a COMPACT snapshot about every 60 s checkpoint); Iceberg none. **Before the snapshot test:** one full compaction of both formats (`compaction/run.sh run both`: Paimon `sys.compact` full, Iceberg a full `RewriteDataFiles` with its deletes applied, then `ExpireSnapshots` 12 h / keep 5), run by the hot test's watcher after its teardown |
 | Source | RDS MySQL **8.0.45** on **db.r6i.4xlarge** (was db.m5.2xlarge), 500 GB gp3, 64,000 IOPS, buffer pool 92 GiB. `ecommerce` DB shrunk to its newest ~10% on 2026-11-02: **491.0M → 49.36M rows** |
 
 ## Architecture
@@ -79,13 +78,13 @@ claude
 │ flink-cdc-paimon            │       │ flink-cdc-iceberg           │
 │ PyFlink SQL executor        │       │ PyFlink SQL executor        │
 │ (jarURI = executor .py)     │       │ (jarURI = executor .py)     │
-│ parallelism 32, ckpt 60 s   │       │ parallelism 32, ckpt 60 s   │
+│ parallelism 12, ckpt 60 s   │       │ parallelism 12, ckpt 60 s   │
 └──────────────┬──────────────┘       └──────────────┬──────────────┘
                │                                     │
    paimon-warehouse/ (S3)                iceberg-warehouse/ (S3)
    Glue DB flink_paimon_db<suffix>       Glue DB flink_iceberg_db<suffix>
-   + Iceberg export under                + FlinkDeployment iceberg-maintain
-     paimon-warehouse/iceberg/             (rewrite + expiry every 10 commits)
+   + Iceberg export under                + no inline compaction: compacted
+     paimon-warehouse/iceberg/             once before the snapshot test
                │                                     │
                └───────────────┬─────────────────────┘
                                ▼
@@ -120,7 +119,7 @@ cdc-pipeline/
 ├── mysql-data-generator/       deploy-data-generator.sh, mysql-upsert-loadgen.yaml
 ├── monitoring/                 deploy-monitor.sh, monitor code, capture-flink-metrics.sh
 ├── engine-deploy/              deploy-duckdb-cdc.sh, deploy-trino.sh, duckdb-image/, trino-image/ (README.md there)
-├── iceberg-compaction/         Iceberg compaction: maintain.py / maintain.yaml / run-maintain.sh (FlinkDeployment iceberg-maintain)
+├── compaction/                 run.sh (run|render|status|logs|down), cdc-compact.py, cdc-compact.yaml: the one-off full compaction of both formats the hot watcher runs before the snapshot test
 ├── querybench/                 run.sh (start|render|status|logs|summary|stop), suites, ingest_stats.py, README.md
 └── bench-results/              local output (git-ignored)
 ```
@@ -144,7 +143,7 @@ verifies all of it read-only.
 | EMR on EKS execution role (`EMR_EXECUTION_ROLE_ARN`, e.g. `emr-on-eks-test-execution-role`) | Trusts `system:serviceaccount:emr-flink:*` through the cluster's OIDC provider; Glue (databases, tables) and S3 read/write on `BUCKET_NAME`. Used by the Flink jobs, the compaction job and, through `starrocks-sa`, the monitor, DuckDB, Trino and the query Jobs |
 | Image-build role (on `image-builder-sa`) | Push to ECR (`emr-flink-cdc-paimon`, `duckdb-cdc-server`, `trino-cdc`: policy `FlinkCDCImagePush`) and read `s3://$BUCKET_NAME/flink/build/` |
 | Your laptop credentials | EKS access (kubectl), Glue, S3 (the bucket), ECR describe, RDS describe, CloudWatch read (the summary's RDS CPU) |
-| On-demand EC2 capacity | About **400 vCPU** at peak (estimate): 16 writer TaskManagers × 8 cpu + 2 JobManagers, the compaction job (8 + 2), DuckDB on one m5.24xlarge (96), Trino on 9 × m5.4xlarge + a coordinator, the generator and runner pods. Check the account's on-demand vCPU quota |
+| On-demand EC2 capacity | About **375 vCPU** at peak (estimate): 12 writer TaskManagers (6 per writer, 2 slots) × 8 cpu (parallelism 12) + 2 JobManagers, the compaction job (8 + 2), DuckDB on one m5.24xlarge (96), Trino on 9 × m5.4xlarge + a coordinator, the generator and runner pods. Check the account's on-demand vCPU quota |
 
 **EKS cluster**
 
@@ -208,7 +207,7 @@ for t in bash git kubectl helm aws python3 uv; do command -v $t >/dev/null || ec
 
 Check the [Prerequisites](#prerequisites) first. Run every command from `cdc-pipeline/`. Each step says what it does, how to
 check it, how long it takes and the usual failure. **(measured)** times are
-from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
+from the 2026-11-03 run; **(estimate)** otherwise.
 
 **The whole run at a glance**
 
@@ -218,13 +217,13 @@ from the 2026-11-03 `_v3r3` run; **(estimate)** otherwise.
 | 1 | Settings | `.bench-env`, `.bench-env.local` | 1 min |
 | 2 | EMR Flink operator 7.14.0 (once) | `helm install ...` | ~5 min |
 | 3 | Images (after a Dockerfile/SQL/executor change) | `./ingest-deploy/build-deploy-generic.sh build` | 20–40 min |
-| 4 | A fresh table set | new `CDC_DB_SUFFIX`, clear leftovers | ~1 min |
-| 5 | Writers + Iceberg compaction | `render`, one `kubectl apply`, `run-maintain.sh up` | ~8 min to RUNNING |
+| 4 | A fresh table set | new `SESSION_SUFFIX`, clear leftovers | ~1 min |
+| 5 | Writers | `render`, one `kubectl apply` | ~8 min to RUNNING |
 | 6 | Load generator | `deploy-data-generator.sh deploy` | 1–2 min |
 | 7 | Monitor | `monitoring/deploy-monitor.sh` (or let Step 9 do it) | 1–2 min |
 | 8 | Query engines (optional, Step 9 does it) | `deploy-duckdb-cdc.sh up`, `deploy-trino.sh up` | 5–20 min |
-| 9 | Hot test | `SUITE=hot ./querybench/run.sh start` | ~35 min after the 15 min writer wait |
-| 10 | Snapshot test | `SUITE=snapshot ./querybench/run.sh start` | ~50 min |
+| 9 | Hot test | `SUITE=hot ./querybench/run.sh start` | ~35 min after the 30 min writer wait |
+| 10 | Snapshot test | `SUITE=snapshot ./querybench/run.sh start` | ~50 min, after the hot watcher's compaction (hours possible on Iceberg) |
 | 11 | Summary | `./querybench/run.sh summary` | a few min |
 | 12 | Teardown | `SUITE=hot ./querybench/run.sh stop` | 2–5 min |
 | 13 | Clean up the old table set | Glue + S3 removal | minutes–1 h |
@@ -282,7 +281,7 @@ and restart the generator. Never print the value; the Secrets are the only place
 
 | File | In git | Holds |
 |---|---|---|
-| `.bench-env` | yes | `NAMESPACE`, `ICEBERG_FORMAT_VERSION=3`, **`CDC_DB_SUFFIX`** (the table set), `SESSION_SUFFIX`, warehouses, `FLINK_JOBS`, Trino/DuckDB versions and sizes, `MYSQL_PORT` / `MYSQL_DATABASE` / `MYSQL_USER` / `MYSQL_ENV_SECRET_NAME`, `GENERATOR_RESOURCES`, the Paimon write and S3A upload settings, `HOT_WINDOW_SECONDS=30` |
+| `.bench-env` | yes | `NAMESPACE`, `ICEBERG_FORMAT_VERSION=3`, **`SESSION_SUFFIX`** (the table set), warehouses, Trino/DuckDB versions and sizes, `MYSQL_PORT` / `MYSQL_DATABASE` / `MYSQL_USER` / `MYSQL_ENV_SECRET_NAME`, `GENERATOR_RESOURCES`, the Paimon write and S3A upload settings, `HOT_WINDOW_SECONDS=30` |
 | `.bench-env.local` | no | `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`, **`MYSQL_HOST`** (the RDS endpoint). `.bench-env` sources it (fallback: `../throughput-benchmark/.bench-env.local`) |
 
 ```bash
@@ -299,22 +298,22 @@ Settings worth knowing (all in `.bench-env`):
 
 | Setting | Value | Meaning |
 |---|---|---|
-| `CDC_DB_SUFFIX` | e.g. `_v3r4` | the table set: Glue DBs `flink_{paimon,iceberg}_db<suffix>`, Flink state paths, result prefixes (Step 4) |
+| `SESSION_SUFFIX` | free text, empty or under 100 characters, e.g. `_<suffix>` | names one test round (the table set): Glue DBs `flink_{paimon,iceberg}_db<suffix>`, Flink state paths, result prefixes (Step 4). It does not set the Iceberg format version (`ICEBERG_FORMAT_VERSION` does) |
 | `PAIMON_WRITE_ONLY` | `false` | Paimon `INSERT` hint; `true` turns off Paimon's inline compaction **and** snapshot expiry. Keep `false` for the comparison |
 | `PAIMON_WRITE_BUFFER_SPILLABLE` / `PAIMON_WRITE_BUFFER_SIZE` | `true` / unset (64mb dimension, 128mb fact = Iceberg's target file sizes) | Paimon `INSERT` hints |
 | `S3A_MULTIPART_SIZE` / `S3A_MULTIPART_THRESHOLD` / `S3A_ACTIVE_BLOCKS` | `16M` / `16M` / `6` | Paimon's S3A upload shape; Iceberg's S3FileIO gets the derived equivalent (16 MiB parts, 24 threads) |
 | `TRINO_WORKERS` / `DUCKDB_CPU` … | `9` / `81` … | engine size (about 81 cpu / 342 GiB each); the script defaults are smaller, these lines make the engines big |
 
-Who reads what: `querybench/run.sh`, `engine-deploy/*.sh`, `iceberg-compaction/run-maintain.sh`
+Who reads what: `querybench/run.sh`, `engine-deploy/*.sh`, `compaction/run.sh`
 and the DuckDB image build read `.bench-env` through `lib/common.sh` (a value on
 the command line wins, with an `overrides` line). `ingest-deploy/build-deploy-generic.sh`
 reads the **environment**, so `source .bench-env` first (it reads only
-`CDC_DB_SUFFIX` itself when that is unset). `mysql-data-generator/deploy-data-generator.sh`
+`SESSION_SUFFIX` itself when that is unset). `mysql-data-generator/deploy-data-generator.sh`
 sources `.bench-env` for `MYSQL_HOST` / `MYSQL_USER`; `monitoring/deploy-monitor.sh`
-reads `CDC_DB_SUFFIX` from it.
+reads `SESSION_SUFFIX` from it.
 
-- **Check (offline):** `bash -c 'source lib/common.sh; echo $ICEBERG_FORMAT_VERSION $PAIMON_DB $ICEBERG_DB $QB_RESULTS_PREFIX'` prints e.g. `3 flink_paimon_db_v3r4 flink_iceberg_db_v3r4 querybench-results/cdc-session-v3r4`.
-- **If it fails:** `CDC_DB_SUFFIX must be empty or like _v3` = the suffix must match `^(_[a-z0-9]+)?$`.
+- **Check (offline):** `bash -c 'source lib/common.sh; echo $ICEBERG_FORMAT_VERSION $PAIMON_DB $ICEBERG_DB $QB_RESULTS_PREFIX'` prints `3 flink_paimon_db<suffix> flink_iceberg_db<suffix> querybench-results/cdc-session<tag>`.
+- **If it fails:** `SESSION_SUFFIX must be empty or under 100 characters` = shorten it. Glue database names allow only lowercase letters, digits and `_`, so keep the suffix to those.
 
 ## Step 2: EMR Flink operator 7.14.0
 
@@ -368,8 +367,8 @@ for amd64 and arm64 in parallel. 1.5–3 h per architecture cold (estimate). See
 
 ## Step 4: A fresh table set
 
-A **table set** is `ICEBERG_FORMAT_VERSION` + `CDC_DB_SUFFIX`. **Every full test
-uses a new suffix** (`_v3r3` → `_v3r4`, ...): the sink DDL is `CREATE TABLE IF NOT
+A **table set** is `ICEBERG_FORMAT_VERSION` + `SESSION_SUFFIX`. **Every full test
+uses a new suffix** (any new free-text name): the sink DDL is `CREATE TABLE IF NOT
 EXISTS`, so table options (buckets, formats, file sizes) apply at creation only,
 and a new set gives empty tables, empty Flink state and a fresh MySQL snapshot.
 Never reuse a suffix: its Flink HA/checkpoint state on S3 would be recovered.
@@ -378,25 +377,27 @@ Never reuse a suffix: its Flink HA/checkpoint state on S3 would be recovered.
 |---|---|
 | Glue databases | `flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>` |
 | Writer state / HA / logs | `s3://$BUCKET_NAME/flink/cdc-{paimon,iceberg}<suffix>/`, `flink/logs/cdc-{paimon,iceberg}<suffix>` |
-| Compaction state | `s3://$BUCKET_NAME/flink/iceberg-maintain<suffix>/` |
+| Compaction logs / results | `flink/logs/cdc-compact<suffix>/`, `querybench-results/cdc-session<tag>/compaction/`; only from older sets: `flink/iceberg-maintain<suffix>/`, `flink/logs/iceberg-maintain/` |
 | Warehouse data | `paimon-warehouse/flink_paimon_db<suffix>.db/`, `paimon-warehouse/iceberg/flink_paimon_db<suffix>/` (Paimon's Iceberg export), `iceberg-warehouse/flink_iceberg_db<suffix>.db/` |
-| Results / pins / monitor reports | `querybench-results/cdc-session<tag><SESSION_SUFFIX>/`, `querybench-pins/...` (`<tag>` = suffix with `-`, e.g. `-v3r4`) |
+| Results / pins / monitor reports | `querybench-results/cdc-session<tag>/`, `querybench-pins/...` (`<tag>` = the suffix with `-` for `_`) |
 
 ```bash
 # 1. stop everything that writes the old set
-kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg iceberg-maintain -n emr-flink --ignore-not-found
-kubectl get pods -n emr-flink | grep -E 'flink-cdc|iceberg-maintain'      # wait until empty
+kubectl delete flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n emr-flink --ignore-not-found
+kubectl delete flinkdeployment iceberg-maintain -n emr-flink --ignore-not-found   # a leftover of a pre-2026-11-06 set
+./compaction/run.sh down                                                   # any leftover one-off compaction job
+kubectl get pods -n emr-flink | grep -E 'flink-cdc|cdc-compact|iceberg-maintain'   # wait until empty
 # 2. HA ConfigMaps (their names carry NO suffix; a leftover makes a new JobManager recover the old job)
-kubectl get configmap -n emr-flink -o name | grep -E '(flink-cdc-(paimon|iceberg)|iceberg-maintain)-.*config-map' \
+kubectl get configmap -n emr-flink -o name | grep -E 'flink-cdc-(paimon|iceberg)-.*config-map' \
   | xargs -r kubectl delete -n emr-flink
 # 3. the new suffix in .bench-env, then check it is really the one every script sees
-sed -i '' 's/^export CDC_DB_SUFFIX=.*/export CDC_DB_SUFFIX=_v3r4/' .bench-env
-bash -c 'source .bench-env; echo "CDC_DB_SUFFIX=$CDC_DB_SUFFIX"'
+sed -i '' 's/^export SESSION_SUFFIX=.*/export SESSION_SUFFIX=_<new suffix>/' .bench-env
+bash -c 'source .bench-env; echo "SESSION_SUFFIX=$SESSION_SUFFIX"'
 # 4. the new set must not exist yet
 source .bench-env
-aws glue get-database --name "flink_iceberg_db${CDC_DB_SUFFIX}"   # expect EntityNotFoundException
-aws glue get-database --name "flink_paimon_db${CDC_DB_SUFFIX}"    # expect EntityNotFoundException
-for p in flink/cdc-iceberg flink/cdc-paimon flink/iceberg-maintain; do aws s3 ls "s3://$BUCKET_NAME/${p}${CDC_DB_SUFFIX}/"; done   # expect nothing
+aws glue get-database --name "flink_iceberg_db${SESSION_SUFFIX}"   # expect EntityNotFoundException
+aws glue get-database --name "flink_paimon_db${SESSION_SUFFIX}"    # expect EntityNotFoundException
+for p in flink/cdc-iceberg flink/cdc-paimon flink/iceberg-maintain; do aws s3 ls "s3://$BUCKET_NAME/${p}${SESSION_SUFFIX}/"; done   # expect nothing
 ```
 
 - **Check:** every check is empty / not found, and `render` (Step 5) later says **"Glue database created"**, not "already exists".
@@ -412,17 +413,16 @@ procedures** (`shrink_10pct_build` → `swap` → `verify` → `drop_old_and_add
 `unswap` rolls back until `*_old` is dropped): 491.0M → 49.36M rows, ~14 min.
 The procedure file is **not in the repo**. Preconditions: generator at 0, both
 writers suspended, no `Binlog Dump` session, a manual RDS snapshot. Afterwards:
-a new `CDC_DB_SUFFIX` (Step 4) and a generator restart (it reads `MIN`/`MAX` ids
+a new `SESSION_SUFFIX` (Step 4) and a generator restart (it reads `MIN`/`MAX` ids
 at pod start).
 
-## Step 5: Writers and Iceberg compaction
+## Step 5: Writers
 
 ```bash
 source .bench-env                                   # MYSQL_HOST (from .bench-env.local), MYSQL_USER, the suffix
 ./ingest-deploy/build-deploy-generic.sh build       # only if the SQL / executor / Dockerfile changed (Step 3a)
 ./ingest-deploy/build-deploy-generic.sh render      # renders ingest-deploy/flink-cdc-*-deployed.yaml, applies nothing
 kubectl apply -n emr-flink -f ingest-deploy/flink-cdc-paimon-deployed.yaml -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
-./iceberg-compaction/run-maintain.sh up             # continuous Iceberg compaction, started WITH the writers
 ```
 
 `render` validates the settings, applies the `ebs-sc` StorageClass and the
@@ -434,23 +434,17 @@ database, prints the Paimon write and S3A upload settings, and fails on any
 - **Re-deploying is delete + create, never `apply` over a live CR**: EMR stages `jarURI` on CREATE only, and an apply over an existing FlinkDeployment empties `/opt/flink/usrlib` (`NoSuchFileException: /tmp/pyflink/...`). Delete, wait for the pods, clear the HA ConfigMaps (Step 4), apply again.
 - **Pause / resume** (no new snapshot; restores the last checkpoint): `kubectl patch flinkdeployment <job> -n emr-flink --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'` (or `"running"`).
 
-**Iceberg compaction (`iceberg-maintain`).** Iceberg's Flink writer never merges
-files: every checkpoint adds data files, equality-delete files and deletion
-vectors. `iceberg-compaction/run-maintain.sh up` creates one FlinkDeployment
-(`maintain.py`, Iceberg's own `TableMaintenance`) that rewrites each table and
-expires its snapshots (older than 12 h, keep 5) every 10 writer commits (~10 min).
-**Start it right after the writers**: the first pass has to read every
-equality delete written so far, and a late start meant ~35M deletes on
-`customers` and an OOM at 8 Gi (now 32 Gi). It only runs while the writers
-commit. `run-maintain.sh status | plan | suspend | resume | down`; details in
-[iceberg-compaction/README.md](iceberg-compaction/README.md). Paimon compacts
-and expires inline in its writer.
+**No Iceberg compaction while the writers run.** Iceberg's Flink writer never
+merges files (every checkpoint adds data files, equality-delete files and
+deletion vectors); Paimon compacts and expires inline. Both formats are
+compacted once, by the hot test's watcher, before the snapshot test (Step 10).
+The sinks keep 100 metadata files (`write.metadata.previous-versions-max`).
 
 - **Check:**
-  - `kubectl get flinkdeployment -n emr-flink`: `flink-cdc-paimon`, `flink-cdc-iceberg` and `iceberg-maintain` `RUNNING` / `STABLE`.
-  - `aws glue get-tables --database-name flink_iceberg_db${CDC_DB_SUFFIX} --query 'TableList[].Name'` lists 4 tables, and the same for `flink_paimon_db${CDC_DB_SUFFIX}`.
+  - `kubectl get flinkdeployment -n emr-flink`: `flink-cdc-paimon` and `flink-cdc-iceberg` `RUNNING` / `STABLE`.
+  - `aws glue get-tables --database-name flink_iceberg_db${SESSION_SUFFIX} --query 'TableList[].Name'` lists 4 tables, and the same for `flink_paimon_db${SESSION_SUFFIX}`.
   - No `Access denied` in `kubectl logs deploy/flink-cdc-iceberg -n emr-flink -c flink-main-container`.
-- **Time:** both writers `RUNNING` / `STABLE` with 16 TaskManagers about **8 min** after the apply (measured). The initial snapshot (~50M rows plus what the generator added) then runs for tens of minutes (estimate).
+- **Time:** both writers `RUNNING` / `STABLE` about **8 min** after the apply (measured at parallelism 32, 16 TaskManagers; now 12, 6 TaskManagers per writer). The initial snapshot (~50M rows plus what the generator added) then runs for tens of minutes (estimate).
 - **If it fails:** see [Troubleshooting](#troubleshooting): a missing or stale Secret, an apply over an existing CR, a leftover HA ConfigMap, nodepool limits, or (Paimon) a JobManager `OutOfMemoryError: Metaspace` (metaspace is 512m in both manifests).
 
 ## Step 6: Load generator (upsert)
@@ -496,13 +490,13 @@ kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 ```
 
 Every ~2–3 min it samples Paimon and Iceberg in parallel over the same 120 s
-window and prints one comparison (rows/s from commit history, source rate,
+window and prints one comparison (ingest rows/s from the sources' rate meter, committed rows/s from commit history,
 checkpoints, backpressure, table stats). Every report JSON is uploaded to
-`s3://<bucket>/querybench-results/cdc-session<tag><SESSION_SUFFIX>/monitor/`;
+`s3://<bucket>/querybench-results/cdc-session<tag>/monitor/`;
 Step 11 reads them back. Details: [3-MONITOR.md](3-MONITOR.md).
 
-- **Check:** the banner says `Reports : ... cdc-session-v3r4/monitor/` for the current set; `aws s3 ls` of that prefix lists `paimon-cdc_*.json` and `iceberg-cdc_*.json` after the first cycle.
-- **Note:** "committed rows/s" is lower on Paimon by design: it merges re-written keys in its write buffer before committing. Compare the **source rate meter** for input.
+- **Check:** the banner says `Reports : ... cdc-session<tag>/monitor/` for the current set; `aws s3 ls` of that prefix lists `paimon-cdc_*.json` and `iceberg-cdc_*.json` after the first cycle.
+- **Note:** "Throughput (rows/s)" is the ingest rate (the CDC sources' rate meter), the figure to compare across formats. Committed rows/s is no longer shown (it stays in the monitor JSON for the query summary).
 
 ## Step 8: Query engines (optional)
 
@@ -510,7 +504,7 @@ Step 11 reads them back. Details: [3-MONITOR.md](3-MONITOR.md).
 
 ```bash
 ./engine-deploy/deploy-duckdb-cdc.sh up      # duckdb-warm-cdc: 81 cpu / 342 GiB, one m5.24xlarge, 450 GiB disk cache
-./engine-deploy/deploy-trino.sh up           # waits until the writers have run 15 min, then 9 workers + coordinator
+./engine-deploy/deploy-trino.sh up           # waits until the writers have run 30 min, then 9 workers + coordinator
 ./engine-deploy/deploy-duckdb-cdc.sh status
 ./engine-deploy/deploy-trino.sh status
 ```
@@ -525,13 +519,13 @@ The four arms (`ENGINES` × `FORMATS`):
 | `trino:paimon` | **native Paimon**, catalog `paimon` (paimon-trino 2.1.0 in `trino-cdc:484-paimon-2.1.0`), `FOR VERSION AS OF BIGINT 'N'` | new 2026-11-04, **not yet run live** |
 
 Both Paimon arms are pinned at the native snapshot `N` of `<table>/snapshot/LATEST`.
-Runs up to `_v3r3` read Paimon's Iceberg export instead (a partial view: top-LSM
+Runs before 2026-11-04 read Paimon's Iceberg export instead (a partial view: top-LSM
 files only until a full compaction; DuckDB could not read its v3 manifests).
 
 - **Check:** DuckDB `/health` `"busy": false`, `iceberg_format_version` 3; Trino 9 active workers, version 484.
-- **Time:** 5–20 min including new nodes (estimate); Trino first waits for the writers' 15 min.
+- **Time:** 5–20 min including new nodes (estimate); Trino first waits for the writers' 30 min.
 
-## Step 9: Hot test (writers, generator and compaction live)
+## Step 9: Hot test (writers and generator live; Paimon compacts inline, Iceberg uncompacted)
 
 ```bash
 SUITE=hot ./querybench/run.sh render   # optional dry run: the Jobs and every query, no cluster/AWS call
@@ -545,35 +539,36 @@ Preconditions: both writers `RUNNING`, the generator running, no other
 `cdc-qb-runner` or throughput `qb-runner` active (`FORCE=1` overrides).
 
 `start`, on the laptop:
-1. waits until every writer has been RUNNING `WRITERS_UP_S` (900 s) since its current job start (a restart restarts the clock), so run it right after Steps 5–6 and it just blocks;
-2. resumes `iceberg-maintain` (or creates it with `run-maintain.sh up` if missing);
-3. brings the monitor up, then DuckDB, then Trino; empties the caches unless every engine just started fresh;
-4. starts the runner and watcher Jobs in the cluster. The laptop can disconnect after that.
+1. waits until every writer has been RUNNING `WRITERS_UP_S` (1800 s = 30 min; 900 s until 2026-11-06, when the hot window fell in Paimon's snapshot catch-up and 8 of 9 Paimon hot queries were ZERO_SCAN) since its current job start (a restart restarts the clock), so run it right after Steps 5–6 and it just blocks;
+2. brings the monitor up, then DuckDB, then Trino; empties the caches unless every engine just started fresh;
+3. starts the runner and watcher Jobs in the cluster. The laptop can disconnect after that.
 
 The runner pins every table of both formats on a **30 s** window ending
 `HOT_LAG_SECONDS=300` before the start, runs a warm-up pass and `RUNS=3` timed
 passes, interleaving DuckDB and Trino and re-pinning before each pass, and
-uploads to `s3://$BUCKET_NAME/querybench-results/cdc-session<tag><SESSION_SUFFIX>/<STAMP>-hot/`.
+uploads to `s3://$BUCKET_NAME/querybench-results/cdc-session<tag>/<STAMP>-hot/`.
 A query that errors on one arm is recorded as `ERROR`; the run goes on.
 
 **The watcher tears down only after a completed test** (`status: runner-exit=0`):
-generator → 0, writers suspended, `iceberg-maintain` suspended, monitor → 0,
+generator → 0, writers suspended, monitor → 0,
 DuckDB deleted, Trino → 0 (`STOP_GENERATOR=0`, `SUSPEND_WRITERS=0`,
-`STOP_COMPACTION_CRON=0`, `STOP_DUCKDB=0`, `STOP_TRINO=0` keep one). On a failure
-it leaves everything running and logs why.
+`STOP_DUCKDB=0`, `STOP_TRINO=0` keep one). Then, once the writers'
+TaskManagers are gone, it runs the **one-off compaction of both formats**
+(`compaction/run.sh run both`, Step 10; `COMPACT_AFTER_HOT=0` skips it). On a
+failure it leaves everything running and logs why. A manual `run.sh stop` does
+the same teardown, without the compaction.
 
-- **Check:** the runner logs `status: results-uploaded ...`, the watcher `status: qb-watch-done`.
+- **Check:** the runner logs `status: results-uploaded ...`, the watcher `status: qb-watch-done` (`qb-watch-compaction-failed` before it = a compaction failed; the snapshot test then reads the tables as last committed).
 - **Time (measured):** engines up ~7 min after the writer wait, runner ~22 min.
 - **If it fails:** `./querybench/run.sh logs`; [querybench/README.md](querybench/README.md). A failure inside `start` stops before any Job ("no query Job left running").
 
-### Step 9a: Iceberg compaction during the hot test
+### Step 9a: Compaction during the hot test
 
-`iceberg-maintain` (started in Step 5) keeps compacting while the writers run;
-the hot `start` resumes it and the watcher suspends it. Check it with
-`./iceberg-compaction/run-maintain.sh status` and `./iceberg-compaction/run-maintain.sh plan`
-(read-only: data/delete files and delete counts per table). On 2026-11-03 it
-started late and completed passes on `products` only, so the Iceberg arms read
-uncompacted tables: the summary must say so.
+The hot test reads Paimon as its writer leaves it (inline compaction unless
+`PAIMON_WRITE_ONLY=true`) and Iceberg uncompacted (every equality delete still
+applied at read time). The continuous Iceberg compaction job `iceberg-maintain`
+(the `iceberg-compaction/` folder, removed 2026-11-06; in git history) is gone:
+both formats get only the one-off compaction before the snapshot test.
 
 ## Step 10: Snapshot test (writers stopped, cold start)
 
@@ -585,13 +580,36 @@ SUITE=snapshot ./querybench/run.sh start
 ```
 
 `start`, on the laptop:
-1. suspends `iceberg-maintain` so the pinned tables stay put;
-2. scales the generator to 0, waits `WRITER_DRAIN_S` (180 s) and until each running writer completed a checkpoint ≥ 60 s after the generator stopped (refuses otherwise), then suspends both writers;
-3. resolves `SNAPSHOT_DT`, the newest closed date in both formats' fact tables;
+1. refuses unless the hot watcher's compaction is over and OK (`check_compaction_done`): it waits while a `cdc-compact-*` job runs (`COMPACT_WAIT_TIMEOUT_S`, 14400 s), stops on a FAILED one, and needs an OK result newer than the latest hot run for every format and table; `REQUIRE_COMPACTION=0` skips it (on `_readonlytest` the start went ahead with Iceberg orders FAILED and order_items never run);
+1b. scales the generator to 0, waits `WRITER_DRAIN_S` (180 s) and until each running writer completed a checkpoint ≥ 60 s after the generator stopped (refuses otherwise), then suspends both writers (a no-op if the hot watcher already did), so the pinned tables stay fixed;
+2. resolves `SNAPSHOT_DT`, the newest closed date in both formats' fact tables;
+3. (no compaction here: step 0 of `start` waits for the hot watcher, as long as a `cdc-compact-*` job runs, so the tables are already compacted);
 4. brings the engines up and starts the runner and watcher.
 
-There is **no pre-test compaction**: Iceberg is measured as the writers and
-`iceberg-maintain` left it; the summary reports its file and delete counts.
+**The one-off compaction** (throughput-benchmark's pattern, `compaction/`; run by the hot test's watcher after its teardown): one batch
+FlinkDeployment per format and table (`cdc-compact-<fmt>-<table>`, `cdc-compact.py`,
+on the writers' image and catalog SQL), the two formats side by side, their
+tables one after another.
+
+- **Paimon:** `CALL sys.compact(compact_strategy => 'full')`: every bucket merged
+  into its top level, which applies the deletion vectors and refreshes the Iceberg export.
+- **Iceberg:** every data file that carries a delete (equality delete, position delete,
+  deletion vector) or is under 70% of the target size is rewritten with its deletes
+  applied (`RowDataRewriter`), grouped per partition up to the target size; one
+  `RewriteFiles` commit swaps the files and removes the delete files they carried;
+  then snapshots older than 12 h are expired, keeping 5. v3 row ids are not carried over.
+- Each table writes a result JSON (before/after data files, delete files, equality and
+  position deletes, rows, bytes, seconds) to `querybench-results/cdc-session<tag>/compaction/`.
+  A failure commits nothing and leaves that table's FlinkDeployment for its logs.
+
+```bash
+./compaction/run.sh run both        # what the watcher runs; by hand too, writers stopped (it refuses otherwise)
+./compaction/run.sh status | logs <fmt> <table> | down
+```
+
+The snapshot test therefore measures both formats fully compacted. Knobs (passed to the watcher): `COMPACT_TABLES`, `COMPACT_PARALLELISM`, `COMPACT_TIMEOUT_S`.
+
+**Iceberg's rewrite faces the whole equality-delete backlog** of the ingest and hot test: hundreds of millions of rows on `orders` / `order_items` (`_v3final1` still held 78M / 156M with continuous compaction). Each rewrite subtask holds a data file's equality-delete set, so 1 slot per 32 Gi TaskManager (`ICEBERG_TM_SLOTS`, `TM_MEMORY`); on an `OutOfMemoryError` raise `TM_MEMORY` ([Troubleshooting](#troubleshooting)). Its time adds to the snapshot start's wait. Measured 2026-11-04 (a run stopped part-way): Paimon `customers` 260 s, `products` 117 s; Iceberg's rewrite of `customers` (1,280 files, 48.7M equality deletes) did not finish before the stop, so the Iceberg run time is not yet known.
 
 The runner (`querybench/snapshot.sh`): waits for the engines, pins the four
 tables of every format, resolves the S4 slice, **empties both caches**, then
@@ -614,7 +632,7 @@ median of passes 1–2. Results go to `.../<STAMP>-snapshot/`.
 
 `summary` downloads both runs' results, runs `querybench/ingest_stats.py`
 (read-only, laptop credentials, through `uv`) over the hot run's window, and
-writes **`bench-results/QUERYBENCH-SUMMARY-<YYYYMMDD><tag><SESSION_SUFFIX>.md`**
+writes **`bench-results/QUERYBENCH-SUMMARY-<YYYYMMDD><tag>.md`**
 with the bucket and account redacted. **Only that `.md` stays local**: the
 ingest JSON goes to `s3://.../cdc-session<tag>/<session>-summary/`, and every raw
 result stays in its run's S3 prefix. Contents:
@@ -627,25 +645,28 @@ metadata); 5. table state; conclusions and open items. A suite where two
 engines on one format return different rows is marked **INVALID**.
 
 Before sharing it, add a short **run notes** section with anything that changes
-how to read the numbers (compaction state, restarts, generator changes), as in
-`bench-results/QUERYBENCH-SUMMARY-20261103-v3r3.md`. `bench-results/` is
+how to read the numbers (compaction state, restarts, generator changes), as in the
+2026-11-03 summary in `bench-results/`. `bench-results/` is
 git-ignored: `git add -f` to commit the summary.
 
 - **Check:** both suites are listed, and the ingest section has numbers (not "ingest_stats.py failed").
-- **If it fails:** `no runs under querybench-results/...` = wrong `CDC_DB_SUFFIX` / `SESSION_SUFFIX`. The ingest step needs the run's commit history, which both formats keep 12 h.
+- **If it fails:** `no runs under querybench-results/...` = wrong `SESSION_SUFFIX`. The ingest step needs the run's commit history, which both formats keep 12 h.
 
 ## Step 12: Stop / teardown
 
 ```bash
 # What the watcher does after a completed test (use it after a failed one):
 SUITE=hot ./querybench/run.sh stop
-#   generator -> 0, writers and iceberg-maintain suspended, monitor -> 0, DuckDB deleted, Trino -> 0
+#   generator -> 0, writers suspended, monitor -> 0, DuckDB deleted, Trino -> 0
+#   (a completed hot test's watcher then also runs ./compaction/run.sh run both; stop does not)
 
 # Remove everything (the S3 data and Glue tables stay; Step 13 removes those):
 ./ingest-deploy/build-deploy-generic.sh cleanup       # asks "yes"; deletes both writer FlinkDeployments
-./iceberg-compaction/run-maintain.sh down
-kubectl get configmap -n emr-flink -o name | grep -E '(flink-cdc-(paimon|iceberg)|iceberg-maintain)-.*config-map' \
+kubectl delete flinkdeployment iceberg-maintain -n emr-flink --ignore-not-found   # a leftover of a pre-2026-11-06 set
+./compaction/run.sh down
+kubectl get configmap -n emr-flink -o name | grep -E 'flink-cdc-(paimon|iceberg)-.*config-map' \
   | xargs -r kubectl delete -n emr-flink
+kubectl get configmap -n emr-flink -o name | grep -E 'iceberg-maintain-.*config-map' | xargs -r kubectl delete -n emr-flink
 ./mysql-data-generator/deploy-data-generator.sh stop
 kubectl delete -f monitoring/monitor-deployment-deployed.yaml
 ./engine-deploy/deploy-duckdb-cdc.sh down
@@ -661,17 +682,17 @@ An old set stays in Glue and S3 until removed. Set `OLD` to its suffix (never
 the current one; `OLD=` empty is the original unsuffixed v2 set):
 
 ```bash
-OLD=_v3r3
+OLD=_<old suffix>
 # 1. nothing writes it
 kubectl get flinkdeployment -n emr-flink -o yaml | grep -A1 -E 'GLUE_DATABASE|--db'
 # 2. keep the table definitions, then drop the databases (and their tables)
 for db in flink_paimon_db$OLD flink_iceberg_db$OLD; do aws glue get-tables --database-name $db > glue-backup-$db.json; done
 aws glue delete-database --name flink_paimon_db$OLD
 aws glue delete-database --name flink_iceberg_db$OLD
-# 3. S3. Keep the TRAILING SLASH: without it OLD=_v3 also matches _v3r1, _v3r3, ...
+# 3. S3. Keep the TRAILING SLASH: without it OLD=_abc also matches _abc1, _abcd, ...
 for p in paimon-warehouse/flink_paimon_db$OLD.db/ paimon-warehouse/iceberg/flink_paimon_db$OLD/ \
          iceberg-warehouse/flink_iceberg_db$OLD.db/ \
-         flink/cdc-paimon$OLD/ flink/cdc-iceberg$OLD/ flink/iceberg-maintain$OLD/ \
+         flink/cdc-paimon$OLD/ flink/cdc-iceberg$OLD/ flink/iceberg-maintain$OLD/ flink/logs/cdc-compact$OLD/ \
          flink/logs/cdc-paimon$OLD/ flink/logs/cdc-iceberg$OLD/; do
   aws s3 rm --recursive "s3://$BUCKET_NAME/$p"
 done
@@ -698,7 +719,7 @@ replaces all rules).
 placeholders: `AWS_REGION` (default `us-west-2`), `AWS_ACCOUNT_ID`,
 `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN`, `EMR_VERSION` (7.14.0), `IMAGE_TAG`
 (the same as `EMR_VERSION`), `ICEBERG_FORMAT_VERSION` (2|3, default 3),
-`CDC_DB_SUFFIX`, `PAIMON_DV_BITMAP64`, `MYSQL_PORT`, `MYSQL_DATABASE`,
+`SESSION_SUFFIX`, `PAIMON_DV_BITMAP64`, `MYSQL_PORT`, `MYSQL_DATABASE`,
 `MYSQL_ENV_SECRET_NAME` (`mysql-credentials`), `JM_NODEPOOL`
 (`driver-nodepool`), `TM_NODEPOOL` (`executor-memorynodepool`), and the write
 and upload settings below.
@@ -711,7 +732,7 @@ and upload settings below.
 | `S3A_MULTIPART_SIZE` / `S3A_MULTIPART_THRESHOLD` / `S3A_ACTIVE_BLOCKS` | `16M` / `16M` / `6` | Paimon catalog `s3.multipart.*`, `s3.fast.upload.active.blocks` (disk buffer in `/tmp/s3a-paimon`) |
 | `ICEBERG_S3_MULTIPART_SIZE_BYTES` / `ICEBERG_S3_MULTIPART_THREADS` | derived: `S3A_MULTIPART_SIZE` in bytes / `S3A_ACTIVE_BLOCKS` × 4 | Iceberg catalog `s3.multipart.part-size-bytes` / `num-threads` |
 
-The hints apply to existing tables, so no new `CDC_DB_SUFFIX` is needed; a
+The hints apply to existing tables, so no new `SESSION_SUFFIX` is needed; a
 change takes `./ingest-deploy/build-deploy-generic.sh build` (uploads the SQL) and a writer
 delete + create (Step 5).
 `PAIMON_DV_BITMAP64` is derived, not a setting: it is `true` exactly when the
@@ -724,9 +745,9 @@ credential lands in a file.
 | Setting | Value |
 |---|---|
 | JobManager | 1 replica, HA in `s3://<bucket>/flink/cdc-<format><suffix>/ha/`, 8 Gi / 4 cpu, metaspace 512m, `driver-nodepool` (on-demand) |
-| TaskManager | 32 Gi / 8 cpu, 4 slots, `executor-memorynodepool` (on-demand). The pods carry `karpenter.sh/do-not-disrupt: "true"` |
-| Parallelism | 32 (`job.parallelism` and `--parallelism 32`), `pipeline.max-parallelism: 128` |
-| Chaining | `pipeline.operator-chaining.enabled: true`, `pipeline.object-reuse: true` |
+| TaskManager | 32 Gi / 8 cpu, 2 slots, `executor-memorynodepool` (on-demand). The pods carry `karpenter.sh/do-not-disrupt: "true"` |
+| Parallelism | 12 (`job.parallelism` and `--parallelism 12`; 32 until 2026-11-04, then 16, then 24 until 2026-11-05), `pipeline.max-parallelism: 128` |
+| Chaining | `pipeline.operator-chaining.enabled: false` (since 2026-11-06, both jobs: the source vertex is the CDC reader alone, so its busy time shows whether the binlog reader is the limit), `pipeline.object-reuse: true` |
 | State | `hashmap` on the task heap (`taskmanager.memory.managed.fraction: 0.1`), checkpoints and savepoints in `s3p://<bucket>/flink/cdc-<format><suffix>/` |
 | Checkpointing | every 60 s, 600 s timeout, 30 s minimum pause, `tolerable-failed-checkpoints: 10` |
 | Failover | `failover-strategy: full`, `restart-strategy: exponential-delay`, `jobmanager.scheduler: default`. The autoscaler is off |
@@ -744,14 +765,14 @@ variables: change them in both manifests together.
 | Data files | Parquet zstd level 1; `target-file-size` 64 MB (dimension tables) / 128 MB (fact tables) | Parquet zstd level 1; `write.target-file-size-bytes` 64 / 128 MB |
 | Row group | `parquet.block.size` 8 MB (dimension) / 16 MB (fact) | `write.parquet.row-group-size-bytes` 8 / 16 MB |
 | Snapshot retention | `snapshot.time-retained 12h`, `num-retained.min 5` (`max 1000`) | `history.expire.max-snapshot-age-ms` 12 h, `min-snapshots-to-keep 5` |
-| Metadata files | export `previous-versions-max 3` + `delete-after-commit` | `write.metadata.previous-versions-max 3` + `delete-after-commit` |
+| Metadata files | export `previous-versions-max 3` + `delete-after-commit` | `write.metadata.previous-versions-max 100` + `delete-after-commit` |
 | Manifests | `manifest.merge-min-count 5`, `manifest.target-file-size 8mb`; export compaction min 5 / max 50 | `commit.manifest.min-count-to-merge 5`, `commit.manifest.target-size-bytes 8 MB` |
 | Column stats | `metadata.stats-mode truncate(16)` | `write.metadata.metrics.default truncate(16)` |
 
 **Asymmetries kept on purpose:**
 
-- **Write layout:** Paimon uses dynamic buckets (no `bucket` option, from the next table set; `_v3r1` / `_v3r3` have 32 fixed buckets): it opens a bucket per ~2M rows, each bucket one writer. Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
-- **Maintenance:** Paimon compacts and expires inline, in the writer. Iceberg relies on the separate FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), which rewrites and expires snapshots (12 h, keep 5) every 10 writer commits, and only while the writers commit.
+- **Write layout:** Paimon has fixed buckets, one writer each: 8 on `customers`, 8 per category on `products`, 4 per date partition on `orders` / `order_items` (from 2026-11-04; earlier rounds had 32 fixed buckets, and one round dynamic buckets, which DuckDB's Paimon reader cannot read). Iceberg's `write.distribution-mode = hash` gives one writer per date partition. Iceberg's `write.distribution-mode = hash` gives one writer per date partition.
+- **Maintenance:** Paimon compacts and expires inline, in the writer; Iceberg is not compacted during ingest. Both get one full compaction (`compaction/run.sh run both`, Iceberg's snapshots expired 12 h / keep 5) from the hot test's watcher, before the snapshot test.
 - **Changelog:** Paimon `changelog-producer = none`, because nothing reads a changelog and Iceberg writes none.
 - **Catalog access:** Paimon uses the Hive metastore client on Glue (`aws.glue.enabled: "true"`, the one `flinkConfiguration` difference). Iceberg uses its own `GlueCatalog` with `S3FileIO`.
 
@@ -761,7 +782,7 @@ variables: change them in both manifests together.
 Athena is not part of the current pipeline. Athena (engine v3) reads Iceberg v2 only
 ([AWS Iceberg V3 support table](https://docs.aws.amazon.com/AmazonS3/latest/userguide/working-with-apache-iceberg-v3.html)),
 so it cannot read the v3 set. A v2 set (`ICEBERG_FORMAT_VERSION=2` with its
-own `CDC_DB_SUFFIX`) can be queried from Athena as
+own `SESSION_SUFFIX`) can be queried from Athena as
 `SELECT ... FROM flink_iceberg_db<suffix>.<table>`. The earlier recipe that
 registered Paimon's v2 export in a separate Glue database for Athena (verified
 2026-09-28 on the v2 set) is in this file's git history.
@@ -787,7 +808,7 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 | New set's JobManager recovers an old job graph | Leftover HA ConfigMaps `flink-cdc-{paimon,iceberg}-*config-map`. Delete them (Step 4) |
 | Paimon: `NoAuthWithAWSException` on the warehouse | The catalog lacks `s3.aws.credentials.provider = ...WebIdentityTokenFileCredentialsProvider`. paimon-s3 ignores `hadoop-conf-dir` (fixed in `01-catalog-setup.sql`) |
 | Iceberg: `NoClassDefFoundError .../hc/core5/http/ClassicHttpRequest` | Iceberg 1.12's default `apache` HTTP client isn't in EMR's SDK bundle. Use `http-client.type = urlconnection` plus the url-connection-client jar (both are in place) |
-| New table options have no effect | `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table. Use a new `CDC_DB_SUFFIX` |
+| New table options have no effect | `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table. Use a new `SESSION_SUFFIX` |
 | TaskManagers die with `exitCode=255`, `NoResourceAvailableException` | The image is single-arch on a mixed-arch pool. Rebuild with both `PLATFORMS` |
 | Pods Pending, `exceed limits for nodepool` | Karpenter counts provisioned capacity against the NodePool `limits.cpu`. Raise it, e.g. `kubectl patch nodepool driver-nodepool --type=merge -p '{"spec":{"limits":{"cpu":256}}}'` (unquoted number) |
 | Job cycles RUNNING → RESTARTING for no visible reason | Karpenter consolidation evicting a TaskManager (`failover-strategy: full` restarts all). Check that `karpenter.sh/do-not-disrupt` is on the running TaskManager pods |
@@ -801,10 +822,10 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 | Trino `FOR VERSION AS OF` fails on Paimon's export (fixed 2026-11-02) | Paimon's snapshot ids are small integers; Trino needs `FOR VERSION AS OF BIGINT '<id>'` |
 | A Trino setup error says only `command terminated with exit code 1` | Fixed 2026-11-02: `qb_trino_try` now prints the Trino CLI's own error line |
 | Spark compaction (removed; history, 2026-11-02) | Parallel GC's full-GC stalls dropped S3 streams ("Premature end of Content-Length"), and a rewrite that rewrote nothing still "committed". Both were fixed before the Spark job was replaced by the Flink one |
-| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` (runs up to `_v3r3`) | The Paimon 2.1 v3 export issue; the arm now reads native Paimon instead |
+| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` (runs before 2026-11-04) | The Paimon 2.1 v3 export issue; the arm now reads native Paimon instead |
 | A Glue `metadata_location` 404s mid-scan | Paimon's export and Iceberg keep only 3 previous metadata files. The benchmark reads pinned copies, so don't read live Glue paths during a test |
 | `run.sh start` refuses: Trino version | Run `./engine-deploy/deploy-trino.sh up` (Trino 484), or set `TRINO_VERSION_CHECK=0` |
-| `iceberg-maintain` RESTARTING, `OutOfMemoryError: Java heap space` in `Rewrite` | A large equality-delete backlog (it started late). TaskManager is 32 Gi by default (`TM_MEMORY`); start it with the writers (Step 5) |
+| A `cdc-compact-iceberg-<table>` run FAILED, `OutOfMemoryError` | A rewrite subtask holds a data file's equality-delete set: 1 slot per 32 Gi TaskManager (`ICEBERG_TM_SLOTS`, `TM_MEMORY`); `./compaction/run.sh logs iceberg <table>` |
 | Writers restart-loop with `Access denied for user 'cdcuser'` | The Secret does not hold cdcuser's current password (e.g. after a rotation): fix the Secret, then delete + create the writers |
 | Paimon JobManager exits 239, `OutOfMemoryError: Metaspace` | JobManager metaspace; both manifests set `jobmanager.memory.jvm-metaspace.size: 512m` |
 | After a failed test everything is still running | By design, the watcher only tears down after `runner-exit=0`. Fix it and re-run, or `SUITE=hot ./querybench/run.sh stop` |
@@ -816,9 +837,9 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 - 1 RDS MySQL 8.0.45 instance, db.r6i.4xlarge, 500 GB gp3 / 64,000 IOPS (binlog, CDC user), and 1 Secret (`mysql-credentials`)
 - ECR `emr-flink-cdc-paimon:7.14.0` and `duckdb-cdc-server:2.0.0`, both multi-arch; `trino-cdc:484-paimon-2.1.0` once the in-progress Paimon Trino image is pushed
 - EMR Flink operator 7.14.0 (Helm), the `ebs-sc` StorageClass, and Kyverno with the `flink-cdc-single-az` ClusterPolicy
-- 2 FlinkDeployments (`flink-cdc-paimon`, `flink-cdc-iceberg`), each 1 JobManager + 8 TaskManagers
+- 2 FlinkDeployments (`flink-cdc-paimon`, `flink-cdc-iceberg`), each 1 JobManager + 6 TaskManagers
 - StatefulSet `mysql-upsert-loadgen` (4 pods)
 - Deployment `flink-cdc-monitor`
 - Deployment `duckdb-warm-cdc` (81 cpu / 342 GiB, one m5.24xlarge), Helm release `trino` (9 workers + coordinator, per-pod gp3-fast cache volumes of 56 Gi), Jobs `cdc-qb-runner` / `cdc-qb-watch`
-- FlinkDeployment `iceberg-maintain` (Iceberg compaction, [iceberg-compaction/](iceberg-compaction/README.md))
+- Per snapshot test: up to 8 short-lived FlinkDeployments `cdc-compact-<fmt>-<table>` (compaction/), deleted when they succeed
 - Per table set: 2 Glue DBs × 4 tables; S3 warehouse, export, Flink state and log prefixes; `querybench-pins/` and `querybench-results/` session prefixes (job-monitor reports under `monitor/`)

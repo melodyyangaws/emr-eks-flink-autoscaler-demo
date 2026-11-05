@@ -380,7 +380,8 @@ def suite_section(suite, d, stamp):
         c = [int(x) for x in re.findall(r"QB_PIN_COMMIT_MS_\w+=(\d+)", txt)]
         if c:
             st["pin_span"] = (min(c), max(c))
-            st["pins"] = len(re.findall(r"^## pins ", txt, re.M))
+            # hot-interleave writes one "## pins" block per pass; snapshot.sh pins once, with no header
+            st["pins"] = len(re.findall(r"^## pins ", txt, re.M)) or 1
         det.append("<details><summary>%s: pins, gates and windows (%s)</summary>\n\n```" % (suite, os.path.basename(pf)))
         det += txt.rstrip("\n").split("\n")
         det.append("```\n</details>\n")
@@ -465,8 +466,10 @@ def ingest_section(ing, err):
     else:
         main3.append("Job-monitor reports not available for this window (reports were pod-local before the S3 upload "
                      "was added); next run. The table-metadata numbers below cover the same window.\n")
-    main3.append("Paimon merges re-written keys in its write buffer before committing, so its committed rows/s is "
-                 "lower than Iceberg's for the same input.\n")
+    main3.append("Rows/s is the ingest rate: the CDC sources' rate meter (`numRecordsOutPerSecond`). Both jobs read "
+                 "the same MySQL change stream, so equal rows/s means both kept up; a lower one means backpressure from "
+                 "its writers. What each format committed (Paimon merges re-written keys first, Iceberg writes every "
+                 "version plus a delete) is in the table-metadata section below.\n")
 
     # From the table metadata: what each format committed.
     main3.append("**From table metadata** (each table's commit history over the window)\n")
@@ -561,6 +564,43 @@ def ingest_section(ing, err):
     return main3 + main4, det, tot
 
 
+def compaction_section(work):
+    """compaction/run.sh's per-table JSONs (<STAMP>-<fmt>-<table>.json): per format and
+    table the newest run, plus the earlier attempts (a table re-run by hand after a
+    failure, as on _readonlytest 2026-11-05, keeps its failed attempts visible)."""
+    import glob
+    runs = {}
+    for f in sorted(glob.glob(os.path.join(work, "compaction", "*.json"))):
+        try:
+            r = json.load(open(f))
+        except Exception:
+            continue
+        r["_stamp"] = os.path.basename(f).split("-", 1)[0]
+        runs.setdefault((r.get("format", ""), (r.get("table") or "").split(".")[-1]), []).append(r)
+    if not runs:
+        return []
+    gib = lambda b: "%.2f" % ((b or 0) / 2**30)
+    stamps = sorted({r["_stamp"] for rs in runs.values() for r in rs})
+    L = ["### Compaction before the snapshot test (run%s %s)\n" % ("s" if len(stamps) > 1 else "", ", ".join(stamps)),
+         "`compaction/run.sh`, writers stopped: Paimon `sys.compact` full; Iceberg data files with deletes rewritten with them "
+         "applied and the delete files removed, then snapshots expired (12 h, keep 5). One row per table: its newest run; "
+         "earlier attempts in the last column.\n",
+         "| format | table | status | s | data files | GiB | rows in files | delete files | eq deletes | pos deletes | earlier attempts |",
+         "|---|---|---|---:|---|---|---|---|---:|---:|---|"]
+    for (fmt, table), rs in sorted(runs.items()):
+        rs.sort(key=lambda r: r["_stamp"])
+        r = rs[-1]
+        b, a = r.get("before", {}), r.get("after", {})
+        arrow = lambda k, fmt=lambda x: "{:,}".format(x or 0): "%s -> %s" % (fmt(b.get(k)), fmt(a.get(k))) if a else fmt(b.get(k))
+        earlier = "; ".join("%s %s (%s s%s)" % (e["_stamp"], e.get("status"), e.get("duration_s"),
+                                                ": " + e["error"][:60] if e.get("error") else "") for e in rs[:-1]) or "-"
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            fmt, table, r.get("status"), r.get("duration_s"),
+            arrow("data_files"), arrow("bytes", gib), arrow("records_in_files"), arrow("delete_files"),
+            "{:,}".format(b.get("equality_deletes") or 0), "{:,}".format(b.get("position_deletes") or 0), earlier))
+    return L + [""]
+
+
 def config_table(meta, ing, sts, fv):
     cfg = (ing or {}).get("config") or {}
     rows = []
@@ -586,14 +626,17 @@ def config_table(meta, ing, sts, fv):
         (meta.get("duckdb_image") or "pip").split("/")[-1], meta.get("duckdb_cpu", "?"), meta.get("duckdb_pod_memory", "?"),
         meta.get("trino_version") or "?", meta.get("trino_workers") or "?")))
     rows.append(("Table set", "Iceberg v%d%s: `%s` / `%s`; Paimon read %s" % (
-        fv, " (CDC_DB_SUFFIX `%s`)" % meta["cdc_db_suffix"] if meta.get("cdc_db_suffix") else "",
+        fv, " (SESSION_SUFFIX `%s`)" % meta["cdc_db_suffix"] if meta.get("cdc_db_suffix") else "",
         meta.get("iceberg_db", "?"), meta.get("paimon_db", "?"),
         "natively (DuckDB paimon_scan, Trino paimon connector)" if NATIVE[0] else "through its Iceberg export")))
     for s in sts:
         if s["ok"]:
             span = s.get("pin_span")
             rows.append(("%s run" % s["suite"].capitalize(), "`%s`, %d queries%s" % (
-                s["stamp"], s["queries"], ", %d pins %s to %s" % (s.get("pins", 0), hhmm(span[0]), hhmm(span[1])) if span else "")))
+                s["stamp"], s["queries"],
+                ("; %s, the pinned snapshots committed %s to %s" % (
+                    "%d pin sets (one per pass: warm-up + timed)" % s["pins"] if s.get("pins", 1) > 1 else "1 pin set (after the writers stopped)",
+                    hhmm(span[0]), hhmm(span[1]))) if span else "")))
     w = (ing or {}).get("window")
     if w:
         rows.append(("Ingest window", "%s to %s (%s)" % (w["from"], w["to"], w["how"])))
@@ -654,8 +697,7 @@ def headline(sts, tot, mon=None):
     mbs = lambda v: "-" if v is None else "%.1f MB/s" % (v / 1e6)
     if mp.get("rows_per_s_median") and mi.get("rows_per_s_median"):
         hb.append("Ingest throughput (job monitor, median of %d / %d reports): Paimon **%s rows/s, %s**; Iceberg "
-                  "**%s rows/s, %s**. Paimon merges re-written keys before committing, so its rows/s is lower for "
-                  "the same input." % (mp["reports"], mi["reports"], num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")),
+                  "**%s rows/s, %s** (rows/s = the CDC sources' rate meter, the ingest rate; bytes/s = committed)." % (mp["reports"], mi["reports"], num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")),
                                        num(mi["rows_per_s_median"]), mbs(mi.get("bytes_per_s_median"))))
         con.append("Ingest (job monitor): Paimon %s rows/s, %s; Iceberg %s rows/s, %s." % (
             num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")), num(mi["rows_per_s_median"]), mbs(mi.get("bytes_per_s_median"))))
@@ -729,10 +771,11 @@ def main():
          "(cdc-pipeline/querybench/); both engines of a format read the same pinned snapshot per table.\n" % paimon_name()]
     L += config_table(meta, ing, sts, fv)
     L += ["Known write-side differences (table settings are otherwise paired; querybench/README.md): Paimon writes "
-          "orders/order_items with one writer per bucket (32 fixed buckets up to _v3r3/_v3r1, dynamic buckets after), Iceberg's hash distribution sends each date partition "
-          "to ONE writer; Paimon compacts and expires snapshots inline, Iceberg only in its compaction job.\n", "---\n"]
+          "orders/order_items with one writer per bucket (16 per date partition), Iceberg's hash distribution sends each date partition "
+          "to ONE writer; Paimon compacts and expires snapshots inline; Iceberg is not compacted during ingest; both get one full "
+          "compaction (compaction/run.sh, run by the hot test's watcher) before the snapshot test.\n", "---\n"]
     L += ["## 1. Headline\n"] + ["- " + b for b in (hb or ["No suite results."])] + [""]
-    L += ["## 2. Query latency\n"] + lat
+    L += ["## 2. Query latency\n"] + compaction_section(a.work) + lat
     L += ing_main
     L += ["## Conclusions\n"] + ["%d. %s" % (n + 1, c) for n, c in enumerate(con)] + [""]
     if opn:

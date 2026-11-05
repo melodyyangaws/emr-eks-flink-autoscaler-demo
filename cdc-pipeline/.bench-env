@@ -15,21 +15,12 @@ unset _cdc_env_dir
 
 export NAMESPACE=emr-flink
 export ICEBERG_FORMAT_VERSION=3
-export CDC_DB_SUFFIX=_v3r1
+export SESSION_SUFFIX=_v3final
 
-# SESSION_SUFFIX names one round of query results: they go to
-# s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
-# and the summary to bench-results/QUERYBENCH-SUMMARY-<date><set tag><SESSION_SUFFIX>.md,
-# where <set tag> is CDC_DB_SUFFIX with - for _ (-v3; empty for the v2 set).
-# Empty or suffix represent the test round like -r2. 
-export SESSION_SUFFIX=""
-
-# The CDC tables, as ingest-deploy/flink-cdc-{paimon,iceberg}-sql.yaml write them. The query
-# benchmark reads the Iceberg tables only (querybench/README.md); FLINK_JOBS is
-# what it stops for the snapshot test.
+# The CDC tables' warehouses, as ingest-deploy/flink-cdc-{paimon,iceberg}-sql.yaml write
+# them; the query benchmark reads both formats.
 export PAIMON_WAREHOUSE="s3://${BUCKET_NAME}/paimon-warehouse"
 export ICEBERG_WAREHOUSE="s3://${BUCKET_NAME}/iceberg-warehouse"
-export FLINK_JOBS="flink-cdc-paimon flink-cdc-iceberg"
 
 # Trino: the version engine-deploy/deploy-trino.sh installs (chart
 # TRINO_CHART_VERSION, 1.45.0 = Trino 484), and the one querybench/run.sh
@@ -65,10 +56,11 @@ export GENERATOR_RESOURCES="statefulset/mysql-upsert-loadgen"
 # inline compaction AND snapshot expiry. PAIMON_WRITE_BUFFER_SIZE unset gives
 # 64mb (dimension) / 128mb (fact), = Iceberg's target file sizes. Changing any
 # of them needs a writer redeploy.
-export PAIMON_WRITE_ONLY=false
-export PAIMON_WRITE_BUFFER_SPILLABLE=true
+export PAIMON_WRITE_ONLY=true
+export PAIMON_WRITE_BUFFER_SPILLABLE=false
 # export PAIMON_WRITE_BUFFER_SIZE=256mb
 export S3A_MULTIPART_SIZE=16M S3A_MULTIPART_THRESHOLD=16M S3A_ACTIVE_BLOCKS=6
+
 
 export TRINO_WORKERS=9
 export TRINO_CACHE_VOLUME=56Gi

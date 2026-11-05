@@ -47,7 +47,14 @@ spec:
     # The UI and REST then show one vertex per chain, so per-operator record
     # counts come from operator-scoped metrics (monitoring/flink_cdc_monitor.py).
     # Fair-comparison variables: keep identical across both formats.
-    pipeline.operator-chaining.enabled: "true"
+    # OFF since 2026-11-06 (both jobs): on _readonlytest the Paimon job read the
+    # binlog catch-up ~2x slower than Iceberg with idle writers and no
+    # backpressure, pointing at the single binlog source subtask doing the
+    # chained per-row conversion (Calc -> ConstraintEnforcer -> Map to BinaryRow).
+    # Unchained, the source vertex is the reader alone, so its busyTimeMsPerSecond
+    # (job monitor: busiest source) isolates the reader; the cost is a serialized
+    # hop per edge (see above).
+    pipeline.operator-chaining.enabled: "false"
     pipeline.object-reuse: "true"
     pipeline.auto-watermark-interval: "1s"
     execution.checkpointing.interval: "60s"
@@ -73,12 +80,12 @@ spec:
     heartbeat.timeout: "180s"
     heartbeat.interval: "20s"
     heartbeat.rpc-failure-threshold: "10"
-    # Every state path carries the CDC_DB_SUFFIX placeholder (_v3 by default),
+    # Every state path carries the SESSION_SUFFIX placeholder (_v3 by default),
     # as do the Glue database names below, so each table set (the v3 default,
     # or the unsuffixed v2 set) starts from its own state and never restores a
     # checkpoint, savepoint or HA pointer written against the other's tables.
-    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/checkpoints/
-    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/savepoints/
+    state.checkpoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${SESSION_SUFFIX}/checkpoints/
+    state.savepoints.dir: s3p://${BUCKET_NAME}/flink/cdc-paimon${SESSION_SUFFIX}/savepoints/
     # Restart Strategy
     # 'full', not 'region'. region restarts only the failed pipelined region, and
     # on this graph each of the 16 source subtasks is its own region — so when
@@ -137,7 +144,9 @@ spec:
     # if it cannot keep it deployed — which is what we want to see, loudly, instead
     # of a silent stall. Keep in sync with Iceberg: this is a fair-comparison knob.
     jobmanager.scheduler: default
-    taskmanager.numberOfTaskSlots: "4"
+    # 2, not 4 (2026-11-04): at 4 slots the Paimon writer heap-OOMed every ~2 min in
+    # the initial snapshot (a TaskManager at 23 of 26 GB heap). Same for both jobs.
+    taskmanager.numberOfTaskSlots: "2"
     # TaskManager heap. The CDC deserializer OOMed at the previous sizing
     # ("OutOfMemoryError: Java heap space" inside RowDataDebeziumDeserializeSchema
     # -> TemporalConversions.toLocalDateTime -> Instant.parse), which took the TM
@@ -174,7 +183,7 @@ spec:
 
   jobManager:
     highAvailabilityEnabled: true
-    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon${CDC_DB_SUFFIX}/ha/
+    storageDir: s3://${BUCKET_NAME}/flink/cdc-paimon${SESSION_SUFFIX}/ha/
     replicas: 1
     resource:
       memory: 8Gi
@@ -226,10 +235,10 @@ spec:
           # (e.g. a hive-site/core-site property the Glue factory reads), not here.
           - name: AWS_DEFAULT_REGION
             value: "${AWS_REGION}"
-          # CDC_DB_SUFFIX keeps a v3 (or any other) run in its own database:
+          # SESSION_SUFFIX keeps a v3 (or any other) run in its own database:
           # an existing table cannot change format version.
           - name: GLUE_DATABASE
-            value: "flink_paimon_db${CDC_DB_SUFFIX}"
+            value: "flink_paimon_db${SESSION_SUFFIX}"
           # Write path (INSERT hints) and S3A upload shape (catalog options);
           # set in build-deploy-generic.sh check_env_vars.
           - name: PAIMON_WRITE_ONLY
@@ -268,7 +277,7 @@ spec:
           # connected first when a second one reuses its id. See the server-id
           # note in sql-scripts/common/02-cdc-sources.sql.
           #
-          # Each range is 32 wide to cover parallelism: 32 below — the connector
+          # Each range is 32 wide, covering parallelism 24 below with room to raise it — the connector
           # hands one id per source subtask, so a range narrower than the
           # parallelism makes subtasks share ids and evict each other.
           - name: CDC_SERVER_ID_CUSTOMERS
@@ -316,13 +325,14 @@ spec:
       - "--checkpoint-interval"
       - "60s"
       - "--parallelism"
-      - "32"
-    parallelism: 32
+      - "12"
+    # 12 (32 until 2026-11-04, then 16, then 24 until 2026-11-05): 6 TaskManagers x 2 slots. Keep both jobs equal.
+    parallelism: 12
     upgradeMode: last-state
 
   monitoringConfiguration:
     s3MonitoringConfiguration:
-      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon${CDC_DB_SUFFIX}
+      logUri: s3://${BUCKET_NAME}/flink/logs/cdc-paimon${SESSION_SUFFIX}
     sideCarResources:
       limits:
         cpuLimit: 500m

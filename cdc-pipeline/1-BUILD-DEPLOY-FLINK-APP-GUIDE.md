@@ -17,7 +17,7 @@ by editing SQL on S3, with no image rebuild.
 >    `kubectl apply` over a live FlinkDeployment is not enough. See
 >    [Step 7](#step-7--re-deploy-after-a-change).
 > 3. Table options apply **at CREATE TABLE only**. New sink settings need a fresh
->    table set, which means a new `CDC_DB_SUFFIX`.
+>    table set, which means a new `SESSION_SUFFIX`.
 
 **This is the reference for the writers.** The step-by-step run (settings, table
 set, writers, generator, tests, summary, teardown) is [README.md](README.md);
@@ -76,7 +76,7 @@ cdc-pipeline/
   │   │   ├── paimon/{01-catalog-setup,03-paimon-sinks,04-cdc-pipelines}.sql
   │   │   └── iceberg/{01-catalog-setup,03-iceberg-sinks,04-cdc-pipelines}.sql
   │   └── k8s/                         ← ebs-sc StorageClass, Kyverno single-AZ policy
-  ├── iceberg-compaction/              ← iceberg-maintain: continuous Iceberg compaction (maintain.py)
+  ├── compaction/                     ← one-off compaction of both formats before the snapshot test
   ├── mysql-data-generator/            ← upsert load generator (StatefulSet)
   ├── monitoring/                      ← job monitor
   ├── engine-deploy/                   ← query engines: DuckDB warm server, Trino
@@ -191,19 +191,19 @@ jobs `build`, `render`, `deploy` and `all` touch.
 | Variable | Default | Effect |
 |---|---|---|
 | `ICEBERG_FORMAT_VERSION` | `3` | Iceberg sink `format-version` and Paimon `metadata.iceberg.format-version`. Must be `2` or `3` |
-| `CDC_DB_SUFFIX` | If unset: the value in `.bench-env`, else `_v3` | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). Must be empty or match `_[a-z0-9]+` |
+| `SESSION_SUFFIX` | If unset: the value in `.bench-env`, else empty. Free text, under 100 characters; names the round only | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). Must be empty or match `_[a-z0-9]+` |
 | `PAIMON_DV_BITMAP64` | Derived, not a setting: `true` if and only if `ICEBERG_FORMAT_VERSION=3` | Paimon `deletion-vectors.bitmap64` |
 
-An explicit `CDC_DB_SUFFIX=` (set but empty) selects the original unsuffixed v2 set:
+An explicit `SESSION_SUFFIX=` (set but empty) selects the original v2 set without a session suffix:
 
 ```bash
-ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./ingest-deploy/build-deploy-generic.sh render
+ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX= ./ingest-deploy/build-deploy-generic.sh render
 ```
 
 Table sets never share tables or Flink state, so one set never restores another's
 checkpoint, as long as the HA ConfigMaps are cleared when you switch
 ([Step 7](#step-7--re-deploy-after-a-change)). The query benchmark and the monitor
-read `CDC_DB_SUFFIX` from the same `.bench-env`. Change it there, not on one command
+read `SESSION_SUFFIX` from the same `.bench-env`. Change it there, not on one command
 line.
 
 ---
@@ -347,7 +347,7 @@ submission, so re-deploy ([Step 7](#step-7--re-deploy-after-a-change)).
 2. Check the configuration block the script prints:
 
    ```
-   DB/state suffix:  _v3r4
+   DB/state suffix:  <suffix>
    Paimon DV 64-bit: true
    Iceberg format:    v3
    ```
@@ -400,7 +400,7 @@ placeholders:
 | `${EMR_VERSION}` | `$EMR_VERSION`, else `7.14.0` (base image and `emrReleaseLabel`) |
 | `${IMAGE_TAG}` | `$IMAGE_TAG`, else `$EMR_VERSION` |
 | `${ICEBERG_FORMAT_VERSION}` | see [Step 2](#which-table-set-a-run-writes) |
-| `${CDC_DB_SUFFIX}` | see Step 2. Used in `GLUE_DATABASE` (hardcoded per manifest as `flink_<format>_db${CDC_DB_SUFFIX}`) and in every state and log path |
+| `${SESSION_SUFFIX}` | see Step 2. Used in `GLUE_DATABASE` (hardcoded per manifest as `flink_<format>_db${SESSION_SUFFIX}`) and in every state and log path |
 | `${PAIMON_DV_BITMAP64}` | derived from `ICEBERG_FORMAT_VERSION` |
 | `${MYSQL_PORT}`, `${MYSQL_DATABASE}` | `3306`, `ecommerce` (`.bench-env`). Host, user and password are not rendered: the pods read them from Secret `mysql-credentials` (`envFrom`) |
 | `${MYSQL_ENV_SECRET_NAME}` | `mysql-credentials` |
@@ -409,7 +409,7 @@ placeholders:
 The script stops if a `${...}` placeholder is left, or if any env `value: ""` is
 rendered. An empty region would otherwise render as a blank value that Kubernetes
 accepts, and the job would die minutes later with a heartbeat timeout that does not
-name the missing variable. An empty `CDC_DB_SUFFIX` never trips the check, because it
+name the missing variable. An empty `SESSION_SUFFIX` never trips the check, because it
 only appears inside non-empty values.
 
 `MYSQL_PASSWORD` is never substituted. `envFrom` is used instead of
@@ -421,7 +421,7 @@ an empty `value: ""` next to `valueFrom`, which the API rejects.
 ## Step 7 — Re-deploy after a change
 
 Use this for any change: template, rendered variable, SQL, executor, or a new
-`CDC_DB_SUFFIX`. `upgradeMode: last-state` restores a running job from its last
+`SESSION_SUFFIX`. `upgradeMode: last-state` restores a running job from its last
 checkpoint and ignores most spec changes. The operator also stages `jarURI` only
 when a CR is created: an `apply` over an existing CR leaves `/opt/flink/usrlib`
 empty.
@@ -449,7 +449,7 @@ empty.
 4. Clear the HA ConfigMaps. They hold the job graph and leader pointer. If one
    survives, the new JobManager recovers the **old** job graph, and the change is
    silently ignored. They are named by cluster id, not by table set, so a leftover
-   one also points a new `CDC_DB_SUFFIX` at the old set's HA state.
+   one also points a new `SESSION_SUFFIX` at the old set's HA state.
 
    ```bash
    kubectl get configmap -n emr-flink | grep -E 'flink-cdc-(paimon|iceberg)'
@@ -493,7 +493,7 @@ fixed by `metadata.iceberg.previous-versions-max = 3` in the table settings belo
 
 `ingest-deploy/sql-scripts/{paimon,iceberg}/03-*-sinks.sql` pair every setting both formats have.
 They apply to **newly created tables only** (`CREATE TABLE IF NOT EXISTS` leaves an
-existing table alone), so they take effect with a fresh `CDC_DB_SUFFIX`.
+existing table alone), so they take effect with a fresh `SESSION_SUFFIX`.
 
 | Setting | Paimon (`03-paimon-sinks.sql`) | Iceberg (`03-iceberg-sinks.sql`) |
 |---|---|---|
@@ -508,7 +508,7 @@ existing table alone), so they take effect with a fresh `CDC_DB_SUFFIX`.
 | Changelog | `changelog-producer = none` (nothing reads one, and Iceberg writes none) | none written |
 | Iceberg format version | `metadata.iceberg.format-version = ${ICEBERG_FORMAT_VERSION}` | `format-version = ${ICEBERG_FORMAT_VERSION}` |
 
-Paimon-only settings without an Iceberg counterpart: dynamic buckets (no `bucket` option; `bucket = 32` until 2026-11-04),
+Paimon-only settings without an Iceberg counterpart: `bucket` 8 (dimension tables) / 4 per date partition (fact tables), `bucket = 32` until 2026-11-04,
 `deletion-vectors.enabled = true`, `deletion-vectors.bitmap64 = ${PAIMON_DV_BITMAP64}`,
 `write-buffer-size` / `write-buffer-spillable`, `num-sorted-run.compaction-trigger = 4`,
 `snapshot.expire.execution-mode = async`, `sink.writer-coordinator.enabled = true`,
@@ -530,7 +530,7 @@ variables.
 |---|---|
 | JobManager | 1 replica, `highAvailabilityEnabled: true`, 8 Gi / 4 cpu, `driver-nodepool`, on-demand |
 | TaskManager | 32 Gi / 8 cpu, `taskmanager.numberOfTaskSlots: 4`, `executor-memorynodepool`, on-demand, annotated `karpenter.sh/do-not-disrupt: "true"` |
-| Job parallelism | 32 (`job.parallelism` and `--parallelism 32`), so 8 TMs per job |
+| Job parallelism | 24 (`job.parallelism` and `--parallelism 24`; 32 until 2026-11-04, then 16), so 6 TMs per job |
 | `parallelism.default` / `pipeline.max-parallelism` | 4 / 128 |
 | Operator chaining / object reuse | on / on |
 | `taskmanager.memory.managed.fraction` | 0.1. Managed memory was RocksDB's, and the state backend is now `hashmap`, so it goes to task heap. The CDC deserializer OOMed inside `RowDataDebeziumDeserializeSchema` at the original sizing |
@@ -557,7 +557,7 @@ Notes on the less obvious ones:
   adaptive buys nothing.
 - **`server-id` ranges must not overlap.** Both jobs read the same RDS instance, and
   MySQL evicts the first binlog client when a second one reuses its id. Each range
-  is 32 wide to cover parallelism 32.
+  is 32 wide, covering parallelism 24 with room to raise it.
 
 ---
 
@@ -670,7 +670,7 @@ and re-deploy ([Step 7](#step-7--re-deploy-after-a-change)).
 
 Do the full [Step 7](#step-7--re-deploy-after-a-change), including the HA
 ConfigMap check. Table options are CREATE-time only: an existing table keeps its old
-options, so use a new `CDC_DB_SUFFIX` for new sink settings.
+options, so use a new `SESSION_SUFFIX` for new sink settings.
 
 ### Job cycles RUNNING → RESTARTING → CREATED → RUNNING
 
@@ -722,7 +722,7 @@ the JM log names the cause.
   load generator: inserts, upserts and, since 2026-11-03, DELETEs on orders /
   order_items. The mixed generator was removed on 2026-11-02.
 - **Monitor the pipelines**: [Monitor Guide](./3-MONITOR.md)
-- **Compact the Iceberg tables**: [iceberg-compaction/README.md](./iceberg-compaction/README.md)
+- **Compact the tables** (before the snapshot test): `compaction/run.sh`, [README Step 10](./README.md#step-10-snapshot-test-writers-stopped-cold-start)
 - **Query the tables**: [Query benchmark, DuckDB vs Trino](./querybench/README.md);
   Athena (v2 sets only) in [README, Athena](./README.md#athena)
 

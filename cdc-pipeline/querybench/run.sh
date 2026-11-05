@@ -22,20 +22,23 @@
 #                                              bench-results/QUERYBENCH-SUMMARY-<session>.md
 #
 # Results: the runner uploads its bench-results/ to
-# s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/
-# (set tag: .bench-env's CDC_DB_SUFFIX with - for _, e.g. _v3r1 -> -v3r1).
+# s3://$BUCKET_NAME/querybench-results/cdc-session<set tag>/<STAMP>-<suite>/
+# (set tag: .bench-env's SESSION_SUFFIX with - for _, e.g. _v3r1 -> -v3r1).
 #
 # `start`, in order (any failure stops it before a Job is created):
 #   0. waits while cdc-qb-runner still runs (FORCE=1: replace it); refuses while
 #      throughput-benchmark's qb-runner runs (same cluster and bucket);
 #   1. waits for the old cdc-qb-watch to finish its shutdown, then deletes it;
-#   2. snapshot: scales the generator to 0, waits WRITER_DRAIN_S (180) for the
+#   2. snapshot: refuses unless the hot watcher's compaction is over and every
+#      format/table has an OK result newer than the latest hot run
+#      (check_compaction_done; REQUIRE_COMPACTION=0 skips it), scales the generator to 0, waits WRITER_DRAIN_S (180) for the
 #      writers to read the binlog tail and until each completed a checkpoint >= 60 s
 #      after the generator stopped (qb_wait_writers_committed; refuses otherwise),
 #      suspends both writers, resolves
 #      SNAPSHOT_DT (newest closed date in both fact tables of every format);
-#      The Iceberg tables are measured as the writers and iceberg-maintain left
-#      them (no pre-test compaction; the summary reports their file/delete counts);
+#      (No compaction here: the hot test's watcher runs the one-off compaction
+#      of both formats right after its teardown, and step 1 waits for that
+#      watcher, as long as a cdc-compact-* job runs.)
 #   3. engines up: duckdb-warm-cdc (engine-deploy/deploy-duckdb-cdc.sh up if it
 #      does not answer /health) and Trino (engine-deploy/deploy-trino.sh up if
 #      fewer than TRINO_WORKERS workers are active);
@@ -49,17 +52,17 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
-PASS_VARS="STAMP SESSION_SUFFIX RUNS WARMUP SNAPSHOT_RUNS ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS
+PASS_VARS="STAMP RUNS WARMUP SNAPSHOT_RUNS ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS HOT_LAG_SECONDS HOT_COMMIT_MARGIN_S HOT_COMMIT_TABLES HOT_REPIN
 STABLE_CHECKS WAIT_COMMIT_S LOOKUP_ORDER_ID LOOKUP_ORDER_DT QB_QUERY_WRITERS
 SNAPSHOT_DT S_FROM S_TO SNAPSHOT_SLICE_MINUTES SNAPSHOT_SLICE_MARGIN_S
-WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB STOP_COMPACTION_CRON
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB COMPACT_AFTER_HOT COMPACT_TABLES COMPACT_PARALLELISM COMPACT_TIMEOUT_S ICEBERG_BIG_TM_TABLES ICEBERG_BIG_TM_MEMORY
 HOT_QUERY_TIMEOUT_S SNAPSHOT_QUERY_TIMEOUT_S MAX_RESULT_ROWS
 ENGINE_GATE_TIMEOUT_S
 QB_RESULTS_PREFIX_RUN TRINO_VERSION TRINO_WORKERS TRINO_USER TRINO_CATALOG CLEAR_COORDINATOR"
 # Passed even when set to an empty value: the pod's .bench-env has non-empty
-# defaults for them (the v3 set), so `CDC_DB_SUFFIX= ...` must reach the pod as such.
-PASS_VARS_EMPTY_OK="ICEBERG_FORMAT_VERSION CDC_DB_SUFFIX DUCKDB_IMAGE"
+# defaults for them (the v3 set), so `SESSION_SUFFIX= ...` must reach the pod as such.
+PASS_VARS_EMPTY_OK="ICEBERG_FORMAT_VERSION SESSION_SUFFIX DUCKDB_IMAGE"
 RUNNER=cdc-qb-runner
 WATCHER=cdc-qb-watch
 DUCK="$DUCKDB_NAME"
@@ -92,9 +95,9 @@ render_job() {   # <name> -> its -deployed.yaml path
 
 bundle() {   # <tgz>
     COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude='*-deployed.yaml' --exclude='__pycache__' \
-        -C "$CDC_DIR" -czf "$1" querybench lib engine-deploy .bench-env .qb-runner-cmd.sh 2>/dev/null \
+        -C "$CDC_DIR" -czf "$1" querybench lib engine-deploy compaction .bench-env .qb-runner-cmd.sh 2>/dev/null \
     || COPYFILE_DISABLE=1 tar --exclude='*-deployed.yaml' --exclude='__pycache__' \
-        -C "$CDC_DIR" -czf "$1" querybench lib engine-deploy .bench-env .qb-runner-cmd.sh
+        -C "$CDC_DIR" -czf "$1" querybench lib engine-deploy compaction .bench-env .qb-runner-cmd.sh
 }
 
 start_job() {   # <name> <step>
@@ -133,13 +136,61 @@ wait_for_runner() {
 }
 
 wait_for_watcher() {
-    local deadline=$(( $(date +%s) + ${WATCH_INTERVAL_S:-600} + 900 ))
+    local deadline=$(( $(date +%s) + ${WATCH_INTERVAL_S:-300} + 1200 ))
     while job_active "$WATCHER"; do
         [[ "${FORCE:-0}" == 1 ]] && { warn "FORCE=1: deleting ${WATCHER} before its shutdown"; return 0; }
+        # The hot watcher's one-off compaction (compaction/run.sh, cdc-compact-*)
+        # can take hours: wait for it, the deadline only bounds the teardown.
+        if kubectl get flinkdeployment -n "$NAMESPACE" -o name 2>/dev/null | grep -q '/cdc-compact-'; then
+            deadline=$(( $(date +%s) + 1200 ))
+            log "${WATCHER} is compacting before the snapshot test ($("${CDC_DIR}/compaction/run.sh" status 2>/dev/null | tr -s ' ' | paste -sd ';' -)); waiting (every 60 s)"
+            sleep 60; continue
+        fi
         (( $(date +%s) < deadline )) || { warn "${WATCHER} still running; deleting it"; return 0; }
         log "${WATCHER} is still shutting the last test down; waiting (every 30 s)"
         sleep 30
     done
+}
+
+# The snapshot test reads what the hot watcher's one-off compaction left, so it
+# starts only once that compaction is over and every table compacted OK: on
+# _readonlytest (2026-11-05) the start went ahead after the watcher finished
+# although Iceberg orders had FAILED, order_items was never run, and a
+# restarted cdc-compact-iceberg-orders was still rewriting. Waits while a
+# cdc-compact-* FlinkDeployment is not FAILED/FINISHED (COMPACT_WAIT_TIMEOUT_S,
+# 14400); refuses if one FAILED (fix it, ./compaction/run.sh down, re-run the
+# table) or if any format/table of COMPACT_TABLES has no OK result newer than
+# the latest hot run. REQUIRE_COMPACTION=0 skips the check.
+check_compaction_done() {
+    [[ "${REQUIRE_COMPACTION:-1}" == 0 ]] && { warn "REQUIRE_COMPACTION=0: not checking the pre-snapshot compaction"; return 0; }
+    local deadline=$(( $(date +%s) + ${COMPACT_WAIT_TIMEOUT_S:-14400} )) busy failed hot res missing="" f t
+    while :; do
+        busy=""; failed=""
+        while read -r n st; do
+            [[ -n "$n" ]] || continue
+            case "$st" in FAILED) failed+=" ${n}" ;; FINISHED) ;; *) busy+=" ${n}(${st:-starting})" ;; esac
+        done < <(kubectl get flinkdeployment -n "$NAMESPACE" --no-headers \
+                    -o custom-columns='N:.metadata.name,S:.status.jobStatus.state' 2>/dev/null | grep '^cdc-compact-')
+        [[ -n "$failed" ]] && die "compaction FAILED:${failed} (./compaction/run.sh logs <fmt> <table>; fix, ./compaction/run.sh down, re-run the table; REQUIRE_COMPACTION=0 skips this check)"
+        [[ -z "$busy" ]] && break
+        (( $(date +%s) < deadline )) || die "compaction still running after ${COMPACT_WAIT_TIMEOUT_S:-14400}s:${busy}"
+        log "compaction still running:${busy}; waiting (every 60 s)"
+        sleep 60
+    done
+    res="s3://${BUCKET_NAME}/${QB_RESULTS_PREFIX}/compaction/"
+    hot=$(aws s3 ls "s3://${BUCKET_NAME}/${QB_RESULTS_PREFIX}/" 2>/dev/null | sed -n 's|.* PRE \([0-9]\{8\}T[0-9]\{6\}Z\)-hot/$|\1|p' | sort | tail -1)
+    for f in paimon iceberg; do
+        for t in ${COMPACT_TABLES:-customers products orders order_items}; do
+            # newest result of this format/table (stamps sort as text), newer than the hot run
+            local key ok
+            key=$(aws s3 ls "$res" 2>/dev/null | awk '{print $4}' | grep -E "^[0-9]{8}T[0-9]{6}Z-${f}-${t}\.json$" | sort | tail -1)
+            if [[ -z "$key" || ( -n "$hot" && "${key%%-*}" < "$hot" ) ]]; then missing+=" ${f}/${t}(no run after hot ${hot:-?})"; continue; fi
+            ok=$(aws s3 cp --only-show-errors "${res}${key}" - 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null)
+            [[ "$ok" == OK ]] || missing+=" ${f}/${t}(${key%%-*} ${ok:-unreadable})"
+        done
+    done
+    [[ -z "$missing" ]] || die "pre-snapshot compaction incomplete:${missing}; re-run those tables (./compaction/run.sh run <fmt> with COMPACT_TABLES=...) or REQUIRE_COMPACTION=0"
+    log "compaction OK: every table of both formats compacted after the hot run ${hot:-?}"
 }
 
 duckdb_health() {
@@ -206,7 +257,7 @@ monitor_up() {
     uri=$(kubectl get configmap flink-cdc-monitor-config -n "$NAMESPACE" -o jsonpath='{.data.REPORT_S3_URI}' 2>/dev/null || true)
     if ! kubectl get deployment "$m" -n "$NAMESPACE" >/dev/null 2>&1 || [[ "$db" != "$ICEBERG_DB" || -z "$uri" ]]; then
         echo "  job monitor: (re)deploying (db '${db:-none}', report copy '${uri:-none}'; want ${ICEBERG_DB} + S3)"
-        CDC_DB_SUFFIX="$CDC_DB_SUFFIX" SESSION_SUFFIX="$SESSION_SUFFIX" "${CDC_DIR}/monitoring/deploy-monitor.sh" >/dev/null \
+        SESSION_SUFFIX="$SESSION_SUFFIX" "${CDC_DIR}/monitoring/deploy-monitor.sh" >/dev/null \
             || warn "job monitor deploy failed: the summary will have no checkpoint / backpressure / events-consumed rows"
     elif kubectl scale "deployment/${m}" -n "$NAMESPACE" --replicas=1 >/dev/null; then
         echo "  job monitor: ${m} scaled to 1 (reports to ${uri})"
@@ -239,7 +290,7 @@ cmd_start() {
     wait_for_runner                                                          # 0
     wait_for_watcher; delete_job "$WATCHER"                                  # 1
     if [[ "$SUITE" == snapshot ]]; then                                      # 2
-        "${CDC_DIR}/iceberg-compaction/run-maintain.sh" suspend   # tables fixed for the pins
+        check_compaction_done                                                # the hot watcher's compaction is over and OK
         gen_stopped_at=$(date +%s)
         qb_stop_generator
         qb_wait_writers_committed "$gen_stopped_at" || die "a writer did not commit after the generator stopped (see above): its tables would not match MySQL"
@@ -248,12 +299,7 @@ cmd_start() {
         echo "  snapshot partition: ${SNAPSHOT_DT}"
     fi
     if [[ "$SUITE" == hot ]]; then                                           # 2c
-        wait_writers_up "${WRITERS_UP_S:-900}"                               # writers 15 min up before the engines
-        if kubectl get flinkdeployment iceberg-maintain -n "$NAMESPACE" >/dev/null 2>&1; then   # continuous compaction during the hot test
-            "${CDC_DIR}/iceberg-compaction/run-maintain.sh" resume     # patch only: an apply over a live CR empties usrlib
-        else
-            "${CDC_DIR}/iceberg-compaction/run-maintain.sh" up
-        fi
+        wait_writers_up "${WRITERS_UP_S:-1800}"                              # writers 30 min up before the engines
         monitor_up                                                           # job-monitor reports for the summary
     fi
     for e in $ENGINES; do                                                    # 3
@@ -316,8 +362,8 @@ cmd_render() {
 }
 
 cmd_status() {
-    echo "== session: SESSION_SUFFIX='${SESSION_SUFFIX}' results: s3://\$BUCKET_NAME/${QB_RESULTS_PREFIX}/"
-    echo "== table set: Iceberg v${ICEBERG_FORMAT_VERSION} CDC_DB_SUFFIX='${CDC_DB_SUFFIX}' (${ICEBERG_DB}, ${PAIMON_DB}); engines $(qb_engines); formats $(qb_formats)"
+    echo "== session: results s3://\$BUCKET_NAME/${QB_RESULTS_PREFIX}/"
+    echo "== table set: Iceberg v${ICEBERG_FORMAT_VERSION} SESSION_SUFFIX='${SESSION_SUFFIX}' (${ICEBERG_DB}, ${PAIMON_DB}); engines $(qb_engines); formats $(qb_formats)"
     echo "== writers:";   kubectl get flinkdeployment $FLINK_JOBS -n "$NAMESPACE" -o custom-columns='  NAME:.metadata.name,SPEC:.spec.job.state,JOB:.status.jobStatus.state' --no-headers 2>/dev/null || echo "  none"
     echo "== generator: $(qb_generator_state)"
     echo "== ${DUCK}: $(duckdb_health | cut -c1-160)"
@@ -371,9 +417,10 @@ cmd_summary() {
         [[ -z "$hot" ]] || aws s3 sync --only-show-errors "${S}/${hot}-hot/" "$T/hot/"
         snap="${SNAPSHOT_STAMP:-$(latest snapshot)}"
         [[ -z "$snap" ]] || aws s3 sync --only-show-errors "${S}/${snap}-snapshot/" "$T/snapshot/"
+        aws s3 sync --only-show-errors "${S}/compaction/" "$T/compaction/" 2>/dev/null || true   # compaction/run.sh results
         [[ -n "$hot$snap" ]] || die "no runs under ${QB_RESULTS_PREFIX}/"
     fi
-    session="${SESSION:-$(echo "${hot:-${snap:-$(date -u +%Y%m%d)}}" | cut -c1-8)${CDC_SET_TAG}${SESSION_SUFFIX}}"
+    session="${SESSION:-$(echo "${hot:-${snap:-$(date -u +%Y%m%d)}}" | cut -c1-8)${CDC_SET_TAG}}"
     out="${CDC_DIR}/bench-results/QUERYBENCH-SUMMARY-${session}.md"
     mkdir -p "${CDC_DIR}/bench-results"
     # Raw ingest numbers go to S3 next to the run's other results (throughput's

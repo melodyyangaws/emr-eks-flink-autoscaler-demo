@@ -39,11 +39,11 @@
 --   - DuckDB 2.0 (iceberg extension): reads v3 DVs.
 --   - Athena engine v3: Iceberg v2 only.
 -- v3 is the default on this branch; its default table set is a fresh
--- CDC_DB_SUFFIX=_v3 database. Use ICEBERG_FORMAT_VERSION=2 (with a matching
+-- SESSION_SUFFIX=_v3 database. Use ICEBERG_FORMAT_VERSION=2 (with a matching
 -- database) where StarRocks' Iceberg reader or Athena must read these tables.
 --
 -- format-version applies at table creation only. Changing it here does not alter
--- tables that already exist; use a fresh database (CDC_DB_SUFFIX, e.g. _v3 ->
+-- tables that already exist; use a fresh database (SESSION_SUFFIX, e.g. _v3 ->
 -- flink_iceberg_db_v3) or drop the four tables (and their S3 warehouse prefix
 -- + Glue entries) before this DDL takes effect.
 --
@@ -64,7 +64,7 @@
 --
 -- Environment variables:
 --   GLUE_DATABASE: default flink_iceberg_db; the manifest sets
---     flink_iceberg_db + CDC_DB_SUFFIX
+--     flink_iceberg_db + SESSION_SUFFIX
 --   ICEBERG_FORMAT_VERSION: 3 (default) or 2
 -- ============================================================================
 
@@ -99,9 +99,9 @@ CREATE TABLE IF NOT EXISTS customers (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
-    -- Paimon's target-file-size.
-    'write.target-file-size-bytes' = '67108864',
+    -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
+    -- was 64 / 128), paired with Paimon's target-file-size.
+    'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -114,7 +114,12 @@ CREATE TABLE IF NOT EXISTS customers (
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '3',
+    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
+    -- and reads it again while the writers keep committing every 60 s needs it
+    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
+    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
+    -- 404. 100 covers ~100 min of commits; still deleted after.
+    'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
@@ -148,9 +153,9 @@ CREATE TABLE IF NOT EXISTS products (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
-    -- Paimon's target-file-size.
-    'write.target-file-size-bytes' = '67108864',
+    -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
+    -- was 64 / 128), paired with Paimon's target-file-size.
+    'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -163,7 +168,12 @@ CREATE TABLE IF NOT EXISTS products (
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '3',
+    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
+    -- and reads it again while the writers keep committing every 60 s needs it
+    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
+    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
+    -- 404. 100 covers ~100 min of commits; still deleted after.
+    'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
@@ -198,9 +208,9 @@ CREATE TABLE IF NOT EXISTS orders (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 128 MB on the fact tables (64 MB on customers/products), paired with
-    -- Paimon's target-file-size.
-    'write.target-file-size-bytes' = '134217728',
+    -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
+    -- was 128 / 64), paired with Paimon's target-file-size.
+    'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -213,7 +223,12 @@ CREATE TABLE IF NOT EXISTS orders (
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '3',
+    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
+    -- and reads it again while the writers keep committing every 60 s needs it
+    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
+    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
+    -- 404. 100 covers ~100 min of commits; still deleted after.
+    'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
@@ -247,9 +262,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 128 MB on the fact tables (64 MB on customers/products), paired with
-    -- Paimon's target-file-size.
-    'write.target-file-size-bytes' = '134217728',
+    -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
+    -- was 128 / 64), paired with Paimon's target-file-size.
+    'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
     -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
@@ -262,7 +277,12 @@ CREATE TABLE IF NOT EXISTS order_items (
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '3',
+    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
+    -- and reads it again while the writers keep committing every 60 s needs it
+    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
+    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
+    -- 404. 100 covers ~100 min of commits; still deleted after.
+    'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.

@@ -18,11 +18,11 @@ data:
   PAIMON_FLINK_URL: "http://flink-cdc-paimon-rest:8081"
   ICEBERG_FLINK_URL: "http://flink-cdc-iceberg-rest:8081"
   AWS_REGION: "${AWS_REGION}"
-  # CDC_DB_SUFFIX (cdc-pipeline/.bench-env; empty, or e.g. _v3 for the Iceberg
+  # SESSION_SUFFIX (cdc-pipeline/.bench-env; empty, or e.g. _v3 for the Iceberg
   # v3 table set): the Glue databases the Flink jobs write, and so the Paimon
   # warehouse path <db>.db/ the monitor scans.
-  PAIMON_GLUE_DB: "flink_paimon_db${CDC_DB_SUFFIX}"
-  ICEBERG_GLUE_DB: "flink_iceberg_db${CDC_DB_SUFFIX}"
+  PAIMON_GLUE_DB: "flink_paimon_db${SESSION_SUFFIX}"
+  ICEBERG_GLUE_DB: "flink_iceberg_db${SESSION_SUFFIX}"
   # Paimon native warehouse root — S3 scan reads <db>.db/<table>/snapshot/ and bucket-N/
   PAIMON_WAREHOUSE: "s3://${BUCKET_NAME}/paimon-warehouse"
   ICEBERG_WAREHOUSE: "s3://${BUCKET_NAME}/iceberg-warehouse/"
@@ -44,7 +44,7 @@ data:
   # the copy the reports are lost. querybench/run.sh summary reads them back by
   # time window. The IRSA role behind starrocks-sa may write the bucket
   # (iam simulate-principal-policy s3:PutObject: allowed). Empty = local only.
-  REPORT_S3_URI: "s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}${SESSION_SUFFIX}/monitor/"
+  REPORT_S3_URI: "s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}/monitor/"
 ---
 apiVersion: apps/v1
 kind: Deployment

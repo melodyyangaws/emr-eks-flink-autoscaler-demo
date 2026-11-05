@@ -30,7 +30,7 @@
 -- 'format-version' on the native Iceberg tables (../iceberg/03-iceberg-sinks.sql),
 -- so the Paimon export and the native Iceberg table are always the same version.
 -- v3 is the default on this branch, and its default table set is a fresh
--- CDC_DB_SUFFIX=_v3 database, so nothing here has to migrate an existing table.
+-- SESSION_SUFFIX=_v3 database, so nothing here has to migrate an existing table.
 -- ICEBERG_FORMAT_VERSION=2 (+ PAIMON_DV_BITMAP64=false) gives the v2 setup.
 --
 --   v2: an Iceberg v2 reader cannot see Paimon deletion vectors, so for a
@@ -72,25 +72,35 @@
 --   storage, hive-client-class, hive-conf-dir, format-version (2 or 3),
 --   manifest-compression
 --
--- Buckets: no 'bucket' option (2026-11-04), so every table uses Paimon's
--- default for primary-key tables, DYNAMIC bucket mode ('bucket' = '-1'):
--- Paimon assigns keys to buckets itself and opens a new bucket when one holds
--- 'dynamic-bucket.target-row-num' rows (default 2,000,000), so the bucket count
--- follows the data instead of a fixed guess. Every primary key includes the
--- table's partition column, so no key ever moves across partitions (the case
--- dynamic mode handles with a global index). Iceberg has no buckets at all
--- (write.distribution-mode = hash). Like every option here: new tables only.
+-- Iceberg export ON again (2026-11-05; off 2026-11-04): Paimon writes
+-- Iceberg-compatible metadata (v3: files at level > 0 plus DVs, see above) and
+-- registers it in Glue. The benchmark still reads Paimon natively (DuckDB
+-- paimon_scan, Trino paimon connector). With write-only = true nothing leaves
+-- level 0 until a compaction, so the export lists no files until then.
+-- previous-versions-max 100 = the native Iceberg tables' value. Tables that
+-- already exist get the options from the ALTER TABLE statements at the end.
+--
+-- Buckets (2026-11-04): FIXED, 8 on the dimension tables (customers; products
+-- per category) and 16 per date partition on the fact tables (orders,
+-- order_items): one bucket per writer subtask at parallelism 16, so the
+-- current date partition, which takes nearly all new rows, uses every writer. Fixed, not dynamic ('bucket' = '-1'): DuckDB's paimon extension
+-- (paimon-cpp) refuses dynamic-bucket primary-key tables ("do not support pk
+-- table bucket=-1 in scan process", _v3r2). One writer per bucket. Iceberg has no
+-- buckets (write.distribution-mode = hash). Like every option here: new tables only.
+-- bucket-key = the table's id column: the primary key minus the partition column,
+-- which is Paimon's default anyway (a primary-key table's bucket key must be a
+-- subset of its primary key); explicit so the high-cardinality choice is visible.
 --
 -- Table options are applied at CREATE TABLE only (CREATE TABLE IF NOT EXISTS
 -- is a no-op for an existing table). The live flink_paimon_db tables have
 -- drifted from this file (they are 'bucket' = '-1', and several sizes differ);
 -- this DDL is deliberately NOT changed to match them. New tables — e.g. a
--- fresh CDC_DB_SUFFIX database — get exactly what is written here.
+-- fresh SESSION_SUFFIX database — get exactly what is written here.
 --
 -- Required: 'aws.glue.enabled: "true"' in flinkConfiguration
 -- Environment variables:
 --   GLUE_DATABASE: Glue database name (default: flink_paimon_db; the manifest
---     sets flink_paimon_db + CDC_DB_SUFFIX)
+--     sets flink_paimon_db + SESSION_SUFFIX)
 --   ICEBERG_FORMAT_VERSION: 3 (default) or 2 — Iceberg export format version
 --   PAIMON_DV_BITMAP64: true or false, derived by build-deploy-generic.sh from
 --     the version (true iff 3); not a setting of its own
@@ -118,6 +128,8 @@ CREATE TABLE IF NOT EXISTS customers (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (customer_id) NOT ENFORCED
 ) WITH (
+    'bucket' = '8',
+    'bucket-key' = 'customer_id',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -138,12 +150,18 @@ CREATE TABLE IF NOT EXISTS customers (
     -- across it — that penalizes Paimon on the read benchmark for a reason that has
     -- nothing to do with the LSM-vs-merge-on-read question being measured.
     'parquet.block.size' = '8388608',
-    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
-    -- Iceberg's write.target-file-size-bytes.
-    'target-file-size' = '64mb',
+    -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
+    -- was 64 / 128), paired with Iceberg's write.target-file-size-bytes.
+    -- Write buffer = 2 x the target file size.
+    'target-file-size' = '32mb',
     'write-buffer-size' = '64mb',
     'write-buffer-spillable' = 'true',
-    'num-sorted-run.compaction-trigger' = '4',
+    'num-sorted-run.compaction-trigger' = '8',
+    -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
+    -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
+    -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
+    -- ran a TaskManager out of heap on _v3r3 (2026-11-04).
+    'lookup.cache-max-disk-size' = '8gb',
     -- 'compaction.max.file-num' was removed from all four tables: no such option
     -- exists in Paimon 1.3.x or 2.1.0 CoreOptions (only compaction.min.file-num,
     -- for append tables), so Paimon stored it and ignored it. Dropping it changes
@@ -159,47 +177,17 @@ CREATE TABLE IF NOT EXISTS customers (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
-    -- Iceberg compatibility via EMR Glue conf
+    -- Iceberg export (header: on again 2026-11-05)
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- ICEBERG_FORMAT_VERSION (3 default on this branch, 2 opt-out) — the format
-    -- version of the Iceberg-compatible metadata Paimon exports; always equal to
-    -- the native Iceberg tables' 'format-version'. 3 exports DVs only together
-    -- with PAIMON_DV_BITMAP64 = true (its default) — see the header. 2 is for
-    -- Iceberg-v2-only readers (Athena engine v3) and needs PAIMON_DV_BITMAP64 =
-    -- false.
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    -- 'snappy', not 'zstd'. This compresses the Avro MANIFEST files of the
-    -- Iceberg-compatible metadata Paimon exports under <table>/iceberg/, and it
-    -- has to be a codec the READER has on its classpath, not just the best
-    -- ratio. StarRocks BE ships avro-1.12.0.jar and snappy-java in
-    -- be/lib/iceberg-reader-lib/ but NO zstd-jni (hudi-reader-lib,
-    -- kudu-reader-lib and odps-reader-lib each bundle it; the Iceberg one does
-    -- not). Avro's ZstandardCodec class itself IS present, so the codec is
-    -- selected and then dies on its missing native binding:
-    --
-    --   java.lang.NoClassDefFoundError: com/github/luben/zstd/ZstdInputStreamNoFinalizer
-    --     at org.apache.avro.file.ZstandardCodec.decompress(ZstandardCodec.java:84)
-    --     at org.apache.iceberg.avro.AvroIterable$AvroReuseIterator.hasNext(...)
-    --
-    -- Fixing it BE-side is not durable: /opt/starrocks/be/lib is a container
-    -- layer (a copied zstd-jni jar is lost on restart, and the classloader is
-    -- built at BE start so a live copy has no effect anyway), and
-    -- /etc/starrocks/be/conf is a read-only ConfigMap mount. Writing a codec
-    -- the reader already supports is the fix that survives a pod restart.
-    -- Costs a little manifest size; manifests are tiny next to the data files.
     'metadata.iceberg.manifest-compression' = 'snappy',
-    -- Export metadata retention, paired with the Iceberg tables'
-    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
-    -- default (0) deleted the previous metadata.json on every commit, so a path
-    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
-    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.previous-versions-max' = '100',
     'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
     'metadata.iceberg.compaction.min.file-num' = '5',
     'metadata.iceberg.compaction.max.file-num' = '50',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -219,6 +207,8 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
+    'bucket' = '8',
+    'bucket-key' = 'product_id',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -239,12 +229,18 @@ CREATE TABLE IF NOT EXISTS products (
     -- across it — that penalizes Paimon on the read benchmark for a reason that has
     -- nothing to do with the LSM-vs-merge-on-read question being measured.
     'parquet.block.size' = '8388608',
-    -- 64 MB on the dimension tables (128 MB on orders/order_items), paired with
-    -- Iceberg's write.target-file-size-bytes.
-    'target-file-size' = '64mb',
+    -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
+    -- was 64 / 128), paired with Iceberg's write.target-file-size-bytes.
+    -- Write buffer = 2 x the target file size.
+    'target-file-size' = '32mb',
     'write-buffer-size' = '64mb',
     'write-buffer-spillable' = 'true',
-    'num-sorted-run.compaction-trigger' = '4',
+    'num-sorted-run.compaction-trigger' = '8',
+    -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
+    -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
+    -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
+    -- ran a TaskManager out of heap on _v3r3 (2026-11-04).
+    'lookup.cache-max-disk-size' = '8gb',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
     -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
     -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
@@ -256,23 +252,17 @@ CREATE TABLE IF NOT EXISTS products (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
+    -- Iceberg export (header: on again 2026-11-05)
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
-    -- Export metadata retention, paired with the Iceberg tables'
-    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
-    -- default (0) deleted the previous metadata.json on every commit, so a path
-    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
-    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.previous-versions-max' = '100',
     'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
     'metadata.iceberg.compaction.min.file-num' = '5',
     'metadata.iceberg.compaction.max.file-num' = '50',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -293,6 +283,8 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(6),
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_date_str) WITH (
+    'bucket' = '16',
+    'bucket-key' = 'order_id',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -308,12 +300,18 @@ CREATE TABLE IF NOT EXISTS orders (
     -- 16MB to match Iceberg's row-group-size on the fact tables — see the
     -- parquet.block.size note on `customers`.
     'parquet.block.size' = '16777216',
-    -- 128 MB on the fact tables (64 MB on customers/products), paired with
-    -- Iceberg's write.target-file-size-bytes.
-    'target-file-size' = '128mb',
+    -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
+    -- was 128 / 64), paired with Iceberg's write.target-file-size-bytes.
+    -- Write buffer = 2 x the target file size.
+    'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
-    'num-sorted-run.compaction-trigger' = '4',
+    'num-sorted-run.compaction-trigger' = '8',
+    -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
+    -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
+    -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
+    -- ran a TaskManager out of heap on _v3r3 (2026-11-04).
+    'lookup.cache-max-disk-size' = '8gb',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
     -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
     -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
@@ -325,23 +323,17 @@ CREATE TABLE IF NOT EXISTS orders (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
+    -- Iceberg export (header: on again 2026-11-05)
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
-    -- Export metadata retention, paired with the Iceberg tables'
-    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
-    -- default (0) deleted the previous metadata.json on every commit, so a path
-    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
-    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.previous-versions-max' = '100',
     'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
     'metadata.iceberg.compaction.min.file-num' = '5',
     'metadata.iceberg.compaction.max.file-num' = '50',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
 );
 
@@ -361,6 +353,8 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_date_str VARCHAR,
     PRIMARY KEY (created_date_str, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_date_str) WITH (
+    'bucket' = '16',
+    'bucket-key' = 'order_item_id',
     -- none, not lookup: the benchmark reads no changelog, and Iceberg writes none,
     -- so lookup's changelog files were a Paimon-only write cost. Deletion vectors
     -- still use lookup compaction (lookup-compact), independent of this option.
@@ -376,12 +370,18 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- 16MB to match Iceberg's row-group-size on the fact tables — see the
     -- parquet.block.size note on `customers`.
     'parquet.block.size' = '16777216',
-    -- 128 MB on the fact tables (64 MB on customers/products), paired with
-    -- Iceberg's write.target-file-size-bytes.
-    'target-file-size' = '128mb',
+    -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
+    -- was 128 / 64), paired with Iceberg's write.target-file-size-bytes.
+    -- Write buffer = 2 x the target file size.
+    'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
     'write-buffer-spillable' = 'true',
-    'num-sorted-run.compaction-trigger' = '4',
+    'num-sorted-run.compaction-trigger' = '8',
+    -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
+    -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
+    -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
+    -- ran a TaskManager out of heap on _v3r3 (2026-11-04).
+    'lookup.cache-max-disk-size' = '8gb',
     -- Parity with the Iceberg tables (history.expire.*): retention by AGE, 12 h.
     -- max 1000 (> 720 = 12 h of 60 s commits) so the age rule binds, not the
     -- count; at 10 it expired after ~10 min, shorter than a hot pass's pin.
@@ -393,22 +393,62 @@ CREATE TABLE IF NOT EXISTS order_items (
     'snapshot.expire.execution-mode' = 'async',
     'manifest.target-file-size' = '8mb',
     'manifest.merge-min-count' = '5',
+    -- Iceberg export (header: on again 2026-11-05)
     'metadata.iceberg.storage' = 'hive-catalog',
     'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
     'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
-    -- ICEBERG_FORMAT_VERSION — see the format-version note on `customers`.
     'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    -- snappy, not zstd — see the manifest-compression note on `customers`.
     'metadata.iceberg.manifest-compression' = 'snappy',
-    -- Export metadata retention, paired with the Iceberg tables'
-    -- write.metadata.previous-versions-max = 3 / delete-after-commit. Paimon's
-    -- default (0) deleted the previous metadata.json on every commit, so a path
-    -- read from Glue 404'd within one checkpoint (dry run 2026-11-02).
-    'metadata.iceberg.previous-versions-max' = '3',
+    'metadata.iceberg.previous-versions-max' = '100',
     'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    -- Export manifest merging, paired with commit.manifest.min-count-to-merge = 5.
     'metadata.iceberg.compaction.min.file-num' = '5',
     'metadata.iceberg.compaction.max.file-num' = '50',
+    'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
+);
+
+-- Iceberg export on tables created before 2026-11-05 (idempotent).
+ALTER TABLE customers SET (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
+    'metadata.iceberg.manifest-compression' = 'snappy',
+    'metadata.iceberg.previous-versions-max' = '100',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50'
+);
+ALTER TABLE products SET (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
+    'metadata.iceberg.manifest-compression' = 'snappy',
+    'metadata.iceberg.previous-versions-max' = '100',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50'
+);
+ALTER TABLE orders SET (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
+    'metadata.iceberg.manifest-compression' = 'snappy',
+    'metadata.iceberg.previous-versions-max' = '100',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50'
+);
+ALTER TABLE order_items SET (
+    'metadata.iceberg.storage' = 'hive-catalog',
+    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
+    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
+    'metadata.iceberg.manifest-compression' = 'snappy',
+    'metadata.iceberg.previous-versions-max' = '100',
+    'metadata.iceberg.delete-after-commit.enabled' = 'true',
+    'metadata.iceberg.compaction.min.file-num' = '5',
+    'metadata.iceberg.compaction.max.file-num' = '50'
 );

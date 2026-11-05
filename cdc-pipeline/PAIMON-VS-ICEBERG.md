@@ -258,14 +258,15 @@ stores it and ignores it.)
 - No manual intervention needed
 
 #### Iceberg
-**A separate compaction job.** Here: one continuous FlinkDeployment, `iceberg-maintain`
-(`iceberg-compaction/maintain.py`, Iceberg 1.12's Flink `TableMaintenance` with
-`RewriteDataFiles` + `ExpireSnapshots`), on the writers' image. It is triggered by the
-tables' own commits: every 10 writer commits it rewrites the data files (partial
-progress, target 64 / 128 MiB) and expires snapshots (12 h, keep 5). A rewrite reloads
-the table's whole equality-delete set, so it must start with the writers: started late
-on 2026-11-03 it faced ~35M deletes on `customers`, needed a 32 Gi TaskManager, and
-completed passes on `products` only. With the writers suspended nothing triggers it.
+**A separate compaction job.** Here: once, before the snapshot test, with the
+writers stopped (`compaction/run.sh`, `cdc-compact.py`): every data file that
+carries a delete is rewritten with its deletes applied (Iceberg's
+`RowDataRewriter`), and one `RewriteFiles` commit also removes the delete files;
+then snapshots older than 12 h are expired. A continuous job (Iceberg 1.12's Flink
+`TableMaintenance`, every 10 writer commits) was tried on 2026-11-03/04 and
+removed: each rewrite reloads the equality-delete set per data file and was
+outlived by the writers' metadata retention, so it committed almost nothing at
+~100K upserts/s.
 
 **Retain snapshots for 12 hours** (as in `ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql`;
 applied when snapshots are expired, here by the compaction job)
@@ -274,7 +275,7 @@ CREATE TABLE orders (...) WITH (
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    'write.metadata.previous-versions-max' = '3'
+    'write.metadata.previous-versions-max' = '100'
 )
 ```
 
@@ -456,7 +457,7 @@ pipeline. The query benchmark now runs DuckDB and Trino
 ([querybench/README.md](./querybench/README.md)). Neither has a native Paimon
 reader (no Paimon connector in the DuckDB image, none for Trino 484): both
 "paimon" arms read **Paimon's Iceberg export** through an Iceberg reader. Trino 484
-reads that v3 export (verified 2026-11-02, `_v3r2` hot test); DuckDB 2.0 still
+reads that v3 export (verified 2026-11-02 hot test); DuckDB 2.0 still
 fails on it with the `schema` error above.
 
 ### Paimon's Iceberg export: behaviours to know
@@ -482,7 +483,7 @@ fails on it with the `schema` error above.
   404 within one checkpoint, mid-scan. The sink DDL now sets
   `metadata.iceberg.previous-versions-max = 3` with
   `metadata.iceberg.delete-after-commit.enabled = true`, the same as the native
-  tables' `write.metadata.previous-versions-max = 3`. A reader still has to pin one
+  tables' `write.metadata.previous-versions-max = 100` (3 until 2026-11-04: the continuous `iceberg-maintain` job, removed 2026-11-06, had its rewrites 404 on a planned metadata.json deleted ~3 commits later). A reader still has to pin one
   metadata version for the length of a query.
 - **Freshness.** With DVs on, lookup compaction moves level 0 up at every checkpoint,
   so the v3 export trails the table by about one checkpoint without forced full
@@ -497,9 +498,9 @@ These differences remain by design. Report them next to every result:
 
 | Difference | Paimon | Iceberg |
 |---|---|---|
-| Writer parallelism | dynamic buckets (`bucket = -1`, the default: a bucket per ~2M rows, one writer each; until 2026-11-04 fixed `bucket = 32`) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
-| Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; a separate continuous FlinkDeployment `iceberg-maintain` (`iceberg-compaction/`), every 10 writer commits while the writers run |
-| Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only when `iceberg-maintain` runs, with the same 12 h / keep-5 rule. Neither expires while its writer is suspended |
+| Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 4 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; dynamic buckets are unreadable by DuckDB's Paimon reader) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
+| Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; `compaction/run.sh` once before the snapshot test (writers stopped) |
+| Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only in `compaction/run.sh`, with the same 12 h / keep-5 rule. Paimon's writer does not expire while suspended |
 | Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |
 | Glue integration | EMR's Glue Hive metastore client (`aws.glue.enabled: "true"`, the one intended `flinkConfiguration` difference) | Iceberg's own `GlueCatalog` |
 | Schema details | `TIMESTAMP(6)`; partition columns `order_date_str`, `created_date_str` | `TIMESTAMP(3)`; partition columns `order_dt`, `created_dt` |

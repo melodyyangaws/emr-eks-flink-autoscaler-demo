@@ -245,7 +245,7 @@ CREATE SECRET p (TYPE paimon, PROVIDER credential_chain, region 'us-west-2',
 ```
 
 **Verified 2026-11-03** in `duckdb-warm-cdc` (writers suspended), on
-`flink_paimon_db_v3r2`. The two tables are bucket 32, primary-key, DVs bitmap64,
+that day's Paimon table set. The two tables are bucket 32, primary-key, DVs bitmap64,
 changelog-producer none:
 
 | Table (snapshot) | `total_record_count` | `count(*)` | `count(pk)` / `count(DISTINCT pk)` |

@@ -16,24 +16,18 @@ export NAMESPACE="${NAMESPACE:-emr-flink}"
 export EMR_EXECUTION_ROLE_ARN="${EMR_EXECUTION_ROLE_ARN:-arn:aws:iam::${AWS_ACCOUNT_ID}:role/emr-on-eks-test-execution-role}"
 # Must already be annotated with an IRSA role that can read Glue + S3.
 export MONITOR_SERVICE_ACCOUNT="${MONITOR_SERVICE_ACCOUNT:-starrocks-sa}"
-# The table set: flink_{paimon,iceberg}_db${CDC_DB_SUFFIX}. Default _v3 (this
-# branch's Iceberg v3 set), i.e. the value in cdc-pipeline/.bench-env, which the
-# Flink jobs and the query benchmark use, read from there when that file sets
-# it; CDC_DB_SUFFIX= (set, empty) monitors the v2 set.
-if [[ -z "${CDC_DB_SUFFIX+set}" ]]; then
-  CDC_DB_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${CDC_DB_SUFFIX+set}" ]] || exit 1; printf %s "$CDC_DB_SUFFIX"' \
-                    _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || CDC_DB_SUFFIX=_v3
-fi
-export CDC_DB_SUFFIX
-# Reports are copied to the query benchmark's results prefix
-# (lib/common.sh QB_RESULTS_PREFIX: cdc-session<CDC_SET_TAG><SESSION_SUFFIX>).
-export CDC_SET_TAG="${CDC_DB_SUFFIX//_/-}"
+# The session: flink_{paimon,iceberg}_db${SESSION_SUFFIX}, read from
+# cdc-pipeline/.bench-env (the value the Flink jobs and the query benchmark use)
+# when not set; empty when neither sets it.
 if [[ -z "${SESSION_SUFFIX+set}" ]]; then
-  SESSION_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1; printf %s "${SESSION_SUFFIX:-}"' \
-                     _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || SESSION_SUFFIX=""
+  SESSION_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${SESSION_SUFFIX+set}" ]] || exit 1; printf %s "$SESSION_SUFFIX"' \
+                    _ "$(cd "$(dirname "$0")/.." && pwd)/.bench-env") || SESSION_SUFFIX=""
 fi
 export SESSION_SUFFIX
-[[ "$CDC_DB_SUFFIX" =~ ^(_[a-z0-9]+)?$ ]] || { echo "CDC_DB_SUFFIX must be empty or like _v3, got '${CDC_DB_SUFFIX}'" >&2; exit 1; }
+# Reports are copied to the query benchmark's results prefix
+# (lib/common.sh QB_RESULTS_PREFIX: cdc-session<CDC_SET_TAG>).
+export CDC_SET_TAG="${SESSION_SUFFIX//_/-}"
+(( ${#SESSION_SUFFIX} < 100 )) || { echo "SESSION_SUFFIX must be empty or under 100 characters, got ${#SESSION_SUFFIX}" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOYMENT_TEMPLATE="${SCRIPT_DIR}/monitor-deployment.yaml"
@@ -47,8 +41,8 @@ echo "  Account:   ${AWS_ACCOUNT_ID}"
 echo "  Bucket:    ${BUCKET_NAME}"
 echo "  Namespace: ${NAMESPACE}"
 echo "  SA:        ${MONITOR_SERVICE_ACCOUNT}"
-echo "  Glue DBs:  flink_paimon_db${CDC_DB_SUFFIX}, flink_iceberg_db${CDC_DB_SUFFIX}"
-echo "  Reports:   s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}${SESSION_SUFFIX}/monitor/"
+echo "  Glue DBs:  flink_paimon_db${SESSION_SUFFIX}, flink_iceberg_db${SESSION_SUFFIX}"
+echo "  Reports:   s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}/monitor/"
 echo "═══════════════════════════════════════════════════════════════"
 
 # ── IRSA ─────────────────────────────────────────────────────────────────────
@@ -76,7 +70,7 @@ kubectl create configmap flink-cdc-monitor-code -n "${NAMESPACE}" \
 
 # ── Resolve variables in deployment manifest and apply ───────────────────────
 echo "Resolving variables in monitor-deployment.yaml..."
-envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${CDC_DB_SUFFIX} ${CDC_SET_TAG} ${SESSION_SUFFIX}' \
+envsubst '${AWS_REGION} ${BUCKET_NAME} ${NAMESPACE} ${MONITOR_SERVICE_ACCOUNT} ${SESSION_SUFFIX} ${CDC_SET_TAG}' \
   < "${DEPLOYMENT_TEMPLATE}" > "${DEPLOYED_MANIFEST}"
 if grep -nE '^[^#]*\$\{[A-Z][A-Z0-9_]*\}' "${DEPLOYED_MANIFEST}" >&2; then
   echo "unrendered placeholder(s) above in ${DEPLOYED_MANIFEST}" >&2; exit 1

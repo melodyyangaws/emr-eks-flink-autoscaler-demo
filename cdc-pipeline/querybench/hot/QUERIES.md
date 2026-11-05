@@ -30,7 +30,7 @@ Fact tables only: `customers` and `products` are not read (see Open points).
 | `H4_hot_narrow_agg` | orders | Groups the change set by `order_status`, using 2 of the 9 columns: projection pushdown. Needs `updated_at` stats pruning across partitions. | `leading-col-is-label` |
 | `H5_hot_wide_row` | orders | All 9 columns of the same rows as H4, as a checksum (UTF-8 bytes of the text columns via `BYTE_LEN_OPEN`/`BYTE_LEN_CLOSE`). H5/H4 is the all-columns tax. | — |
 | `H6_hot_product_agg` | order_items | Per-product `COUNT(DISTINCT order_id)`, up to ~20k groups: the hash table. | `leading-col-is-label` |
-| `H7_hot_mor_dedup` | order_items | Merge-on-read: key plus the columns upserts change, resolved to the current versions. Iceberg equality deletes vs Paimon deletion vectors. `dup_rows` must be 0. | — |
+| `H7_hot_status_category_rank` | order_items ⋈ orders ⋈ products | Multi-step hot query: both fact tables merged-on-read over the window, `ROW_NUMBER()` per order (`dup_versions` must be 0: a superseded version returned), a 3-way join to the category, a status × category aggregate, then `RANK()` and a per-status window `SUM`, top 3 categories per status. Replaces the old count-only `H7_hot_mor_dedup` (2026-11-04). | `leading-col-is-label` |
 | `H8_hot_pk_lookup` | orders | Primary-key point lookup of an order updated in the window. The merge-on-read worst case on Iceberg: it grows with the equality deletes in that key's partition since the last compaction. | — |
 | `H9_hot_join` | order_items ⋈ orders | Items inserted in the window joined to orders changed in the window, by status. Both sides merge at once; dynamic join filters prune the orders side. | `leading-col-is-label` |
 
@@ -38,7 +38,7 @@ Fact tables only: `customers` and `products` are not read (see Open points).
 
 | Placeholder | Value |
 |---|---|
-| `${ORDERS}`, `${ORDER_ITEMS}` | table expression for the arm, pinned to the run's version (`${CUSTOMERS}`, `${PRODUCTS}` are unused here) |
+| `${ORDERS}`, `${ORDER_ITEMS}` | table expression for the arm, pinned to the run's version (`${PRODUCTS}` is used by H7 only; `${CUSTOMERS}` is unused here) |
 | `${ORDERS_PART}` | `order_dt` (Iceberg; a STRING partition column holding `yyyy-MM-dd`) / `order_date_str` (Paimon) |
 | `${ORDER_ITEMS_PART}` | `created_dt` (Iceberg, STRING) / `created_date_str` (Paimon) |
 | `${HOT_DT}` | `yyyy-MM-dd`, the date of the window; compared as a string literal with the STRING partition column |

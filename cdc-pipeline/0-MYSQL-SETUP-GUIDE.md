@@ -67,7 +67,7 @@ This guide walks you through creating and configuring a MySQL database as the so
 >   [2-DATA-GEN-GUIDE.md](./2-DATA-GEN-GUIDE.md#the-cold-tail-spans-minpk-maxpk-not-1-maxpk).
 >
 > Both Flink jobs use `scan.startup.mode = initial`, so a fresh table set
-> (`CDC_DB_SUFFIX`) snapshots whatever the source holds when the jobs start.
+> (`SESSION_SUFFIX`) snapshots whatever the source holds when the jobs start.
 
 ### Option A: Using AWS Console (Dev/POC shape — smaller than the benchmark instance)
 

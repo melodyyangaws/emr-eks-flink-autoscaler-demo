@@ -38,7 +38,7 @@ Check `run-meta.txt` names the table set the writers write.
 | Check | How |
 |---|---|
 | Account values in `cdc-pipeline/.bench-env.local` (git-ignored; else `throughput-benchmark/.bench-env.local`) | `AWS_REGION`, `AWS_ACCOUNT_ID`, `BUCKET_NAME`, `EMR_EXECUTION_ROLE_ARN` |
-| `.bench-env` names the table set the writers write | `ICEBERG_FORMAT_VERSION=3`, `CDC_DB_SUFFIX=_v3r1` on this branch → `flink_iceberg_db_v3r1` / `flink_paimon_db_v3r1`. Unset `CDC_DB_SUFFIX` means `_v3`; `CDC_DB_SUFFIX=` (empty) is the v2 set |
+| `.bench-env` names the table set the writers write | `ICEBERG_FORMAT_VERSION=3`, `SESSION_SUFFIX=<suffix>` (a free-text round name) → `flink_iceberg_db<suffix>` / `flink_paimon_db<suffix>`. Unset or empty `SESSION_SUFFIX` means the unsuffixed databases |
 | Both writers RUNNING on that set | `./querybench/run.sh status` (writers, generator, engines, Jobs) or `kubectl get flinkdeployment flink-cdc-paimon flink-cdc-iceberg -n emr-flink`. Deploy: [../1-BUILD-DEPLOY-FLINK-APP-GUIDE.md](../1-BUILD-DEPLOY-FLINK-APP-GUIDE.md) |
 | Hot only: the upsert generator running | `./mysql-data-generator/deploy-data-generator.sh status` (`deploy` to start). A stopped generator is logged as a WARNING, not refused |
 | Engines with native Paimon readers | DuckDB image `duckdb-cdc-server:2.0.0` (the `paimon` extension) and Trino image `trino-cdc:484-paimon-2.1.0` (catalog `paimon`); see [../engine-deploy/README.md](../engine-deploy/README.md) |
@@ -51,18 +51,18 @@ Check `run-meta.txt` names the table set the writers write.
 the laptop before it starts the runner:
 
 - **Writers first** (hot only): `start` waits until both writers have been
-  RUNNING 15 min (`WRITERS_UP_S`, 900 s; `wait_writers_up` in `lib/common.sh`)
-  before it touches an engine, then resumes (or creates) the Iceberg compaction
-  FlinkDeployment `iceberg-maintain` (`iceberg-compaction/run-maintain.sh`; README Step 9a) and
-  brings the job monitor up (`flink-cdc-monitor` scaled to 1, or deployed; its
-  reports feed the summary's ingest throughput; `MONITOR_UP=0` skips). The
-  snapshot `start` suspends `iceberg-maintain` instead, so the pinned tables stay put.
+  RUNNING 30 min (`WRITERS_UP_S`, 1800 s; `wait_writers_up` in `lib/common.sh`)
+  before it touches an engine, then brings the job monitor up (`flink-cdc-monitor` scaled to 1, or
+  deployed; its reports feed the summary's ingest throughput; `MONITOR_UP=0` skips).
+  After a completed hot test its watcher, right after the teardown, compacts both
+  formats once (`compaction/run.sh run both`, README Step 10; `COMPACT_AFTER_HOT=0`
+  skips it); during ingest Paimon compacts inline only, Iceberg not at all.
 - **DuckDB** (`duckdb-warm-cdc`): `engine-deploy/deploy-duckdb-cdc.sh up` when
   the server does not answer `/health`, or answers for another
   `ICEBERG_FORMAT_VERSION` or image. It must then report `"busy": false`.
 - **Trino**: `engine-deploy/deploy-trino.sh up` when fewer than
   `TRINO_WORKERS` (3) workers are active. Replicas the watcher scaled to 0
-  are restored first. `up` makes the same 15 min writer check
+  are restored first. `up` makes the same 30 min writer check
   (`TRINO_AFTER_WRITERS_S`), which a hot `start` has already passed. A Trino that is already up must run `TRINO_VERSION`
   (484), else `start` stops (`TRINO_VERSION_CHECK=0` measures it as is).
 
@@ -100,11 +100,11 @@ The runner (`hot-interleave.sh`):
 5. writes the medians, then the step uploads `bench-results/`.
 
 **Done** looks like this in the runner log, then the watcher's teardown (it
-checks every `WATCH_INTERVAL_S`, 600 s, so up to 10 min later):
+checks every `WATCH_INTERVAL_S`, 300 s, so up to 5 min later):
 
 ```
   [querybench] done. Pins: .../hot-interleave-<STAMP>.pins  Log: ...
-status: results-uploaded querybench-results/cdc-session-v3r1/<STAMP>-hot/
+status: results-uploaded querybench-results/cdc-session<tag>/<STAMP>-hot/
 status: runner-exit=0 <date>
 ...                                      # watcher:
   [querybench] hot test completed: tearing the run down
@@ -120,8 +120,8 @@ and the runner still ends `runner-exit=0`. Only a driver failure in a pass
 run, the medians are written, and the runner then exits non-zero, so the
 watcher leaves everything running.
 
-Results: `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-hot/`
-(set tag = `CDC_DB_SUFFIX` with `-` for `_`: `-v3r1` here).
+Results: `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag>/<STAMP>-hot/`
+(set tag = `SESSION_SUFFIX` with `-` for `_`).
 
 The completed-test teardown stops the generator, suspends the writers and
 stops the job monitor. To keep the pipeline live for another hot run, start
@@ -141,14 +141,13 @@ SUITE=snapshot ./querybench/run.sh start
 1. the same runner and watcher waits as the hot test;
 2. **stops the writers**: scales the generator(s) in `GENERATOR_RESOURCES`
    to 0, waits `WRITER_DRAIN_S` (180 s) so both jobs commit the binlog tail,
-   suspends both FlinkDeployments (`FLINK_JOBS`, patched to `suspended`) and
+   suspends both FlinkDeployments (`flink-cdc-paimon`, `flink-cdc-iceberg`, patched to `suspended`) and
    waits (up to 600 s) until no TaskManager is left;
 3. resolves `SNAPSHOT_DT`: the newest date before today (UTC) that `orders`
    and `order_items` hold in every format (`SNAPSHOT_DT_PICK=oldest`, or set
    `SNAPSHOT_DT`);
-4. suspends `iceberg-maintain`. There is no pre-test compaction: the Iceberg
-   tables are measured as the writers and `iceberg-maintain` left them, and the
-   summary reports their data/delete file and delete counts;
+4. compacts nothing itself: step 1 waited for the hot watcher (as long as a
+   `cdc-compact-*` job runs), which already ran the one-off compaction of both formats;
 5. brings the engines up and starts the runner and the watcher (no cache
    clear here: the runner does it).
 
@@ -168,7 +167,7 @@ The runner (`snapshot.sh`):
 ```
 status: duckdb-snapshot-exit=0
 status: trino-snapshot-exit=0
-status: results-uploaded-snapshot querybench-results/cdc-session-v3r1/<STAMP>-snapshot/
+status: results-uploaded-snapshot querybench-results/cdc-session<tag>/<STAMP>-snapshot/
 status: runner-exit=0 <date>
 ```
 
@@ -194,7 +193,7 @@ cache-clear time and each engine's finish time and exit.
 Syncs the session's newest hot and snapshot run from S3 (`HOT_STAMP=` /
 `SNAPSHOT_STAMP=` pick others; `SUMMARY_DIR=<dir with hot/ and/or snapshot/>`
 reads a local copy) and writes
-`bench-results/QUERYBENCH-SUMMARY-<yyyymmdd><set tag><SESSION_SUFFIX>.md`
+`bench-results/QUERYBENCH-SUMMARY-<yyyymmdd><set tag>.md`
 (`SESSION=` overrides the name). Bucket name and account id are masked.
 `bench-results/` is git-ignored: `git add -f` to commit a summary.
 
@@ -246,7 +245,7 @@ they work for any past run while its snapshots are retained (Paimon
   over the reports whose sampling window overlaps the ingest window, plus
   median checkpoint duration and max backpressure share. Each report JSON is
   copied to
-  `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/monitor/`
+  `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag>/monitor/`
   (`REPORT_S3_URI`, set by `monitoring/deploy-monitor.sh`; best-effort). The
   monitor samples Paimon and Iceberg in parallel over the same 120 s, with a
   15 s pause between cycles (`REPEAT_INTERVAL`): about 10 reports per format
@@ -254,7 +253,7 @@ they work for any past run while its snapshots are retained (Paimon
   (scales it to 1, or runs `deploy-monitor.sh` when it is missing, set up for
   another table set, or without the S3 copy; `MONITOR_UP=0` skips), and the
   watcher's teardown scales it to 0. Runs before the S3 copy existed (e.g.
-  2026-11-02, `_v3r2`) have no reports: the reports lived only in the pod's
+  2026-11-02) have no reports: the reports lived only in the pod's
   `/tmp/reports` and were lost at teardown, so the summary says so and shows
   the table-metadata numbers.
 
@@ -268,7 +267,7 @@ In order: generator to 0 (no drain wait), writers suspended (wait for the
 TaskManagers to go), `flink-cdc-monitor` to 0, `duckdb-warm-cdc` deleted,
 Trino's coordinator and workers scaled to 0 (the Helm release stays), the
 runner's ConfigMap and Secret deleted. `STOP_GENERATOR=0`, `SUSPEND_WRITERS=0`,
-`STOP_DUCKDB=0`, `STOP_TRINO=0`, `STOP_COMPACTION_CRON=0` each keep one running. `SUITE` only labels
+`STOP_DUCKDB=0`, `STOP_TRINO=0` each keep one running. `SUITE` only labels
 the log. Finished Jobs are deleted by their TTL (1 day) or the next `start`.
 
 Remove Trino completely: `./engine-deploy/deploy-trino.sh down`.
@@ -320,7 +319,7 @@ scripts print.
 | Runner ends with a non-zero `runner-exit` and no ERROR line | A command failing under `set -e` ended the script before it logged anything | Fixed: the runner step and `snapshot.sh` run with `set -uo pipefail` and record each engine's exit (`status: <engine>-snapshot-exit=N`); the other scripts stop through `qb_die` with a message |
 | Trino rejects a query that DuckDB runs, e.g. `Cannot apply operator: timestamp(6) >= varchar(19)` | Dialect: no implicit VARCHAR → TIMESTAMP coercion, no byte-length function on VARCHAR, table alias only after `FOR VERSION AS OF` | Fixed in the SQL: `TIMESTAMP '…'` literals, the `BYTE_LEN_OPEN`/`BYTE_LEN_CLOSE` dialect keys (`dialect-*.env`), aliases after the placeholder. Rules: [hot/QUERIES.md](hot/QUERIES.md) "Writing for both engines". Check a change offline with `run.sh render` |
 | `duckdb:paimon` queries all `ERROR`: `Manifest ... missing required Avro key-value metadata field 'schema'` | Paimon 2.1's v3 Iceberg export writes manifests without the `schema` key DuckDB 2.0 requires | Not fixed (upstream). The arm records `ERROR`, is not retried and is never counted as a mismatch; it does not change the exit (listed in the `N of M queries not OK` line). `FORMATS=iceberg` skips both paimon arms |
-| `404` / `NoSuchKey` on a Paimon export `vN.metadata.json` mid-scan | Paimon's default kept no previous export metadata, so the path read from `version-hint.text` was gone within a checkpoint | Pinned copies (`pin.sh` copies every metadata.json to `querybench-pins/`, 3 attempts), and the Paimon sinks now set `metadata.iceberg.previous-versions-max = 3` + `delete-after-commit.enabled`. Table options apply to new tables only: a fresh `CDC_DB_SUFFIX` |
+| `404` / `NoSuchKey` on a Paimon export `vN.metadata.json` mid-scan | Paimon's default kept no previous export metadata, so the path read from `version-hint.text` was gone within a checkpoint | Pinned copies (`pin.sh` copies every metadata.json to `querybench-pins/`, 3 attempts), and the Paimon sinks now set `metadata.iceberg.previous-versions-max = 3` + `delete-after-commit.enabled`. Table options apply to new tables only: a fresh `SESSION_SUFFIX` |
 | `ENGINES must name duckdb and/or trino, got 'starrocks'` | StarRocks was removed from this harness (4.1.7 reads neither the v3 Paimon tables nor Iceberg v3 deletion vectors) | Use `duckdb` / `trino`. Its scripts and results stay in git history; `starrocks-sa` keeps its name |
 | `throughput-benchmark's qb-runner/qb-watch is active` | Same cluster, bucket and nodepools | Wait, or `FORCE=1` |
 | `Trino runs <v>, not TRINO_VERSION=484` | A different Trino is up | `./engine-deploy/deploy-trino.sh up`, or `TRINO_VERSION_CHECK=0` |
@@ -347,7 +346,7 @@ either suite; `ENGINES` order is the run order.
 
 Since 2026-11-04 both Paimon arms read Paimon itself, not its Iceberg export
 (which listed only top-LSM-level files until a full compaction, and whose v3
-manifests DuckDB could not read). Runs before that (`_v3r3` and older) read the
+manifests DuckDB could not read). Runs before that read the
 export; `summarize.py` keeps their `(export)` labels (no `paimon_reader=native` in
 their pins).
 
@@ -378,12 +377,12 @@ their pins).
 
 Table sets (`.bench-env`):
 
-| Set | `ICEBERG_FORMAT_VERSION` | `CDC_DB_SUFFIX` | Glue databases | Results prefix / summary |
+| Set | `ICEBERG_FORMAT_VERSION` | `SESSION_SUFFIX` | Glue databases | Results prefix / summary |
 |---|---|---|---|---|
-| v3, this branch | `3` | `_v3r1` (unset = `_v3`) | `flink_iceberg_db_v3r1`, `flink_paimon_db_v3r1` | `cdc-session-v3r1<SESSION_SUFFIX>/`, `QUERYBENCH-SUMMARY-<date>-v3r1<SESSION_SUFFIX>.md` |
-| v2 | `2` | empty | `flink_iceberg_db`, `flink_paimon_db` | `cdc-session<SESSION_SUFFIX>/`, `QUERYBENCH-SUMMARY-<date><SESSION_SUFFIX>.md` |
+| any round | `3` (or `2`) | `<suffix>`, free text | `flink_iceberg_db<suffix>`, `flink_paimon_db<suffix>` | `cdc-session<tag>/`, `QUERYBENCH-SUMMARY-<date><tag>.md` |
+| unsuffixed | `3` (or `2`) | empty | `flink_iceberg_db`, `flink_paimon_db` | `cdc-session/`, `QUERYBENCH-SUMMARY-<date>.md` |
 
-`ICEBERG_FORMAT_VERSION=2 CDC_DB_SUFFIX= ./querybench/run.sh ...` runs the v2
+`ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX= ./querybench/run.sh ...` runs the v2
 set. Every `.pins` file and the summary header record the set, engines,
 formats, engine versions and DuckDB's puffin setting; `pin.sh` warns when a
 pinned metadata.json's `format-version` differs from `ICEBERG_FORMAT_VERSION`.
@@ -396,19 +395,19 @@ level 1, row-group and target file sizes, manifest size and merge count,
 file statistics (`truncate(16)`), snapshot retention (12 h, at least 5 kept),
 3 previous metadata.json files kept (Paimon's export too). Paimon writes no
 changelog (`changelog-producer = none`). New settings apply to new tables
-only (a fresh `CDC_DB_SUFFIX`). Differences kept on purpose; state them with
+only (a fresh `SESSION_SUFFIX`). Differences kept on purpose; state them with
 every result:
 
 - **Writer parallelism:** Paimon writes each table with one writer per bucket
-  (32 fixed buckets up to `_v3r1` / `_v3r3`; dynamic buckets, ~2M rows each, after);
+  (32 fixed buckets before 2026-11-04, then 8 per dimension table and 16 per fact-table date partition);
   Iceberg's `hash` distribution sends each date partition to one writer. At
   the source-limited rate (~52K rows/s 2026-11-02, ~105K 2026-11-03) both keep up;
   above that the single Iceberg writer is the expected ceiling.
-- **Compaction:** Paimon compacts inline (deletion vectors); Iceberg only in
-  the separate `iceberg-maintain` job, which may not keep up (2026-11-03: it
-  completed passes on `products` only).
+- **Compaction:** Paimon compacts inline (deletion vectors); Iceberg not during
+  ingest (the hot test reads it uncompacted). Both get one full compaction in
+  `compaction/run.sh run both`, from the hot watcher, before the snapshot test.
 - **Snapshot expiry:** Paimon expires continuously in the writer; Iceberg
-  only in `iceberg-maintain`.
+  only in `compaction/run.sh`, before the snapshot test.
 
 ## Sizing parity
 
@@ -500,7 +499,7 @@ to the pods (`PASS_VARS` in `run.sh`).
 | `SUITE` | — | `hot` / `snapshot` (`start` requires one) |
 | `ENGINES` / `FORMATS` | `duckdb trino` / `both` | the arms; `ENGINES` order = run order |
 | `RUNS` / `WARMUP` | `3` / `1` | timed / discarded passes (hot: one warm-up pass p0) |
-| `SESSION_SUFFIX` / `STAMP` | `""` / now (UTC) | results session (`-r2`) / run id |
+| `STAMP` | now (UTC) | run id |
 | `QB_SETUP_ENGINE` | `trino` if in `ENGINES`, else `duckdb` | engine of the untimed setup reads |
 | `SKIP_PUFFIN_VERIFICATION_ARMS` | empty | DuckDB arms with `iceberg_unsafe_skip_puffin_verification` (was `paimon` on v3, for the export); applied at `deploy-duckdb-cdc.sh up` |
 | `QB_TRINO_PAIMON_CATALOG` | `paimon` | Trino catalog of the `trino:paimon` arm |
@@ -521,8 +520,8 @@ to the pods (`PASS_VARS` in `run.sh`).
 | `HOT_QUERY_TIMEOUT_S` / `SNAPSHOT_QUERY_TIMEOUT_S` | `1800` / `3600` | per query, both engines |
 | `MAX_RESULT_ROWS` | `10000` | rows kept per query for the comparison |
 | `PROFILE_SCAN` | `1` | DuckDB's untimed scan-bytes pass (hot: last pass only) |
-| `WATCH_INTERVAL_S` | `600` | watcher poll |
-| `STOP_GENERATOR` / `SUSPEND_WRITERS` / `STOP_DUCKDB` / `STOP_TRINO` / `STOP_COMPACTION_CRON` | `1` | what the teardown stops (`STOP_COMPACTION_CRON`: `iceberg-maintain`) |
+| `WATCH_INTERVAL_S` | `300` | watcher poll |
+| `STOP_GENERATOR` / `SUSPEND_WRITERS` / `STOP_DUCKDB` / `STOP_TRINO` | `1` | what the teardown stops |
 | `WRITERS_UP_S` | `900` | a hot `start` waits until the writers have been RUNNING this long |
 | `FORCE` / `ALLOW_CONCURRENT` | off | replace an active runner, ignore throughput's Jobs / skip the one-test-at-a-time guard |
 | `RENDER_DIR` | temp dir | `render` output |
@@ -531,7 +530,7 @@ to the pods (`PASS_VARS` in `run.sh`).
 
 ## Output
 
-In `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<STAMP>-<suite>/`:
+In `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag>/<STAMP>-<suite>/`:
 
 | File | Content |
 |---|---|
@@ -543,7 +542,7 @@ In `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag><SESSION_SUFFIX>/<S
 | `hot-interleave-<STAMP>.pins` / `snapshot-<STAMP>.pins` | windows, pins, H8 key, gates, writer and generator state |
 | hot: `*-p<N>.csv`, `hot-interleave-<STAMP>.log` | every pass (p0 = warm-up) |
 
-Pinned metadata copies: `s3://$BUCKET_NAME/querybench-pins/cdc-session<set tag><SESSION_SUFFIX>/<tag>/<format>/<table>/`.
+Pinned metadata copies: `s3://$BUCKET_NAME/querybench-pins/cdc-session<set tag>/<tag>/<format>/<table>/`.
 
 ## Caveats
 

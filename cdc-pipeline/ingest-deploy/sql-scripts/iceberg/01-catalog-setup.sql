@@ -7,7 +7,7 @@
 -- Environment variables:
 --   ICEBERG_WAREHOUSE: S3 path for Iceberg warehouse (e.g., s3://bucket/iceberg/)
 --   GLUE_DATABASE: AWS Glue database name (default: flink_iceberg_db; the
---     manifest sets flink_iceberg_db + CDC_DB_SUFFIX, e.g. flink_iceberg_db_v3)
+--     manifest sets flink_iceberg_db + SESSION_SUFFIX, e.g. flink_iceberg_db_v3)
 --   AWS_REGION: AWS region
 --   ICEBERG_FORMAT_VERSION: 3 (default on this branch) or 2
 --

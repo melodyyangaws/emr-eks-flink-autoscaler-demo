@@ -72,10 +72,9 @@ QB_DIALECT_DIR="${QB_DIALECT_DIR:-${QB_DIR}}"
 QB_TABLES="customers products orders order_items"
 PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE:-s3://${BUCKET_NAME}/paimon-warehouse}"; PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE%/}"
 ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-s3://${BUCKET_NAME}/iceberg-warehouse}"; ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE%/}"
-# flink_{paimon,iceberg}_db<CDC_DB_SUFFIX>: set by common.sh.
-PAIMON_DB="${PAIMON_DB:-flink_paimon_db${CDC_DB_SUFFIX:-}}"
-ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${CDC_DB_SUFFIX:-}}"
-FLINK_JOBS="${FLINK_JOBS:-flink-cdc-paimon flink-cdc-iceberg}"
+# flink_{paimon,iceberg}_db<SESSION_SUFFIX>: set by common.sh.
+PAIMON_DB="${PAIMON_DB:-flink_paimon_db${SESSION_SUFFIX:-}}"
+ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${SESSION_SUFFIX:-}}"
 GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}"
 DUCKDB_NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
 # Trino (engine-deploy/deploy-trino.sh: the trino Helm chart, release `trino`).
@@ -99,7 +98,7 @@ TRINO_URL="${TRINO_URL:-http://trino.${NAMESPACE}.svc.cluster.local:8080}"
 # Heap of the CLI's own JVM in the coordinator container (it only streams results).
 TRINO_CLI_JAVA_OPTS="${TRINO_CLI_JAVA_OPTS:--Xmx512m -XX:TieredStopAtLevel=1}"
 # Copies of the pinned metadata.json files (one key per run and table).
-QB_PIN_PREFIX="${QB_PIN_PREFIX:-querybench-pins/cdc-session${CDC_SET_TAG:-}${SESSION_SUFFIX}}"
+QB_PIN_PREFIX="${QB_PIN_PREFIX:-querybench-pins/cdc-session${CDC_SET_TAG:-}}"
 SUITE="${SUITE:-all}"
 RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-1}"
@@ -157,7 +156,7 @@ qb_engine_label() { case "$1" in duckdb) echo duckdb_warm ;; *) echo "$1" ;; esa
 # every .pins file (and through them the summary's header).
 qb_run_meta() {
     echo "iceberg_format_version=${ICEBERG_FORMAT_VERSION:-3}"
-    echo "cdc_db_suffix=${CDC_DB_SUFFIX:-} iceberg_db=${ICEBERG_DB} paimon_db=${PAIMON_DB} engines=$(qb_engines | tr ' ' ',') formats=$(qb_formats | tr ' ' ',')"
+    echo "cdc_db_suffix=${SESSION_SUFFIX:-} iceberg_db=${ICEBERG_DB} paimon_db=${PAIMON_DB} engines=$(qb_engines | tr ' ' ',') formats=$(qb_formats | tr ' ' ',')"
     local sp="${SKIP_PUFFIN_VERIFICATION_ARMS-}"
     echo "duckdb_image=${DUCKDB_IMAGE:-pip duckdb==${DUCKDB_VERSION:-2.0.0}} duckdb_cpu=${DUCKDB_CPU:-27} duckdb_pod_memory=${DUCKDB_POD_MEMORY:-114Gi} duckdb_skip_puffin_verification_arms=${sp// /,}"
     echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_paimon_catalog=${QB_TRINO_PAIMON_CATALOG} trino_workers=${TRINO_WORKERS} paimon_reader=native"

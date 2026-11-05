@@ -3,7 +3,7 @@
 ## Overview
 
 A monitoring pod that tracks both CDC pipelines, **Paimon** and **Iceberg**, and
-compares committed rows/s, checkpoint health and table growth side by side.
+compares ingest rows/s (the sources' rate meter), committed rows/s, checkpoint health and table growth side by side.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -50,7 +50,7 @@ extended from one table to the four CDC tables.
 
 ```bash
 cd cdc-pipeline
-source .bench-env                      # BUCKET_NAME, AWS_REGION, CDC_DB_SUFFIX (_v3r1 now)
+source .bench-env                      # BUCKET_NAME, AWS_REGION, SESSION_SUFFIX (the current round)
 bash ./monitoring/deploy-monitor.sh    # the file has no execute bit
 ```
 
@@ -60,7 +60,7 @@ The script:
    `aws sts get-caller-identity`), `BUCKET_NAME` (default
    `emr-on-eks-test-<account>-<region>`), `NAMESPACE` (default `emr-flink`) and
    `EMR_EXECUTION_ROLE_ARN`
-2. resolves `CDC_DB_SUFFIX` (below) and rejects anything other than empty or
+2. resolves `SESSION_SUFFIX` (below) and rejects anything other than empty or
    `_[a-z0-9]+`
 3. annotates the ServiceAccount if it has no role yet
 4. recreates the `flink-cdc-monitor-code` ConfigMap from `flink_cdc_monitor.py`,
@@ -76,19 +76,19 @@ minutes on a cold pod). To pick up a code change, re-run the script.
 Check the banner it prints. `Glue DBs:` must name the databases the Flink jobs write:
 
 ```
-  Glue DBs:  flink_paimon_db_v3r1, flink_iceberg_db_v3r1
+  Glue DBs:  flink_paimon_db<suffix>, flink_iceberg_db<suffix>
 ```
 
-### Which table set it reads: `CDC_DB_SUFFIX`
+### Which table set it reads: `SESSION_SUFFIX`
 
-| `CDC_DB_SUFFIX` in your shell | Monitored databases |
+| `SESSION_SUFFIX` in your shell | Monitored databases |
 |---|---|
-| unset | the value in `cdc-pipeline/.bench-env` (`_v3r1` now); `_v3` if that file does not set it |
-| set, e.g. `_v3` | `flink_paimon_db_v3`, `flink_iceberg_db_v3` |
-| set but empty (`CDC_DB_SUFFIX=`) | the v2 set: `flink_paimon_db`, `flink_iceberg_db` |
+| unset | the value in `cdc-pipeline/.bench-env`; empty if that file does not set it |
+| set, e.g. `_<suffix>` | `flink_paimon_db_<suffix>`, `flink_iceberg_db_<suffix>` |
+| set but empty (`SESSION_SUFFIX=`) | the unsuffixed set: `flink_paimon_db`, `flink_iceberg_db` |
 
 ```bash
-CDC_DB_SUFFIX= bash ./monitoring/deploy-monitor.sh  # the v2 set
+SESSION_SUFFIX= bash ./monitoring/deploy-monitor.sh  # the v2 set
 ```
 
 `ingest-deploy/build-deploy-generic.sh` resolves it the same way, so with an unchanged `.bench-env`
@@ -136,10 +136,40 @@ stopping it does not affect them.
 
 ## How the numbers are computed
 
-### Rows/s: from the tables' commit history, per table
+### Rows/s: ingest (source rate meter) and committed (table commits)
 
-The headline "Throughput (rows/s)" is computed from each table's own commits, not from
-Flink counters:
+The headline **"Throughput (rows/s)"** is the ingest rate: the median over the window
+of the CDC sources' `numRecordsOutPerSecond` (Flink's rate meter), summed over their
+subtasks; if the meter has no samples, the source counter delta. Both jobs read the
+same MySQL change stream, so equal values mean both kept up; a lower one means its
+writers backpressure its sources. (Until 2026-11-04 the headline was committed rows/s,
+with the meter as a separate "Source rate meter" row.)
+
+**Backpressure rows** (added 2026-11-04), from each sample's `/jobs/<id>/vertices/<v>/backpressure`:
+the share of the window's samples in which any vertex reported `HIGH`; the median over the
+samples of the CDC sources' highest subtask `backPressuredRatio`, in ms per second (how long
+a source waited on its downstream); and the median of the writers' highest subtask `busyRatio`
+in ms/s (near 1,000 = one writer saturated: Iceberg's single writer per date partition).
+`-` = no RUNNING sample in the window. JSON: `backpressured_sample_ratio` (unchanged),
+`source_backpressured_ms_per_s`, `writer_busy_max_ms_per_s`.
+
+**Source busy and fetch lag rows** (added 2026-11-06): the median over the samples of the
+sources' highest subtask `busyRatio` (`busyTimeMsPerSecond` / 1000, from the same
+`/backpressure` response), in ms/s. Near 1,000 with the writers idle and the sources not
+backpressured means the source subtask itself is the bottleneck (with chaining on, the
+source vertex also runs the chained operators, so its busy time includes their work).
+And the median of the sources' highest `currentFetchEventTimeLag` (the Flink CDC MySQL
+reader gauge: now minus the binlog timestamp of the last event fetched, in ms), read as
+the operator-scoped `Source__<operator>.currentFetchEventTimeLag` from
+`/vertices/<v>/subtasks/metrics?agg=max`; values < 0 (-1 = no binlog event seen yet) are
+ignored. A growing lag means the binlog read falls behind. `-` = no data. JSON:
+`source_busy_max_ms_per_s`, `source_fetch_lag_max_ms`.
+
+**Committed rows/s** (not in the side-by-side table since 2026-11-05; still in the
+JSON as `commit_records_per_sec` / `table_commit_records_per_sec`, which the query
+summary reads) is what each format wrote, computed from each table's own commits, not from
+Flink counters. Paimon's is lower for the same input: it merges re-written keys in its
+write buffer before committing, while Iceberg writes every version plus a delete:
 
 1. At the start of the window the monitor records each table's current snapshot,
    then polls Flink every 20 s for 120 s, then reads the tables again.
@@ -261,10 +291,12 @@ are placeholders, not a measurement:
 | Metric                                 | Paimon CDC         | Iceberg CDC        | Delta |
 | Job Name / Status / Parallelism        | …  RUNNING  32     | …  RUNNING  32     |       |
 | Duration (s)                           | 120                | 120                |       |
-| Throughput (rows/s)                    | <n> (commits)      | <n> (commits)      | ±x%   |
-|   ↳ customers (committed rows/s)       | <n>                | <n>                | ±x%   |
-|   ↳ products / orders / order_items    | …                  | …                  |       |
-| Source rate meter (rows/s)             | <n>                | <n>                |       |
+| Throughput (rows/s)                    | <n> (source rate meter) | <n> (source rate meter) | ±x% |
+| Backpressure (sources, share of samples HIGH) | <x%>        | <x%>               |       |
+|   ↳ sources backpressured (ms/s, max subtask) | <n>          | <n>                |       |
+|   ↳ busiest writer (busy ms/s, max subtask)   | <n>          | <n>                |       |
+|   ↳ busiest source (busy ms/s, max subtask)   | <n>          | <n>                |       |
+|   ↳ source fetch lag (ms, max subtask)        | <n>          | <n>                |       |
 | Restarts in window                     | 0                  | 0                  |       |
 | Records Processed (counter)            | <n>                | <n>                |       |
 | Committed bytes/s (Parquet)            | <n> MB             | <n> MB             |       |
@@ -292,8 +324,8 @@ are placeholders, not a measurement:
 | `PAIMON_FLINK_URL` | `http://flink-cdc-paimon-rest:8081` | Paimon Flink REST endpoint |
 | `ICEBERG_FLINK_URL` | `http://flink-cdc-iceberg-rest:8081` | Iceberg Flink REST endpoint |
 | `AWS_REGION` | `${AWS_REGION}` | |
-| `PAIMON_GLUE_DB` | `flink_paimon_db${CDC_DB_SUFFIX}` | also the Paimon path `<warehouse>/<db>.db/` |
-| `ICEBERG_GLUE_DB` | `flink_iceberg_db${CDC_DB_SUFFIX}` | |
+| `PAIMON_GLUE_DB` | `flink_paimon_db${SESSION_SUFFIX}` | also the Paimon path `<warehouse>/<db>.db/` |
+| `ICEBERG_GLUE_DB` | `flink_iceberg_db${SESSION_SUFFIX}` | |
 | `PAIMON_WAREHOUSE` | `s3://${BUCKET_NAME}/paimon-warehouse` | required; the pod exits if unset |
 | `ICEBERG_WAREHOUSE` | `s3://${BUCKET_NAME}/iceberg-warehouse/` | required |
 | `CDC_TABLES` | `customers,products,orders,order_items` | |
