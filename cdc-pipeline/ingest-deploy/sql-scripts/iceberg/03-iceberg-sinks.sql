@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS products (
 -- High write volume, mostly inserts + status updates.
 -- Explicit order_dt STRING column computed from order_date via DATE_FORMAT().
 CREATE TABLE IF NOT EXISTS orders (
-    order_id INT,
+    order_id BIGINT,
     customer_id INT,
     order_date TIMESTAMP(3),
     order_dt STRING,
@@ -244,8 +244,8 @@ CREATE TABLE IF NOT EXISTS orders (
 -- Highest write volume (multiple items per order), append-heavy.
 -- Explicit created_dt STRING column computed from created_at via DATE_FORMAT().
 CREATE TABLE IF NOT EXISTS order_items (
-    order_item_id INT,
-    order_id INT,
+    order_item_id BIGINT,
+    order_id BIGINT,
     product_id INT,
     quantity INT,
     unit_price DECIMAL(10, 2),

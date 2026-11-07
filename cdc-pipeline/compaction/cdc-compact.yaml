@@ -39,7 +39,10 @@ spec:
     # _v3writeonly (2026-11-05). A fresh connection per request costs a TLS
     # handshake per 16 MiB part.
     env.java.opts.jobmanager: "-Dhttp.keepAlive=false"
-    env.java.opts.taskmanager: "-Dhttp.keepAlive=false"
+    # delete-num-threads 8, not Iceberg's default (32 seen on 8-cpu TaskManagers):
+    # each thread copies a whole equality-delete file into heap before the set is
+    # built, and the GC-locker stalls they caused preceded the OOMs (2026-11-06).
+    env.java.opts.taskmanager: "-Dhttp.keepAlive=false -Diceberg.worker.delete-num-threads=8"
     heartbeat.timeout: "180s"
     heartbeat.interval: "20s"
     taskmanager.numberOfTaskSlots: "${TM_SLOTS}"
@@ -121,6 +124,8 @@ spec:
       - "s3://${BUCKET_NAME}/flink/sql-scripts/${FMT}/01-catalog-setup.sql"
       - "--parallelism"
       - "${COMPACT_PARALLELISM}"
+      - "--max-group-delete-keys"
+      - "${ICEBERG_MAX_GROUP_DELETE_KEYS}"
       - "--result-uri"
       - "${RESULT_URI}"
     parallelism: ${COMPACT_PARALLELISM}

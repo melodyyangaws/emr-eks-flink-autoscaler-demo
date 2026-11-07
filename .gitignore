@@ -40,3 +40,4 @@ throughput-benchmark/.qb-runner-cmd.sh
 cdc-pipeline/.qb-runner-cmd.sh
 # GenAI tool
 *claude
+cdc-pipeline/ingest-deploy/docker/patched-jars/*.jar

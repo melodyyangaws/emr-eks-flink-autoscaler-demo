@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hot suite over the LIVE CDC tables, warm DuckDB vs Trino on Iceberg and on
-# native Paimon (ENGINES x FORMATS: up to four arms), engines
+# Paimon (default: its Iceberg v3 export; PAIMON_READER=native: the native
+# readers) (ENGINES x FORMATS: up to four arms), engines
 # INTERLEAVED pass by pass on the same pinned table versions. Adapted from
 # throughput-benchmark/querybench/hot-interleave.sh.
 #
@@ -17,8 +18,11 @@
 #    the writers checkpoint at different moments and the export lags, so H1's
 #    row per arm records what each arm saw (the summary shows the gap).
 # 3. Pins every table in every format (pin.sh: one metadata.json copy per
-#    table and format, whose snapshot id Trino reads) and picks H8's key
-#    (qb_resolve_lookup), once.
+#    table and format, whose snapshot id Trino reads), and re-pins every 60 s
+#    until every format's PINNED fact tables hold a row at or past HOT_TO
+#    (orders.updated_at, order_items.created_at in HOT_DT), up to
+#    HOT_DATA_WAIT_S (3600; 0 skips): a commit past the window can still carry
+#    older binlog events. Then picks H8's key (qb_resolve_lookup), once.
 # 4. Warm-up pass p0 (discarded), then RUNS timed passes; each pass runs every
 #    engine in ENGINES (default "duckdb trino", in that order; ENGINES=trino or
 #    duckdb runs one alone), each on its arms (FORMATS), on the SAME pins.
@@ -101,7 +105,40 @@ pin() {   # <tag>
 { echo "stamp=${BASE} window=[${HOT_FROM}, ${HOT_TO}) dt=${HOT_DT} repin=${HOT_REPIN} engines=${ENGINE_LIST// /,} formats=$(qb_formats | tr ' ' ',')"
   qb_run_meta
   echo "generator_before=${gen_start:-none}"; } > "$PINS"
-pin "${BASE}-p0"
+# 3a. Data past the window, not just a commit past it: in a binlog backlog a writer
+# commits every checkpoint but with events minutes old, so the commit wait above
+# passes while the window's rows are not in the table yet (_v3final2, 2026-11-06:
+# Paimon ~17 min behind, 5 of 9 Paimon hot queries ZERO_SCAN). Pin, then on the
+# PINNED tables of every format require a fact row at or past HOT_TO (orders by
+# updated_at, order_items by created_at, in partition HOT_DT); otherwise wait 60 s
+# and pin again, up to HOT_DATA_WAIT_S (3600). HOT_DATA_WAIT_S=0 skips the check.
+data_behind() {   # prints the formats/tables with no row at or past HOT_TO on the current pins
+    local e fmt t col r out=""
+    e=$(qb_setup_engine)
+    for fmt in $(qb_formats); do
+        for t in orders order_items; do
+            [[ "$t" == orders ]] && col=updated_at || col=created_at
+            r=$(qb_setup_query "$e" "$fmt" "SELECT COUNT(*) FROM (SELECT 1 FROM \${$(qb_upper "$t")} AS x
+                     WHERE x.$(qb_part_col "$fmt" "$t") = '${HOT_DT}' AND x.${col} >= TIMESTAMP '${HOT_TO}' LIMIT 1) AS y" 600 | tail -1) || r=""
+            [[ "$r" == 1 ]] || out+=" ${fmt}.${t}(${r:-error})"
+        done
+    done
+    echo "$out"
+}
+data_t0=$(date +%s)
+while :; do
+    p=$("${HERE}/pin.sh" "${BASE}-p0") || qb_die "pin ${BASE}-p0 failed"
+    eval "$p"
+    [[ "${HOT_DATA_WAIT_S:-3600}" == 0 ]] && { qb_log "HOT_DATA_WAIT_S=0: not checking the window's data"; break; }
+    behind=$(data_behind)
+    [[ -z "$behind" ]] && { qb_log "every format has data past the window on its pins (waited $(( $(date +%s) - data_t0 ))s)"; break; }
+    (( $(date +%s) - data_t0 < ${HOT_DATA_WAIT_S:-3600} )) \
+        || qb_die "no data at or past HOT_TO=${HOT_TO} after ${HOT_DATA_WAIT_S:-3600}s:${behind} (a writer is still behind; HOT_DATA_WAIT_S=0 skips the check)"
+    qb_log "waiting for data past the window (re-pinning in 60s):${behind}"
+    sleep 60
+done
+echo "data_wait_s=$(( $(date +%s) - data_t0 ))" >> "$PINS"
+{ echo "## pins ${BASE}-p0"; qb_pins_dump; } >> "$PINS"
 qb_resolve_lookup
 export QB_LOOKUP_ORDER_ID QB_LOOKUP_ORDER_DT
 echo "h8_key order_id=${QB_LOOKUP_ORDER_ID} dt=${QB_LOOKUP_ORDER_DT} (${QB_LOOKUP_NOTE})" >> "$PINS"

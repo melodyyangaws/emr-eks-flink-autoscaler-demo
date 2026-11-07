@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The CDC query benchmark: DuckDB vs Trino on the tables Flink writes in both
 # formats (four arms, ENGINES x FORMATS: Iceberg natively, Paimon through its
-# Iceberg export), run from INSIDE the cluster with a watcher that shuts the
+# Iceberg v3 export, or natively with PAIMON_READER=native), run from INSIDE the cluster with a watcher that shuts the
 # run down when the test ends. Run from cdc-pipeline/.
 #
 #   SUITE=hot      ./querybench/run.sh start   hot test (hot-interleave.sh), writers + generator LIVE
@@ -9,6 +9,7 @@
 #                                              engines from a cold start
 #   ENGINES=duckdb|trino SUITE=... start       one engine only (default: "duckdb trino")
 #   FORMATS=iceberg|paimon SUITE=... start     one storage format only (default: both)
+#   PAIMON_READER=native SUITE=... start       paimon arms on the native readers (default: iceberg, the export)
 #   ./querybench/run.sh logs [watch]           follow the runner (watch: the watcher)
 #   ./querybench/run.sh status                 writers, generator, engines, Jobs
 #   SUITE=hot ./querybench/run.sh stop         tear the run down by hand (generator, writers,
@@ -52,11 +53,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/querybench.sh
 source "${HERE}/../lib/querybench.sh"
-PASS_VARS="STAMP RUNS WARMUP SNAPSHOT_RUNS ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS
+PASS_VARS="STAMP RUNS WARMUP SNAPSHOT_RUNS ALLOW_CONCURRENT ENGINES FORMATS PROFILE_SCAN QB_SETUP_ENGINE SKIP_PUFFIN_VERIFICATION_ARMS PAIMON_READER PMNICE_ROOT
 HOT_TO HOT_FROM HOT_DT HOT_WINDOW_SECONDS HOT_LAG_SECONDS HOT_COMMIT_MARGIN_S HOT_COMMIT_TABLES HOT_REPIN
-STABLE_CHECKS WAIT_COMMIT_S LOOKUP_ORDER_ID LOOKUP_ORDER_DT QB_QUERY_WRITERS
+STABLE_CHECKS WAIT_COMMIT_S HOT_DATA_WAIT_S LOOKUP_ORDER_ID LOOKUP_ORDER_DT QB_QUERY_WRITERS
 SNAPSHOT_DT S_FROM S_TO SNAPSHOT_SLICE_MINUTES SNAPSHOT_SLICE_MARGIN_S
-WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB COMPACT_AFTER_HOT COMPACT_TABLES COMPACT_PARALLELISM COMPACT_TIMEOUT_S ICEBERG_BIG_TM_TABLES ICEBERG_BIG_TM_MEMORY
+WATCH_INTERVAL_S SUSPEND_WRITERS STOP_GENERATOR STOP_TRINO STOP_DUCKDB COMPACT_AFTER_HOT COMPACT_TABLES COMPACT_PARALLELISM COMPACT_TIMEOUT_S ICEBERG_BIG_TM_TABLES ICEBERG_BIG_TM_MEMORY ICEBERG_MAX_GROUP_DELETE_KEYS
 HOT_QUERY_TIMEOUT_S SNAPSHOT_QUERY_TIMEOUT_S MAX_RESULT_ROWS
 ENGINE_GATE_TIMEOUT_S
 QB_RESULTS_PREFIX_RUN TRINO_VERSION TRINO_WORKERS TRINO_USER TRINO_CATALOG CLEAR_COORDINATOR"
@@ -201,11 +202,14 @@ duckdb_health() {
 STARTED_FRESH=""
 duckdb_up() {
     local h; h=$(duckdb_health)
-    # A server deployed for the other table set or from another image is redeployed.
+    # A server deployed for the other table set, from another image or with other
+    # skip-puffin arms (PAIMON_READER=iceberg needs `paimon`) is redeployed.
     if [[ -n "$h" ]] && ! python3 -c '
 import json, sys
-h, fv, img = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
-sys.exit(0 if str(h.get("iceberg_format_version", 3)) == fv and (h.get("image") or "pip") == (img or "pip") else 1)' "$h" "${ICEBERG_FORMAT_VERSION}" "${DUCKDB_IMAGE:-}" 2>/dev/null; then
+h, fv, img, sp = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3], sorted(sys.argv[4].split())
+sys.exit(0 if str(h.get("iceberg_format_version", 3)) == fv and (h.get("image") or "pip") == (img or "pip")
+         and sorted(h.get("skip_puffin_verification_arms") or []) == sp else 1)' \
+        "$h" "${ICEBERG_FORMAT_VERSION}" "${DUCKDB_IMAGE:-}" "${SKIP_PUFFIN_VERIFICATION_ARMS-$(qb_skip_puffin_default)}" 2>/dev/null; then
         echo "${SUITE}: ${DUCK} is up for another set or image (/health: ${h:0:200}); redeploying"
         h=""
     fi
@@ -340,7 +344,8 @@ cmd_render() {
         T=$(qb_upper "$t")
         for v in "QB_PIN_SNAP_ICEBERG_${T}=8000000000000000101" "QB_PIN_SNAP_PAIMON_${T}=101" \
                  "QB_PIN_META_ICEBERG_${T}=s3://${BUCKET_NAME}/${QB_PIN_PREFIX}/SAMPLE/iceberg/${t}/00001-x.metadata.json" \
-                 "QB_PIN_META_PAIMON_${T}=${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/${t}"; do
+                 "QB_PIN_META_PAIMON_${T}=$([[ "$PAIMON_READER" == native ]] && echo "${PAIMON_WAREHOUSE}/${PAIMON_DB}.db/${t}" \
+                     || echo "s3://${BUCKET_NAME}/${QB_PIN_PREFIX}/SAMPLE/paimon/${t}/v101.metadata.json")"; do
             n="${v%%=*}"; [[ -n "${!n:-}" ]] || export "$v"
         done
     done
@@ -428,7 +433,11 @@ cmd_summary() {
     # was computed from is in S3, so another laptop can reproduce or re-read it).
     ingest_json="$T/QUERYBENCH-INGEST-${session}.json"
     summary_ingest "$T" "$hot" "$snap" "$ingest_json"
+    # Engine shape at summary time: fills only what a run's own metadata lacks
+    # (runs before 2026-11-07 did not record it).
+    local shape; shape=$(qb_engine_shape 2>/dev/null || true)
     python3 "${HERE}/summarize.py" --work "$T" --session "$session" ${hot:+--hot "$hot"} ${snap:+--snapshot "$snap"} \
+        ${shape:+--engine-shape "$shape"} \
         --iceberg-format-version "$ICEBERG_FORMAT_VERSION" --warmup "${WARMUP:-1}" \
         ${INGEST_JSON:+--ingest "$INGEST_JSON"} ${INGEST_ERR:+--ingest-error "$INGEST_ERR"} --out "$out"
     [[ -z "${AWS_ACCOUNT_ID:-}" ]] || sed -i.bak -e "s/${BUCKET_NAME}/<bucket>/g" -e "s/${AWS_ACCOUNT_ID}/<id>/g" "$out"

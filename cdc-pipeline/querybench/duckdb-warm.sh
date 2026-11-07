@@ -7,10 +7,11 @@
 #   ./querybench/duckdb-warm.sh render <suite> [arm]   print the rendered SQL (no cluster; dry run)
 #
 # Arms (FORMATS=iceberg|paimon|both, default both): iceberg (the Iceberg
-# tables) and paimon (native Paimon). Every table is read at
-# its pinned version: iceberg_scan() of the copied metadata.json for `iceberg`,
-# paimon_scan(<table path>, snapshot_from_id=N) (the native Paimon extension) for
-# `paimon` (QB_PIN_* from pin.sh), the same pins Trino reads by snapshot id. The
+# tables) and paimon (default: Paimon's Iceberg v3 export; PAIMON_READER=native:
+# native Paimon). Every table is read at its pinned version: iceberg_scan() of the
+# copied metadata.json for `iceberg` and for `paimon` (the export's v<N>.metadata.json),
+# or with PAIMON_READER=native paimon_scan(<table path>, snapshot_from_id=N) (the
+# native Paimon extension) (QB_PIN_* from pin.sh), the same pins Trino reads by snapshot id. The
 # client renders the whole statement, the server only runs it. An arm that cannot
 # read its tables records ERROR per query; the other arm still runs.
 #

@@ -158,7 +158,7 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_products (
 -- Table: orders
 -- ============================================================================
 CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
-    order_id INT,
+    order_id BIGINT,
     customer_id INT,
     order_date TIMESTAMP(3),
     total_amount DECIMAL(12, 2),
@@ -206,8 +206,8 @@ CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_orders (
 -- Table: order_items
 -- ============================================================================
 CREATE TEMPORARY TABLE IF NOT EXISTS mysql_src_order_items (
-    order_item_id INT,
-    order_id INT,
+    order_item_id BIGINT,
+    order_id BIGINT,
     product_id INT,
     quantity INT,
     unit_price DECIMAL(10, 2),

@@ -524,10 +524,7 @@ These differences remain by design. Report them next to every result:
 
 **Run of 2026-09-22 — 40,000 rows/s sustained upsert load.** Both pipelines ingested the
 same MySQL binlog stream concurrently; both were verified `RUNNING` with 34/34 checkpoints
-completed and 0 failed before any query was timed. Query timings are medians of 3
-server-side `Time=` readings from the StarRocks FE audit log, taken while the load was
-still running. Raw CSV: `bench-results/starrocks-audit-20260922T160312Z.csv` (in git
-history).
+completed and 0 failed before any query was timed.
 
 ### Write workload
 

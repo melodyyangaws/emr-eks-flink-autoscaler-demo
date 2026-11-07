@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pin one version of each of the four tables in every format of FORMATS
-# (iceberg, native Paimon), for one run (or one hot pass), and print the pins
+# (iceberg, paimon), for one run (or one hot pass), and print the pins
 # as shell exports:
 #
 #   eval "$(./querybench/pin.sh [tag])"     tag: default $STAMP
@@ -8,10 +8,13 @@
 #   1. iceberg: copies each table's current metadata.json (Glue
 #      metadata_location) to s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/iceberg/<table>/,
 #      so DuckDB reads a file the writer cannot delete, and reads its snapshot id
-#      (Trino FOR VERSION AS OF); paimon: the native snapshot N of
-#      <table>/snapshot/LATEST, which DuckDB reads as paimon_scan(...,
-#      snapshot_from_id=N) and Trino as paimon.<db>.<t> FOR VERSION AS OF N
-#      (lib qb_pin_tables): one pin per format, both engines;
+#      (Trino FOR VERSION AS OF); paimon (default, Paimon's Iceberg v3 export):
+#      the same copy of <PMNICE_ROOT>/<table>/metadata/v<N>.metadata.json (from
+#      version-hint.text; N = Paimon's snapshot id, which the export reuses), read
+#      by DuckDB as iceberg_scan() and Trino as iceberg.<db>.<t> FOR VERSION AS OF N;
+#      with PAIMON_READER=native: the native snapshot N of <table>/snapshot/LATEST,
+#      read as paimon_scan(..., snapshot_from_id=N) and paimon.<db>.<t> FOR VERSION
+#      AS OF N (lib qb_pin_tables): one pin per format, both engines;
 #   2. appends the pinned snapshots' state (records, data/delete files,
 #      equality/position deletes, bytes; Paimon: records and commit kind) to
 #      $OUT_DIR/tables-$STAMP.tsv;

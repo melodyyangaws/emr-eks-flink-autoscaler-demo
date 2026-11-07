@@ -5,7 +5,10 @@
 # image trino-cdc:484-paimon-2.1.0), on the pinned snapshot of each table, ids
 # from pin.sh (the same pins DuckDB reads):
 #   arm iceberg   iceberg.<ICEBERG_DB>.<t> FOR VERSION AS OF BIGINT '<snapshot id>'
-#   arm paimon    paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<Paimon snapshot N>'
+#   arm paimon    default: Paimon's Iceberg v3 export through the Iceberg connector,
+#                 iceberg.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<Paimon snapshot N>'
+#                 (the export reuses Paimon's snapshot ids); PAIMON_READER=native:
+#                 paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<N>'
 #                 (QB_TRINO_PAIMON_CATALOG; the connector maps it to scan.snapshot-id)
 # FORMATS=iceberg|paimon|both (default both). An arm that cannot read its
 # tables records ERROR per query; the other arm still runs.

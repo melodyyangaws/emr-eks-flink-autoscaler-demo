@@ -515,7 +515,7 @@ CREATE TABLE products (
 -- Purpose: Order transactions (fact table)
 -- ============================================================================
 CREATE TABLE orders (
-    order_id INT PRIMARY KEY AUTO_INCREMENT,
+    order_id BIGINT PRIMARY KEY AUTO_INCREMENT,   -- BIGINT since 2026-11-06: INT ran out (README Troubleshooting, error 1467)
     customer_id INT NOT NULL,
     order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total_amount DECIMAL(12, 2) NOT NULL,
@@ -536,8 +536,8 @@ CREATE TABLE orders (
 -- Purpose: Order line items (fact table)
 -- ============================================================================
 CREATE TABLE order_items (
-    order_item_id INT PRIMARY KEY AUTO_INCREMENT,
-    order_id INT NOT NULL,
+    order_item_id BIGINT PRIMARY KEY AUTO_INCREMENT,   -- BIGINT since 2026-11-06
+    order_id BIGINT NOT NULL,
     product_id INT NOT NULL,
     quantity INT NOT NULL,
     unit_price DECIMAL(10, 2) NOT NULL,

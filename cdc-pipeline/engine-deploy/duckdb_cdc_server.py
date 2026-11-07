@@ -23,12 +23,13 @@ EXPLAIN (ANALYZE, FORMAT JSON) (2.0 draws the text plan in boxes, "Table Scan",
 which the 1.5 regex no longer matched); results stream, so execute and fetch
 stay under one try and one timer (attempt). Python >= 3.11.
 Arms: `iceberg` sends iceberg_scan() of a pinned metadata.json copy; `paimon`
-sends paimon_scan('<table path>', snapshot_from_id=N), the NATIVE Paimon
-extension (paimon-cpp has its own S3 client: it reads the `paimon_irsa`
-secret below, not httpfs, so cache_httpfs does not cache the paimon arm).
-SKIP_PUFFIN_VERIFICATION_ARMS (default none) still sets
-iceberg_unsafe_skip_puffin_verification per arm; it existed for Paimon's
-Iceberg export, which is no longer read.
+sends the same for Paimon's Iceberg v3 export (the client's default,
+PAIMON_READER=iceberg), or with PAIMON_READER=native paimon_scan('<table path>',
+snapshot_from_id=N), the NATIVE Paimon extension (paimon-cpp has its own S3
+client: it reads the `paimon_irsa` secret below, not httpfs, so cache_httpfs
+does not cache that arm). SKIP_PUFFIN_VERIFICATION_ARMS sets
+iceberg_unsafe_skip_puffin_verification per arm (deploy-duckdb-cdc.sh: `paimon`
+with the export, whose DV files are not real Puffin containers; none with native).
 
 Original: Warm DuckDB query server: the DuckDB side of a warm-vs-warm comparison with
 StarRocks. Runs in a long-lived pod. (History: StarRocks was the other engine until

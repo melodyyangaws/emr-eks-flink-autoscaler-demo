@@ -171,18 +171,29 @@ def iceberg(a, result):
     log(f"before: snapshot {start}, { {k: v for k, v in result['before'].items() if k != 'records_in_files_per_partition'} }")
 
     # What to rewrite: every file a delete applies to, plus small ones; grouped
-    # per partition (a group never spans two) up to the target size.
+    # per partition (a group never spans two) up to the target size AND up to
+    # --max-group-delete-keys applicable equality-delete rows. One group is one
+    # rewrite task, and the task loads each file's equality deletes into heap
+    # (Iceberg BaseDeleteLoader); by bytes alone, _v3final2's order_items put 15
+    # files needing ~1.23B delete keys into one task: OOM at 96Gi and 120Gi, and
+    # that one task set the run time (OK at 200Gi, 1,705 s, 2026-11-06). A file
+    # over the cap gets a group of its own.
+    max_keys = a.max_group_delete_keys
+    eq_content = J.org.apache.iceberg.FileContent.EQUALITY_DELETES
+    def eq_keys(t):
+        return sum(d.recordCount() for d in t.deletes() if d.content() == eq_content)
     parts = {}
     for t in tasks:
         if t.deletes().size() > 0 or t.file().fileSizeInBytes() < threshold:
             parts.setdefault(spec.partitionToPath(t.file().partition()), []).append(t)
     groups, old_data, old_deletes = [], J.java.util.HashSet(), {}
     for path, ts in sorted(parts.items()):
-        cur, size = [], 0
+        cur, size, keys = [], 0, 0
         for t in sorted(ts, key=lambda x: str(x.file().location())):
-            if cur and size + t.file().fileSizeInBytes() > target:
-                groups.append(cur); cur, size = [], 0
-            cur.append(t); size += t.file().fileSizeInBytes()
+            k = eq_keys(t)
+            if cur and (size + t.file().fileSizeInBytes() > target or keys + k > max_keys):
+                groups.append(cur); cur, size, keys = [], 0, 0
+            cur.append(t); size += t.file().fileSizeInBytes(); keys += k
         if cur:
             groups.append(cur)
         for t in ts:
@@ -205,7 +216,10 @@ def iceberg(a, result):
             jgroups.add(J.org.apache.iceberg.BaseCombinedScanTask(lst))
         par = max(1, min(a.parallelism, len(groups)))
         result["parallelism"] = par
-        log(f"rewriting {old_data.size()} data file(s) in {len(groups)} group(s), "
+        result["max_group_delete_keys"] = max_keys
+        result["largest_group_delete_keys"] = max((sum(eq_keys(t) for t in g) for g in groups), default=0)
+        log(f"rewriting {old_data.size()} data file(s) in {len(groups)} group(s) "
+            f"(largest group {result['largest_group_delete_keys']:,} equality-delete rows, cap {max_keys:,}), "
             f"removing {len(old_deletes)} delete file(s), parallelism {par}")
         t0 = time.time()
         ds = env._j_stream_execution_environment.fromCollection(jgroups)
@@ -243,6 +257,8 @@ def main():
     ap.add_argument("--table", required=True, choices=("customers", "products", "orders", "order_items"))
     ap.add_argument("--catalog-sql", required=True, help="s3:// URI of the writers' 01-catalog-setup.sql")
     ap.add_argument("--parallelism", type=int, required=True)
+    ap.add_argument("--max-group-delete-keys", type=int, default=100_000_000,
+                    help="Iceberg: close a rewrite group once its files' applicable equality-delete rows pass this")
     ap.add_argument("--result-uri", required=True, help="s3:// URI for the result JSON")
     ap.add_argument("--expire-hours", type=float, default=12.0, help="Iceberg: expire snapshots older than this")
     ap.add_argument("--retain-last", type=int, default=5, help="Iceberg: keep at least this many snapshots")

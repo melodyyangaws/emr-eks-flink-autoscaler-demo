@@ -77,8 +77,6 @@
 -- registers it in Glue. The benchmark still reads Paimon natively (DuckDB
 -- paimon_scan, Trino paimon connector). With write-only = true nothing leaves
 -- level 0 until a compaction, so the export lists no files until then.
--- previous-versions-max 100 = the native Iceberg tables' value. Tables that
--- already exist get the options from the ALTER TABLE statements at the end.
 --
 -- Buckets (2026-11-04): FIXED, 8 on the dimension tables (customers; products
 -- per category) and 16 per date partition on the fact tables (orders,
@@ -90,12 +88,6 @@
 -- bucket-key = the table's id column: the primary key minus the partition column,
 -- which is Paimon's default anyway (a primary-key table's bucket key must be a
 -- subset of its primary key); explicit so the high-cardinality choice is visible.
---
--- Table options are applied at CREATE TABLE only (CREATE TABLE IF NOT EXISTS
--- is a no-op for an existing table). The live flink_paimon_db tables have
--- drifted from this file (they are 'bucket' = '-1', and several sizes differ);
--- this DDL is deliberately NOT changed to match them. New tables — e.g. a
--- fresh SESSION_SUFFIX database — get exactly what is written here.
 --
 -- Required: 'aws.glue.enabled: "true"' in flinkConfiguration
 -- Environment variables:
@@ -272,7 +264,7 @@ CREATE TABLE IF NOT EXISTS products (
 -- High write volume, mostly inserts + status updates.
 -- Larger write buffer (128mb, = Iceberg's fact-table target file size).
 CREATE TABLE IF NOT EXISTS orders (
-    order_id INT,
+    order_id BIGINT,
     customer_id INT,
     order_date TIMESTAMP(6),
     order_date_str VARCHAR,
@@ -343,8 +335,8 @@ CREATE TABLE IF NOT EXISTS orders (
 -- Highest write volume (multiple items per order), append-heavy.
 -- Write buffer 128mb, as orders.
 CREATE TABLE IF NOT EXISTS order_items (
-    order_item_id INT,
-    order_id INT,
+    order_item_id BIGINT,
+    order_id BIGINT,
     product_id INT,
     quantity INT,
     unit_price DECIMAL(10, 2),
@@ -405,50 +397,4 @@ CREATE TABLE IF NOT EXISTS order_items (
     'metadata.iceberg.compaction.max.file-num' = '50',
     'fs.s3.impl' ='org.apache.hadoop.fs.s3a.S3AFileSystem',
     'sink.writer-coordinator.enabled' = 'true'
-);
-
--- Iceberg export on tables created before 2026-11-05 (idempotent).
-ALTER TABLE customers SET (
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    'metadata.iceberg.manifest-compression' = 'snappy',
-    'metadata.iceberg.previous-versions-max' = '100',
-    'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    'metadata.iceberg.compaction.min.file-num' = '5',
-    'metadata.iceberg.compaction.max.file-num' = '50'
-);
-ALTER TABLE products SET (
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    'metadata.iceberg.manifest-compression' = 'snappy',
-    'metadata.iceberg.previous-versions-max' = '100',
-    'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    'metadata.iceberg.compaction.min.file-num' = '5',
-    'metadata.iceberg.compaction.max.file-num' = '50'
-);
-ALTER TABLE orders SET (
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    'metadata.iceberg.manifest-compression' = 'snappy',
-    'metadata.iceberg.previous-versions-max' = '100',
-    'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    'metadata.iceberg.compaction.min.file-num' = '5',
-    'metadata.iceberg.compaction.max.file-num' = '50'
-);
-ALTER TABLE order_items SET (
-    'metadata.iceberg.storage' = 'hive-catalog',
-    'metadata.iceberg.hive-client-class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
-    'metadata.iceberg.hive-conf-dir' = '/glue/confs/hive/conf',
-    'metadata.iceberg.format-version' = '${ICEBERG_FORMAT_VERSION:3}',
-    'metadata.iceberg.manifest-compression' = 'snappy',
-    'metadata.iceberg.previous-versions-max' = '100',
-    'metadata.iceberg.delete-after-commit.enabled' = 'true',
-    'metadata.iceberg.compaction.min.file-num' = '5',
-    'metadata.iceberg.compaction.max.file-num' = '50'
 );

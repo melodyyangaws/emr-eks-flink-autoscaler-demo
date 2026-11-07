@@ -92,7 +92,7 @@ claude
         │ Query benchmark (querybench/): four arms     │
         │ DuckDB 2.0.0 warm     │ Trino 484            │
         │ 81 cpu / 342 GiB      │ 9 wkr x 9 cpu/38 GiB │
-        │ × Iceberg native      │ × Paimon native      │
+        │ × Iceberg             │ × Paimon (export)    │
         └──────────────────────────────────────────────┘
    monitor: flink-cdc-monitor (Flink REST + table stats, both formats in
             parallel; reports to s3://<bucket>/querybench-results/.../monitor/)
@@ -515,12 +515,17 @@ The four arms (`ENGINES` × `FORMATS`):
 |---|---|---|
 | `duckdb:iceberg` | `flink_iceberg_db<suffix>`, pinned `metadata.json` copy | works |
 | `trino:iceberg` | the same, `FOR VERSION AS OF BIGINT '<snapshot>'` | works |
-| `duckdb:paimon` | **native Paimon**, `paimon_scan('<warehouse>/<PAIMON_DB>.db/<t>', snapshot_from_id=N)` (the image's `paimon` extension) | new 2026-11-04, **not yet run live**; reads S3 uncached (paimon-cpp's own S3 client) |
-| `trino:paimon` | **native Paimon**, catalog `paimon` (paimon-trino 2.1.0 in `trino-cdc:484-paimon-2.1.0`), `FOR VERSION AS OF BIGINT 'N'` | new 2026-11-04, **not yet run live** |
+| `duckdb:paimon` | **Paimon's Iceberg v3 export**, `iceberg_scan('<pinned v<N>.metadata.json copy>')` with `iceberg_unsafe_skip_puffin_verification` | default since 2026-11-07, **not yet run live** |
+| `trino:paimon` | **Paimon's Iceberg v3 export**, catalog `iceberg`, `flink_paimon_db<suffix>.<t> FOR VERSION AS OF BIGINT 'N'` | default since 2026-11-07, **not yet run live** |
 
-Both Paimon arms are pinned at the native snapshot `N` of `<table>/snapshot/LATEST`.
-Runs before 2026-11-04 read Paimon's Iceberg export instead (a partial view: top-LSM
-files only until a full compaction; DuckDB could not read its v3 manifests).
+Both Paimon arms are pinned at a copy of the export's `v<N>.metadata.json`
+(`paimon-warehouse/iceberg/<PAIMON_DB>/<t>/metadata/`, `N` from `version-hint.text`;
+the export reuses Paimon's snapshot id `N`). The export is a partial view: top-LSM
+files only until a full compaction. `PAIMON_READER=native` reads Paimon itself
+instead: DuckDB `paimon_scan('<warehouse>/<PAIMON_DB>.db/<t>', snapshot_from_id=N)` (the
+image's `paimon` extension; reads S3 uncached) and Trino's `paimon` catalog
+(paimon-trino 2.1.0 in `trino-cdc:484-paimon-2.1.0`), pinned at the native snapshot
+`N` of `<table>/snapshot/LATEST`.
 
 - **Check:** DuckDB `/health` `"busy": false`, `iceberg_format_version` 3; Trino 9 active workers, version 484.
 - **Time:** 5–20 min including new nodes (estimate); Trino first waits for the writers' 30 min.
@@ -822,10 +827,11 @@ registered Paimon's v2 export in a separate Glue database for Athena (verified
 | Trino `FOR VERSION AS OF` fails on Paimon's export (fixed 2026-11-02) | Paimon's snapshot ids are small integers; Trino needs `FOR VERSION AS OF BIGINT '<id>'` |
 | A Trino setup error says only `command terminated with exit code 1` | Fixed 2026-11-02: `qb_trino_try` now prints the Trino CLI's own error line |
 | Spark compaction (removed; history, 2026-11-02) | Parallel GC's full-GC stalls dropped S3 streams ("Premature end of Content-Length"), and a rewrite that rewrote nothing still "committed". Both were fixed before the Spark job was replaced by the Flink one |
-| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` (runs before 2026-11-04) | The Paimon 2.1 v3 export issue; the arm now reads native Paimon instead |
+| `duckdb:paimon` errors `missing required Avro key-value metadata field 'schema'` (runs before 2026-11-04) | The Paimon 2.1 v3 export wrote manifests without that key; the writer image's apache/paimon PR #10329 backport writes it (the default reader since 2026-11-07). Or `PAIMON_READER=native` |
 | A Glue `metadata_location` 404s mid-scan | Paimon's export and Iceberg keep only 3 previous metadata files. The benchmark reads pinned copies, so don't read live Glue paths during a test |
 | `run.sh start` refuses: Trino version | Run `./engine-deploy/deploy-trino.sh up` (Trino 484), or set `TRINO_VERSION_CHECK=0` |
 | A `cdc-compact-iceberg-<table>` run FAILED, `OutOfMemoryError` | A rewrite subtask holds a data file's equality-delete set: 1 slot per 32 Gi TaskManager (`ICEBERG_TM_SLOTS`, `TM_MEMORY`); `./compaction/run.sh logs iceberg <table>` |
+| Generator logs `1467 (HY000): Failed to read auto-increment value from storage engine`; hot queries counting new order items are ZERO_SCAN on every arm | A source id column reached its type's maximum (order_items.order_item_id hit the signed INT ceiling on 2026-11-05). Widen them to BIGINT with the generator and writers stopped: drop the foreign key order_items -> orders(order_id), `ALTER TABLE orders MODIFY order_id BIGINT NOT NULL AUTO_INCREMENT`, `ALTER TABLE order_items MODIFY order_item_id BIGINT NOT NULL AUTO_INCREMENT, MODIFY order_id BIGINT NOT NULL`, re-add the foreign key with `foreign_key_checks=0` (a table copy each, writes blocked; done 2026-11-06). The Flink DDL is BIGINT for them already; start a new `SESSION_SUFFIX` afterwards |
 | Writers restart-loop with `Access denied for user 'cdcuser'` | The Secret does not hold cdcuser's current password (e.g. after a rotation): fix the Secret, then delete + create the writers |
 | Paimon JobManager exits 239, `OutOfMemoryError: Metaspace` | JobManager metaspace; both manifests set `jobmanager.memory.jvm-metaspace.size: 512m` |
 | After a failed test everything is still running | By design, the watcher only tears down after `runner-exit=0`. Fix it and re-run, or `SUITE=hot ./querybench/run.sh stop` |

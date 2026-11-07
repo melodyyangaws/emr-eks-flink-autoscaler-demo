@@ -456,10 +456,16 @@ build_image_with_kaniko() {
        eks.amazonaws.com/role-arn annotation for a role that can push to ECR."
     fi
 
-    # Pack only the Dockerfile — every dependency is fetched from Maven/ECR at
-    # build time, so no other local file is part of the context.
+    # Pack the Dockerfile and docker/patched-jars/ (the PR #10329 Paimon jars,
+    # git-ignored; patched-jars/README.md): every other dependency is fetched from
+    # Maven/ECR at build time.
+    if ! ls docker/patched-jars/*.jar &>/dev/null; then
+        error "no jar in ingest-deploy/docker/patched-jars/: fetch them with
+       aws s3 cp --recursive s3://${BUCKET_NAME}/flink/build/patched-jars/ ingest-deploy/docker/patched-jars/
+       (or rebuild them, ingest-deploy/docker/patched-jars/README.md)"
+    fi
     log "Packing build context -> ${context_s3}"
-    tar -czf "$context_tar" -C docker Dockerfile.cdc-paimon || error "Failed to pack build context"
+    tar -czf "$context_tar" -C docker Dockerfile.cdc-paimon patched-jars || error "Failed to pack build context"
     aws s3 cp "$context_tar" "$context_s3" --region "$AWS_REGION" >&2 || \
         error "Failed to upload build context to S3"
 
