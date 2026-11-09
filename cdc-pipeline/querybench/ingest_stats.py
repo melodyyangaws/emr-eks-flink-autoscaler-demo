@@ -264,6 +264,7 @@ def monitor_reports(bucket, prefix, t0, t1):
             # so read the meter key, present in both), and committed bytes/s
             "rows_per_s_median": med(vals("meter_records_per_sec")),
             "rows_per_s_max": max(vals("meter_records_per_sec"), default=None),
+            "rows_total": sum(vals("total_records_processed")) or None,   # rows the sources emitted, over the reports
             "committed_rows_per_s_median": med(vals("commit_records_per_sec")),
             "bytes_per_s_median": med(vals("throughput_bytes_per_sec")),
             "bytes_per_s_max": max(vals("throughput_bytes_per_sec"), default=None),

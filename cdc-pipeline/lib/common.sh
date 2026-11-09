@@ -65,9 +65,6 @@ info()  { echo -e "${_B}[INFO]${_N} $*" >&2; }
 warn()  { echo -e "${_Y}[WARNING]${_N} $*" >&2; }
 die()   { echo -e "${_R}[ERROR]${_N} $*" >&2; exit 1; }
 
-# render <template> <out> VAR...: substitutes ${VAR} for exactly the named
-# variables (envsubst; any other $... stays for the container's shell), then
-# fails if an UPPERCASE ${...} is left. *-deployed.yaml is git-ignored.
 # Block until every writer in FLINK_JOBS has been RUNNING <seconds> (default
 # WRITERS_UP_S, 1800 = 30 min; 900 until 2026-11-06, when the hot window fell in Paimon's catch-up) since its current job start, so a restarted writer
 # restarts the clock. Used before the query engines start (querybench/run.sh
@@ -101,6 +98,9 @@ wait_writers_up() {
     done
 }
 
+# render <template> <out> VAR...: substitutes ${VAR} for exactly the named
+# variables (envsubst; any other $... stays for the container's shell), then
+# fails if an UPPERCASE ${...} is left. *-deployed.yaml is git-ignored.
 render() {
     local tpl="$1" out="$2" list="" v; shift 2
     command -v envsubst >/dev/null || { echo "envsubst not found (brew install gettext)" >&2; return 1; }

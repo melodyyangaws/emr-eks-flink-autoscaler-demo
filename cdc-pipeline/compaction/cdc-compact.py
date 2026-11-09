@@ -245,7 +245,7 @@ def iceberg(a, result):
     # Expiry: the tables' history.expire rule; deletes the files no snapshot keeps.
     t1 = time.time()
     older = int(time.time() * 1000) - int(a.expire_hours * 3600 * 1000)
-    expired = table.expireSnapshots().expireOlderThan(older).retainLast(a.retain_last).commit()
+    table.expireSnapshots().expireOlderThan(older).retainLast(a.retain_last).commit()
     table.refresh()
     result.update(expire_s=round(time.time() - t1, 1), snapshots_after_expiry=len(list(table.snapshots())))
     log(f"expiry: {result['snapshots_after_expiry']} snapshot(s) left ({result['expire_s']} s)")

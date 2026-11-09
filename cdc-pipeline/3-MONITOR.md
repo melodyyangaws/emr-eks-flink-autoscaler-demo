@@ -3,14 +3,16 @@
 ## Overview
 
 A monitoring pod that tracks both CDC pipelines, **Paimon** and **Iceberg**, and
-compares ingest rows/s (the sources' rate meter), committed rows/s, checkpoint health and table growth side by side.
+compares ingest rows/s (the sources' rate meter), backpressure, checkpoint health and
+table growth side by side. Its reports feed the query summary's ingest section
+([querybench/README.md](querybench/README.md#4-summary)).
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │              Flink CDC Monitor Pod (emr-flink)              │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  entrypoint.py        — loop: Paimon window, Iceberg   │  │
-│  │                         window, comparison, sleep      │  │
+│  │  entrypoint.py        — loop: both windows in parallel, │  │
+│  │                         comparison, sleep              │  │
 │  │  flink_cdc_monitor.py — Flink REST + table metadata    │  │
 │  │                                                       │  │
 │  │  Data sources:                                        │  │
@@ -19,7 +21,7 @@ compares ingest rows/s (the sources' rate meter), committed rows/s, checkpoint h
 │  │  • boto3 + fastavro → Paimon snapshots and manifests  │  │
 │  │                       read directly from S3           │  │
 │  └───────────────────────────────────────────────────────┘  │
-│  Output: /tmp/reports/*.json + the comparison table in logs │
+│  Output: /tmp/reports/*.json (+ S3 copy), comparison in logs│
 └─────────────────────────────────────────────────────────────┘
          │                              │
          ↓                              ↓
@@ -51,7 +53,7 @@ extended from one table to the four CDC tables.
 ```bash
 cd cdc-pipeline
 source .bench-env                      # BUCKET_NAME, AWS_REGION, SESSION_SUFFIX (the current round)
-bash ./monitoring/deploy-monitor.sh    # the file has no execute bit
+./monitoring/deploy-monitor.sh
 ```
 
 The script:
@@ -60,8 +62,8 @@ The script:
    `aws sts get-caller-identity`), `BUCKET_NAME` (default
    `emr-on-eks-test-<account>-<region>`), `NAMESPACE` (default `emr-flink`) and
    `EMR_EXECUTION_ROLE_ARN`
-2. resolves `SESSION_SUFFIX` (below) and rejects anything other than empty or
-   `_[a-z0-9]+`
+2. resolves `SESSION_SUFFIX` (below; rejected at 100 characters or more) and its
+   results tag (`CDC_SET_TAG`, the suffix with `-` for `_`)
 3. annotates the ServiceAccount if it has no role yet
 4. recreates the `flink-cdc-monitor-code` ConfigMap from `flink_cdc_monitor.py`,
    `entrypoint.py` and `requirements.txt`
@@ -88,7 +90,7 @@ Check the banner it prints. `Glue DBs:` must name the databases the Flink jobs w
 | set but empty (`SESSION_SUFFIX=`) | the unsuffixed set: `flink_paimon_db`, `flink_iceberg_db` |
 
 ```bash
-SESSION_SUFFIX= bash ./monitoring/deploy-monitor.sh  # the v2 set
+SESSION_SUFFIX= ./monitoring/deploy-monitor.sh  # the unsuffixed set
 ```
 
 `ingest-deploy/build-deploy-generic.sh` resolves it the same way, so with an unchanged `.bench-env`
@@ -101,13 +103,18 @@ monitor reads: `paimon-warehouse/flink_paimon_db<suffix>.db/<table>/`.
 kubectl logs -f deployment/flink-cdc-monitor -n emr-flink
 ```
 
-Each cycle runs a 120 s window on Paimon, then a 120 s window on Iceberg, logs the
-comparison table, writes `paimon-cdc_<UTC>.json` and `iceberg-cdc_<UTC>.json` to
-`/tmp/reports` in the pod, then sleeps 60 s. The two windows are back to back, **not
-concurrent**, so the two columns describe adjacent 2-minute intervals.
+Each cycle samples Paimon and Iceberg **in parallel over the same 120 s window**
+(two threads; until 2026-11-04 the windows ran back to back, so the two columns
+described adjacent intervals), logs the comparison table, writes
+`paimon-cdc_<UTC>.json` and `iceberg-cdc_<UTC>.json` to `/tmp/reports` in the pod,
+copies each to `REPORT_S3_URI`
+(`s3://<bucket>/querybench-results/cdc-session<tag>/monitor/`, best-effort), then
+sleeps `REPEAT_INTERVAL` (15 s). A cycle is the window plus the table reads, so a
+30-minute hot-test window gets about 10 reports per format.
 
-To copy the JSON reports out (they are on an `emptyDir` and are lost when the pod
-restarts):
+`/tmp/reports` is an `emptyDir`, lost when the pod restarts or is scaled to 0 (the
+query benchmark's teardown does that); the S3 copy is what `querybench/run.sh summary`
+reads. To copy the local reports out by hand:
 
 ```bash
 POD=$(kubectl get pod -n emr-flink -l app=flink-cdc-monitor -o name | head -1)
@@ -156,8 +163,9 @@ in ms/s (near 1,000 = one writer saturated: Iceberg's single writer per date par
 **Source busy and fetch lag rows** (added 2026-11-06): the median over the samples of the
 sources' highest subtask `busyRatio` (`busyTimeMsPerSecond` / 1000, from the same
 `/backpressure` response), in ms/s. Near 1,000 with the writers idle and the sources not
-backpressured means the source subtask itself is the bottleneck (with chaining on, the
-source vertex also runs the chained operators, so its busy time includes their work).
+backpressured means the source subtask itself is the bottleneck. Both jobs run with
+operator chaining off since 2026-11-06, so the source vertex is the CDC reader alone
+(with chaining on, its busy time also included the chained operators' work).
 And the median of the sources' highest `currentFetchEventTimeLag` (the Flink CDC MySQL
 reader gauge: now minus the binlog timestamp of the last event fetched, in ms), read as
 the operator-scoped `Source__<operator>.currentFetchEventTimeLag` from
@@ -193,9 +201,10 @@ write buffer before committing, while Iceberg writes every version plus a delete
    ```
 
    A table with no anchor or no commit in the window contributes 0.
-4. The pipeline rate is the sum over the four tables. Each table also gets its own
-   row in the comparison (`↳ <table> (committed rows/s)`), which shows where one
-   format falls behind (order_items carries most of the upsert load).
+4. The pipeline rate is the sum over the four tables; the per-table terms are in
+   the JSON (`table_commit_records_per_sec`), which shows where one format falls
+   behind (order_items carries most of the upsert load). Neither is a row of the
+   comparison table any more.
 
 Because the rate comes from what was committed, it has no REST-counter caching and no
 restart artifacts: rows replayed after a restart are not committed twice. With 60 s
@@ -212,7 +221,7 @@ number says which one was used:
 
 Records come from **operator-scoped** metrics: the sources' `numRecordsOut` and the
 writers' `numRecordsIn`. Summing vertex-level `numRecordsOut` counts a row once per
-hop, and with chaining on, a chained writer's vertex counters see only committables.
+hop, and (when chaining was on) a chained writer's vertex counters saw only committables.
 Figures from the earlier monitor (before 2026-11-01, including
 the `bench-results/JOB-MONITOR-2026092*.md` reports, now in git history only) summed every vertex and are **not
 comparable**: 6x on the Paimon graph, 3x on Iceberg.
@@ -261,8 +270,15 @@ distort it.
   when either side's summaries carry DV keys, and `n/a` for a side without them.
 - The JSON adds `total_new_dvs` / `total_removed_dvs`, and per table `added_dvs` (the
   current snapshot), `dvs_added_in_window` and `dvs_removed_in_window`.
-- A v2 table and Paimon have no such keys, and their reports are unchanged.
-  Paimon's own deletion vectors live in its index files and are not counted here.
+- A v2 table has no such keys, and its report is unchanged.
+- Paimon's deletion vectors live in per-bucket DV index files listed by each
+  snapshot's index manifest (written by compaction, not the writer). The monitor
+  counts the DV index files new / gone between the window's start and end
+  snapshots, and the live data files that carry a DV; the row then reads
+  `+<added> / -<removed> index files (<n> data files with DVs)`. JSON per table:
+  `dv_index_files_added_in_window`, `dv_index_files_removed_in_window`,
+  `dv_index_files_live`, `dv_data_files_live`. (Added 2026-11-08; before that
+  Paimon's side showed `n/a`.)
 - "New Delete Files" counts DVs too, so on v3 it is equality-delete files plus DV
   files.
 
@@ -289,7 +305,9 @@ are placeholders, not a measurement:
   Time: <start> → <end>
 ================================================================================
 | Metric                                 | Paimon CDC         | Iceberg CDC        | Delta |
-| Job Name / Status / Parallelism        | …  RUNNING  32     | …  RUNNING  32     |       |
+| Job Name                               | …                  | …                  |       |
+| Status                                 | RUNNING            | RUNNING            |       |
+| Parallelism                            | 12                 | 12                 |       |
 | Duration (s)                           | 120                | 120                |       |
 | Throughput (rows/s)                    | <n> (source rate meter) | <n> (source rate meter) | ±x% |
 | Backpressure (sources, share of samples HIGH) | <x%>        | <x%>               |       |
@@ -309,7 +327,7 @@ are placeholders, not a measurement:
 | New Delete Files                       | 0                  | <n>                |       |
 |   ↳ Position Deletes (Δ)               | 0                  | <n>                |       |
 |   ↳ Equality Deletes (Δ)               | 0                  | <n>                |       |
-|   ↳ Deletion Vectors (added / removed) | n/a                | +<n> / -<n>        |       |
+|   ↳ Deletion Vectors (added / removed) | +<n> / -<n> index files (<n> data files with DVs) | +<n> / -<n> |   |
 | New Records in Tables                  | <n>                | <n>                |       |
 | New Bytes in Tables                    | <n> MB             | <n> MB             |       |
 | Errors                                 | None               | None               |       |   (only when an error occurred)
@@ -331,12 +349,13 @@ are placeholders, not a measurement:
 | `CDC_TABLES` | `customers,products,orders,order_items` | |
 | `MONITOR_DURATION` | `120` | window per pipeline, s; must span at least one 60 s checkpoint |
 | `POLL_INTERVAL` | `20` | Flink REST poll interval inside the window, s |
-| `REPEAT_INTERVAL` | `60` | sleep between cycles, s |
+| `REPEAT_INTERVAL` | `15` | sleep between cycles, s (the code's default is 300) |
 | `RUN_MODE` | `continuous` | `once` runs one cycle and exits |
+| `REPORT_S3_URI` | `s3://${BUCKET_NAME}/querybench-results/cdc-session${CDC_SET_TAG}/monitor/` | S3 copy of every report (best-effort); empty = local only |
 
 `REPORT_OUTPUT_DIR` (default `/tmp/reports`) is read by `entrypoint.py` but not set in
 the ConfigMap. To change any value, edit `monitoring/monitor-deployment.yaml` and
-re-run `bash ./monitoring/deploy-monitor.sh`.
+re-run `./monitoring/deploy-monitor.sh`.
 
 ### Files
 
@@ -344,7 +363,7 @@ re-run `bash ./monitoring/deploy-monitor.sh`.
 monitoring/
 ├── deploy-monitor.sh                ← Code ConfigMap + envsubst + apply + rollout restart
 ├── flink_cdc_monitor.py             ← FlinkCDCMonitor: Flink REST, Iceberg and Paimon metadata readers
-├── entrypoint.py                    ← Loop: Paimon window → Iceberg window → comparison → sleep
+├── entrypoint.py                    ← Loop: both windows in parallel → comparison → S3 copy → sleep
 ├── monitor-deployment.yaml          ← Template: ConfigMap + Deployment (python:3.11-slim)
 ├── monitor-deployment-deployed.yaml ← Rendered output (git-ignored)
 ├── capture-flink-metrics.sh         ← One bounded REST-only window, from the laptop
@@ -399,4 +418,4 @@ kubectl port-forward svc/flink-cdc-paimon-rest 8081:8081 -n emr-flink    # http:
 
 ---
 
-**Last Updated**: 2026-11-02
+**Last Updated**: 2026-11-08

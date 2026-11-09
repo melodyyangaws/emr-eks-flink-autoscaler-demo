@@ -24,10 +24,6 @@
 -- (build-deploy-generic.sh; needs table.dynamic-table-options.enabled, which the
 -- executor sets).
 -- ============================================================================
--- SET 'execution.checkpointing.interval' = '60s';
--- SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
--- SET 'table.exec.sink.upsert-materialize' = 'NONE';
--- ============================================================================
 -- Pipeline 1: Customers (Dimension Table)
 -- ============================================================================
 INSERT INTO paimon_catalog.${GLUE_DATABASE:flink_paimon_db}.customers /*+ OPTIONS(

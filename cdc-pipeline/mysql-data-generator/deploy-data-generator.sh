@@ -53,16 +53,13 @@ info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-# Configuration
-# MYSQL_HOST / MYSQL_USER from .bench-env (+ .bench-env.local); a value already
-# in the environment wins.
+# Configuration: .bench-env (+ .bench-env.local), e.g. NAMESPACE. No MySQL value
+# is read here: the generator pods take host, user and password from the
+# mysql-credentials Secret.
 _gen_env="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.bench-env"
 if [[ -f "$_gen_env" ]]; then
-    _keep_host="${MYSQL_HOST:-}" _keep_user="${MYSQL_USER:-}"
     # shellcheck source=../.bench-env
     source "$_gen_env" >/dev/null 2>&1 || true
-    MYSQL_HOST="${_keep_host:-${MYSQL_HOST:-}}" MYSQL_USER="${_keep_user:-${MYSQL_USER:-}}"
-    unset _keep_host _keep_user
 fi
 unset _gen_env
 NAMESPACE=${NAMESPACE:-emr-flink}

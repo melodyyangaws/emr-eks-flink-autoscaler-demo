@@ -1,8 +1,9 @@
 # StorageClass for Flink task-local recovery by EBS volume mount.
 #
 # The name MUST be exactly "ebs-sc". EMR on EKS hardcodes it: when
-# `task.local-recovery.ebs.enable: "true"` is set (see flink-cdc-paimon-sql.yaml
-# and flink-cdc-iceberg-sql.yaml), the operator auto-creates one PVC per
+# `task.local-recovery.ebs.enable: "true"` is set (neither CDC writer sets it
+# since 2026-11-02, state.backend.type: hashmap; build-deploy-generic.sh still
+# applies this class), the operator auto-creates one PVC per
 # TaskManager named ebs-claim-<deployment>-taskmanager-<n>-<slot> with
 # storageClassName: ebs-sc. There is no Flink config key to change that name —
 # only the size (kubernetes.taskmanager.local-recovery.persistentVolumeClaim.sizeLimit).

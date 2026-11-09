@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Snapshot suite over the STOPPED CDC tables, warm DuckDB vs Trino on the
-# Iceberg tables and on Paimon (both compacted once by the hot test's watcher,
-# compaction/run.sh run both) (ENGINES x FORMATS), from a cold start, every arm of a format
+# Iceberg tables and on Paimon-as-iceberg (both table sets compacted once by
+# the hot test's watcher, compaction/run.sh run both) (ENGINES x FORMATS, up to four arms),
+# from a cold start, every arm of a format
 # on the same pinned snapshot per table (run.sh's runner step).
 #
 #   1. gate: the CDC writers stopped (suspended here if not already); every engine in ENGINES up
@@ -10,7 +11,7 @@
 #   2. pin: the four tables of every format, after the gate; Trino checked to read every pin (a paimon
 #      table it cannot read is a WARNING, its queries record the error);
 #   3. the S4 slice [S_FROM, S_TO) on the pinned tables, unless set (untimed,
-#      on qb_setup_engine, before the cold start);
+#      on qb_setup_engine, before the cold start): the busiest bucket with rows in every format;
 #   4. cold start: clear-caches.sh (DuckDB server restarted,
 #      deploy-trino.sh clear-cache);
 #   5. each engine in ENGINES order (default duckdb, then trino): SNAPSHOT_RUNS (3)

@@ -225,7 +225,8 @@ COPY --from=paimon-build /out/paimon.duckdb_extension /tmp/paimon.duckdb_extensi
 
 # paimon is self-built, so unsigned: it goes where INSTALL would put it
 # (~/.duckdb/extensions/v2.0.0/<platform>), and LOAD needs a connection with
-# allow_unsigned_extensions=true (duckdb_cdc_server.py connects with it).
+# allow_unsigned_extensions=true. duckdb_cdc_server.py no longer loads it: the
+# harness reads Paimon only as Paimon-as-iceberg (since 2026-11-09).
 # AWSCLI_SPEC is pinned (awscli==...); hadolint cannot see through the ARG.
 # hadolint ignore=DL3013
 RUN pip install --no-cache-dir /tmp/wheels/duckdb-*.whl "${AWSCLI_SPEC}" \

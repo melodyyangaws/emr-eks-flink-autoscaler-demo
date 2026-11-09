@@ -1,6 +1,7 @@
-# Trino 484 + the native Paimon connector (apache/paimon-trino), for the CDC
-# query benchmark's Trino (deploy-trino.sh, catalog `paimon`). See README.md
-# (Trino: native Paimon).
+# Trino 484 + the native Paimon connector (apache/paimon-trino), the CDC query
+# benchmark's Trino image (deploy-trino.sh). The harness no longer configures a
+# `paimon` catalog (Paimon is read as Paimon-as-iceberg since 2026-11-09), so the
+# connector is unused. See engine-deploy/README.md (The image).
 #
 # apache/paimon-trino has no release at all (nothing on Maven Central; main is
 # Trino 476 / Paimon 1.3.1, a 1.3-SNAPSHOT). This builds it from source:

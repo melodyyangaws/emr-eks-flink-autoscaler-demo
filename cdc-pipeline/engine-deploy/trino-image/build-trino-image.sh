@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build the CDC benchmark's Trino image (trinodb/trino:484 + the native Paimon
 # connector built from apache/paimon-trino, see Dockerfile) and push it to ECR
-# as ${REPO}:${IMAGE_TAG}. deploy-trino.sh uses it when TRINO_IMAGE_REPO points
-# at it (.bench-env).
+# as ${REPO}:${IMAGE_TAG}. deploy-trino.sh uses it by default (TRINO_IMAGE;
+# empty = the stock trinodb/trino image; the harness configures no paimon catalog
+# either way, so the bundled connector is unused).
 #
 #   ./engine-deploy/trino-image/build-trino-image.sh
 #   NO_PUSH=1 ./engine-deploy/trino-image/build-trino-image.sh   build only (Kaniko --no-push)

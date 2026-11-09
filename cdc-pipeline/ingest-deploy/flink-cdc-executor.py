@@ -15,8 +15,8 @@ Features:
 - Catalog-agnostic (Paimon, Iceberg, or custom)
 
 Usage:
-  python flink-cdc-executor.py --scripts s3://bucket/scripts/
-  python flink-cdc-executor.py --scripts /opt/flink/sql/ --format paimon
+  python flink-cdc-executor.py --sql-dir s3://bucket/scripts/
+  python flink-cdc-executor.py --sql-dir /opt/flink/sql/
   python flink-cdc-executor.py --sql-file setup.sql,pipelines.sql
 """
 
@@ -25,7 +25,7 @@ import sys
 import argparse
 import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Optional
 from pyflink.table import EnvironmentSettings, TableEnvironment
 from pyflink.table.table_result import TableResult
 
@@ -425,7 +425,7 @@ Environment Variables:
             executor.execute_sql_directory(args.sql_dir, args.pattern)
 
         # Execute all collected INSERT statements as a single StatementSet
-        result = executor.execute_pending_inserts()
+        executor.execute_pending_inserts()
 
         print("\n" + "=" * 80)
         print("✓ All SQL executed and StatementSet submitted!")

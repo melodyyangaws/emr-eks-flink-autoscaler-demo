@@ -15,7 +15,7 @@ unset _cdc_env_dir
 
 export NAMESPACE=emr-flink
 export ICEBERG_FORMAT_VERSION=3
-export SESSION_SUFFIX=_v3final
+export SESSION_SUFFIX=_v3
 
 # The CDC tables' warehouses, as ingest-deploy/flink-cdc-{paimon,iceberg}-sql.yaml write
 # them; the query benchmark reads both formats.

@@ -3,7 +3,7 @@
 ## Overview
 
 The **MySQL upsert load generator** (`mysql-data-generator/mysql-upsert-loadgen.yaml`,
-StatefulSet `mysql-upsert-loadgen`, 4 replicas) is the only CDC source for this
+StatefulSet `mysql-upsert-loadgen`, 24 replicas) is the only CDC source for this
 pipeline. Each pod runs a Python script that writes batched
 `INSERT … ON DUPLICATE KEY UPDATE` statements against the `ecommerce` database
 (`customers`, `products`, `orders`, `order_items`), so the binlog carries `+I` events
@@ -14,11 +14,11 @@ small share of each batch is a multi-row `DELETE`, which shows up as `-D` events
 | | |
 |---|---|
 | Manifest | `mysql-upsert-loadgen.yaml` |
-| Kubernetes kind | **StatefulSet**, 4 replicas |
-| Statements | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows per batch (manifest: 5000); on `orders` / `order_items`, `DELETE_RATIO` of those rows go to a `DELETE … WHERE pk IN (…)` instead |
+| Kubernetes kind | **StatefulSet**, 24 replicas (4 until 2026-11-06) |
+| Statements | `INSERT … ON DUPLICATE KEY UPDATE`, `BATCH_ROWS` rows per batch (manifest: 2000); on `orders` / `order_items`, `DELETE_RATIO` of those rows go to a `DELETE … WHERE pk IN (…)` instead |
 | Rate | measure it — `RATE_PER_POD` is 80,000, a deliberately unreachable token-bucket ceiling |
 | DELETE events | `DELETE_RATIO` 0.05 of `orders` / `order_items` rows (~3.75% of all rows, plus the items deleted with their orders); never `customers` / `products`. Added 2026-11-03, not yet measured on RDS |
-| Iceberg position deletes | **design target ~50%** of the Iceberg writer's deletes (`RECENT_KEY_RATIO`), not yet measured; ~2% before 2026-11-02 |
+| Iceberg position deletes | **25% measured** on 2026-11-07 (`_v3final`, `RECENT_KEY_RATIO` 0.3: 65.3M deletes, 49.0M of them equality); the earlier design target was ~50% at `RECENT_KEY_RATIO` 0.6 (2026-11-02 to 2026-11-06, not measured); ~2% before 2026-11-02 |
 | Use it for | the Paimon-vs-Iceberg storage benchmark and the hot query test |
 
 > **The mixed generator is gone.** The row-at-a-time INSERT/UPDATE/DELETE generator
@@ -29,8 +29,8 @@ small share of each batch is a multi-row `DELETE`, which shows up as `-D` events
 > measure inserts and upserts only. See [Deletes](#deletes-and-foreign-keys).
 
 > **`RATE_PER_POD` is not a throughput claim.** It is set
-> far above anything the instance has delivered (4 x 80,000 = 320,000 rows/s of
-> *target*; the 2026-11-02 dry run reached ~64,000 rows/s on 8 pods) precisely so the bucket
+> far above anything the instance has delivered (24 x 80,000 = 1,920,000 rows/s of
+> *target*; the source has delivered about 64,000–100,000 rows/s, see [Rates seen](#rates-seen)) precisely so the bucket
 > never binds and the pods run flat out. Read the achieved rate off the pod logs
 > (`inst=`), and read the gap to the target as a headroom measurement.
 
@@ -38,14 +38,15 @@ Repeated upserts on a skewed hot-key window are what
 make Iceberg accumulate equality-delete files while Paimon's LSM compacts them away; a
 uniformly random key stream over the whole id range would measure raw ingest and show neither effect.
 
-On top of that, `RECENT_KEY_RATIO` (0.6) of every batch **re-writes keys the same
-worker thread wrote a few seconds earlier**, so that about half of the deletes the
-Iceberg writer produces are position deletes (deletion vectors on v3) instead of
-equality deletes. See [Recent re-writes](#recent-re-writes-iceberg-position-deletes).
+On top of that, `RECENT_KEY_RATIO` (0.3 in the manifest since 2026-11-06; 0.6
+before) of every batch **re-writes keys the same worker thread wrote a few seconds
+earlier**, so that part of the deletes the Iceberg writer produces are position
+deletes (deletion vectors on v3) instead of equality deletes (25% measured at
+0.3). See [Recent re-writes](#recent-re-writes-iceberg-position-deletes).
 
 > **The generator is a StatefulSet, not a Deployment.** Each pod owns a *disjoint
 > slice* of the hot-key window and derives that slice from its ordinal, and only a
-> StatefulSet hands out exact `0..N-1` ordinals (`mysql-upsert-loadgen-0` … `-3`). This
+> StatefulSet hands out exact `0..N-1` ordinals (`mysql-upsert-loadgen-0` … `-23`). This
 > matters for two commands: `kubectl` calls must say `statefulset`, not `deployment`, and
 > if you ever ran the older Deployment version you must `kubectl delete deployment
 > mysql-upsert-loadgen -n emr-flink` first — `kubectl apply` cannot convert a Deployment
@@ -58,18 +59,21 @@ equality deletes. See [Recent re-writes](#recent-re-writes-iceberg-position-dele
 Used by the Paimon-vs-Iceberg comparison and the hot query test
 ([querybench/README.md](querybench/README.md)). Run the script from `cdc-pipeline/`:
 its manifest path (`mysql-data-generator/mysql-upsert-loadgen.yaml`) is relative to
-that directory. A trailing `upsert` argument (`deploy upsert`, `scale 4 upsert`) and
+that directory. A trailing `upsert` argument (`deploy upsert`, `scale 24 upsert`) and
 `WORKLOAD=upsert` are still accepted from the two-generator days; `WORKLOAD=mixed`
 is rejected.
 
 ### Step 1 — Deploy
 
-1. Load the connection values. The script creates the `mysql-credentials` secret from
-   them on the first deploy, and reuses an existing one after that:
+1. Check the `mysql-credentials` Secret exists ([README Step 0](README.md#step-0-one-time-setup)).
+   The pods read `MYSQL_HOST`, `MYSQL_USER` and `MYSQL_PASSWORD` from it
+   (`secretKeyRef`); the script refuses to deploy when it or one of its keys is
+   missing, and never creates it:
 
    ```bash
-   cd cdc-pipeline                  # MYSQL_HOST / MYSQL_USER come from .bench-env(.local);
-                                    # the password from Secret mysql-credentials
+   cd cdc-pipeline
+   kubectl get secret mysql-credentials -n emr-flink -o jsonpath='{.data}' \
+     | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'   # key names only
    ```
 
 2. One time only, and only if the older Deployment version was ever applied
@@ -85,7 +89,7 @@ is rejected.
    ./mysql-data-generator/deploy-data-generator.sh deploy
    ```
 
-4. Check that all 4 pods came up together (`podManagementPolicy: Parallel`) and that
+4. Check that all 24 pods came up together (`podManagementPolicy: Parallel`) and that
    each logged a distinct ordinal and the live id ranges:
 
    ```bash
@@ -95,7 +99,7 @@ is rejected.
 
    ```
    mysql C extension: available
-   pod=mysql-upsert-loadgen-3 ordinal=3 of 4
+   pod=mysql-upsert-loadgen-3 ordinal=3 of 24
    id ranges: {'customers': (<min>, <max>), 'products': (…), 'orders': (…), 'order_items': (…)}
    ```
 
@@ -142,19 +146,25 @@ Each pod prints a counter line every `REPORT_SECONDS` (15):
   in `errors=` like failed upserts. `batches=` counts upsert statements only.
 
 `RATE_PER_POD` is a token-bucket ceiling set far above anything the instance has
-delivered (4 x 80,000 = 320,000 rows/s of *target*), so the bucket never binds and
+delivered (24 x 80,000 = 1,920,000 rows/s of *target*), so the bucket never binds and
 the pods run flat out. The achieved rate is the real limit of MySQL plus the driver.
 
 ### Rates seen
 
-| Run | Settings | Aggregate `inst=` | `errors=` / `batches=` | RDS CPU |
+| Run | Settings | Aggregate rate | `errors=` / `batches=` | RDS CPU |
 |---|---|---:|---:|---:|
-| **Dry run, 2026-11-02** (source shrunk to ~37.5M rows) | manifest values below, but 8 pods | **~64,000 rows/s** | **~34%** | **64–79%** |
-| Best earlier measurement at 8 pods | 64,000 IOPS volume, full-size source | 94,327 rows/s | — | — |
+| **`_v3final`, 2026-11-07** (db.r6i.4xlarge, ~49M-row source) | the current manifest values: 24 pods, `BATCH_ROWS` 2000, `RECENT_KEY_RATIO` 0.3, `HOT_KEY_RATIO` 0.3 / 20M | **~100,000 rows/s** ingested by each writer (job monitor: Paimon 99,135, Iceberg 101,137) | — | — |
+| 2026-11-03 (db.r6i.4xlarge) | 4 pods / 8 pods, `BATCH_ROWS` 5000, `RECENT_KEY_RATIO` 0.6 | ~89,000 / ~79,000 rows/s `inst=` | — | — |
+| Dry run, 2026-11-02 (db.m5.2xlarge, source shrunk to ~37.5M rows) | 8 pods, `BATCH_ROWS` 5000 | ~64,000 rows/s `inst=` | ~34% | 64–79% |
+| Best earlier measurement at 8 pods | db.m5.2xlarge, 64,000 IOPS volume, full-size source | 94,327 rows/s | — | — |
 
-On the dry run the bottleneck was RDS CPU plus row-lock contention, not storage. The
-Flink jobs kept up with that rate. The manifest went from 8 to 4 pods afterwards
-(2026-11-02) to cut that contention; the 4-pod rate is not measured yet.
+On the 2026-11-02 dry run the bottleneck was RDS CPU plus row-lock contention, not
+storage, and on 2026-11-03 extra pods past a few added lock contention rather than
+throughput. The `_v3final` figure is the writers' ingest rate, not the generator's
+own `inst=` sum: about 5% of the 1,920,000 rows/s target. Both writers kept up
+with no backpressure, so the source side (generator plus RDS) set the rate; RDS CPU
+averaged 34.9% (max 44.9%) over the ingest window, so on this instance the limit
+was not CPU ([the summary](bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)).
 
 ### Step 3 — Restart the pods after a source shrink
 
@@ -165,7 +175,7 @@ Restart them all at once, then check the new `id ranges:` lines as in Step 1:
 
 ```bash
 kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
-kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=4
+kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=24
 ```
 
 `kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink` also works,
@@ -205,19 +215,23 @@ returns. Too high, and part of the window goes unwritten. If you scale with a ba
 ### Tune rate and key skew
 
 ```bash
-# rate/pod, worker threads, rows per statement (script defaults = manifest values)
-./mysql-data-generator/deploy-data-generator.sh config 80000 8 5000
+# rate/pod, worker threads, rows per statement (the manifest values)
+./mysql-data-generator/deploy-data-generator.sh config 80000 8 2000
 
-# upsert ratio, hot-key ratio, hot-key window (script defaults = manifest values);
+# upsert ratio, hot-key ratio, hot-key window (the manifest values);
 # optional 5th/6th: RECENT_KEY_RATIO, RECENT_KEY_MAX_AGE_S (left as-is if omitted)
-./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.6 5000000
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.3 20000000
 
-# only the recent-key knobs: ratio, max age in seconds
-./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
+# only the recent-key knobs: ratio, max age in seconds (the manifest values)
+./mysql-data-generator/deploy-data-generator.sh recent-mix 0.3 20
 
 # only DELETE_RATIO (orders / order_items); 0 turns deletes off
 ./mysql-data-generator/deploy-data-generator.sh delete-mix 0.05
 ```
+
+**Pass every argument.** The commands' built-in defaults for an omitted argument
+are older values, not the manifest's: `config` 80000 8 **5000**, `upsert-mix`
+**0.5 0.6 5000000**, `recent-mix` **0.6** 20, `delete-mix` 0.05.
 
 `config` changes *how fast*. `upsert-mix`, `recent-mix` and `delete-mix` change *what
 is being measured*. `recent-mix` warns if the age is 60 s or more (the checkpoint
@@ -225,32 +239,34 @@ interval). `delete-mix` rejects values outside `[0, 1)` and warns above 0.1, whe
 deletes clearly outpace the ~4–5% inserts and the fact tables shrink.
 
 Both commands are `kubectl set env`, which starts a rolling restart. The StatefulSet
-replaces pods one at a time in descending ordinal order, so for 4 pods the cluster
+replaces pods one at a time in descending ordinal order, so for 24 pods the cluster
 runs a mix of old and new settings for a few minutes. Do not start a measurement
 window until every pod has printed its startup banner again, and do not interrupt a
 rollout, because the pods not yet replaced keep the old values.
 
 ### Current manifest values
 
-`mysql-data-generator/mysql-upsert-loadgen.yaml` is the ground truth; the script's
-CLI defaults copy it. A `config` or `upsert-mix` run changes the live StatefulSet
-but not this file: check the live values with
+`mysql-data-generator/mysql-upsert-loadgen.yaml` is the ground truth (these values
+since 2026-11-06, the `_v3final` run). The script's CLI defaults, the target-rate and
+`RECENT_KEY_RATIO` lines `deploy` and `help` print ("80,000 x 4", "0.6") and some of the
+manifest's own comments still describe the earlier values. A `config` or
+`upsert-mix` run changes the live StatefulSet but not this file: check the live values with
 `kubectl get statefulset mysql-upsert-loadgen -n emr-flink -o jsonpath='{.spec.template.spec.containers[0].env}'`.
 
 | Variable | Value | Note |
 |---|---|---|
-| `replicas` | 4 | `podManagementPolicy: Parallel`; was 8 until 2026-11-02 |
+| `replicas` | 24 | `podManagementPolicy: Parallel`; 8 until 2026-11-02, then 4 until 2026-11-06 |
 | `RATE_PER_POD` | 80000 | token-bucket ceiling, deliberately unreachable |
 | `THREADS` | 8 | |
-| `BATCH_ROWS` | 5000 | the measured optimum; 10,000 was worse. Multiplies with `THREADS` x `replicas` into lock contention |
+| `BATCH_ROWS` | 2000 | 5000 until 2026-11-06 (then the measured optimum at 4–8 pods; 10,000 was worse). Multiplies with `THREADS` x `replicas` into lock contention |
 | `UPSERT_RATIO` | 0.9 | applies to the **non-recent** rows only: of those, 90% update a `pick_key()` key, 10% are new inserts (was 0.5 until 2026-11-02: the tables outgrew the buffer pool and the rate fell from ~85K to ~30K rows/s in 4 h) |
-| `RECENT_KEY_RATIO` | 0.6 | share of **all** rows that re-write a key this thread wrote within `RECENT_KEY_MAX_AGE_S`. Design target ~50% Iceberg position deletes; 0 disables it. Added 2026-11-02 |
+| `RECENT_KEY_RATIO` | 0.3 | share of **all** rows that re-write a key this thread wrote within `RECENT_KEY_MAX_AGE_S`; 0 disables it. Added 2026-11-02 at 0.6 (design target ~50% Iceberg position deletes); 0.3 since 2026-11-06 (25% measured) |
 | `RECENT_KEY_MAX_AGE_S` | 20 | well under the 60 s checkpoint interval |
 | `TABLE_RUN_BATCHES` | 8 | consecutive batches a thread spends on one table; long-run mix unchanged. 1 = the old one draw per batch |
 | `DELETE_RATIO` | 0.05 | share of every `orders` / `order_items` batch that is deleted instead of written; `customers` / `products` are never deleted. 0 turns deletes off. Added 2026-11-03 |
-| `HOT_KEY_RATIO` | 0.6 | share of upserts drawn from the hot window |
-| `HOT_KEY_WINDOW` | 5000000 | sized to the buffer pool, about 16 GB of rows |
-| `POD_COUNT` | 4 | must equal `replicas` |
+| `HOT_KEY_RATIO` | 0.3 | share of upserts drawn from the hot window (0.6 until 2026-11-06) |
+| `HOT_KEY_WINDOW` | 20000000 | sized to the buffer pool: about 67 GB of rows against db.r6i.4xlarge's 92 GiB (5,000,000 until 2026-11-06, sized to db.m5.2xlarge's 24 GB) |
+| `POD_COUNT` | 24 | must equal `replicas` |
 | `SHARD_HOT_KEYS` | true | a disjoint hot slice per ordinal |
 | `REPORT_SECONDS` | 15 | interval behind `inst=` |
 | `DURATION_SECONDS` | 0 | run forever |
@@ -264,9 +280,9 @@ same defaults in Python as in the manifest. Three more exist only in Python:
 `ORDER_DELETE_MAX_ITEMS=20` (see [Deletes](#deletes-and-foreign-keys)). The startup
 banner prints them on the `recent keys :` and `deletes     :` lines.
 
-Stream-wide, the manifest values give at most 60% recent re-writes, 36% hot/cold
-upserts and 4% inserts, with 5% of the `orders` / `order_items` rows (75% of the
-mix) turned into deletes. A batch never lists the same primary key twice: duplicates
+Stream-wide, the manifest values give at most 30% recent re-writes, 63% hot/cold
+upserts and 7% inserts (at the earlier 0.6: 60% / 36% / 4%), with 5% of the
+`orders` / `order_items` rows (75% of the mix) turned into deletes. A batch never lists the same primary key twice: duplicates
 are dropped from the recent draw and redrawn in the normal path.
 
 ### How keys are picked
@@ -292,13 +308,13 @@ nothing:
 window = 0.65 x buffer_pool_bytes / avg_row_bytes
 ```
 
-On `db.m5.2xlarge` (32 GiB, `innodb_buffer_pool_size = {DBInstanceClassMemory*3/4}`,
-about 24 GB) with rows of about 3.36 KB:
+With rows of about 3.36 KB and `innodb_buffer_pool_size = {DBInstanceClassMemory*3/4}`:
 
-| `HOT_KEY_WINDOW` | Span | vs 24 GB pool |
+| `HOT_KEY_WINDOW` | Span | vs the pool |
 |---:|---:|---|
-| 200,000,000 | 641 GB | 27x the pool. This ran once, and it was wrong |
-| **5,000,000** (current) | 16 GB | fits, with room for the cold tail |
+| 200,000,000 | 641 GB | 27x db.m5.2xlarge's 24 GB pool. This ran once, and it was wrong |
+| 5,000,000 (until 2026-11-06) | 16 GB | fits db.m5.2xlarge's 24 GB, with room for the cold tail |
+| **20,000,000** (current) | 67 GB | about the formula's value for db.r6i.4xlarge's 92 GiB pool (0.65 × 92 GiB / 3.36 KB ≈ 19M) |
 
 At 200,000,000: ReadIOPS 6,619 against WriteIOPS 8,690 (nearly every upsert read a
 page from disk first), CPU 60–73%, WriteIOPS 14% of the 64,000 provisioned, about 50%
@@ -314,7 +330,7 @@ key index, so both are instant lookups) and logs them on the `id ranges:` line a
 `[MIN, MAX]`.
 
 The lower bound matters because the source tables were shrunk to their newest ~10% of
-ids (2026-11-02, see [0-MYSQL-SETUP-GUIDE.md](./0-MYSQL-SETUP-GUIDE.md#step-1-create-rds-mysql-instance)).
+ids (2026-11-02, see [README Step 4a](./README.md#step-4a-shrink-the-source-to-10-only-when-it-outgrew-the-buffer-pool)).
 After that, about 90% of `[1, MAX]` is ids that no longer exist. A cold "upsert" on
 one of them finds no row, `ON DUPLICATE KEY UPDATE` takes the INSERT path at that old
 id, and the table grows back toward its old size. Drawing from `[MIN, MAX]` keeps cold
@@ -374,7 +390,8 @@ batches, 25–50 s at 1,000–2,000 rows/s per thread. `TABLE_RUN_BATCHES=8` kee
 thread on one table for 8 batches, chosen with the same weights, so the previous
 same-table batch is one batch back.
 
-**Why 0.6 for a 50% target.** The position share is about
+**Why 0.6 for a 50% target (the 2026-11-02 design; superseded by 0.3 on
+2026-11-06, which measured 25% on `_v3final`).** The position share is about
 `RECENT_KEY_RATIO` × (share of re-writes the buffer can serve, ~0.92) ×
 (same-checkpoint probability, ~0.89), plus the ~1–2% the hot window already makes.
 An offline simulation of the planner gave these numbers. It used the real
@@ -395,8 +412,8 @@ checkpoints that run long, and both of those lower the share. Measure it and adj
 
 **Side effects to expect (not yet measured):**
 
-- **Inserts.** Fewer rows are new inserts (about 4–5% of rows at `UPSERT_RATIO` 0.9,
-  instead of 50%), so the source tables grow far more slowly. On the fact tables,
+- **Inserts.** Fewer rows are new inserts (about 4–5% of rows at `UPSERT_RATIO` 0.9
+  and `RECENT_KEY_RATIO` 0.6, 7% at 0.3, instead of 50%), so the source tables grow far more slowly. On the fact tables,
   the deletes roughly offset them.
 - **Write cost.** More rows are updates, and an update writes undo and redo for the
   old image, so achieved rows/s may move either way. Re-written rows are hot in the
@@ -426,8 +443,8 @@ buffer pool problem is why `UPSERT_RATIO` went to 0.9.
 **Foreign keys.** The three FKs re-added by the 2026-11-02 shrink
 (`orders_ibfk_1` orders→customers, `order_items_ibfk_1` / `_2`
 order_items→orders/products) have **no `ON DELETE` clause, so they are RESTRICT**
-(see `shrink_10pct_drop_old_and_add_fks` and the DDL in
-[0-MYSQL-SETUP-GUIDE.md](./0-MYSQL-SETUP-GUIDE.md)). Each table is handled as
+(the shrink's `shrink_10pct_drop_old_and_add_fks` procedure, which is not in the
+repo, and the DDL in [0-MYSQL-SETUP-GUIDE.md](./0-MYSQL-SETUP-GUIDE.md#32-create-e-commerce-tables)). Each table is handled as
 follows:
 
 | Table | Deleted? | How the FKs hold |
@@ -533,8 +550,8 @@ Bigger batches amortize the redo-log flush, but a batch is **one transaction hol
 every row lock it touches for the whole statement**. At `BATCH_ROWS=10000`: `inst=`
 4,000/s per pod with 53 of 130 batches erroring, about 30,000 rows/s aggregate, while
 RDS had about 5x storage headroom (`DiskQueueDepth` 18–76: requests queued behind lock
-waits, not behind the device). 5,000 is the manifest value. Do not raise it without
-also reducing `THREADS` x `replicas`.
+waits, not behind the device). 5,000 was the manifest value at 4–8 pods; at 24 pods
+it is 2,000 (since 2026-11-06). Do not raise it without also reducing `THREADS` x `replicas`.
 
 ### Measured ceiling (historical)
 
@@ -622,7 +639,7 @@ per 60 s checkpoint).
 Athena reads Iceberg v2 only, so it cannot read the v3 table set. Query it with the
 DuckDB and Trino arms of [querybench/](./querybench/README.md). On a v2 set
 (`ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX=`), Athena reads `flink_iceberg_db`
-directly ([README Step 4](./README.md#step-4--olap-query-layer-athena)):
+directly ([README, Athena](./README.md#athena)):
 
 ```sql
 SELECT COUNT(*) AS total_customers, MAX(updated_at) AS latest_update
@@ -675,13 +692,9 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 
 ### **Database Connection Errors**
 
-```bash
-# Test connection from pod
-kubectl run mysql-test --rm -it --restart=Never \
-  --image=mysql:8.0 \
-  --namespace=emr-flink \
-  --command -- mysql -h $MYSQL_HOST -u $MYSQL_USER -p$MYSQL_PASSWORD -e "SELECT 1;"
-```
+Test the connection from a pod that reads the credentials from the Secret
+(the password never reaches the command line or the laptop):
+[0-MYSQL-SETUP-GUIDE.md, Test the connection from EKS](./0-MYSQL-SETUP-GUIDE.md#step-8-test-the-connection-from-eks).
 
 ---
 
@@ -727,7 +740,7 @@ or checkpoints are failing; check the monitor's per-table committed rows/s and
 # One-time, only if the older Deployment version was ever applied
 kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
 
-# Deploy: 4 pods, RATE_PER_POD 80000 (an unreachable ceiling by design)
+# Deploy: 24 pods, RATE_PER_POD 80000 (an unreachable ceiling by design)
 ./mysql-data-generator/deploy-data-generator.sh deploy
 
 # Status + achieved rate per pod (quote the summed inst=, not avg=)
@@ -735,7 +748,7 @@ kubectl delete deployment mysql-upsert-loadgen -n emr-flink --ignore-not-found
 
 # Restart all pods at once, e.g. after a source shrink (re-reads MIN/MAX ids)
 kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
-kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=4
+kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=24
 
 # Pause without deleting (also how to bound a measurement window)
 kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
@@ -750,13 +763,13 @@ kubectl scale statefulset mysql-upsert-loadgen -n emr-flink --replicas=0
 ./mysql-data-generator/deploy-data-generator.sh scale 16
 
 # Rate: rows/s per pod, threads, rows per statement (rolling restart)
-./mysql-data-generator/deploy-data-generator.sh config 80000 8 5000
+./mysql-data-generator/deploy-data-generator.sh config 80000 8 2000
 
 # Key skew: upsert ratio, hot-key ratio, hot-key window (rolling restart)
-./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.5 0.6 5000000
+./mysql-data-generator/deploy-data-generator.sh upsert-mix 0.9 0.3 20000000
 
 # Recent re-writes (Iceberg position deletes): ratio, max age s (rolling restart)
-./mysql-data-generator/deploy-data-generator.sh recent-mix 0.6 20
+./mysql-data-generator/deploy-data-generator.sh recent-mix 0.3 20
 
 # Deletes on orders / order_items: ratio, 0 = off (rolling restart)
 ./mysql-data-generator/deploy-data-generator.sh delete-mix 0.05
@@ -768,7 +781,7 @@ The manifest values are in [Current manifest values](#current-manifest-values).
 
 ## Summary
 
-✅ **One generator**: StatefulSet `mysql-upsert-loadgen`, 4 pods, rate is measured
+✅ **One generator**: StatefulSet `mysql-upsert-loadgen`, 24 pods, rate is measured
    not configured. The mixed INSERT/UPDATE/DELETE generator was removed 2026-11-02;
    since 2026-11-03 the upsert generator emits DELETEs itself (`DELETE_RATIO`)
 ✅ **Deployed in**: `emr-flink` namespace, run from `cdc-pipeline/`
@@ -778,7 +791,8 @@ The manifest values are in [Current manifest values](#current-manifest-values).
    order's items go first; `customers` / `products` are never deleted)
 ✅ **Keys**: hot window sharded per pod; cold tail drawn from the live
    `[MIN(id), MAX(id)]`, read at pod start (restart the pods after a shrink);
-   60% of rows re-write a key written < 20 s earlier by the same thread, so that
-   ~50% of Iceberg deletes are position deletes (design target, not yet measured)
-✅ **Measured**: ~64,000 rows/s at 8 pods on the 2026-11-02 dry run (RDS CPU 64–79%,
-   errors/batches ~34%). Re-measure; never quote a stale ceiling.
+   30% of rows re-write a key written < 20 s earlier by the same thread, so that
+   part of the Iceberg deletes are position deletes (25% measured on 2026-11-07)
+✅ **Measured**: ~100,000 rows/s ingested by each writer at 24 pods (2026-11-07);
+   ~64,000 rows/s at 8 pods on the 2026-11-02 dry run on db.m5.2xlarge. Re-measure;
+   never quote a stale ceiling.

@@ -7,7 +7,6 @@ Runs as a long-lived pod in the emr-flink namespace.
 import os
 import sys
 import time
-import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -62,10 +61,10 @@ def build_monitor(flink_url, glue_db, warehouse, tables, catalog_type="glue"):
         }
     else:
         catalog_config = {
-        "type": "glue",
-        "warehouse": warehouse,
-        "region_name": AWS_REGION,
-        "s3.region": AWS_REGION,
+            "type": "glue",
+            "warehouse": warehouse,
+            "region_name": AWS_REGION,
+            "s3.region": AWS_REGION,
         }
     return FlinkCDCMonitor(
         flink_url=flink_url,

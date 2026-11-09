@@ -64,6 +64,12 @@ class TableSnapshot:
     # on Paimon (no such keys), and then nothing DV-related is reported.
     added_dvs: int = 0                                     # the current snapshot's added-dvs
     dv_history: dict = field(default_factory=dict)         # {snapshot id: (added-dvs, removed-dvs)}
+    # Paimon: its deletion vectors live in per-bucket DV index files listed by
+    # the snapshot's index manifest (written by compaction, not the writer), so
+    # the window's added / removed DVs are the index files new / gone between
+    # the start and end snapshots. None = not read (Iceberg, or no index manifest).
+    paimon_dv_index_files: Optional[set] = None
+    paimon_dv_data_files: int = 0                          # live data files that carry a DV
     current_snapshot_id: Optional[int] = None
     error: str = ""          # set when the table could not be read
 
@@ -150,6 +156,10 @@ class PipelineReport:
     total_new_dvs: int = 0
     total_removed_dvs: int = 0
     has_dvs: bool = False
+    # Paimon: the DV counts above are DV index files (one per written bucket,
+    # rewritten by each compaction), plus the live data files carrying a DV.
+    paimon_dv_counts: bool = False
+    paimon_dv_data_files: int = 0
     total_new_records_in_tables: int = 0
     total_new_bytes_in_tables: int = 0
     failed_checkpoints: int = 0
@@ -310,7 +320,6 @@ class FlinkCDCMonitor:
             "count": counts.get("completed", 0),
             "failed": counts.get("failed", 0),
             "latest_duration_ms": duration,
-            "latest_size": latest.get("state_size", 0) if latest else 0,
         }
 
     def _check_backpressure(self, details: dict):
@@ -488,6 +497,17 @@ class FlinkCDCMonitor:
             s3 = self._s3 = s3_client(self.catalog_config.get("s3.region", "us-west-2"))
         return s3, bucket, f"{prefix}/{self.glue_database}.db/{table_name}".lstrip("/")
 
+    def _paimon_snapshot(self, table_name: str, sid: int) -> Optional[dict]:
+        """snapshot-<sid> of a Paimon table as a dict; None (logged) when it
+        cannot be read, e.g. already expired."""
+        s3, bucket, table_prefix = self._paimon_s3(table_name)
+        try:
+            return json.loads(s3.get_object(
+                Bucket=bucket, Key=f"{table_prefix}/snapshot/snapshot-{sid}")["Body"].read())
+        except Exception as e:
+            log.warning("Paimon snapshot-%d of %s unreadable, skipped: %s", sid, table_name, e)
+            return None
+
     @staticmethod
     def _read_avro(s3, bucket: str, key: str) -> list:
         # Paimon manifests and manifest lists: Avro, zstd by default.
@@ -531,6 +551,13 @@ class FlinkCDCMonitor:
                 if ml:
                     for m in self._read_avro(s3, bucket, f"{table_prefix}/manifest/{ml}"):
                         ts.total_data_files += m["_NUM_ADDED_FILES"] - m["_NUM_DELETED_FILES"]
+            # The index manifest is the table's full live index set (ADD entries).
+            ts.paimon_dv_index_files = set()
+            if snap.get("indexManifest"):
+                for r in self._read_avro(s3, bucket, f"{table_prefix}/manifest/{snap['indexManifest']}"):
+                    if r.get("_INDEX_TYPE") == "DELETION_VECTORS" and r.get("_KIND", 0) == 0:
+                        ts.paimon_dv_index_files.add(r["_FILE_NAME"])
+                        ts.paimon_dv_data_files += len(r.get("_DELETIONS_VECTORS_RANGES") or [])
             paginator = s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=bucket, Prefix=f"{table_prefix}/snapshot/snapshot-"):
                 ts.snapshot_count += len(page.get("Contents", []))
@@ -551,13 +578,9 @@ class FlinkCDCMonitor:
         and deletes); the changelog files of changelog-producer=lookup are
         in a separate manifest list and are not counted."""
         out = []
-        s3, bucket, table_prefix = self._paimon_s3(table_name)
         for sid in range(start_id, end_id + 1):
-            try:
-                snap = json.loads(s3.get_object(
-                    Bucket=bucket, Key=f"{table_prefix}/snapshot/snapshot-{sid}")["Body"].read())
-            except Exception as e:
-                log.warning("Paimon snapshot-%d of %s unreadable, skipped: %s", sid, table_name, e)
+            snap = self._paimon_snapshot(table_name, sid)
+            if snap is None:
                 continue
             if snap.get("commitKind") == "APPEND" or sid == start_id:
                 out.append((snap["timeMillis"] / 1000.0, int(snap.get("deltaRecordCount") or 0)))
@@ -575,6 +598,13 @@ class FlinkCDCMonitor:
         except Exception as e:
             log.warning("Iceberg commit history unreadable for %s.%s: %s", self.glue_database, table_name, e)
             return []
+
+    @staticmethod
+    def _dv_window(s: TableSnapshot, e: TableSnapshot):
+        """(added, removed) Iceberg v3 DVs of the commits retained at the end
+        that were not there at the start (immune to snapshot expiry in between)."""
+        new = [ar for i, ar in e.dv_history.items() if i not in s.dv_history]
+        return sum(a for a, _ in new), sum(r for _, r in new)
 
     @staticmethod
     def _counter_rate(snaps: list):
@@ -620,11 +650,8 @@ class FlinkCDCMonitor:
         out = {"commits": 0, "files": 0, "records": 0, "bytes": 0}
         s3, bucket, table_prefix = self._paimon_s3(table_name)
         for sid in range(start_id + 1, end_id + 1):
-            try:
-                snap = json.loads(s3.get_object(
-                    Bucket=bucket, Key=f"{table_prefix}/snapshot/snapshot-{sid}")["Body"].read())
-            except Exception as e:
-                log.warning("Paimon snapshot-%d of %s unreadable, skipped: %s", sid, table_name, e)
+            snap = self._paimon_snapshot(table_name, sid)
+            if snap is None:
                 continue
             if snap.get("commitKind") != "APPEND" or not snap.get("deltaManifestList"):
                 continue
@@ -768,10 +795,15 @@ class FlinkCDCMonitor:
             # the start (immune to snapshot expiry in between).
             if e.dv_history or s.dv_history:
                 report.has_dvs = True
-                for sid, (a, r) in e.dv_history.items():
-                    if sid not in s.dv_history:
-                        report.total_new_dvs += a
-                        report.total_removed_dvs += r
+                a, r = self._dv_window(s, e)
+                report.total_new_dvs += a
+                report.total_removed_dvs += r
+            if e.paimon_dv_index_files is not None and s.paimon_dv_index_files is not None:
+                report.has_dvs = True
+                report.paimon_dv_counts = True
+                report.total_new_dvs += len(e.paimon_dv_index_files - s.paimon_dv_index_files)
+                report.total_removed_dvs += len(s.paimon_dv_index_files - e.paimon_dv_index_files)
+                report.paimon_dv_data_files += e.paimon_dv_data_files
             # Paimon: bytes of files added by APPEND commits in the window,
             # read from each commit's delta manifests. Iceberg: live-size
             # delta from the snapshot summary.
@@ -791,9 +823,7 @@ class FlinkCDCMonitor:
                      s.total_equality_deletes, e.total_equality_deletes,
                      s.snapshot_count, e.snapshot_count,
                      s.current_snapshot_id, e.current_snapshot_id,
-                     (" dvs +%d/-%d" % (sum(a for i, (a, _) in e.dv_history.items() if i not in s.dv_history),
-                                        sum(r for i, (_, r) in e.dv_history.items() if i not in s.dv_history)))
-                     if e.dv_history else "")
+                     (" dvs +%d/-%d" % self._dv_window(s, e)) if e.dv_history else "")
 
             # Commit-based rows/s: the headline. Rows each commit added / time
             # between commits, from the table's own history, so no counter
@@ -921,7 +951,9 @@ class FlinkCDCMonitor:
         # Iceberg v3 only: shown when either side's summaries carry DV keys,
         # so a v2 run's table is unchanged. DVs are also counted in New Delete Files.
         if report_a.has_dvs or report_b.has_dvs:
-            dv = lambda r: f"+{r.total_new_dvs:,} / -{r.total_removed_dvs:,}" if r.has_dvs else "n/a"
+            dv = lambda r: ((f"+{r.total_new_dvs:,} / -{r.total_removed_dvs:,} index files "
+                             f"({r.paimon_dv_data_files:,} data files with DVs)") if r.paimon_dv_counts
+                            else f"+{r.total_new_dvs:,} / -{r.total_removed_dvs:,}") if r.has_dvs else "n/a"
             rows.append(["  ↳ Deletion Vectors (added / removed)", dv(report_a), dv(report_b), ""])
         rows += [
             ["New Records in Tables",
@@ -1018,9 +1050,13 @@ class FlinkCDCMonitor:
                     "equality_deletes_delta": e.total_equality_deletes - s.total_equality_deletes,
                     "added_delete_files": e.added_delete_files,
                     **({"added_dvs": e.added_dvs,
-                        "dvs_added_in_window": sum(a for i, (a, _) in e.dv_history.items() if i not in s.dv_history),
-                        "dvs_removed_in_window": sum(r for i, (_, r) in e.dv_history.items() if i not in s.dv_history)}
+                        **dict(zip(("dvs_added_in_window", "dvs_removed_in_window"), self._dv_window(s, e)))}
                        if e.dv_history else {}),
+                    **({"dv_index_files_added_in_window": len(e.paimon_dv_index_files - s.paimon_dv_index_files),
+                        "dv_index_files_removed_in_window": len(s.paimon_dv_index_files - e.paimon_dv_index_files),
+                        "dv_index_files_live": len(e.paimon_dv_index_files),
+                        "dv_data_files_live": e.paimon_dv_data_files}
+                       if e.paimon_dv_index_files is not None and s.paimon_dv_index_files is not None else {}),
                     "bytes_delta": e.total_size_bytes - s.total_size_bytes,
                 }
         return json.dumps(d, indent=2)

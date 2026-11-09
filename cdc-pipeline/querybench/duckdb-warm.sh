@@ -6,14 +6,13 @@
 #   SUITE=hot|snapshot ./querybench/duckdb-warm.sh run
 #   ./querybench/duckdb-warm.sh render <suite> [arm]   print the rendered SQL (no cluster; dry run)
 #
-# Arms (FORMATS=iceberg|paimon|both, default both): iceberg (the Iceberg
-# tables) and paimon (default: Paimon's Iceberg v3 export; PAIMON_READER=native:
-# native Paimon). Every table is read at its pinned version: iceberg_scan() of the
-# copied metadata.json for `iceberg` and for `paimon` (the export's v<N>.metadata.json),
-# or with PAIMON_READER=native paimon_scan(<table path>, snapshot_from_id=N) (the
-# native Paimon extension) (QB_PIN_* from pin.sh), the same pins Trino reads by snapshot id. The
+# Arms (FORMATS, default "iceberg paimon"): iceberg (the Iceberg tables) and
+# paimon (Paimon-as-iceberg, its Iceberg v3 metadata). Every table is read at its
+# pinned version: iceberg_scan() of the copied metadata.json for `iceberg` and for
+# `paimon` (the export's v<N>.metadata.json) (QB_PIN_* from pin.sh), the same pins
+# Trino reads by snapshot id. The
 # client renders the whole statement, the server only runs it. An arm that cannot
-# read its tables records ERROR per query; the other arm still runs.
+# read its tables records ERROR per query; the other arms still run.
 #
 # Same RUNS/WARMUP, pass-major order, median, timeouts and ZERO_SCAN guard
 # as trino.sh (allow-zero-rows, leading-col-is-label). Also:
@@ -43,7 +42,6 @@ READY_GRACE="${READY_GRACE:-1200}"
 POLL_S=5
 CSV="${OUT_DIR}/duckdb_warm-${STAMP}.csv"
 LOG="${OUT_DIR}/duckdb_warm-${STAMP}.log"
-ROWS_TSV="${CSV%.csv}-rows.tsv"
 EVENTS="${CSV%.csv}-events.csv"
 NAME="$DUCKDB_NAME"
 PORT="${DUCKDB_LOCAL_PORT:-18182}"
@@ -71,8 +69,7 @@ api() {     # GET|POST <path> [json body]
     done
     return 1
 }
-jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1]); print("" if v is None else v)' "$1"; }
-started_at() { api GET /health 2>/dev/null | jget started_at 2>/dev/null || true; }
+started_at() { api GET /health 2>/dev/null | qb_jget started_at 2>/dev/null || true; }
 
 restart_server() {
     kubectl rollout restart -n "$NAMESPACE" "deploy/${NAME}" >/dev/null
@@ -108,7 +105,7 @@ print(json.dumps({"sql": open(a[1]).read(), "suite": a[2], "arm": a[3], "name": 
                   "timeout_s": int(a[5]), "allow_zero_rows": a[6] == "1", "leading_col_is_label": a[7] == "1"}))
 EOF
 )
-    id=$(api POST /query "$body" | jget id 2>/dev/null || true)
+    id=$(api POST /query "$body" | qb_jget id 2>/dev/null || true)
     [[ -n "$id" ]] || { echo '{"status": "ERROR", "error": "server refused the query"}'; return 0; }
     deadline=$(( $(date +%s) + to + 300 ))
     while :; do
@@ -122,7 +119,7 @@ EOF
         j=$(curl -s -m 30 "localhost:${PORT}/job/${id}" 2>/dev/null) || { pf_up || true; continue; }
         [[ -n "$j" ]] || { pf_up || true; continue; }
         [[ "$j" == *'"no such job"'* ]] && { echo '{"status": "CRASH", "error": "job lost: the server restarted under it (OOM kill?)"}'; return 0; }
-        state=$(jget state <<<"$j" 2>/dev/null || true)
+        state=$(qb_jget state <<<"$j" 2>/dev/null || true)
         [[ "$state" == done ]] && { printf '%s\n' "$j"; return 0; }
     done
 }
@@ -134,15 +131,15 @@ profile_pass() {   # suite arm query-file rendered-sql-file
     to=$(qb_query_timeout "$s")
     body=$(python3 -c 'import json, sys; print(json.dumps({"sql": open(sys.argv[1]).read(), "suite": sys.argv[2], "arm": sys.argv[3], "name": sys.argv[4], "timeout_s": int(sys.argv[5]), "profile": True}))' \
              "$4" "$s" "$arm" "$(qb_query_name "$f")" "$to")
-    id=$(api POST /query "$body" | jget id 2>/dev/null || true)
+    id=$(api POST /query "$body" | qb_jget id 2>/dev/null || true)
     [[ -n "$id" ]] || return 0
     deadline=$(( $(date +%s) + to + 300 ))
     while (( $(date +%s) < deadline )); do
         sleep "$POLL_S"
         j=$(curl -s -m 30 "localhost:${PORT}/job/${id}" 2>/dev/null) || { pf_up || true; continue; }
         [[ "$j" == *'"no such job"'* ]] && { wait_server; return 0; }
-        [[ "$(jget state <<<"$j" 2>/dev/null)" == done ]] || continue
-        [[ "$(jget status <<<"$j")" == OK ]] && echo "$(jget scan_bytes <<<"$j") $(jget scan_rows <<<"$j")"
+        [[ "$(qb_jget state <<<"$j" 2>/dev/null)" == done ]] || continue
+        [[ "$(qb_jget status <<<"$j")" == OK ]] && echo "$(qb_jget scan_bytes <<<"$j") $(qb_jget scan_rows <<<"$j")"
         return 0
     done
 }
@@ -161,7 +158,7 @@ run_arm() {   # suite arm rendered-dir rows-file
             (( cold )) && echo "${arm},${s},${pass},${name},cold" >> "$EVENTS"
             t0=$(started_at)
             j=$(run_pass "$s" "$arm" "$f" "${dir}/${arm}.$(printf '%02d' "$n").sql")
-            st=$(jget status <<<"$j")
+            st=$(qb_jget status <<<"$j")
             [[ "$st" == CRASH ]] && wait_server
             t1=$(started_at)
             if [[ -n "$t0" && -n "$t1" && "$t0" != "$t1" ]]; then
@@ -190,7 +187,7 @@ EOF
                 echo "$st" > "${q}/${n}.bad"
                 qb_log "[${arm}/${s}] ${name} pass ${pass}: ${st}; not run again"
             else
-                qb_log "[${arm}/${s}] ${name} pass ${pass}: OK $(jget median_ms <<<"$j") ms"
+                qb_log "[${arm}/${s}] ${name} pass ${pass}: OK $(qb_jget median_ms <<<"$j") ms"
             fi
         done
     done
@@ -210,41 +207,19 @@ EOF
         [[ -f "${q}/${n}.cold" ]] && cms=$(<"${q}/${n}.cold")
         [[ -f "${q}/${n}.bad" ]] && st=$(<"${q}/${n}.bad")
         [[ -z "$med" && "$st" == OK ]] && st=ERROR
-        [[ -f "${q}/${n}.last" ]] && rr=$(jget result_rows < "${q}/${n}.last")
+        [[ -f "${q}/${n}.last" ]] && rr=$(qb_jget result_rows < "${q}/${n}.last")
         [[ -s "${q}/${n}.scan" ]] && read -r sb srr < "${q}/${n}.scan"
         echo "${STAMP},duckdb_warm,${arm},${s},${name},${st},${med},${rr},${srr},${sb},${cms}" >> "$rows"
-        if [[ -f "${q}/${n}.last" ]]; then
-            echo "${arm},${s},${name},$(jget first_row < "${q}/${n}.last")" >> "${CSV%.csv}-firstrows.csv"
-            python3 - "${q}/${n}.last" "$arm" "$s" "$name" >> "$ROWS_TSV" <<'EOF'
-import json, sys
-j = json.load(open(sys.argv[1]))
-for i, r in enumerate(j.get("rows") or [], 1):
-    print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], str(i), r.replace("\t", " ").replace("\n", " ")]))
-EOF
-        fi
+        if [[ -f "${q}/${n}.last" ]]; then qb_write_last_rows "${q}/${n}.last" "$arm" "$s" "$name" "$CSV"; fi
         printf '  %-30s MEDIAN %9s ms  %s\n' "$name" "${med:--}" "$st" >> "$LOG"
     done
 }
 
-render_suite_dir() {   # suite dir
-    local f n arm
-    for arm in $ARMS; do
-        n=0
-        for f in $(qb_query_files "$1"); do
-            n=$((n + 1)); qb_render "$f" duckdb "$arm" > "${2}/${arm}.$(printf '%02d' "$n").sql" || qb_die "render failed: ${f} (duckdb/${arm})"
-        done
-    done
-}
-
 run_suite() {   # suite
-    local s="$1" dir arm writers rows bad n
+    local s="$1" dir arm writers rows n
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
     qb_start_suite "$s"
-    # H8's key: exported by hot-interleave.sh; resolved here when run by hand.
-    if [[ "$s" == hot && -z "${QB_LOOKUP_ORDER_ID:-}" ]] && grep -q 'LOOKUP_ORDER' "${QB_DIR}"/hot/*.sql; then
-        qb_resolve_lookup
-    fi
-    render_suite_dir "$s" "$dir"
+    qb_render_suite_dir duckdb "$s" "$dir"
     pf_up || qb_die "${NAME} is not up: ./engine-deploy/deploy-duckdb-cdc.sh up"
     writers=$(qb_writer_state)
     { echo "# ---- suite=${s} arms=${ARMS} writers: ${writers}"; echo "# server: $(api GET /health)"; } >> "$LOG"
@@ -257,14 +232,7 @@ run_suite() {   # suite
     n=$(grep -c . "$rows" || true)
     (( n > 0 )) || { qb_log "ERROR: ${s}: no result rows written"; rm -rf "$dir"; return 1; }
     cat "$rows" >> "$CSV"
-    # Not-OK queries are results, not a driver failure: logged, exit unchanged.
-    bad=$(awk -F, '$6 != "OK" { printf " duckdb:%s:%s=%s", $3, $5, $6 }' "$rows")
-    if [[ -n "$bad" ]]; then
-        qb_log "${s}: $(wc -w <<<"$bad" | tr -d ' ') of ${n} queries not OK:${bad}"
-    else
-        qb_log "${s}: ${n} queries, all OK"
-    fi
-    echo "# suite=${s} queries=${n} not OK:${bad:- none}" >> "$LOG"
+    qb_log_not_ok duckdb "$s" "$rows" "$n" "$LOG"
     rm -rf "$dir"
     pf_up || { qb_log "ERROR: ${NAME} stopped answering during the ${s} suite"; return 1; }
 }
@@ -282,9 +250,6 @@ cmd_run() {
 
 case "${1:-run}" in
     run)    cmd_run ;;
-    render) s="${2:?render <hot|snapshot> [arm]}"
-            for arm in ${3:-$ARMS}; do
-                for f in $(qb_query_files "$s"); do echo "-- duckdb/${arm}: $(qb_query_name "$f")"; qb_render "$f" duckdb "$arm"; done
-            done ;;
+    render) s="${2:?render <hot|snapshot> [arm]}"; qb_print_rendered duckdb "$s" "${3:-}" ;;
     *)      qb_die "usage: $0 run | render <suite> [arm]" ;;
 esac

@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # The Trino side of the CDC query tests, the counterpart of duckdb-warm.sh:
 # runs a suite on Trino (engine-deploy/deploy-trino.sh: coordinator + workers,
-# catalogs `iceberg` = Glue Iceberg, `paimon` = the native Paimon connector of
-# image trino-cdc:484-paimon-2.1.0), on the pinned snapshot of each table, ids
+# catalog `iceberg` = Glue Iceberg), on the pinned snapshot of each table, ids
 # from pin.sh (the same pins DuckDB reads):
 #   arm iceberg   iceberg.<ICEBERG_DB>.<t> FOR VERSION AS OF BIGINT '<snapshot id>'
-#   arm paimon    default: Paimon's Iceberg v3 export through the Iceberg connector,
+#   arm paimon    Paimon's Iceberg v3 export through the Iceberg connector,
 #                 iceberg.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<Paimon snapshot N>'
-#                 (the export reuses Paimon's snapshot ids); PAIMON_READER=native:
-#                 paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<N>'
-#                 (QB_TRINO_PAIMON_CATALOG; the connector maps it to scan.snapshot-id)
-# FORMATS=iceberg|paimon|both (default both). An arm that cannot read its
-# tables records ERROR per query; the other arm still runs.
+#                 (the export reuses Paimon's snapshot ids)
+# FORMATS (default "iceberg paimon"). An arm that cannot read its
+# tables records ERROR per query; the other arms still run.
 #
 #   SUITE=hot|snapshot ./querybench/trino.sh run
 #   ./querybench/trino.sh render <suite> [arm]   print the rendered SQL (no cluster; dry run)
@@ -59,7 +56,6 @@ source "${HERE}/../lib/querybench.sh"
 
 CSV="${OUT_DIR}/trino-${STAMP}.csv"
 LOG="${OUT_DIR}/trino-${STAMP}.log"
-ROWS_TSV="${CSV%.csv}-rows.tsv"
 QUERIES_CSV="${CSV%.csv}-queries.csv"
 RUN_ID="${STAMP//[^0-9A-Za-z]/}$$"
 MAX_RESULT_ROWS="${MAX_RESULT_ROWS:-10000}"
@@ -180,6 +176,12 @@ if rc is None:
             pass
 elif not row:
     res.update(status="ERROR", error="no row in system.runtime.queries for source %s (cli rc %s: %s)" % (tag, rc, stderr_tail(err)))
+elif row[1] == "FINISHED" and rc != 0 and res.get("exec_ms") is not None:
+    # Trino finished the query; only the CLI's stream back through kubectl exec
+    # broke (e.g. "connection reset by peer" to the API server, H8 on
+    # _v3final 2026-11-07). The server-side time is the recorded time, so the
+    # pass is OK; its result rows are lost (not compared for this pass).
+    res.update(status="OK", rows_lost=True, error="FINISHED, result stream lost: %s" % stderr_tail(err))
 elif row[1] != "FINISHED" or rc != 0:
     code = row[6] if len(row) > 6 else ""
     st = ("TIMEOUT" if code == "EXCEEDED_TIME_LIMIT" else
@@ -188,7 +190,9 @@ elif row[1] != "FINISHED" or rc != 0:
 if res.get("query_id"):
     res.update(query_stats(res["query_id"]))
 rows = []
-if res["status"] == "OK":
+if res["status"] == "OK" and res.get("rows_lost"):
+    res["result_rows"], res["first_row"] = "", ""
+elif res["status"] == "OK":
     n = 0
     for line in out.splitlines():
         if not line.strip():
@@ -214,8 +218,6 @@ print(json.dumps(res))
 EOF
 }
 
-jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1]); print("" if v is None else v)' "$1"; }
-
 run_pass() {   # suite query-file rendered-sql-file tag
     local f="$2"
     NAMESPACE="$NAMESPACE" TRINO_COORDINATOR="$TRINO_COORDINATOR" TRINO_CONTAINER="$TRINO_CONTAINER" \
@@ -239,7 +241,7 @@ run_suite_passes() {   # suite arm rendered-dir rows-file
             n=$((n + 1)); name=$(qb_query_name "$f")
             [[ -f "${q}/${n}.bad" ]] && continue
             j=$(run_pass "$s" "$f" "${dir}/${arm}.$(printf '%02d' "$n").sql" "qb-${RUN_ID}-${s}-${arm}-p${pass}-q${n}")
-            st=$(jget status <<<"$j")
+            st=$(qb_jget status <<<"$j")
             python3 - "$j" "$name" "$pass" "$WARMUP" "$q" "$n" "$s" "$QUERIES_CSV" "$arm" 2>>"$LOG" <<'EOF'
 import csv, json, os, sys
 j, name, p, w, q, n, suite, qcsv, arm = json.loads(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9]
@@ -265,9 +267,9 @@ if j["status"] == "OK" and (cold or p >= w):
 EOF
             if [[ "$st" != OK ]]; then
                 echo "$st" > "${q}/${n}.bad"
-                qb_log "[trino:${arm}/${s}] ${name} pass ${pass}: ${st} ($(jget error <<<"$j" | cut -c1-160)); not run again"
+                qb_log "[trino:${arm}/${s}] ${name} pass ${pass}: ${st} ($(qb_jget error <<<"$j" | cut -c1-160)); not run again"
             else
-                qb_log "[trino:${arm}/${s}] ${name} pass ${pass}: OK $(jget exec_ms <<<"$j") ms"
+                qb_log "[trino:${arm}/${s}] ${name} pass ${pass}: OK $(qb_jget exec_ms <<<"$j") ms"
             fi
         done
     done
@@ -280,41 +282,19 @@ EOF
         [[ -f "${q}/${n}.bad" ]] && st=$(<"${q}/${n}.bad")
         [[ -z "$med" && "$st" == OK ]] && st=ERROR
         if [[ -f "${q}/${n}.last" ]]; then
-            rr=$(jget result_rows < "${q}/${n}.last"); sb=$(jget physical_input_bytes < "${q}/${n}.last"); srr=$(jget physical_input_rows < "${q}/${n}.last")
+            rr=$(qb_jget result_rows < "${q}/${n}.last"); sb=$(qb_jget physical_input_bytes < "${q}/${n}.last"); srr=$(qb_jget physical_input_rows < "${q}/${n}.last")
         fi
         echo "${STAMP},trino,${arm},${s},${name},${st},${med},${rr},${srr},${sb},${cms}" >> "$rows"
-        if [[ -f "${q}/${n}.last" ]]; then
-            echo "${arm},${s},${name},$(jget first_row < "${q}/${n}.last")" >> "${CSV%.csv}-firstrows.csv"
-            python3 - "${q}/${n}.last" "$arm" "$s" "$name" >> "$ROWS_TSV" <<'EOF'
-import json, sys
-j = json.load(open(sys.argv[1]))
-for i, r in enumerate(j.get("rows") or [], 1):
-    print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], str(i), r.replace("\t", " ").replace("\n", " ")]))
-EOF
-        fi
+        if [[ -f "${q}/${n}.last" ]]; then qb_write_last_rows "${q}/${n}.last" "$arm" "$s" "$name" "$CSV"; fi
         printf '  %-7s %-30s MEDIAN %9s ms  %s\n' "$arm" "$name" "${med:--}" "$st" >> "$LOG"
     done
 }
 
-render_suite_dir() {   # suite dir
-    local f n arm
-    for arm in $ARMS; do
-        n=0
-        for f in $(qb_query_files "$1"); do
-            n=$((n + 1)); qb_render "$f" trino "$arm" > "${2}/${arm}.$(printf '%02d' "$n").sql" || qb_die "render failed: ${f} (trino/${arm})"
-        done
-    done
-}
-
 run_suite() {   # suite
-    local s="$1" dir writers rows bad arm n
+    local s="$1" dir writers rows arm n
     dir=$(mktemp -d); rows="${dir}/rows.csv"; : > "$rows"
     qb_start_suite "$s"
-    # H8's key: exported by hot-interleave.sh; resolved here when run by hand.
-    if [[ "$s" == hot && -z "${QB_LOOKUP_ORDER_ID:-}" ]] && grep -q 'LOOKUP_ORDER' "${QB_DIR}"/hot/*.sql; then
-        qb_resolve_lookup
-    fi
-    render_suite_dir "$s" "$dir"
+    qb_render_suite_dir trino "$s" "$dir"
     qb_trino_ready || qb_die "Trino is not up with ${TRINO_WORKERS} active workers: ./engine-deploy/deploy-trino.sh up"
     writers=$(qb_writer_state)
     { echo "# ---- suite=${s} arms=${ARMS} runs=${RUNS} warmup=${WARMUP} run_id=${RUN_ID} writers: ${writers}"
@@ -330,14 +310,7 @@ run_suite() {   # suite
     (( n > 0 )) || { qb_log "ERROR: ${s}: no result rows written"; rm -rf "$dir"; return 1; }
     { echo "# suite=${s} writers: ${writers}"; echo "# suite=${s} runs=${RUNS} warmup=${WARMUP} run_id=${RUN_ID} time=execution (elapsed - queued), system.runtime.queries"; } >> "$CSV"
     cat "$rows" >> "$CSV"
-    # Not-OK queries are results, not a driver failure: logged, exit unchanged.
-    bad=$(awk -F, '$6 != "OK" { printf " trino:%s:%s=%s", $3, $5, $6 }' "$rows")
-    if [[ -n "$bad" ]]; then
-        qb_log "${s}: $(wc -w <<<"$bad" | tr -d ' ') of ${n} queries not OK:${bad}"
-    else
-        qb_log "${s}: ${n} queries, all OK"
-    fi
-    echo "# suite=${s} queries=${n} not OK:${bad:- none}" >> "$LOG"
+    qb_log_not_ok trino "$s" "$rows" "$n" "$LOG"
     rm -rf "$dir"
     qb_trino_ready || { qb_log "ERROR: Trino lost its ${TRINO_WORKERS} active workers during the ${s} suite"; return 1; }
 }
@@ -356,9 +329,6 @@ cmd_run() {
 
 case "${1:-run}" in
     run)    cmd_run ;;
-    render) s="${2:?render <hot|snapshot> [arm]}"
-            for arm in ${3:-$ARMS}; do
-                for f in $(qb_query_files "$s"); do echo "-- trino/${arm}: $(qb_query_name "$f")"; qb_render "$f" trino "$arm"; done
-            done ;;
+    render) s="${2:?render <hot|snapshot> [arm]}"; qb_print_rendered trino "$s" "${3:-}" ;;
     *)      qb_die "usage: $0 run | render <suite> [arm]" ;;
 esac

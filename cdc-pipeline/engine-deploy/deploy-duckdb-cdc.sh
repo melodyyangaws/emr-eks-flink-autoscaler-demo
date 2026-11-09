@@ -36,9 +36,8 @@ if [[ -n "$DUCKDB_IMAGE" ]]; then DUCKDB_POD_IMAGE="$DUCKDB_IMAGE" DUCKDB_FROM_I
 else DUCKDB_POD_IMAGE="$DUCKDB_FALLBACK_IMAGE" DUCKDB_FROM_IMAGE=0; fi
 ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}"
 # Arms run with iceberg_unsafe_skip_puffin_verification. Default (lib
-# qb_skip_puffin_default): `paimon` with PAIMON_READER=iceberg, since the export's
-# DV files are bare blobs, not Puffin containers; none with PAIMON_READER=native
-# (paimon_scan). Set it empty to verify every arm.
+# qb_skip_puffin_default): `paimon` (Paimon-as-iceberg), since the export's DV
+# files are bare blobs, not Puffin containers. Set it empty to verify every arm.
 SKIP_PUFFIN_VERIFICATION_ARMS="${SKIP_PUFFIN_VERIFICATION_ARMS-$(qb_skip_puffin_default)}"
 DUCKDB_CPU="${DUCKDB_CPU:-27}"
 DUCKDB_THREADS="${DUCKDB_THREADS:-27}"

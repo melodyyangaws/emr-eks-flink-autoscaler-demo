@@ -4,11 +4,14 @@ The writer image (`../Dockerfile.cdc-paimon`) replaces the Maven Central
 `paimon-flink-1.20-2.1.0.jar` with the one here. Both jars were built 2026-11-06 from Paimon `release-2.1.0` plus a backport of
 [apache/paimon PR #10329](https://github.com/apache/paimon/pull/10329)
 ("[iceberg] Write required Avro metadata to manifest files", a draft, unmerged).
-It fixes [issue #8440](https://github.com/apache/paimon/issues/8440): Paimon's
-Iceberg export wrote manifest files with no Iceberg key-value metadata (`schema`,
-`schema-id`, `partition-spec`, `partition-spec-id`, `format-version`, `content`).
-DuckDB 2.0 then refuses the v3 export: "Manifest ... missing required Avro
-key-value metadata field 'schema'".
+It fixes [issue #8440](https://github.com/apache/paimon/issues/8440): the Iceberg
+metadata Paimon writes next to its own (`metadata.iceberg.*`, read by the query
+benchmark's `paimon` arm as Paimon-as-iceberg) had manifest files with no Iceberg
+key-value metadata (`schema`, `schema-id`, `partition-spec`, `partition-spec-id`,
+`format-version`, `content`). DuckDB 2.0 then refuses it: "Manifest ... missing
+required Avro key-value metadata field 'schema'". Manifests written before a
+writer ran this jar still lack the metadata, so start a new `SESSION_SUFFIX` after
+switching (the `_v3final` round, 2026-11-07, read Paimon-as-iceberg on DuckDB this way).
 
 | jar | sha256 |
 |---|---|
@@ -32,7 +35,8 @@ The jars are git-ignored; the copy is in
 aws s3 cp --recursive s3://$BUCKET_NAME/flink/build/patched-jars/ ingest-deploy/docker/patched-jars/
 ```
 
-`build-deploy-generic.sh build` refuses to build without them.
+`build-deploy-generic.sh build` refuses to build when this directory holds no jar;
+the Dockerfile's `COPY` needs `paimon-flink-1.20-2.1.0.jar` itself.
 
 ## Rebuild
 
@@ -44,7 +48,8 @@ gh api repos/apache/paimon/pulls/10329 -H "Accept: application/vnd.github.v3.dif
 git apply pr10329.diff            # applies cleanly to release-2.1.0 (line offsets only)
 FLAGS="-Pflink1 -DskipTests -Dcheckstyle.skip -Dspotless.check.skip -Dspotless.apply.skip -Drat.skip -Denforcer.skip"
 mvn -B -ntp -T 1C install $FLAGS -pl paimon-flink/paimon-flink-1.20 -am
-mvn -B -ntp -T 1C install $FLAGS -pl paimon-hive/paimon-hive-connector-3.1 -am
+# only if the Hive connector comes back into the image:
+# mvn -B -ntp -T 1C install $FLAGS -pl paimon-hive/paimon-hive-connector-3.1 -am
 # the PR's unit tests
 mvn -B -ntp test -Pflink1 -Dcheckstyle.skip -Dspotless.check.skip -Drat.skip -Denforcer.skip \
     -DfailIfNoTests=false -Dsurefire.failIfNoSpecifiedTests=false \
@@ -53,8 +58,8 @@ mvn -B -ntp test -Pflink1 -Dcheckstyle.skip -Dspotless.check.skip -Drat.skip -De
 
 `-Pflink1` is needed: the profile that lists the Flink 1.x modules is only
 `activeByDefault`, and a JDK-activated profile switches it off under JDK 11.
-Outputs: `paimon-flink/paimon-flink-1.20/target/paimon-flink-1.20-2.1.0.jar` and
-`paimon-hive/paimon-hive-connector-3.1/target/paimon-hive-connector-3.1-2.1.0.jar (copy it here as paimon-hive-connector-2.1.0.jar)`.
+Output: `paimon-flink/paimon-flink-1.20/target/paimon-flink-1.20-2.1.0.jar` (and,
+with the Hive line, `paimon-hive/paimon-hive-connector-3.1/target/paimon-hive-connector-3.1-2.1.0.jar`).
 
 Check a jar carries the patch:
 
@@ -66,4 +71,8 @@ unzip -p <jar> org/apache/paimon/iceberg/manifest/IcebergManifestFile.class | st
 Drop these jars (and the Dockerfile's `COPY patched-jars/` step) once a Paimon
 release that contains the fix is used.
 
-> Named `paimon-hive-connector-2.1.0.jar`, not Maven's `paimon-hive-connector-3.1-2.1.0.jar`: the Dockerfile saves the downloaded connector under that shorter name, and a patched jar replaces only a jar of exactly the same name.
+> The stored copy is named `paimon-hive-connector-2.1.0.jar`, not Maven's
+> `paimon-hive-connector-3.1-2.1.0.jar`, because the Dockerfile used to save the
+> downloaded connector under that shorter name, and a patched jar replaces only a
+> downloaded jar of exactly the same name. The Dockerfile no longer downloads it
+> (2026-11-07); a returning connector download would have to use that name again.

@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Hot suite over the LIVE CDC tables, warm DuckDB vs Trino on Iceberg and on
-# Paimon (default: its Iceberg v3 export; PAIMON_READER=native: the native
-# readers) (ENGINES x FORMATS: up to four arms), engines
+# Paimon-as-iceberg (`paimon`) (ENGINES x FORMATS: up to four arms), engines
 # INTERLEAVED pass by pass on the same pinned table versions. Adapted from
 # throughput-benchmark/querybench/hot-interleave.sh.
 #
 #   ./querybench/hot-interleave.sh        (run.sh's runner step; by hand: the laptop must stay up)
 #
-# 0. The queried writers RUNNING (QB_QUERY_WRITERS: flink-cdc-<format> per
-#    format in FORMATS; once a minute, STABLE_CHECKS=10 times); the generator's
+# 0. The queried writers RUNNING (QB_QUERY_WRITERS: flink-cdc-iceberg and/or
+#    flink-cdc-paimon, the writers of FORMATS' table sets; once a minute, STABLE_CHECKS=10 times); the generator's
 #    state is logged (a stopped generator = not a writers-live run).
 # 1. The window: HOT_WINDOW_SECONDS (30) ending HOT_LAG_SECONDS (300) before now.
 # 2. Waits until every format's fact tables (HOT_COMMIT_TABLES: orders
@@ -78,7 +77,7 @@ need_ms=$(( (to_s + ${HOT_COMMIT_MARGIN_S:-60}) * 1000 ))
 t0=$(date +%s)
 while :; do
     late=""
-    for fmt in $(qb_formats); do
+    for fmt in $(qb_formats); do   # one check per table set
         for t in ${HOT_COMMIT_TABLES:-orders order_items}; do
             ms=$(qb_commit_ms "$fmt" "$t" || true)
             [[ "$ms" =~ ^[0-9]+$ && "$ms" -ge "$need_ms" ]] || late+=" ${fmt}.${t}@${ms:-?}"
@@ -144,6 +143,7 @@ export QB_LOOKUP_ORDER_ID QB_LOOKUP_ORDER_DT
 echo "h8_key order_id=${QB_LOOKUP_ORDER_ID} dt=${QB_LOOKUP_ORDER_DT} (${QB_LOOKUP_NOTE})" >> "$PINS"
 
 failed=""
+echo "queries_started_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')" >> "$PINS"
 for (( pass = 0; pass <= RUNS; pass++ )); do
     (( pass > 0 )) && [[ "$HOT_REPIN" == pass ]] && pin "${BASE}-p${pass}"
     # shellcheck disable=SC2046
@@ -161,7 +161,7 @@ for (( pass = 0; pass <= RUNS; pass++ )); do
 done
 
 gen_end=$(qb_generator_state)
-echo "generator_after=${gen_end:-none}" >> "$PINS"
+{ echo "finished_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')"; echo "generator_after=${gen_end:-none}"; } >> "$PINS"
 qb_log "generator after the last pass: ${gen_end:-none}"
 qb_generator_live || qb_log "WARNING: the generator stopped before the last pass ended"
 

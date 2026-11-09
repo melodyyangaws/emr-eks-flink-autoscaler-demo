@@ -48,7 +48,7 @@
 -- + Glue entries) before this DDL takes effect.
 --
 -- Streaming best practices applied:
---   1. Target data files: 64 MB on customers/products, 128 MB on orders/order_items (same as Paimon)
+--   1. Target data files: 32 MB on customers/products, 64 MB on orders/order_items (same as Paimon)
 --   2. Hash distribution ensures same-PK rows land in the same file writer
 --   3. Aggressive metadata cleanup (delete-after-commit) to prevent S3 bloat
 --   4. Manifest merging to keep read planning fast as snapshots accumulate
@@ -145,41 +145,24 @@ CREATE TABLE IF NOT EXISTS products (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (category, product_id) NOT ENFORCED
 ) PARTITIONED BY (category) WITH (
-    -- ICEBERG_FORMAT_VERSION (3 default, 2 opt-out): v3 replaces positional-delete
-    -- files with DVs, which StarRocks 4.1.x cannot read — see the header.
+    -- The notes on each property are on customers above.
     'format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
-    -- was 64 / 128), paired with Paimon's target-file-size.
     'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
-    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
-    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
-    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
-    -- throughput and a stored-bytes difference that is a config artifact rather than
-    -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '8388608',
-    -- 12 h, paired with Paimon's snapshot.time-retained.
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
-    -- and reads it again while the writers keep committing every 60 s needs it
-    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
-    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
-    -- 404. 100 covers ~100 min of commits; still deleted after.
     'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
     'commit.manifest.min-count-to-merge' = '5',
-    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
-    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
     'write.metadata.metrics.default' = 'truncate(16)'
 );
 
@@ -200,8 +183,7 @@ CREATE TABLE IF NOT EXISTS orders (
     updated_at TIMESTAMP(3),
     PRIMARY KEY (order_dt, order_id) NOT ENFORCED
 ) PARTITIONED BY (order_dt) WITH (
-    -- ICEBERG_FORMAT_VERSION (3 default, 2 opt-out): v3 replaces positional-delete
-    -- files with DVs, which StarRocks 4.1.x cannot read — see the header.
+    -- The notes on each property are on customers above.
     'format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
@@ -212,29 +194,15 @@ CREATE TABLE IF NOT EXISTS orders (
     -- was 128 / 64), paired with Paimon's target-file-size.
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
-    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
-    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
-    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
-    -- throughput and a stored-bytes difference that is a config artifact rather than
-    -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
-    -- 12 h, paired with Paimon's snapshot.time-retained.
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
-    -- and reads it again while the writers keep committing every 60 s needs it
-    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
-    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
-    -- 404. 100 covers ~100 min of commits; still deleted after.
     'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
     'commit.manifest.min-count-to-merge' = '5',
-    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
-    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
     'write.metadata.metrics.default' = 'truncate(16)'
 );
 
@@ -254,40 +222,23 @@ CREATE TABLE IF NOT EXISTS order_items (
     created_dt STRING,
     PRIMARY KEY (created_dt, order_item_id) NOT ENFORCED
 ) PARTITIONED BY (created_dt) WITH (
-    -- ICEBERG_FORMAT_VERSION (3 default, 2 opt-out): v3 replaces positional-delete
-    -- files with DVs, which StarRocks 4.1.x cannot read — see the header.
+    -- The notes on each property are on customers above.
     'format-version' = '${ICEBERG_FORMAT_VERSION:3}',
     'write.upsert.enabled' = 'true',
     'write.delete.mode' = 'merge-on-read',
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
-    -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
-    -- was 128 / 64), paired with Paimon's target-file-size.
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
-    -- Level 1, to match Paimon's 'file.compression.zstd-level' = '1'. Both sides
-    -- write ZSTD Parquet, but Iceberg sets no level, so parquet-mr defaults to 3 —
-    -- a different CPU-vs-ratio tradeoff on the write path, which shows up as both a
-    -- throughput and a stored-bytes difference that is a config artifact rather than
-    -- a property of either table format.
     'write.parquet.compression-level' = '1',
     'write.parquet.row-group-size-bytes' = '16777216',
-    -- 12 h, paired with Paimon's snapshot.time-retained.
     'history.expire.max-snapshot-age-ms' = '43200000',
     'history.expire.min-snapshots-to-keep' = '5',
     'write.metadata.delete-after-commit.enabled' = 'true',
-    -- 100, not 3 (2026-11-04): a reader that plans against one metadata.json
-    -- and reads it again while the writers keep committing every 60 s needs it
-    -- to survive. With 3 kept it was deleted ~3 commits later: the continuous
-    -- iceberg-maintain job (removed 2026-11-06) aborted its rewrites with an S3
-    -- 404. 100 covers ~100 min of commits; still deleted after.
     'write.metadata.previous-versions-max' = '100',
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
-    -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
     'commit.manifest.min-count-to-merge' = '5',
-    -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
-    -- gave Iceberg exact min/max for file pruning that Paimon does not get.
     'write.metadata.metrics.default' = 'truncate(16)'
 );

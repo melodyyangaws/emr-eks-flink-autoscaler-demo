@@ -8,16 +8,13 @@
 #   1. iceberg: copies each table's current metadata.json (Glue
 #      metadata_location) to s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/iceberg/<table>/,
 #      so DuckDB reads a file the writer cannot delete, and reads its snapshot id
-#      (Trino FOR VERSION AS OF); paimon (default, Paimon's Iceberg v3 export):
-#      the same copy of <PMNICE_ROOT>/<table>/metadata/v<N>.metadata.json (from
+#      (Trino FOR VERSION AS OF); paimon (Paimon's Iceberg v3 export): the same
+#      copy of <PMNICE_ROOT>/<table>/metadata/v<N>.metadata.json (from
 #      version-hint.text; N = Paimon's snapshot id, which the export reuses), read
-#      by DuckDB as iceberg_scan() and Trino as iceberg.<db>.<t> FOR VERSION AS OF N;
-#      with PAIMON_READER=native: the native snapshot N of <table>/snapshot/LATEST,
-#      read as paimon_scan(..., snapshot_from_id=N) and paimon.<db>.<t> FOR VERSION
-#      AS OF N (lib qb_pin_tables): one pin per format, both engines;
-#   2. appends the pinned snapshots' state (records, data/delete files,
-#      equality/position deletes, bytes; Paimon: records and commit kind) to
-#      $OUT_DIR/tables-$STAMP.tsv;
+#      by DuckDB as iceberg_scan() and Trino as iceberg.<db>.<t> FOR VERSION AS OF N
+#      (lib qb_pin_tables): one pin per format, both engines;
+#   2. appends the pinned snapshots' state, one row per format and table (records,
+#      data/delete files, equality/position deletes, bytes) to $OUT_DIR/tables-$STAMP.tsv;
 #   3. when trino is in ENGINES and its coordinator is up: checks Trino reads
 #      every table at its pinned snapshot (qb_trino_check_pins: retried while
 #      the coordinator's view of the table is older than the pin; a paimon

@@ -6,35 +6,25 @@
 # they render, the windows, the pins, the timeout, the median, the writer stop
 # and the results format.
 #
-# Two engines x two storage formats = four arms (ENGINES x FORMATS), every arm
-# on a pinned version of each table. Flink writes both formats (the two CDC
-# jobs); DuckDB and Trino only query:
+# Two engines x two formats = four arms (ENGINES x FORMATS), every arm on a
+# pinned version of each table. Flink writes two table sets (the two CDC jobs).
+# DuckDB and Trino only query:
 #   duckdb:iceberg   the warm DuckDB server (engine-deploy/deploy-duckdb-cdc.sh),
 #                    iceberg_scan() of a COPY of the Iceberg table's pinned metadata.json
 #   trino:iceberg    Trino (engine-deploy/deploy-trino.sh), catalog `iceberg`
 #                    (Glue), <ICEBERG_DB>.<t> FOR VERSION AS OF the pinned snapshot id
-# The paimon arms read Paimon one of two ways (PAIMON_READER, below):
-#   iceberg (default) Paimon's Iceberg v3 export (<PMNICE_ROOT>/<t>/metadata/):
-#     duckdb:paimon  iceberg_scan() of a COPY of the export's pinned v<N>.metadata.json,
+# `paimon` reads Paimon ONLY as Paimon-as-iceberg, its Iceberg v3 metadata
+# (<PMNICE_ROOT>/<t>/metadata/; the native readers were removed on 2026-11-09):
+#   duckdb:paimon    iceberg_scan() of a COPY of the export's pinned v<N>.metadata.json,
 #                    with iceberg_unsafe_skip_puffin_verification (Paimon's DV files are
 #                    not real Puffin containers; deploy-duckdb-cdc.sh's default arms)
-#     trino:paimon   catalog TRINO_CATALOG (the export's Glue registration):
+#   trino:paimon     catalog TRINO_CATALOG (the export's Glue registration):
 #                    iceberg.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT 'N'
-#   native            the NATIVE readers:
-#     duckdb:paimon  the server's Paimon extension (polardb/duckdb-paimon on paimon-cpp,
-#                    bitmap64 DVs; duckdb-image/README.md):
-#                    paimon_scan('<warehouse>/<PAIMON_DB>.db/<t>', snapshot_from_id=N)
-#     trino:paimon   the Paimon connector (paimon-trino 2.1.0 ported to 484, image
-#                    trino-cdc:484-paimon-2.1.0), catalog QB_TRINO_PAIMON_CATALOG
-#                    (`paimon`, filesystem metastore on the warehouse):
-#                    paimon.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT 'N' (scan.snapshot-id)
-# One pin.sh call pins both formats; both engines of a format read the same
-# snapshot (Iceberg: the copied metadata.json / its snapshot id; Paimon, export:
-# the copied v<N>.metadata.json, N = Paimon's snapshot id, which the export reuses;
-# Paimon, native: snapshot N from <table>/snapshot/LATEST, no copy: a snapshot's
-# files stay until it expires, >= 12 h). The two formats are pinned at the same
-# moment, not the same binlog point, so iceberg vs paimon rows can differ by about
-# a checkpoint (summarize.py).
+# One pin.sh call pins every format; both engines of a format read the same
+# snapshot (Iceberg: the copied metadata.json / its snapshot id; Paimon-as-iceberg:
+# the copied v<N>.metadata.json, N = Paimon's snapshot id, which the export reuses).
+# Iceberg and Paimon are pinned at the same moment, not the same binlog point, so iceberg vs
+# paimon rows can differ by about a checkpoint (summarize.py).
 # An arm that cannot read a table records ERROR per query and the run goes on.
 #
 # Placeholders in querybench/hot/*.sql and querybench/snapshot/*.sql
@@ -43,10 +33,8 @@
 #       the table at its pinned version, per engine and arm (qb_table_expr):
 #         duckdb  iceberg: iceberg_scan('<copied metadata.json>')
 #                 paimon:  iceberg_scan('<copied export metadata.json>')
-#                          (PAIMON_READER=native: paimon_scan('<table path>', snapshot_from_id=<N>))
 #         trino   iceberg: <TRINO_CATALOG>.<ICEBERG_DB>.<table> FOR VERSION AS OF BIGINT '<snapshot id>'
 #                 paimon:  <TRINO_CATALOG>.<PAIMON_DB>.<table> FOR VERSION AS OF BIGINT '<N>'
-#                          (PAIMON_READER=native: <QB_TRINO_PAIMON_CATALOG>.<PAIMON_DB>.<table> ...)
 #       An alias may follow (`FROM ${ORDERS} o`, `${ORDERS} AS o`): Trino's
 #       grammar (aliasedRelation: relationPrimary (AS? identifier)?, with
 #       relationPrimary: qualifiedName queryPeriod?) takes it after the
@@ -82,9 +70,6 @@ QB_DIALECT_DIR="${QB_DIALECT_DIR:-${QB_DIR}}"
 QB_TABLES="customers products orders order_items"
 PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE:-s3://${BUCKET_NAME}/paimon-warehouse}"; PAIMON_WAREHOUSE="${PAIMON_WAREHOUSE%/}"
 ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-s3://${BUCKET_NAME}/iceberg-warehouse}"; ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE%/}"
-# flink_{paimon,iceberg}_db<SESSION_SUFFIX>: set by common.sh.
-PAIMON_DB="${PAIMON_DB:-flink_paimon_db${SESSION_SUFFIX:-}}"
-ICEBERG_DB="${ICEBERG_DB:-flink_iceberg_db${SESSION_SUFFIX:-}}"
 GENERATOR_RESOURCES="${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}"
 DUCKDB_NAME="${DUCKDB_NAME:-duckdb-warm-cdc}"
 # Trino (engine-deploy/deploy-trino.sh: the trino Helm chart, release `trino`).
@@ -95,21 +80,17 @@ TRINO_CONTAINER="${TRINO_CONTAINER:-trino-coordinator}"
 TRINO_WORKER_DEPLOY="${TRINO_WORKER_DEPLOY:-trino-worker}"
 TRINO_WORKERS="${TRINO_WORKERS:-3}"
 TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
-# The native Paimon connector's catalog (engine-deploy/trino-values.yaml `paimon`).
-QB_TRINO_PAIMON_CATALOG="${QB_TRINO_PAIMON_CATALOG:-paimon}"
-# How the paimon arms read Paimon (2026-11-07): `iceberg` (default) = Paimon's
-# Iceberg v3 export (DuckDB iceberg_scan of a pinned metadata.json copy, Trino's
-# Iceberg connector on the export's Glue registration), readable by DuckDB with the
-# writer image's PR #10329 backport (Paimon manifests carry the Iceberg Avro
-# metadata, apache/paimon#8440); `native` = paimon_scan / Trino paimon connector.
-PAIMON_READER="${PAIMON_READER:-iceberg}"   # validated below, after qb_die
-# The export's root: metadata.iceberg.storage = hive-catalog writes
+# The paimon arm reads Paimon's Iceberg v3 export (DuckDB iceberg_scan of a pinned
+# metadata.json copy, Trino's Iceberg connector on the export's Glue registration),
+# readable by DuckDB with the writer image's PR #10329 backport (Paimon manifests
+# carry the Iceberg Avro metadata, apache/paimon#8440). The export's root:
+# metadata.iceberg.storage = hive-catalog writes
 # <root>/<table>/metadata/v<N>.metadata.json + version-hint.text.
 PMNICE_ROOT="${PMNICE_ROOT:-${PAIMON_WAREHOUSE%/}/iceberg/${PAIMON_DB}}"
 # The DuckDB arms that run with iceberg_unsafe_skip_puffin_verification when
-# SKIP_PUFFIN_VERIFICATION_ARMS is unset: `paimon` with the export (its DV files
-# are bare blobs, not Puffin containers), none with the native reader.
-qb_skip_puffin_default() { [[ "$PAIMON_READER" == iceberg ]] && echo paimon; return 0; }
+# SKIP_PUFFIN_VERIFICATION_ARMS is unset: `paimon` (the export's DV files are bare
+# blobs, not Puffin containers).
+qb_skip_puffin_default() { echo paimon; }
 TRINO_USER="${TRINO_USER:-cdcbench}"
 # Not TRINO_PORT: Kubernetes service links set TRINO_PORT=tcp://<ip>:8080 in every pod
 # of the namespace (Service "trino"), and the runner then called
@@ -132,19 +113,29 @@ qb_log() { echo "  [querybench] $*" >&2; }
 qb_die() { echo "  [querybench] ERROR: $*" >&2; exit 1; }
 
 case "$SUITE" in all|hot|snapshot) ;; *) qb_die "SUITE must be all|hot|snapshot, got '${SUITE}'" ;; esac
-case "$PAIMON_READER" in iceberg|native) ;; *) qb_die "PAIMON_READER must be iceberg or native, got '${PAIMON_READER}'" ;; esac
+# The native Paimon readers are gone: fail fast on a leftover PAIMON_READER=native.
+case "${PAIMON_READER:-iceberg}" in iceberg) ;; *) qb_die "PAIMON_READER=${PAIMON_READER} was removed on 2026-11-09: Paimon is read as Paimon-as-iceberg only (unset PAIMON_READER)" ;; esac
 qb_suites() { case "$SUITE" in all) echo "hot snapshot" ;; *) echo "$SUITE" ;; esac; }
 qb_upper() { tr '[:lower:]' '[:upper:]' <<<"$1"; }
 
 # ── Formats (arms) ──────────────────────────────────────────────────────────
-# FORMATS=iceberg|paimon|both (default both) -> "iceberg paimon" or one.
-qb_formats() {
-    case "${FORMATS:-both}" in
-        both|"iceberg paimon"|"paimon iceberg"|iceberg,paimon|paimon,iceberg) echo "iceberg paimon" ;;
-        iceberg|paimon) echo "$FORMATS" ;;
-        *) qb_die "FORMATS must be iceberg|paimon|both, got '${FORMATS}'" ;;
-    esac
+# FORMATS: iceberg and/or paimon (space- or comma-separated; default all;
+# `all` = `both` = "iceberg paimon"), always in that order. Resolved once when
+# this file is sourced.
+_qb_resolve_formats() {
+    local raw="${FORMATS:-all}" f out="" want=""
+    case "$raw" in all|both) raw="iceberg paimon" ;; esac
+    for f in ${raw//,/ }; do
+        case "$f" in iceberg|paimon) want+=" $f" ;;
+                     paimon_native) qb_die "FORMATS: paimon_native was removed on 2026-11-09: Paimon is read as Paimon-as-iceberg only (the paimon arm)" ;;
+                     *) qb_die "FORMATS must name iceberg and/or paimon (or all|both), got '${FORMATS}'" ;; esac
+    done
+    for f in iceberg paimon; do [[ " $want " == *" $f "* ]] && out+=" $f"; done
+    [[ -n "$out" ]] || qb_die "FORMATS is empty"
+    QB_FORMATS_LIST="${out# }"
 }
+_qb_resolve_formats
+qb_formats() { echo "$QB_FORMATS_LIST"; }
 qb_has_format() { [[ " $(qb_formats) " == *" $1 "* ]]; }
 # The writer(s) whose tables are queried (one per format in FORMATS): the hot
 # test needs them RUNNING and a suite is void if their state changes under it.
@@ -173,8 +164,6 @@ qb_setup_engine() {
     elif qb_has_engine trino; then echo trino
     else echo duckdb; fi
 }
-# The CSV `engine` value of each engine.
-qb_engine_label() { case "$1" in duckdb) echo duckdb_warm ;; *) echo "$1" ;; esac; }
 
 # The table set and engine settings of this run, one key=value line each, for
 # every .pins file (and through them the summary's header).
@@ -183,7 +172,7 @@ qb_run_meta() {
     echo "cdc_db_suffix=${SESSION_SUFFIX:-} iceberg_db=${ICEBERG_DB} paimon_db=${PAIMON_DB} engines=$(qb_engines | tr ' ' ',') formats=$(qb_formats | tr ' ' ',')"
     local sp="${SKIP_PUFFIN_VERIFICATION_ARMS-$(qb_skip_puffin_default)}"
     echo "duckdb_image=${DUCKDB_IMAGE:-pip duckdb==${DUCKDB_VERSION:-2.0.0}} duckdb_cpu=${DUCKDB_CPU:-27} duckdb_pod_memory=${DUCKDB_POD_MEMORY:-114Gi} duckdb_skip_puffin_verification_arms=${sp// /,}"
-    echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_paimon_catalog=${QB_TRINO_PAIMON_CATALOG} trino_workers=${TRINO_WORKERS} paimon_reader=${PAIMON_READER}"
+    echo "trino_version=${TRINO_VERSION:-484} trino_catalog=${TRINO_CATALOG} trino_workers=${TRINO_WORKERS} paimon_reader=iceberg"
     qb_engine_shape
 }
 
@@ -217,10 +206,9 @@ qb_part_col() {   # <iceberg|paimon> <table>
 
 # The table expression for one engine, arm and table, at its pin. Pins are
 # the QB_PIN_* variables pin.sh prints (eval'd by the caller):
-#   QB_PIN_META_ICEBERG_<TABLE>   the copied metadata.json (DuckDB)
-#   QB_PIN_META_PAIMON_<TABLE>    the copied export metadata.json (DuckDB iceberg_scan);
-#                                 PAIMON_READER=native: the table path (paimon_scan)
-#   QB_PIN_SNAP_<ICEBERG|PAIMON>_<TABLE>   the snapshot id (both engines for paimon)
+#   QB_PIN_META_ICEBERG_<TABLE>        the copied metadata.json (DuckDB)
+#   QB_PIN_META_PAIMON_<TABLE>         the copied export metadata.json (DuckDB)
+#   QB_PIN_SNAP_<ICEBERG|PAIMON>_<TABLE>   the snapshot id (Trino)
 # Without a pin both are an error: DuckDB's live metadata.json is deleted by
 # the writer mid-scan (memory note: pinned metadata on every arm), and an
 # unpinned Trino read is a different version from DuckDB's.
@@ -232,21 +220,11 @@ qb_table_expr() {   # <duckdb|trino> <iceberg|paimon> <table>
         duckdb)
             v="QB_PIN_META_${A}_${T}"
             [[ -n "${!v:-}" ]] || { qb_log "no ${v}: DuckDB reads only pinned tables (run pin.sh first)"; return 1; }
-            if [[ "$arm" == paimon && "$PAIMON_READER" == native ]]; then
-                local s="QB_PIN_SNAP_${A}_${T}"
-                [[ "${!s:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${s}: DuckDB reads Paimon only at the pinned snapshot"; return 1; }
-                echo "paimon_scan('${!v}', snapshot_from_id=${!s})"
-            else
-                echo "iceberg_scan('${!v}')"
-            fi ;;
+            echo "iceberg_scan('${!v}')" ;;
         trino)
             v="QB_PIN_SNAP_${A}_${T}"
             [[ "${!v:-}" =~ ^[0-9]+$ ]] || { qb_log "no ${v}: Trino reads only the pinned snapshot (run pin.sh first)"; return 1; }
-            if [[ "$arm" == paimon && "$PAIMON_READER" == native ]]; then
-                echo "${QB_TRINO_PAIMON_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'"
-            else
-                echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'"
-            fi ;;
+            echo "${TRINO_CATALOG}.${db}.${t} FOR VERSION AS OF BIGINT '${!v}'" ;;
         *) return 1 ;;
     esac
 }
@@ -257,49 +235,31 @@ qb_table_expr() {   # <duckdb|trino> <iceberg|paimon> <table>
 #   iceberg  copy Glue's metadata_location to a key this run owns
 #            (s3://$BUCKET_NAME/$QB_PIN_PREFIX/<tag>/iceberg/<table>/; the writer
 #            deletes old metadata files) and take its current-snapshot-id
-#   paimon   PAIMON_READER=iceberg (default): the export's version-hint.text ->
+#   paimon   the export's version-hint.text ->
 #            <PMNICE_ROOT>/<table>/metadata/v<N>.metadata.json, copied like an
 #            Iceberg table's (.../<tag>/paimon/<table>/), snapshot id N (Paimon's).
-#            PAIMON_READER=native: snapshot N in <warehouse>/<db>.db/<table>/snapshot/LATEST,
-#            checked against snapshot-N (its commit time and record count); no copy:
-#            a Paimon snapshot's files stay until the snapshot expires (>= 12 h)
-# Prints shell exports: QB_PIN_META_<FMT>_<T> (iceberg and the export: copied
-# metadata.json; native paimon: the table path), QB_PIN_SNAP_<FMT>_<T>,
-# QB_PIN_COMMIT_MS_<FMT>_<T> (the pinned snapshot's commit time),
-# QB_PIN_FORMAT_VERSION_<FMT>_<T> (not for native paimon).
+# Prints shell exports: QB_PIN_META_<FMT>_<T> (the copied metadata.json),
+# QB_PIN_SNAP_<FMT>_<T>, QB_PIN_COMMIT_MS_<FMT>_<T> (the pinned snapshot's
+# commit time), QB_PIN_FORMAT_VERSION_<FMT>_<T>; <FMT> = ICEBERG or PAIMON.
 # Read-only on the tables; needs the aws CLI and s3:PutObject on the bucket.
 # With QB_TABLE_STATE_OUT set, appends one TSV line per format and table: the
 # pinned snapshot's id, commit time and summary totals (records, data files,
-# delete files, equality / position deletes, bytes; for Paimon: its snapshot's
-# totalRecordCount and commitKind), the state the times depend on.
+# delete files, equality / position deletes, bytes), the state the times depend on.
 qb_pin_tables() {   # <tag>
     ICEBERG_FORMAT_VERSION="${ICEBERG_FORMAT_VERSION:-3}" QB_PIN_FORMATS="${QB_PIN_FORMATS:-$(qb_formats)}" QB_TABLES="$QB_TABLES" \
-    QB_PIN_PREFIX="$QB_PIN_PREFIX" PAIMON_WAREHOUSE="$PAIMON_WAREHOUSE" PAIMON_READER="$PAIMON_READER" PMNICE_ROOT="$PMNICE_ROOT" \
+    QB_PIN_PREFIX="$QB_PIN_PREFIX" PMNICE_ROOT="$PMNICE_ROOT" \
     PAIMON_DB="$PAIMON_DB" ICEBERG_DB="$ICEBERG_DB" python3 - "$1" <<'EOF'
 import json, os, subprocess, sys, time
 E = os.environ
 tag, bucket, region = sys.argv[1], E["BUCKET_NAME"], E["AWS_REGION"]
-prefix, pwh = E["QB_PIN_PREFIX"].strip("/"), E["PAIMON_WAREHOUSE"].rstrip("/")
+prefix = E["QB_PIN_PREFIX"].strip("/")
 def aws(*a):
     return subprocess.run(["aws", "--region", region, *a], check=True, capture_output=True, text=True).stdout
 STATE_KEYS = ("total-records", "total-data-files", "total-delete-files", "total-equality-deletes",
               "total-position-deletes", "total-files-size")
 out, state = [], []
-def pin_paimon(t):
-    """The native Paimon snapshot N (snapshot/LATEST, checked against snapshot-N)."""
-    root = "%s/%s.db/%s" % (pwh, E["PAIMON_DB"], t)
-    n = aws("s3", "cp", root + "/snapshot/LATEST", "-").strip()
-    if not n.isdigit():
-        sys.exit("no snapshot/LATEST under %s (is it a Paimon table?)" % root)
-    ps = json.loads(aws("s3", "cp", "%s/snapshot/snapshot-%s" % (root, n), "-"))
-    ts = ps.get("timeMillis", "")
-    state.append(["paimon", t, n, ts, ps.get("totalRecordCount", ""), "", "", "", "", "",
-                  "commitKind=%s" % ps.get("commitKind", "?")])
-    T = t.upper()
-    out.extend(["QB_PIN_META_PAIMON_%s=%s" % (T, root), "QB_PIN_SNAP_PAIMON_%s=%s" % (T, n),
-                "QB_PIN_COMMIT_MS_PAIMON_%s=%s" % (T, ts)])
 def pin(fmt, t, loc, want_sid=None):
-    """Copy <loc>; returns (pinned s3 uri, snapshot id, commit ms)."""
+    """Copy <loc>; returns the pinned snapshot id."""
     key = "%s/%s/%s/%s/%s" % (prefix, tag, fmt, t, loc.rsplit("/", 1)[1])
     aws("s3", "cp", "--only-show-errors", loc, "s3://%s/%s" % (bucket, key))
     meta = json.loads(aws("s3", "cp", "s3://%s/%s" % (bucket, key), "-"))
@@ -323,7 +283,10 @@ def pin(fmt, t, loc, want_sid=None):
     F, T = fmt.upper(), t.upper()
     out.extend(["QB_PIN_META_%s_%s=s3://%s/%s" % (F, T, bucket, key), "QB_PIN_SNAP_%s_%s=%s" % (F, T, sid),
                 "QB_PIN_COMMIT_MS_%s_%s=%s" % (F, T, ts), "QB_PIN_FORMAT_VERSION_%s_%s=%s" % (F, T, fv)])
-FORMATS = E["QB_PIN_FORMATS"].split()
+    return sid
+FORMATS = E["QB_PIN_FORMATS"].replace(",", " ").split()
+if "paimon_native" in FORMATS:
+    sys.exit("QB_PIN_FORMATS: paimon_native was removed on 2026-11-09: Paimon is read as Paimon-as-iceberg only (the paimon arm)")
 for t in E["QB_TABLES"].split():
     for attempt in range(3):   # a writer may delete the file between the lookup and the copy
         mark = (len(out), len(state))
@@ -334,9 +297,7 @@ for t in E["QB_TABLES"].split():
                 if not loc or loc == "None":
                     sys.exit("no metadata_location on %s.%s" % (E["ICEBERG_DB"], t))
                 pin("iceberg", t, loc)
-            if "paimon" in FORMATS and E.get("PAIMON_READER", "iceberg") == "native":
-                pin_paimon(t)
-            elif "paimon" in FORMATS:
+            if "paimon" in FORMATS:
                 # Paimon's Iceberg export: version-hint.text -> v<N>.metadata.json, a copy
                 # pinned like an Iceberg table; N is Paimon's snapshot id, which the export
                 # reuses as its snapshot id.
@@ -374,8 +335,8 @@ s = next((s for s in m.get("snapshots", []) if s.get("snapshot-id") == sid), {})
 print(s.get("summary", {}).get("operation", "?"), s.get("timestamp-ms", 0))'
 }
 
-# The newest commit time (ms) of <table> in <iceberg|paimon> (read-only: the
-# Iceberg metadata via Glue, Paimon's latest snapshot file).
+# The newest commit time (ms) of <table> in <iceberg|paimon> (read-only:
+# the Iceberg metadata via Glue, Paimon's latest snapshot file).
 qb_commit_ms() {   # <iceberg|paimon> <table>
     if [[ "$1" == iceberg ]]; then
         local c; c=$(qb_iceberg_current "$2") || return 1
@@ -549,8 +510,9 @@ qb_resolve_snapshot_slice() {
     # and the midpoint between its first and last order sat in a gap on every
     # round (S4 ZERO_SCAN on all arms, e.g. [12:48, 12:58) on 2026-11-06). Each
     # format's pinned orders are counted per M-minute bucket of order_date in the
-    # partition; the bucket whose SMALLER per-format count is largest wins, so both
-    # formats have rows in it. A format no engine can read is left out, and logged.
+    # partition; the bucket whose SMALLER per-format count is largest wins, so every
+    # format has rows in it. A format no engine can read is
+    # left out, and logged.
     local hist="" bsec=$(( M * 60 )) bexpr
     for arm in $(qb_formats); do
         for tc in ${SNAPSHOT_SLICE_COLUMNS:-orders:order_date}; do
@@ -598,8 +560,8 @@ EOF
 
 # H8's key: an order UPDATED in the hot window (updated_at in [HOT_FROM, HOT_TO),
 # created before it), picked on the pinned orders of the first format in
-# FORMATS (iceberg when it runs) on qb_setup_engine. Not confirmed on the other
-# arms: the summary compares their rows. Sets QB_LOOKUP_ORDER_ID / QB_LOOKUP_ORDER_DT
+# FORMATS (iceberg when it runs, else paimon) on qb_setup_engine.
+# Not confirmed on the other arms: the summary compares their rows. Sets QB_LOOKUP_ORDER_ID / QB_LOOKUP_ORDER_DT
 # (LOOKUP_ORDER_ID / LOOKUP_ORDER_DT pin them) and QB_LOOKUP_NOTE. The
 # selection reads updated_at over the whole table (no partition filter, like
 # H4), untimed, before the warm-up pass.
@@ -609,16 +571,20 @@ qb_resolve_lookup() {
             || qb_die "LOOKUP_ORDER_ID must be an integer and LOOKUP_ORDER_DT a YYYY-MM-DD"
         QB_LOOKUP_ORDER_ID="$LOOKUP_ORDER_ID"; QB_LOOKUP_ORDER_DT="$LOOKUP_ORDER_DT"; QB_LOOKUP_NOTE="pinned by hand"
     else
-        local e r arm
+        local e r arm mod="${FK_PARENT_MOD:-16}"
         e=$(qb_setup_engine); arm=$(qb_formats); arm="${arm%% *}"   # iceberg when it is in FORMATS
+        # Only from the generator's never-deleted pool (order_id % FK_PARENT_MOD = 0,
+        # mysql-upsert-loadgen.yaml): the key is picked once and every pass re-pins, so a
+        # key the generator DELETEs mid-run makes H8 ZERO_SCAN on every later pass (_v3,
+        # 2026-11-08: gone from Iceberg by p1, from Paimon by p2).
         r=$(qb_setup_query "$e" "$arm" "SELECT o.order_id, o.$(qb_part_col "$arm" orders) FROM \${ORDERS} AS o
                  WHERE o.updated_at >= TIMESTAMP '${QB_HOT_FROM}' AND o.updated_at < TIMESTAMP '${QB_HOT_TO}'
-                   AND o.order_date < TIMESTAMP '${QB_HOT_FROM}'
+                   AND o.order_date < TIMESTAMP '${QB_HOT_FROM}' AND o.order_id % ${mod} = 0
                  ORDER BY o.updated_at DESC, o.order_id LIMIT 1" | tail -1) || true
         [[ "$r" =~ ^[0-9]+$'\t'[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
-            || qb_die "no H8 candidate on ${e}:${arm} (got '${r}'): no update of an older order in the window? Set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
+            || qb_die "no H8 candidate on ${e}:${arm} (got '${r}'): no update of an older order with order_id % ${mod} = 0 in the window? Set LOOKUP_ORDER_ID and LOOKUP_ORDER_DT"
         QB_LOOKUP_ORDER_ID="${r%%$'\t'*}" QB_LOOKUP_ORDER_DT="${r#*$'\t'}"
-        QB_LOOKUP_NOTE="picked on ${e}:${arm} (pinned orders), not confirmed on the other arms (the summary compares their rows)"
+        QB_LOOKUP_NOTE="picked on ${e}:${arm} (pinned orders, order_id % ${mod} = 0: never deleted by the generator), not confirmed on the other arms (the summary compares their rows)"
     fi
     if [[ "$QB_LOOKUP_ORDER_DT" == "${QB_HOT_DT:-}" ]]; then QB_LOOKUP_NOTE+="; partition = HOT_DT"
     else QB_LOOKUP_NOTE+="; partition older than HOT_DT (more equality deletes)"; fi
@@ -630,6 +596,8 @@ qb_query_files() { ls "${QB_DIR}/$1"/*.sql 2>/dev/null || qb_die "no .sql files 
 qb_query_name()  { basename "$1" .sql; }
 qb_query_flag()  { grep -qE "^-- bench:.*(^|[^A-Za-z0-9_-])$2([^A-Za-z0-9_=-]|\$)" "$1"; }
 qb_dialect_file() { echo "${QB_DIALECT_DIR}/dialect-$1.env"; }
+# One field of the JSON object on stdin ("" for null or missing).
+qb_jget() { python3 -c 'import json,sys; d=json.load(sys.stdin); v=d.get(sys.argv[1]); print("" if v is None else v)' "$1"; }
 
 # Render one file for one engine: every placeholder above, from the QB_*
 # windows, the pins and the engine's dialect file. ANY ${...} left is fatal and
@@ -682,6 +650,25 @@ sys.stdout.write(sql if sql.endswith("\n") else sql + "\n")
 EOF
 }
 
+# Every query of <suite> rendered for <engine> on each arm of FORMATS, into
+# <dir>/<arm>.<NN>.sql (NN = the file's place in run order).
+qb_render_suite_dir() {   # <duckdb|trino> <suite> <dir>
+    local f n arm
+    for arm in $(qb_formats); do
+        n=0
+        for f in $(qb_query_files "$2"); do
+            n=$((n + 1)); qb_render "$f" "$1" "$arm" > "${3}/${arm}.$(printf '%02d' "$n").sql" || qb_die "render failed: ${f} (${1}/${arm})"
+        done
+    done
+}
+# The drivers' `render <suite> [arm]`: every query of <suite>, rendered, on stdout.
+qb_print_rendered() {   # <duckdb|trino> <suite> [arm; default: FORMATS]
+    local arm f
+    for arm in ${3:-$(qb_formats)}; do
+        for f in $(qb_query_files "$2"); do echo "-- ${1}/${arm}: $(qb_query_name "$f")"; qb_render "$f" "$1" "$arm"; done
+    done
+}
+
 # Per-query cap, the same on both engines, so a TIMEOUT means the same thing.
 qb_query_timeout() { [[ "$1" == hot ]] && echo "${HOT_QUERY_TIMEOUT_S:-1800}" || echo "${SNAPSHOT_QUERY_TIMEOUT_S:-3600}"; }
 
@@ -696,6 +683,29 @@ qb_median() {
 # caches were emptied); median_ms is then the median of the other passes.
 QB_CSV_HEADER="stamp,engine,arm,suite,query,status,median_ms,result_rows,scan_rows,scan_bytes,cold_ms"
 qb_csv_init() { mkdir -p "$(dirname "$1")"; [[ -f "$1" ]] || echo "$QB_CSV_HEADER" > "$1"; }
+# A query's last kept pass (<last>: its job JSON) -> <csv>'s -firstrows.csv (its
+# first row) and -rows.tsv (every result row: the summary compares them all).
+qb_write_last_rows() {   # <last json> <arm> <suite> <query> <csv>
+    echo "${2},${3},${4},$(qb_jget first_row < "$1")" >> "${5%.csv}-firstrows.csv"
+    python3 - "$1" "$2" "$3" "$4" >> "${5%.csv}-rows.tsv" <<'EOF'
+import json, sys
+j = json.load(open(sys.argv[1]))
+for i, r in enumerate(j.get("rows") or [], 1):
+    print("\t".join([sys.argv[2], sys.argv[3], sys.argv[4], str(i), r.replace("\t", " ").replace("\n", " ")]))
+EOF
+}
+# A suite's not-OK queries are results, not a driver failure: logged (and to
+# <log>), the exit unchanged.
+qb_log_not_ok() {   # <duckdb|trino> <suite> <rows csv> <row count> <log>
+    local bad
+    bad=$(awk -F, -v e="$1" '$6 != "OK" { printf " %s:%s:%s=%s", e, $3, $5, $6 }' "$3")
+    if [[ -n "$bad" ]]; then
+        qb_log "${2}: $(wc -w <<<"$bad" | tr -d ' ') of ${4} queries not OK:${bad}"
+    else
+        qb_log "${2}: ${4} queries, all OK"
+    fi
+    echo "# suite=${2} queries=${4} not OK:${bad:- none}" >> "$5"
+}
 
 # ── Writers and generator ───────────────────────────────────────────────────
 qb_writer_state() {   # [jobs; default QB_QUERY_WRITERS]
@@ -862,12 +872,16 @@ ${busy}"
 
 # ── Suite plumbing shared by both drivers ───────────────────────────────────
 # Resolve and log the suite's values the same way on both engines. Snapshot
-# values come from snapshot.sh (exported SNAPSHOT_DT / S_FROM / S_TO); resolved
-# here only when a driver runs by hand.
+# values come from snapshot.sh (exported SNAPSHOT_DT / S_FROM / S_TO), H8's key
+# from hot-interleave.sh (exported QB_LOOKUP_*); resolved here only when a
+# driver runs by hand.
 qb_start_suite() {   # <hot|snapshot>
     if [[ "$1" == hot ]]; then
         qb_resolve_hot
         qb_log "hot: dt=${QB_HOT_DT} [${QB_HOT_FROM}, ${QB_HOT_TO})"
+        if [[ -z "${QB_LOOKUP_ORDER_ID:-}" ]] && grep -q 'LOOKUP_ORDER' "${QB_DIR}"/hot/*.sql; then
+            qb_resolve_lookup
+        fi
     else
         [[ -n "${SNAPSHOT_DT:-}" && -n "${S_FROM:-}" ]] || qb_stop_writers
         qb_resolve_snapshot_dt
@@ -892,9 +906,8 @@ qb_pins_dump() { local v; for v in $(compgen -v | grep '^QB_PIN_' | sort); do ec
 # (FOR VERSION AS OF, alias included, as the SQL writes `${ORDERS} AS o`). A
 # coordinator whose view of the table is older than the pin ("Snapshot ... not
 # found") is retried for up to 5 min. Iceberg: anything else stops the run.
-# Paimon (the export through TRINO_CATALOG, or with PAIMON_READER=native the
-# Paimon connector, catalog QB_TRINO_PAIMON_CATALOG): logged as a WARNING, and
-# the arm's queries then record the error, so the run goes on.
+# paimon (the export through TRINO_CATALOG): logged as a WARNING, and the arm's
+# queries then record the error, so the run goes on.
 qb_trino_check_pins() {
     local arm t r try tries
     for arm in $(qb_formats); do
@@ -907,9 +920,7 @@ qb_trino_check_pins() {
                 sleep 30
             done
             [[ "$r" == 0$'\t'* ]] && continue
-            if [[ "$arm" == paimon && "$PAIMON_READER" == native ]]; then
-                qb_log "WARNING: Trino cannot read ${QB_TRINO_PAIMON_CATALOG}.${PAIMON_DB}.${t} (native Paimon) at its pinned snapshot: ${r#*$'\t'}; trino:paimon queries will record the error"
-            elif [[ "$arm" == paimon ]]; then
+            if [[ "$arm" == paimon ]]; then
                 qb_log "WARNING: Trino cannot read ${TRINO_CATALOG}.${PAIMON_DB}.${t} (Paimon's Iceberg export) at its pinned snapshot: ${r#*$'\t'}; trino:paimon queries will record the error"
             else
                 qb_die "Trino cannot read ${ICEBERG_DB}.${t} at its pinned snapshot: ${r#*$'\t'}"

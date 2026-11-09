@@ -8,7 +8,6 @@
 
 # Runtime logs
 *.log
-cdc-pipeline/bench-results
 #python
 *pycache*
 # Account-specific values for throughput-benchmark/.bench-env

@@ -41,7 +41,6 @@ info() {
 
 # Default values
 LAKEHOUSE_FORMAT=${LAKEHOUSE_FORMAT:-both}
-ACTION=${1:-help}
 
 # Default the region rather than leaving it unset. An empty AWS_REGION renders
 # empty into the manifests, and the AWS SDK then silently falls back to
@@ -84,20 +83,18 @@ if [[ "$ICEBERG_FORMAT_VERSION" == "3" ]]; then PAIMON_DV_BITMAP64=true; else PA
 export PAIMON_DV_BITMAP64
 
 # Check required environment variables
-check_env_vars() {   # [build]
+check_env_vars() {
     log "Checking required environment variables..."
 
-    # MYSQL_PASSWORD is never needed here: the manifests read it from the
-    # ${MYSQL_ENV_SECRET_NAME} Secret at pod start. `build` (image + S3 upload)
-    # needs no MySQL values at all.
     local required_vars=(
         "AWS_REGION"
         "AWS_ACCOUNT_ID"
         "BUCKET_NAME"
         "EMR_EXECUTION_ROLE_ARN"
     )
-    # MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD are not needed here: the writers read
-    # them from Secret ${MYSQL_ENV_SECRET_NAME} (envFrom). Port and database are rendered.
+    # MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD are never needed here: the writers
+    # read them from Secret ${MYSQL_ENV_SECRET_NAME} (envFrom) at pod start. Port
+    # and database are rendered.
     export MYSQL_PORT="${MYSQL_PORT:-3306}" MYSQL_DATABASE="${MYSQL_DATABASE:-ecommerce}"
     [[ "$MYSQL_PORT" =~ ^[0-9]+$ ]] || error "MYSQL_PORT must be a number (got '${MYSQL_PORT}')"
     [[ "$MYSQL_DATABASE" =~ ^[A-Za-z0-9_]+$ ]] || error "MYSQL_DATABASE must be a plain identifier (got '${MYSQL_DATABASE}')"
@@ -280,18 +277,25 @@ BUILD_TAG_SUFFIX="buildstage-"
 # Note there is deliberately no lifecycle policy expiring untagged images on
 # this repository: such a rule WOULD delete these children and silently break
 # the multi-arch tag.
+# The manifest list (index) body stored under <repo>:<tag>; empty or "None"
+# when the tag is missing or is not a manifest list.
+get_index_manifest() {
+    local repo_name=$1 image_tag=$2
+    aws ecr batch-get-image --repository-name "$repo_name" \
+        --image-ids imageTag="$image_tag" \
+        --accepted-media-types \
+            "application/vnd.docker.distribution.manifest.list.v2+json" \
+            "application/vnd.oci.image.index.v1+json" \
+        --region "$AWS_REGION" \
+        --query 'images[0].imageManifest' --output text 2>/dev/null
+}
+
 delete_build_tags() {
     local repo_name=$1 image_tag=$2 platforms=$3
     local arch ids=()
 
     local list
-    list=$(aws ecr batch-get-image --repository-name "$repo_name" \
-             --image-ids imageTag="$image_tag" \
-             --accepted-media-types \
-                 "application/vnd.docker.distribution.manifest.list.v2+json" \
-                 "application/vnd.oci.image.index.v1+json" \
-             --region "$AWS_REGION" \
-             --query 'images[0].imageManifest' --output text 2>/dev/null)
+    list=$(get_index_manifest "$repo_name" "$image_tag")
 
     if [[ -n "$list" && "$list" != "None" ]]; then
         for arch in $platforms; do
@@ -324,13 +328,7 @@ verify_multiarch_tag() {
     local repo_name=$1 image_tag=$2 platforms=$3
 
     local list
-    list=$(aws ecr batch-get-image --repository-name "$repo_name" \
-             --image-ids imageTag="$image_tag" \
-             --accepted-media-types \
-                 "application/vnd.docker.distribution.manifest.list.v2+json" \
-                 "application/vnd.oci.image.index.v1+json" \
-             --region "$AWS_REGION" \
-             --query 'images[0].imageManifest' --output text 2>/dev/null)
+    list=$(get_index_manifest "$repo_name" "$image_tag")
     [[ -n "$list" && "$list" != "None" ]] || \
         error "${repo_name}:${image_tag} is not a manifest list"
 
@@ -595,13 +593,16 @@ create_glue_database() {
     fi
 }
 
-# Create the "ebs-sc" StorageClass required by task-local recovery by EBS.
+# Create the "ebs-sc" StorageClass that task-local recovery by EBS needs.
 #
-# One-off, cluster-scoped, idempotent: run it once per EKS cluster. Both jobs set
-# `task.local-recovery.ebs.enable: "true"`, and EMR then auto-creates one PVC per
+# One-off, cluster-scoped, idempotent: run it once per EKS cluster. With
+# `task.local-recovery.ebs.enable: "true"` EMR auto-creates one PVC per
 # TaskManager with the hardcoded storageClassName "ebs-sc" — the name is not
 # configurable. Without the class, TaskManager pods stay Pending with
 # "failed to get storage class, StorageClass storage.k8s.io \"ebs-sc\" not found".
+# Neither writer enables local recovery any more (state.backend.type: hashmap
+# since 2026-11-02), so nothing in this pipeline uses the class today; the step
+# is kept so render/deploy still leave the cluster as before.
 create_ebs_storage_class() {
     local manifest="k8s/ebs-sc-storageclass.yaml"
 
@@ -798,7 +799,7 @@ main() {
 
     case $action in
         build)
-            check_env_vars build
+            check_env_vars
             display_config
             build_and_push_image
             upload_scripts_to_s3
@@ -841,8 +842,6 @@ main() {
             display_config
             create_ebs_storage_class
             install_kyverno_az_policy
-            # upload_scripts_to_s3
-            # create_mysql_secret
 
             if [[ "$format" == "paimon" || "$format" == "both" ]]; then
                 log "Deploying Paimon lakehouse..."
@@ -867,7 +866,6 @@ main() {
             upload_scripts_to_s3
             create_ebs_storage_class
             install_kyverno_az_policy
-            # create_mysql_secret
 
             if [[ "$format" == "paimon" || "$format" == "both" ]]; then
                 log "Deploying Paimon lakehouse..."
@@ -933,21 +931,21 @@ main() {
             echo "Optional:"
             echo "  EMR_VERSION            (default: 7.14.0; image tag and emrReleaseLabel)"
             echo "  ICEBERG_FORMAT_VERSION (default: 3; 2 or 3)"
-            echo "  SESSION_SUFFIX          (default when unset: _v3; set empty for the v2 set)"
+            echo "  SESSION_SUFFIX          (default when unset: cdc-pipeline/.bench-env's; set empty for the v2 set)"
             echo "  -> ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX= selects the original v2 tables"
             echo ""
             echo "Examples:"
             echo "  # Deploy Paimon only"
             echo "  export LAKEHOUSE_FORMAT=paimon"
-            echo "  ./deploy-generic.sh all"
+            echo "  $0 all"
             echo ""
             echo "  # Deploy Iceberg only"
             echo "  export LAKEHOUSE_FORMAT=iceberg"
-            echo "  ./deploy-generic.sh all"
+            echo "  $0 all"
             echo ""
             echo "  # Deploy both"
             echo "  export LAKEHOUSE_FORMAT=both"
-            echo "  ./deploy-generic.sh all"
+            echo "  $0 all"
             exit 1
             ;;
     esac

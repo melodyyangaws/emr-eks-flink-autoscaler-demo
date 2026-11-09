@@ -5,8 +5,9 @@
 source** with **iceberg, httpfs, aws and avro statically linked** into the
 Python module (no CLI), plus awscli 1.46.2, the `cache_httpfs` community
 extension preinstalled, and the **`paimon` extension built from source** (a
-loadable extension, installed, unsigned) so DuckDB reads the Flink-written Paimon
-tables natively. One tag, a manifest list for **linux/amd64 and linux/arm64**.
+loadable extension, installed, unsigned) that reads the Flink-written Paimon
+tables natively; the server no longer loads it (the harness reads Paimon only as
+Paimon-as-iceberg, see [below](#the-paimon-extension-native-paimon-reads)). One tag, a manifest list for **linux/amd64 and linux/arm64**.
 
 | File | What |
 |---|---|
@@ -34,8 +35,8 @@ tables natively. One tag, a manifest list for **linux/amd64 and linux/arm64**.
    (the pod requests 150Gi ephemeral storage). The pods are pinned to
    `karpenter.sh/nodepool: ${NODEPOOL}` (default **`executor-memorynodepool`**:
    on-demand allowed, m family gen > 4, 4/8/12/16xlarge, amd64 and arm64,
-   EC2NodeClass `memoryec2` = 200Gi root volume; `driver-nodepool` stops at
-   8xlarge). The 2026-11-03 build got an m5a.16xlarge (amd64) and an
+   EC2NodeClass `memoryec2` = 200Gi root volume; the builds do not use
+   `driver-nodepool`, the engines' pool). The 2026-11-03 build got an m5a.16xlarge (amd64) and an
    m6g.16xlarge (arm64).
 
 ## Build
@@ -91,7 +92,7 @@ time from start to the manifest list was 23 min. Digests: `2.0.0-amd64`
 the list `2.0.0` `sha256:b11a33f8e12abb3d23efefe6dee769bf8d685550b3199696998be1c8e71318e2`.
 
 The build is CPU-bound (vcpkg dependencies, aws-sdk-cpp the largest, then the
-wheel); the measured builds kept their 8 jobs 100 % busy. Both architectures
+wheel); the 2026-11-02 build kept its 8 jobs 100 % busy. Both architectures
 run at the same time, so the wall time is the slower one plus node start-up.
 
 ## Verify the pushed image
@@ -121,7 +122,7 @@ The image's last build step already ran `SELECT version()` and `LOAD iceberg`,
 `LOAD httpfs`, `LOAD paimon` (with `allow_unsigned_extensions`), so an image
 that cannot load them is never pushed. `/health` lists
 `"extensions": {"httpfs": "static", "iceberg": "static", "cache_httpfs":
-"preinstalled", "paimon": "preinstalled"}`.
+"preinstalled"}` (the server does not load `paimon`).
 
 ## What the Dockerfile builds
 
@@ -173,8 +174,7 @@ with runs on the PyPI engine (`DUCKDB_IMAGE=`).
 2. **No `INSTALL` for built-in extensions**: `INSTALL` downloads the official
    binary even for a statically linked extension, so the server only `LOAD`s
    extensions that are `STATICALLY_LINKED` or already installed
-   (`cache_httpfs`, `paimon`). On this image the pod downloads nothing at start.
-   The connection allows unsigned extensions (the self-built paimon).
+   (`cache_httpfs`). On this image the pod downloads nothing at start.
 3. **Results stream**: in duckdb-python 2.0 an error can surface in
    `fetchall()`; execute and fetch share one `try` and one timer, and each
    query uses its own cursor.
@@ -185,12 +185,13 @@ with runs on the PyPI engine (`DUCKDB_IMAGE=`).
 New in the 2.0 iceberg extension (global, default `false`): skips the check
 that a v3 deletion-vector file is a real Puffin container.
 
-- **The Paimon arm on v3 needs it**: Paimon 2.1's exported deletion vectors
-  point into its own index files, bare blobs, not Puffin. The server sets it
-  per query: `true` for the arms in `SKIP_PUFFIN_VERIFICATION_ARMS` (default
-  `paimon` when `ICEBERG_FORMAT_VERSION=3`), `false` otherwise, so native
-  Iceberg's Puffin files are still verified. `/health` and the results record it.
-- The v2 set doesn't need it (a v2 export has no deletion vectors).
+- **The Paimon-as-iceberg arm (`paimon`) on v3 needs it**: the deletion vectors
+  in Paimon 2.1's Iceberg metadata point into its own index files, bare blobs, not
+  Puffin. The server sets it per query: `true` for the arms in
+  `SKIP_PUFFIN_VERIFICATION_ARMS` (default `paimon`, `lib/querybench.sh`
+  `qb_skip_puffin_default`), `false` otherwise, so native Iceberg's Puffin files are
+  still verified. `/health` and the results record it.
+- The v2 set doesn't need it (Paimon's v2 Iceberg metadata has no deletion vectors).
 - "Unsafe": a wrong offset gives wrong deletes silently, so keep the
   zero-scan and cross-arm row checks on.
 
@@ -199,8 +200,15 @@ that a v3 deletion-vector file is a real Puffin container.
 `paimon_scan('s3://…/paimon-warehouse/<db>.db/<table>')` (or `ATTACH
 's3://…/paimon-warehouse' AS p (TYPE paimon)`) reads a Paimon table directly:
 its snapshot, manifests, LSM levels and deletion vectors. Paimon's Iceberg
-export is not involved. It is polardb/duckdb-paimon on
+metadata (Paimon-as-iceberg) is not involved. It is polardb/duckdb-paimon on
 [paimon-cpp](https://github.com/apache/paimon-cpp) (C++, no JVM).
+
+**Not used by the harness.** Native Paimon (`paimon_native`, DuckDB paimon_scan /
+Trino paimon connector) was tried on _v3, 2026-11-08: correct rows but 4–29×
+slower than Paimon-as-iceberg (no file skipping, no DuckDB cache); removed
+2026-11-09. `duckdb_cdc_server.py` neither loads the extension nor creates a
+`TYPE paimon` secret; the extension stays in the image, and the notes below
+describe it for hand use.
 
 **Why built from source.** The community binary (`INSTALL paimon FROM
 community`, 0.1.3 = duckdb-paimon `6762e34b` + paimon-cpp `53f9c86d`) is
@@ -229,15 +237,16 @@ If paimon-cpp's sub-build fails, the RUN prints every non-empty ExternalProject
 `*-err.log`: CMake itself only says `Stopping after outputting logs`.
 
 **Unsigned.** A self-built extension carries no DuckDB signature. It is
-installed where `INSTALL` would put it (`~/.duckdb/extensions/v2.0.0/<platform>/`),
-and `duckdb_cdc_server.py` connects with `allow_unsigned_extensions=true`.
-On the PyPI fallback (`DUCKDB_IMAGE=`) the server INSTALLs the community 0.1.3
-instead, which cannot read these tables.
+installed where `INSTALL` would put it (`~/.duckdb/extensions/v2.0.0/<platform>/`);
+a connection that loads it needs `allow_unsigned_extensions=true`. The community
+0.1.3 cannot read these tables.
 
 **S3 and credentials.** paimon-cpp has its own S3 client (aws-c-auth), not
 httpfs. So `cache_httpfs` and the `irsa` S3 secret do not apply to it. It needs
-a secret of `TYPE paimon`. `PROVIDER credential_chain` works in the pod, because
-the chain includes STS web identity (IRSA):
+a secret of `TYPE paimon` (until 2026-11-09 the server created one from the
+same STS web-identity keys as its `irsa` S3 secret). By hand,
+`PROVIDER credential_chain` works in the pod, because the chain
+includes STS web identity (IRSA):
 
 ```sql
 CREATE SECRET p (TYPE paimon, PROVIDER credential_chain, region 'us-west-2',
@@ -245,7 +254,8 @@ CREATE SECRET p (TYPE paimon, PROVIDER credential_chain, region 'us-west-2',
 ```
 
 **Verified 2026-11-03** in `duckdb-warm-cdc` (writers suspended), on
-that day's Paimon table set. The two tables are bucket 32, primary-key, DVs bitmap64,
+that day's Paimon table set (a historical check; today's tables have 8 / 16
+buckets). The two tables are bucket 32, primary-key, DVs bitmap64,
 changelog-producer none:
 
 | Table (snapshot) | `total_record_count` | `count(*)` | `count(pk)` / `count(DISTINCT pk)` |

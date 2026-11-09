@@ -4,8 +4,12 @@
 
 Both **Apache Paimon** and **Apache Iceberg** are open table formats that enable building data lakehouses on S3. This guide helps you choose the right format for your Flink CDC use case.
 
-> **Latest measured findings:** [Iceberg v3 on EMR 7.14 (2026-11-02)](#iceberg-v3-on-emr-714-findings-of-2026-11-02).
-> The StarRocks-era benchmark below ([Performance Benchmarks](#performance-benchmarks)) is historical.
+> **Latest measured results:** the 2026-11-07 `_v3final` round,
+> [bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md](bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)
+> (DuckDB and Trino on Iceberg v3 and on Paimon-as-iceberg, hot and snapshot suites).
+> The reader findings of [2026-11-02](#iceberg-v3-on-emr-714-findings-of-2026-11-02) are
+> partly superseded (marked there). The StarRocks-era benchmark below
+> ([Performance Benchmarks](#performance-benchmarks)) is historical.
 
 ## Quick Comparison
 
@@ -89,19 +93,25 @@ MySQL CDC → Flink
 ### 1. Catalog Management
 
 #### Paimon
-```python
+```sql
+-- abridged from ingest-deploy/sql-scripts/paimon/01-catalog-setup.sql
 CREATE CATALOG paimon_catalog WITH (
     'type' = 'paimon',
-    'warehouse' = 's3://bucket/paimon-warehouse/'
-    # Glue integration
+    'warehouse' = 's3://bucket/paimon-warehouse',
+    -- Glue integration, through EMR's Glue Hive metastore client
     'metastore' = 'hive',
-    'metastore.client.class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient'
-    # provided by EMR on EKS flink
+    'metastore.client.class' = 'com.amazonaws.glue.catalog.metastore.AWSCatalogMetastoreClient',
+    -- provided by EMR on EKS Flink
     'hive-conf-dir' = '/glue/confs/hive/conf',
     'hadoop-conf-dir' = '/glue/confs/hadoop/conf',
+    -- paimon-s3 reads only s3.* options, so IRSA is named here
+    's3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider',
     'lock.enabled' = 'false'
-)
+);
 ```
+
+This pipeline registers Paimon in Glue (above). The pros below are those of a
+filesystem catalog (`'metastore' = 'filesystem'`, the default), which needs no Glue.
 
 **Pros:**
 - ✅ No external dependencies
@@ -114,7 +124,7 @@ CREATE CATALOG paimon_catalog WITH (
 - ❌ File-based locking can have issues
 
 #### Iceberg
-```python
+```sql
 CREATE CATALOG iceberg_catalog WITH (
     'type' = 'iceberg',
     'catalog-impl' = 'org.apache.iceberg.aws.glue.GlueCatalog',
@@ -140,7 +150,7 @@ CREATE CATALOG iceberg_catalog WITH (
 -- No hidden partition support
 -- Manual partitioning with string partition column
 CREATE TABLE orders (
-    order_id INT,
+    order_id BIGINT,
     order_date TIMESTAMP(6),
     order_date_str STRING,  -- Must create partition column
     ...
@@ -157,12 +167,17 @@ CREATE TABLE orders (
 ```sql
 -- Hidden partitioning with function-based transforms
 CREATE TABLE orders (
-    order_id INT,
+    order_id BIGINT,
     order_date TIMESTAMP(3),
     ...
     PRIMARY KEY (order_id) NOT ENFORCED
 ) PARTITIONED BY (DAYS(order_date))  -- Automatic!
 ```
+
+This pipeline does not use a transform: Flink SQL's `PARTITIONED BY` takes columns
+only, and an upsert table's partition column must be in its primary key, so the
+Iceberg sinks partition by a `DATE_FORMAT()` string column too (`order_dt`,
+`created_dt`; `ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql`).
 
 **Characteristics:**
 - **Hidden partitioning** - no extra columns needed
@@ -242,7 +257,7 @@ SELECT * FROM customers /*+ OPTIONS(
 **Automatic compaction, retain snapshots for 12 hours** (as in `ingest-deploy/sql-scripts/paimon/03-paimon-sinks.sql`):
 ```sql
 CREATE TABLE orders (...) WITH (
-    'num-sorted-run.compaction-trigger' = '4',
+    'num-sorted-run.compaction-trigger' = '8',
     'snapshot.time-retained' = '12h',
     'snapshot.num-retained.min' = '5',
     'snapshot.num-retained.max' = '1000'   -- above 720 commits in 12 h, so age binds
@@ -259,10 +274,10 @@ stores it and ignores it.)
 
 #### Iceberg
 **A separate compaction job.** Here: once, before the snapshot test, with the
-writers stopped (`compaction/run.sh`, `cdc-compact.py`): every data file that
-carries a delete is rewritten with its deletes applied (Iceberg's
-`RowDataRewriter`), and one `RewriteFiles` commit also removes the delete files;
-then snapshots older than 12 h are expired. A continuous job (Iceberg 1.12's Flink
+writers stopped (`compaction/run.sh run both`, run by the hot test's watcher): the
+data files that carry deletes are rewritten with them applied, the delete files are
+removed in the same commit, then snapshots older than 12 h are expired. How it
+works and what it needs: [README, The one-off compaction](README.md#the-one-off-compaction-compaction). A continuous job (Iceberg 1.12's Flink
 `TableMaintenance`, every 10 writer commits) was tried on 2026-11-03/04 and
 removed: each rewrite reloads the equality-delete set per data file and was
 outlived by the writers' metadata retention, so it committed almost nothing at
@@ -437,7 +452,7 @@ measure it on your own data rather than assuming a ratio. See
 
 **Setup.** First v3 dry run on the `cdc-icebergv3` branch: EMR on EKS 7.14.0 (Flink
 1.20.0-amzn-8), Paimon 2.1.0, Iceberg Flink runtime 1.12.0, `format-version = 3` on
-the native Iceberg tables and on Paimon's Iceberg export
+the native Iceberg tables and on Paimon's Iceberg metadata
 (`ICEBERG_FORMAT_VERSION=3`, `deletion-vectors.bitmap64 = true`). About one hour of
 the upsert workload at ~64,000 rows/s against the shrunk source (~37.5M rows; see
 [0-MYSQL-SETUP-GUIDE.md](./0-MYSQL-SETUP-GUIDE.md)). Readers: DuckDB 2.0.0 (built
@@ -447,47 +462,55 @@ from source) and StarRocks 4.1.7.
 
 | Reader | Native Iceberg v3 (DVs + equality deletes) | Paimon v3 |
 |---|---|---|
-| **DuckDB 2.0** (`iceberg` extension) | **Reads it**, including deletion vectors (Puffin) and equality deletes. `customers`: 17.07M rows in 7.5 s; `order_items`: 177M rows in 28.1 s; 0 duplicate keys | **Fails** on the Iceberg export: the exported manifests have no Avro key-value metadata field `schema`, which DuckDB requires (`Manifest ... missing required Avro key-value metadata field 'schema'`) |
+| **DuckDB 2.0** (`iceberg` extension) | **Reads it**, including deletion vectors (Puffin) and equality deletes. `customers`: 17.07M rows in 7.5 s; `order_items`: 177M rows in 28.1 s; 0 duplicate keys | **Failed** on Paimon's Iceberg metadata: its manifests had no Avro key-value metadata field `schema`, which DuckDB requires (`Manifest ... missing required Avro key-value metadata field 'schema'`). Fixed 2026-11-07 by the writer image's PR #10329 backport ([patched-jars/README.md](ingest-deploy/docker/patched-jars/README.md)) |
 | **StarRocks 4.1.7** | **Refuses** any scan that touches a DV: `Iceberg V3 Deletion Vectors are not supported` (a v3 table with only equality deletes still plans) | **Fails** in both Paimon readers. The native C++ reader cannot decode the 64-bit DV layout (`can not read fully`). The JNI reader (`SET paimon_force_jni_reader = true`) fails with an `InstantiationIOException` on StarRocks' credential provider class (`com.starrocks.credential.provider.…`) when it opens the DV index files |
 | **Athena engine v3** | Not supported (Iceberg v2 only) | Not supported |
 
-**Net result:** on v3, the only engine in this stack that read native Iceberg was
-DuckDB, and none of these read Paimon. StarRocks has since been removed from the CDC
-pipeline. The query benchmark now runs DuckDB and Trino
-([querybench/README.md](./querybench/README.md)). Neither has a native Paimon
-reader (no Paimon connector in the DuckDB image, none for Trino 484): both
-"paimon" arms read **Paimon's Iceberg export** through an Iceberg reader. Trino 484
-reads that v3 export (verified 2026-11-02 hot test); DuckDB 2.0 still
-fails on it with the `schema` error above.
+**Net result (2026-11-02):** on v3, the only engine in this stack that read native
+Iceberg was DuckDB, and none of these read Paimon. StarRocks has since been removed
+from the CDC pipeline; the query benchmark runs DuckDB and Trino
+([querybench/README.md](./querybench/README.md)). Trino 484 read Paimon's v3
+Iceberg metadata in the 2026-11-02 hot test.
 
-### Paimon's Iceberg export: behaviours to know
+**Superseded since:** both engines now read Paimon as *Paimon-as-iceberg* (the
+`paimon` arm, [querybench/README.md, The four arms](querybench/README.md#the-four-arms)):
+DuckDB reads it since the patched `paimon-flink-1.20` (2026-11-07; the `_v3final`
+round ran DuckDB and Trino on it). Native Paimon (`paimon_native`, DuckDB
+paimon_scan / Trino paimon connector) was tried on _v3, 2026-11-08: correct rows
+but 4–29× slower than Paimon-as-iceberg (no file skipping, no DuckDB cache);
+removed 2026-11-09.
 
-- **v3 needs 64-bit deletion vectors.** Paimon writes DVs into the v3 export only when
+### Paimon-as-iceberg: behaviours to know
+
+- **v3 needs 64-bit deletion vectors.** Paimon writes DVs into its v3 Iceberg metadata only when
   all three hold (`IcebergCommitCallback.needAddDvToIceberg`):
   `deletion-vectors.enabled = true`, `deletion-vectors.bitmap64 = true`,
   `metadata.iceberg.format-version = 3`. `bitmap64` takes effect at CREATE TABLE
   only (existing 32-bit DV index files are not rewritten), and it breaks StarRocks'
   native Paimon reader. That is why `ingest-deploy/build-deploy-generic.sh` derives
   `PAIMON_DV_BITMAP64` from the format version (true for v3, false for v2) instead of
-  exposing it as a setting. On a v2 export Paimon writes no DVs and lists only files
-  at the top LSM level, so v2 readers see a stale, read-optimized view until a full
-  compaction.
+  exposing it as a setting. On v2 Paimon writes no DVs into its Iceberg metadata and
+  lists only files at the top LSM level, so v2 readers see a stale, read-optimized
+  view until a full compaction.
 - **The Glue entries are re-registered as ICEBERG.** With
-  `metadata.iceberg.storage = hive-catalog`, the export's committer re-registers each
+  `metadata.iceberg.storage = hive-catalog`, Paimon's Iceberg committer re-registers each
   table in the Paimon Glue database (`flink_paimon_db<suffix>`) as
-  `table_type = ICEBERG`, pointing at the export's metadata. Glue-based Iceberg
+  `table_type = ICEBERG`, pointing at its Iceberg metadata (`paimon-warehouse/iceberg/<db>/<table>/`). Glue-based Iceberg
   readers (Trino's `trino:paimon` arm) read Paimon through those entries. Paimon's
   committer owns them, so do not edit them by hand.
 - **`metadata.json` rotation.** Paimon's default kept **0** previous metadata files:
   each commit deleted the previous `metadata.json`, so a path read from Glue returned
-  404 within one checkpoint, mid-scan. The sink DDL now sets
-  `metadata.iceberg.previous-versions-max = 3` with
+  404 within one checkpoint, mid-scan. The sink DDL sets
+  `metadata.iceberg.previous-versions-max = 100` with
   `metadata.iceberg.delete-after-commit.enabled = true`, the same as the native
-  tables' `write.metadata.previous-versions-max = 100` (3 until 2026-11-04: the continuous `iceberg-maintain` job, removed 2026-11-06, had its rewrites 404 on a planned metadata.json deleted ~3 commits later). A reader still has to pin one
-  metadata version for the length of a query.
+  tables' `write.metadata.previous-versions-max = 100` (both 3 from 2026-11-02 until
+  2026-11-04, when the continuous `iceberg-maintain` job, removed 2026-11-06, had its
+  rewrites 404 on a planned metadata.json deleted ~3 commits later). A reader still
+  has to pin one metadata version for the length of a query (`querybench/pin.sh` copies it).
 - **Freshness.** With DVs on, lookup compaction moves level 0 up at every checkpoint,
-  so the v3 export trails the table by about one checkpoint without forced full
-  compaction.
+  so the v3 Iceberg metadata trails the table by about one checkpoint without forced
+  full compaction. With `PAIMON_WRITE_ONLY=true` nothing leaves level 0 until a
+  compaction, so it would list nothing new (one reason `false` is the default).
 
 ### Write-side asymmetries kept on purpose
 
@@ -498,13 +521,13 @@ These differences remain by design. Report them next to every result:
 
 | Difference | Paimon | Iceberg |
 |---|---|---|
-| Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 4 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; dynamic buckets are unreadable by DuckDB's Paimon reader) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
+| Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 16 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; dynamic buckets are unreadable by DuckDB's Paimon reader) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
 | Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; `compaction/run.sh` once before the snapshot test (writers stopped) |
 | Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only in `compaction/run.sh`, with the same 12 h / keep-5 rule. Paimon's writer does not expire while suspended |
 | Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |
 | Glue integration | EMR's Glue Hive metastore client (`aws.glue.enabled: "true"`, the one intended `flinkConfiguration` difference) | Iceberg's own `GlueCatalog` |
 | Schema details | `TIMESTAMP(6)`; partition columns `order_date_str`, `created_date_str` | `TIMESTAMP(3)`; partition columns `order_dt`, `created_dt` |
-| Paimon-only knobs | write buffers (64/128 MB, spillable; = Iceberg target file size; `INSERT` hints), `num-sorted-run.compaction-trigger = 4`, `sink.writer-coordinator.enabled` | — |
+| Paimon-only knobs | write buffers (64/128 MB, spillable unless `PAIMON_WRITE_BUFFER_SPILLABLE=false` as in `.bench-env`; `INSERT` hints), `num-sorted-run.compaction-trigger = 8`, `sink.writer-coordinator.enabled` | — |
 
 ---
 
@@ -516,7 +539,7 @@ These differences remain by design. Report them next to every result:
 > the CDC pipeline, and none of these settings match the current branch. The
 > "Ingest side" rows came from the earlier monitor, which summed `numRecordsOut`
 > over every vertex and over-counts by about 6x on Paimon and 3x on Iceberg
-> ([3-MONITOR.md](./3-MONITOR.md#rows-s-from-the-tables-commit-history-per-table)), so
+> ([3-MONITOR.md](./3-MONITOR.md#rowss-ingest-source-rate-meter-and-committed-table-commits)), so
 > do not compare them with current monitor output. The query-side ratios describe
 > that configuration only. For current results, see
 > [the 2026-11-02 findings](#iceberg-v3-on-emr-714-findings-of-2026-11-02) and
@@ -614,16 +637,20 @@ The 2026-09 numbers cannot be regenerated as they were: the StarRocks harness
 history only. The current equivalents:
 
 ```bash
-# upsert load (4 pods)
+# upsert load (24 pods)
 ./mysql-data-generator/deploy-data-generator.sh deploy
 
 # Flink side: one bounded REST window (WINDOW=120 by default), or the monitor pod
 ./monitoring/capture-flink-metrics.sh
-bash ./monitoring/deploy-monitor.sh
+./monitoring/deploy-monitor.sh
 
-# Query side: DuckDB vs Trino, server-side times
+# Query side: DuckDB vs Trino, server-side times; then the snapshot suite and the summary
 SUITE=hot ./querybench/run.sh start
+SUITE=snapshot ./querybench/run.sh start
+./querybench/run.sh summary
 ```
+
+The full sequence is the [README runbook](README.md#runbook).
 
 ### Running a comparison that means something
 
@@ -644,10 +671,12 @@ SUITE=hot ./querybench/run.sh start
 5. **Use UTC in hot-window predicates.** CDC writes UTC timestamps. On StarRocks the
    FE session timezone was +08:00, so `NOW()` silently matched zero rows; querybench
    uses explicit `TIMESTAMP` literals for the same reason.
-6. **Measure Iceberg before and after `rewrite_data_files`.** Paimon's LSM compacts
+6. **Measure Iceberg before and after a compaction.** Paimon's LSM compacts
    continuously with no operator action, so a single Iceberg state is not a fair
-   comparison — capture both and label which is which. This asymmetry is itself a finding
-   and should not be smoothed over by compacting Paimon too.
+   comparison — capture both and label which is which. The current harness does this:
+   the hot suite reads Iceberg uncompacted (Paimon as its writer leaves it), the
+   snapshot suite reads both formats after one full compaction each
+   ([README Step 10](README.md#the-one-off-compaction-compaction)).
 
 Dimensions worth capturing: records written and throughput over an identical window;
 checkpoint completion rate and duration; end-to-end freshness lag; snapshot-query and

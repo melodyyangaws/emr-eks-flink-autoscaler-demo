@@ -21,25 +21,11 @@ spec:
     # Region from the AWS_REGION placeholder, never hardcoded: the Paimon
     # manifest used to pin us-west-2 here while the Iceberg one was templated.
     aws.region: ${AWS_REGION}
-    # table.catalog-store.kind: glue
     # S3 Configuration
     fs.s3a.endpoint.region: ${AWS_REGION}
-    # # scale down instantly to test the scaling up behavior, in production you might want to set it to a higher value to avoid too frequent scaling down
-    # job.autoscaler.scale-down.interval: "0"
-    # # restart with local-recovery is still needed
-    # # in order to redistribute states, update DAG etc by adaptive-scheduler
-    # job.autoscaler.restart.time-tracking.enabled: "true"
-    # Autoscaler parameters
+    # Autoscaler off
     job.autoscaler.scaling.enabled: "false"
     job.autoscaler.enabled: "false"
-    # job.autoscaler.stabilization.interval: "1m"
-    # job.autoscaler.metrics.window: "15m"
-    # # lower these settings to trigger autoscaling earlier
-    # job.autoscaler.target.utilization: "0.5"
-    # job.autoscaler.target.utilization.boundary: "0.3"
-    # job.autoscaler.restart.time: "2m"
-    # job.autoscaler.catch-up.duration: "5m"
-    # job.autoscaler.vertex.exclude.ids: ""
     # ON (it was "false"), with object reuse, as in the throughput-benchmark
     # writers. Off, every row was serialized and copied across each Source ->
     # DropUpdateBefore -> Calc -> ConstraintEnforcer edge; object-reuse-off
@@ -277,7 +263,7 @@ spec:
           # connected first when a second one reuses its id. See the server-id
           # note in sql-scripts/common/02-cdc-sources.sql.
           #
-          # Each range is 32 wide, covering parallelism 24 below with room to raise it — the connector
+          # Each range is 32 wide, covering the job parallelism below with room to raise it — the connector
           # hands one id per source subtask, so a range narrower than the
           # parallelism makes subtasks share ids and evict each other.
           - name: CDC_SERVER_ID_CUSTOMERS

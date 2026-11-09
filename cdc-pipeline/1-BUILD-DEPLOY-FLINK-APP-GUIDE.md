@@ -3,8 +3,9 @@
 ## Overview
 
 Two FlinkDeployments on EMR on EKS 7.14.0 read the same MySQL binlog and write the
-same four tables: `flink-cdc-paimon` to Apache Paimon 2.1.0 and `flink-cdc-iceberg`
-to Apache Iceberg (Flink runtime 1.12.0). A generic PyFlink executor
+same four tables: `flink-cdc-paimon` to Apache Paimon 2.1.0 (with a patched
+`paimon-flink-1.20` jar) and `flink-cdc-iceberg` to Apache Iceberg (Flink runtime
+1.12.0, replacing EMR's 1.10.1). A generic PyFlink executor
 (`ingest-deploy/flink-cdc-executor.py`) runs the SQL in `ingest-deploy/sql-scripts/`. You can change a pipeline
 by editing SQL on S3, with no image rebuild.
 
@@ -52,7 +53,8 @@ templates and their renders) are inside `ingest-deploy/`.
         │  (Glue via Hive    │   │  (Glue via        │
         │   metastore client)│   │   GlueCatalog)    │
         └────────┬───────────┘   └───────┬───────────┘
-                 │ Iceberg export        │
+                 │ + Iceberg v3 metadata │
+                 │ (Paimon-as-iceberg)   │
         ┌────────┴──────────────────────┴────────┐
         │  querybench/: DuckDB 2.0, Trino 484    │
         └────────────────────────────────────────┘
@@ -71,6 +73,7 @@ cdc-pipeline/
   │   ├── flink-cdc-paimon-sql.yaml    ← FlinkDeployment template (Paimon)
   │   ├── flink-cdc-iceberg-sql.yaml   ← FlinkDeployment template (Iceberg)
   │   ├── docker/Dockerfile.cdc-paimon ← image: EMR 7.14 Flink + MySQL CDC + Paimon 2.1 + Iceberg 1.12
+  │   ├── docker/patched-jars/         ← the patched paimon-flink-1.20 jar (git-ignored; README.md there)
   │   ├── sql-scripts/
   │   │   ├── common/02-cdc-sources.sql      ← MySQL CDC sources (copied into each format dir on S3)
   │   │   ├── paimon/{01-catalog-setup,03-paimon-sinks,04-cdc-pipelines}.sql
@@ -191,7 +194,7 @@ jobs `build`, `render`, `deploy` and `all` touch.
 | Variable | Default | Effect |
 |---|---|---|
 | `ICEBERG_FORMAT_VERSION` | `3` | Iceberg sink `format-version` and Paimon `metadata.iceberg.format-version`. Must be `2` or `3` |
-| `SESSION_SUFFIX` | If unset: the value in `.bench-env`, else empty. Free text, under 100 characters; names the round only | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). Must be empty or match `_[a-z0-9]+` |
+| `SESSION_SUFFIX` | If unset: the value in `.bench-env`, else empty. Free text, under 100 characters; names the round only | Appended to both Glue DBs (`flink_paimon_db<suffix>`, `flink_iceberg_db<suffix>`) and to the checkpoint, savepoint, HA and log paths (`flink/cdc-<format><suffix>/`). `render` rejects 100 characters or more; Glue database names allow only lowercase letters, digits and `_` |
 | `PAIMON_DV_BITMAP64` | Derived, not a setting: `true` if and only if `ICEBERG_FORMAT_VERSION=3` | Paimon `deletion-vectors.bitmap64` |
 
 An explicit `SESSION_SUFFIX=` (set but empty) selects the original v2 set without a session suffix:
@@ -212,8 +215,7 @@ line.
 
 `build-deploy-generic.sh` does not create it. The writers and the generator share
 one Secret, `mysql-credentials` (keys `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`),
-created as in [README Step 0](README.md#step-0-one-time-setup) /
-[0-MYSQL-SETUP-GUIDE.md, Step 8](./0-MYSQL-SETUP-GUIDE.md#step-8-create-the-kubernetes-secret).
+created as in [README Step 0](README.md#step-0-one-time-setup).
 The manifests load it with `envFrom: secretRef`; no credential is substituted into
 any file, including the git-ignored `*-deployed.yaml`.
 
@@ -222,6 +224,7 @@ any file, including the git-ignored `*-deployed.yaml`.
 ## Step 4 — Build the image and upload the scripts
 
 ```bash
+aws s3 cp --recursive s3://$BUCKET_NAME/flink/build/patched-jars/ ingest-deploy/docker/patched-jars/   # once per checkout
 ./ingest-deploy/build-deploy-generic.sh build
 ```
 
@@ -233,8 +236,9 @@ needs no MySQL values. It does the following:
 2. Builds the image **in the cluster with Kaniko**, one pod per architecture
    (`flink-cdc-image-build-amd64`, then `-arm64`), each pinned to a node of its
    architecture, because Kaniko cannot cross-build. Each build takes several minutes
-   and times out after 30 minutes. The build context is only the Dockerfile, shipped
-   via `s3://$BUCKET_NAME/flink/build/`. It needs the ServiceAccount
+   and times out after 30 minutes. The build context is the Dockerfile plus
+   `docker/patched-jars/` (the patched Paimon jar; `build` stops if the directory
+   holds no jar), shipped via `s3://$BUCKET_NAME/flink/build/`. It needs the ServiceAccount
    `image-builder-sa` in `emr-flink`, with IRSA to push to ECR and read that S3 key.
 3. Joins the two per-arch images into **one manifest-list tag**,
    `emr-flink-cdc-paimon:7.14.0` (`IMAGE_TAG`, default `EMR_VERSION`), and deletes
@@ -284,8 +288,13 @@ A failed check prints `ERROR: ...` and fails the pod. The script then prints the
 `public.ecr.aws/emr-on-eks/flink/emr-7.14.0-flink:latest` (Flink 1.20.0-amzn-8,
 Corretto 17) and adds:
 
-- Paimon 2.1.0: `paimon-flink-1.20`, `-flink-action`, `-s3`, `-hive-catalog`,
-  `-hive-connector-3.1`
+- Paimon 2.1.0: `paimon-s3` from Maven Central, and `paimon-flink-1.20` **replaced
+  by the patched build** in `docker/patched-jars/` (release-2.1.0 + the apache/paimon
+  PR #10329 backport, so Paimon's Iceberg v3 manifests carry the Avro metadata
+  DuckDB requires; [patched-jars/README.md](ingest-deploy/docker/patched-jars/README.md)).
+  `paimon-flink-action`, `paimon-hive-catalog` and `paimon-hive-connector-3.1` are
+  no longer installed (2026-11-07): the bundle already carries their classes, and
+  the Dockerfile's comments give the evidence
 - `flink-sql-connector-mysql-cdc` 3.7.0-1.20 and `mysql-connector-j` 8.4.0
 - the OSS `iceberg-flink-runtime-1.20-1.12.0.jar`, which **replaces** EMR's bundled
   Iceberg 1.10.1-amzn-1 (deleted from `/usr/share/aws/iceberg/lib`). On a v3 table,
@@ -334,9 +343,14 @@ submission, so re-deploy ([Step 7](#step-7--re-deploy-after-a-change)).
    ./ingest-deploy/build-deploy-generic.sh render
    ```
 
-   `render` needs the four AWS values plus `MYSQL_HOST` and `MYSQL_USER`. It also:
+   `render` needs the four AWS values. It needs no MySQL host, user or password
+   (the pods read them from the Secret); `MYSQL_PORT` / `MYSQL_DATABASE` default to
+   `3306` / `ecommerce`. It also:
 
-   - creates the `ebs-sc` StorageClass (`ingest-deploy/k8s/ebs-sc-storageclass.yaml`) if missing
+   - creates the `ebs-sc` StorageClass (`ingest-deploy/k8s/ebs-sc-storageclass.yaml`) if missing.
+     It is the class EMR uses for task-local recovery on EBS; neither writer enables
+     local recovery since the switch to the `hashmap` state backend (2026-11-02), so
+     nothing uses it today
    - installs Kyverno with Helm if missing, and applies the `flink-cdc-single-az`
      ClusterPolicy (`ingest-deploy/k8s/kyverno-flink-az-affinity.yaml`)
    - creates the Glue database `flink_iceberg_db<suffix>`. The Paimon database is
@@ -405,6 +419,22 @@ placeholders:
 | `${MYSQL_PORT}`, `${MYSQL_DATABASE}` | `3306`, `ecommerce` (`.bench-env`). Host, user and password are not rendered: the pods read them from Secret `mysql-credentials` (`envFrom`) |
 | `${MYSQL_ENV_SECRET_NAME}` | `mysql-credentials` |
 | `${JM_NODEPOOL}` / `${TM_NODEPOOL}` | `driver-nodepool` / `executor-memorynodepool` |
+| the write and upload settings | below |
+
+The write and upload settings (from the environment, so `source .bench-env`
+first; `render` validates them and prints them in its configuration block):
+
+| Setting | Script default (`.bench-env`) | Where it lands |
+|---|---|---|
+| `PAIMON_WRITE_ONLY` | `false` (`false`) | Paimon `INSERT` hint `write-only`. `true` = no inline compaction and no snapshot expiry in the writer, and new data stays in level 0, which batch reads with deletion vectors (and Paimon-as-iceberg) do not see; keep `false` |
+| `PAIMON_WRITE_BUFFER_SPILLABLE` | `true` (`false`) | hint `write-buffer-spillable` |
+| `PAIMON_WRITE_BUFFER_SIZE` | unset: 64mb dimension / 128mb fact | hint `write-buffer-size`, one value for every table when set |
+| `S3A_MULTIPART_SIZE` / `S3A_MULTIPART_THRESHOLD` / `S3A_ACTIVE_BLOCKS` | `16M` / `16M` / `6` | Paimon catalog `s3.multipart.*`, `s3.fast.upload.active.blocks` (disk buffer in `/tmp/s3a-paimon`) |
+| `ICEBERG_S3_MULTIPART_SIZE_BYTES` / `ICEBERG_S3_MULTIPART_THREADS` | derived: `S3A_MULTIPART_SIZE` in bytes / `S3A_ACTIVE_BLOCKS` × 4 | Iceberg catalog `s3.multipart.part-size-bytes` / `num-threads` |
+
+The hints apply to existing tables, so no new `SESSION_SUFFIX` is needed; a
+change takes `build` (uploads the SQL) and a writer delete + create
+([Step 7](#step-7--re-deploy-after-a-change)).
 
 The script stops if a `${...}` placeholder is left, or if any env `value: ""` is
 rendered. An empty region would otherwise render as a blank value that Kubernetes
@@ -483,9 +513,10 @@ The first v3 deploy on EMR 7.14 needed three fixes. All three are in the repo no
 | Paimon | `NoAuthWithAWSException` on the warehouse. Paimon 2.1 opens `s3://` through the `paimon-s3` plugin, an isolated S3A that reads only `s3.*` catalog options and never `hadoop-conf-dir`, so it had no IRSA provider | `'s3.aws.credentials.provider' = 'software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider'` in `ingest-deploy/sql-scripts/paimon/01-catalog-setup.sql` |
 | both | A node runs a stale copy of the rebuilt `7.14.0` tag | `imagePullPolicy: Always` in both templates |
 
-The same run found that Paimon's Iceberg export deleted its previous `metadata.json`
+The same run found that Paimon's Iceberg metadata deleted its previous `metadata.json`
 on every commit, so a path read from Glue returned 404 within one checkpoint. That is
-fixed by `metadata.iceberg.previous-versions-max = 3` in the table settings below.
+fixed by `metadata.iceberg.previous-versions-max` in the table settings below (3
+from 2026-11-02, 100 since 2026-11-04).
 
 ---
 
@@ -498,22 +529,26 @@ existing table alone), so they take effect with a fresh `SESSION_SUFFIX`.
 | Setting | Paimon (`03-paimon-sinks.sql`) | Iceberg (`03-iceberg-sinks.sql`) |
 |---|---|---|
 | Snapshot retention, 12 h | `snapshot.time-retained = 12h`, `snapshot.num-retained.min = 5`, `snapshot.num-retained.max = 1000` (above 720 commits in 12 h, so age binds, not count) | `history.expire.max-snapshot-age-ms = 43200000`, `history.expire.min-snapshots-to-keep = 5` |
-| Previous `metadata.json` kept: 3 | `metadata.iceberg.previous-versions-max = 3`, `metadata.iceberg.delete-after-commit.enabled = true` (the export; Paimon's default kept 0) | `write.metadata.previous-versions-max = 3`, `write.metadata.delete-after-commit.enabled = true` |
-| Manifest merge after 5 | `manifest.merge-min-count = 5`; export: `metadata.iceberg.compaction.min.file-num = 5`, `max.file-num = 50` | `commit.manifest-merge.enabled = true`, `commit.manifest.min-count-to-merge = 5` (default 100) |
+| Previous `metadata.json` kept: 100 (3 until 2026-11-04) | `metadata.iceberg.previous-versions-max = 100`, `metadata.iceberg.delete-after-commit.enabled = true` (Paimon-as-iceberg; Paimon's default kept 0) | `write.metadata.previous-versions-max = 100`, `write.metadata.delete-after-commit.enabled = true` |
+| Manifest merge after 5 | `manifest.merge-min-count = 5`; Iceberg metadata: `metadata.iceberg.compaction.min.file-num = 5`, `max.file-num = 50` | `commit.manifest-merge.enabled = true`, `commit.manifest.min-count-to-merge = 5` (default 100) |
 | Manifest target size, 8 MB | `manifest.target-file-size = 8mb` | `commit.manifest.target-size-bytes = 8388608` |
 | Column stats `truncate(16)` | `metadata.stats-mode = truncate(16)` | `write.metadata.metrics.default = truncate(16)` (was `full`) |
-| Target data file: 64 MB (customers, products), 128 MB (orders, order_items) | `target-file-size = 64mb` / `128mb` | `write.target-file-size-bytes = 67108864` / `134217728` |
+| Target data file: 32 MB (customers, products), 64 MB (orders, order_items); 64 / 128 MB until 2026-11-04 | `target-file-size = 32mb` / `64mb` | `write.target-file-size-bytes = 33554432` / `67108864` |
 | Parquet row group: 8 MB / 16 MB | `parquet.block.size = 8388608` / `16777216` | `write.parquet.row-group-size-bytes = 8388608` / `16777216` |
 | Compression | `file.compression = zstd`, `file.compression.zstd-level = 1` | `write.parquet.compression-codec = zstd`, `write.parquet.compression-level = 1` |
 | Changelog | `changelog-producer = none` (nothing reads one, and Iceberg writes none) | none written |
 | Iceberg format version | `metadata.iceberg.format-version = ${ICEBERG_FORMAT_VERSION}` | `format-version = ${ICEBERG_FORMAT_VERSION}` |
 
-Paimon-only settings without an Iceberg counterpart: `bucket` 8 (dimension tables) / 4 per date partition (fact tables), `bucket = 32` until 2026-11-04,
-`deletion-vectors.enabled = true`, `deletion-vectors.bitmap64 = ${PAIMON_DV_BITMAP64}`,
-`write-buffer-size` / `write-buffer-spillable`, `num-sorted-run.compaction-trigger = 4`,
+Paimon-only settings without an Iceberg counterpart: fixed `bucket` 8 (dimension
+tables; per category on `products`) / 16 per date partition (fact tables), `bucket = 32`
+until 2026-11-04, `deletion-vectors.enabled = true`,
+`deletion-vectors.bitmap64 = ${PAIMON_DV_BITMAP64}`,
+`write-buffer-size` (64 / 128 MB) / `write-buffer-spillable` (also `INSERT` hints, below),
+`num-sorted-run.compaction-trigger = 8`,
 `snapshot.expire.execution-mode = async`, `sink.writer-coordinator.enabled = true`,
-and `metadata.iceberg.manifest-compression = snappy` (a codec every export reader
-has). Iceberg-only: `write.upsert.enabled = true`, `write.distribution-mode = hash`,
+`metadata.iceberg.storage = hive-catalog` (the Iceberg v3 metadata, registered in
+Glue as `table_type=ICEBERG`) and `metadata.iceberg.manifest-compression = snappy`
+(a codec every Iceberg reader of it has). Iceberg-only: `write.upsert.enabled = true`, `write.distribution-mode = hash`,
 and the `write.{delete,update,merge}.mode = merge-on-read` properties. The
 write-side differences that are kept on purpose (writer parallelism, compaction,
 snapshot-expiry timing) are listed in
@@ -529,10 +564,11 @@ variables.
 | Setting | Value |
 |---|---|
 | JobManager | 1 replica, `highAvailabilityEnabled: true`, 8 Gi / 4 cpu, `driver-nodepool`, on-demand |
-| TaskManager | 32 Gi / 8 cpu, `taskmanager.numberOfTaskSlots: 4`, `executor-memorynodepool`, on-demand, annotated `karpenter.sh/do-not-disrupt: "true"` |
-| Job parallelism | 24 (`job.parallelism` and `--parallelism 24`; 32 until 2026-11-04, then 16), so 6 TMs per job |
+| TaskManager | 32 Gi / 8 cpu, `taskmanager.numberOfTaskSlots: 2`, `executor-memorynodepool`, on-demand, annotated `karpenter.sh/do-not-disrupt: "true"` |
+| Job parallelism | 12 (`job.parallelism` and `--parallelism 12`; 32 until 2026-11-04, then 16, then 24 until 2026-11-05), so 6 TMs per job |
 | `parallelism.default` / `pipeline.max-parallelism` | 4 / 128 |
-| Operator chaining / object reuse | on / on |
+| JobManager metaspace | `jobmanager.memory.jvm-metaspace.size: 512m` (Paimon's JobManager exited 239 on `OutOfMemoryError: Metaspace` at the default) |
+| Operator chaining / object reuse | **off** since 2026-11-06 (`pipeline.operator-chaining.enabled: false`, both jobs: the source vertex is the CDC reader alone, so its busy time shows whether the binlog reader is the limit) / on |
 | `taskmanager.memory.managed.fraction` | 0.1. Managed memory was RocksDB's, and the state backend is now `hashmap`, so it goes to task heap. The CDC deserializer OOMed inside `RowDataDebeziumDeserializeSchema` at the original sizing |
 | Checkpointing | 60 s interval, 600 s timeout, 30 s min-pause, `tolerable-failed-checkpoints: 10`, `RETAIN_ON_CANCELLATION` |
 | State | `hashmap`, checkpoints on S3 (`s3p://…/flink/cdc-<format><suffix>/checkpoints/`). RocksDB + changelog + EBS local recovery before 2026-11-02 |
@@ -557,7 +593,7 @@ Notes on the less obvious ones:
   adaptive buys nothing.
 - **`server-id` ranges must not overlap.** Both jobs read the same RDS instance, and
   MySQL evicts the first binlog client when a second one reuses its id. Each range
-  is 32 wide, covering parallelism 24 with room to raise it.
+  is 32 wide, covering parallelism 12 with room to raise it to 32.
 
 ---
 
@@ -722,16 +758,16 @@ the JM log names the cause.
   load generator: inserts, upserts and, since 2026-11-03, DELETEs on orders /
   order_items. The mixed generator was removed on 2026-11-02.
 - **Monitor the pipelines**: [Monitor Guide](./3-MONITOR.md)
-- **Compact the tables** (before the snapshot test): `compaction/run.sh`, [README Step 10](./README.md#step-10-snapshot-test-writers-stopped-cold-start)
+- **Compact the tables** (before the snapshot test): `compaction/run.sh`, [README Step 10](./README.md#the-one-off-compaction-compaction)
 - **Query the tables**: [Query benchmark, DuckDB vs Trino](./querybench/README.md);
   Athena (v2 sets only) in [README, Athena](./README.md#athena)
 
 ---
 
-**Last Updated**: 2026-11-04
+**Last Updated**: 2026-11-08
 **EMR Version**: 7.14.0 (Flink operator chart 7.14.0, see Step 1)
 **Flink Version**: 1.20.0-amzn-8 (Java 17)
-**Paimon Version**: 2.1.0
+**Paimon Version**: 2.1.0 (patched `paimon-flink-1.20`: apache/paimon PR #10329 backport)
 **Iceberg Version**: 1.12.0 OSS Flink runtime (replaces EMR's 1.10.1-amzn-1); format v3 by default on this branch
 **Flink CDC MySQL connector**: 3.7.0-1.20
 **MySQL Version**: 8.0.45

@@ -22,16 +22,9 @@ spec:
     aws.region: ${AWS_REGION}
     # S3 Configuration
     fs.s3a.endpoint.region: ${AWS_REGION}
+    # Autoscaler off
     job.autoscaler.scaling.enabled: "false"
     job.autoscaler.enabled: "false"
-    # job.autoscaler.stabilization.interval: "1m"
-    # job.autoscaler.metrics.window: "15m"
-    # # lower these settings to trigger autoscaling earlier
-    # job.autoscaler.target.utilization: "0.5"
-    # job.autoscaler.target.utilization.boundary: "0.3"
-    # job.autoscaler.restart.time: "2m"
-    # job.autoscaler.catch-up.duration: "5m"
-    # job.autoscaler.vertex.exclude.ids: ""
     # ON (it was "false"), with object reuse, as in the throughput-benchmark
     # writers. Off, every row was serialized and copied across each Source ->
     # DropUpdateBefore -> Calc -> ConstraintEnforcer edge; object-reuse-off
@@ -204,12 +197,10 @@ spec:
             value: "${ICEBERG_S3_MULTIPART_SIZE_BYTES}"
           - name: ICEBERG_S3_MULTIPART_THREADS
             value: "${ICEBERG_S3_MULTIPART_THREADS}"
-          # Table-format knobs, rendered by build-deploy-generic.sh and
-          # substituted into the sink DDL by the executor. All are set on both
-          # JobManagers so the manifests stay in lockstep; each SQL reads only
-          # the ones it needs. ICEBERG_FORMAT_VERSION and PAIMON_DV_BITMAP64
-          # must never render empty: the executor treats "" as set, and an
-          # empty value becomes = '' in CREATE TABLE.
+          # Table-format knob, rendered by build-deploy-generic.sh and
+          # substituted into the sink DDL by the executor (the Paimon job also
+          # gets PAIMON_DV_BITMAP64). It must never render empty: the executor
+          # treats "" as set, and an empty value becomes = '' in CREATE TABLE.
           #  - ICEBERG_FORMAT_VERSION (2|3): Iceberg sink format-version, and
           #    Paimon's metadata.iceberg.format-version.
           - name: ICEBERG_FORMAT_VERSION
@@ -221,7 +212,7 @@ spec:
           # connected first when a second one reuses its id. See the server-id
           # note in sql-scripts/common/02-cdc-sources.sql.
           #
-          # Each range is 32 wide, covering parallelism 24 below with room to raise it — the connector
+          # Each range is 32 wide, covering the job parallelism below with room to raise it — the connector
           # hands one id per source subtask, so a range narrower than the
           # parallelism makes subtasks share ids and evict each other.
           - name: CDC_SERVER_ID_CUSTOMERS

@@ -74,8 +74,8 @@
 --
 -- Iceberg export ON again (2026-11-05; off 2026-11-04): Paimon writes
 -- Iceberg-compatible metadata (v3: files at level > 0 plus DVs, see above) and
--- registers it in Glue. The benchmark still reads Paimon natively (DuckDB
--- paimon_scan, Trino paimon connector). With write-only = true nothing leaves
+-- registers it in Glue. The benchmark reads Paimon only through it
+-- (Paimon-as-iceberg; native readers removed 2026-11-09). With write-only = true nothing leaves
 -- level 0 until a compaction, so the export lists no files until then.
 --
 -- Buckets (2026-11-04): FIXED, 8 on the dimension tables (customers; products

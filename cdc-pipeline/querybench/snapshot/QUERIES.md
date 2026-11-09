@@ -4,9 +4,9 @@ Analytics on a pinned snapshot of the four CDC tables (MySQL `ecommerce` →
 Flink CDC → Paimon / Iceberg), writers stopped. Modelled on
 `throughput-benchmark/querybench/snapshot/`: one query per file, file name =
 query name, name order = run order. Every query runs unchanged on **DuckDB 2.0**
-(`iceberg_scan`) and **Trino 484** (Iceberg connector) against the native
-Iceberg v3 tables, the arm that matters now (neither engine reads Paimon's v3
-tables or their export). The SQL is the subset both engines accept and print
+and **Trino 484** on every arm: the native Iceberg v3 tables and Paimon-as-iceberg
+(`paimon`), both formats after the one-off
+compaction ([../README.md, The four arms](../README.md#the-four-arms)). The SQL is the subset both engines accept and print
 alike; the one difference SQL cannot hide is a dialect key. The rules and the
 key are the same as the hot suite's: see `../hot/QUERIES.md`, "Dialect keys"
 and "Writing for both engines".
@@ -23,8 +23,10 @@ and "Writing for both engines".
 | `S6_topn_customers` | orders (partition), customers | Top 20 customers by spend: aggregate → TopN → lookup. The spend uses each order's current `total_amount`, so an unapplied delete reorders it. | — | seconds |
 | `S7_dedup_keys` | all four (facts: partition, dimensions: whole) | Correctness: per table, live rows, distinct source PKs, and `dup_rows` (must be 0). Compare every row across arms. | `leading-col-is-label` | tens of seconds (`COUNT(DISTINCT)` on ~145–380M keys) |
 
-Sizes on 2026-11-01: each fact table has a single partition (`2026-09-27`),
-so the partition-bounded queries currently read the whole table.
+Sizes on 2026-11-01 (historical: the v2-era table set, before the source shrink).
+Each fact table then had a single partition (`2026-09-27`), so the
+partition-bounded queries read the whole table. Current sizes are in each run's
+summary (Table state, compaction results).
 
 | Table | Iceberg (current snapshot) | Paimon native, 2026-09-30 |
 |---|---|---|
@@ -54,11 +56,12 @@ it needs no partition placeholder.
   is a plain Parquet scan. Record per table and arm: data files, delete files,
   equality and position deletes, and the snapshot id the run pinned. The
   "compacted" and "uncompacted" Iceberg results are separate results, not one.
-- **Paimon's Iceberg export is complete only after a full compaction.** On
-  2026-09-30 it showed 0.4–9.2% fewer rows than the native Paimon reader at the
-  same snapshot id (rows still in un-compacted LSM levels). An export reader
-  then does less work, and its time looks like a speed-up. (Not read on the v3
-  set: neither DuckDB 2.0 nor Trino 484 reads it.)
+- **Paimon-as-iceberg is complete only after a full compaction**
+  ([../README.md, Paimon-as-iceberg coverage](../README.md#the-four-arms)); the
+  one-off full compaction before this suite makes it complete. On the v2 set
+  (top-level files only) it showed 0.4–9.2% fewer rows than the native Paimon
+  reader at the same snapshot id on 2026-09-30: a reader of it then does less
+  work, and its time looks like a speed-up.
 - **Cross-format counts need both pipelines drained to one binlog position.**
   The two formats are written by separate Flink jobs. Unless both caught up
   before the writers were suspended, they hold different data (orders differed
@@ -66,25 +69,28 @@ it needs no partition placeholder.
   the formats then read different data.
 - **Metadata shortcuts.** A bare `COUNT(*)` on a delete-free Iceberg table can
   be answered from manifests: StarRocks did it in 22 ms with ScanRows=0 (2026-09),
-  and DuckDB in 43 ms on Paimon's export. No query here has a bare count. S1 adds
+  and DuckDB in 43 ms on Paimon-as-iceberg (2026-09, v2). No query here has a bare count. S1 adds
   `SUM(quantity)`, and S7 adds `COUNT(DISTINCT)`.
-- **Stats mode.** Iceberg tables write `write.metadata.metrics.default=full`
-  (whole min/max for every column, strings included). Paimon truncates string
-  stats. Pruning compares equally on numbers and timestamps, but not on long
-  strings. That is why S4 slices on `order_date` and no query filters on a
-  string other than the partition columns.
+- **Stats mode.** Both formats now write `truncate(16)` column stats (Iceberg
+  `write.metadata.metrics.default`, `full` on earlier sets; Paimon
+  `metadata.stats-mode`). Pruning compares equally on numbers and timestamps, but
+  truncated bounds prune long strings poorly. That is why S4 slices on
+  `order_date` and no query filters on a string other than the partition columns.
 - **Delete key columns are always read.** On Iceberg with live equality
   deletes, `(created_dt, order_item_id)` / `(order_dt, order_id)` are read
   whatever the query projects. That makes Iceberg's narrow scans (S1, S2) wider
   than Paimon's. This is a real format cost, so keep it.
-- **File layout after compaction.** Athena's bin-pack produced 2 files of
-  ~800 MB for orders. Paimon keeps 32 buckets per partition, sorted by key.
-  S4's slice pruning depends on this layout, so record it with the result.
+- **File layout after compaction.** `compaction/run.sh` rewrites Iceberg files per
+  partition into groups of up to the target size (64 MB on the fact tables; on
+  2026-09-28 Athena's bin-pack produced 2 files of ~800 MB for orders). Paimon
+  keeps 16 buckets per fact-table partition (32 before 2026-11-04), sorted by
+  key. S4's slice pruning depends on this layout, so record it with the result
+  (the summary's compaction table has the file counts).
 - **Delete-set memory.** The 2026-09 order_items OOMs (then on StarRocks and
   DuckDB) came from building the equality-delete set, not from scan width, so
   no query carries a scan-width flag. Record each engine's peak query memory
   beside the time.
-- **DuckDB memory.** On 1.5.6 the equality-delete set sits outside
+- **DuckDB memory (historical, 1.5.6).** On 1.5.6 the equality-delete set sits outside
   `memory_limit` and the spill. It was SIGKILLed, not errored, at 52 Gi and at
   72 Gi. On uncompacted Iceberg order_items, expect a pod restart (cache lost)
   rather than an ERROR row.

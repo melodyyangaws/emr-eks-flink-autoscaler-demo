@@ -2,9 +2,9 @@
 
 Run while the CDC writers and the upsert generator are live. Each file holds one
 query; file name = query name; name order = run order. Every query runs
-unchanged on **DuckDB 2.0** (`iceberg_scan`) and **Trino 484** (Iceberg
-connector) against the native Iceberg v3 tables; the Iceberg arm is the one
-that matters now (neither engine reads Paimon's v3 tables or their export).
+unchanged on **DuckDB 2.0** and **Trino 484** on every arm: the native Iceberg v3
+tables and Paimon-as-iceberg (`paimon`); see
+[../README.md, The four arms](../README.md#the-four-arms).
 Every table reference has an alias (`AS o`, `AS oi`), so a placeholder can
 render as a plain name, `name FOR VERSION AS OF n`, an `iceberg_scan('…')` call
 or a parenthesised subquery. The few engine differences that SQL cannot paper
@@ -90,42 +90,46 @@ the same text (the summary compares rows as text):
 ### Picking the H8 key (harness, untimed, after pinning)
 
 Pick a real update (an order created before the window and changed inside it)
-on the native Iceberg arm at the pinned version:
+on the pinned `orders` of the first format in `FORMATS` (iceberg when it runs,
+else paimon), on the setup engine (`qb_resolve_lookup`):
 
 ```sql
 SELECT o.order_id, o.<orders part col>
 FROM <orders, pinned> AS o
 WHERE o.updated_at >= TIMESTAMP '<HOT_FROM>' AND o.updated_at < TIMESTAMP '<HOT_TO>'
   AND o.order_date <  TIMESTAMP '<HOT_FROM>'
+  AND o.order_id % <FK_PARENT_MOD> = 0
 ORDER BY o.updated_at DESC, o.order_id
 LIMIT 1;
 ```
 
-(`TIMESTAMP` literals, so the same text runs on DuckDB and Trino.) Where a
-Paimon arm is run, check the key there with H8; if that returns no row, take
-the next candidate (`LIMIT 1 OFFSET n`). Write the key, its partition, and whether
-the partition is `HOT_DT` or older to the `.pins` file. An older partition
+(`TIMESTAMP` literals, so the same text runs on DuckDB and Trino.) Only orders
+with `order_id % FK_PARENT_MOD = 0` (16, the generator's value): the generator never
+deletes those. Every pass re-pins but the key is picked once, so a deleted key made
+H8 ZERO_SCAN on every later pass (`_v3`, 2026-11-08). The key is not
+re-checked on the other arms; the summary compares their H8 rows.
+`LOOKUP_ORDER_ID` / `LOOKUP_ORDER_DT` pin it. The key, its partition, and whether
+the partition is `HOT_DT` or older go to the `.pins` file (`h8_key`). An older partition
 holds far more equality deletes, so H8's Iceberg time depends on it. This query
 has no partition filter, so it reads `updated_at` across the whole table (same
 read as H4; not yet timed).
 
 ## Things that can make an arm look fast or slow
 
-- **Paimon's Iceberg export lags.** On the v3 default (Paimon 2.1, format 3,
-  64-bit deletion vectors) the export lists every file above LSM level 0 plus
-  its deletion vectors, so it trails native Paimon by about one checkpoint; only
-  readers that support it could read it (neither DuckDB 2.0 nor Trino 484
-  reads the v3 export today). On the v2 set the export holds only the top LSM
-  level and no deletion vectors
-  (`IcebergCommitCallback.shouldAddFileToIceberg`), so an export reader sees an
-  older, fully merged view. In the hot window they can see fewer rows (H1) or none, or miss the H8
-  key, and they do no merge work. Compare their H1 row with native `paimon`'s;
-  where it differs, the export arms' times describe lagged data, not the
-  reader. The snapshot suite saw 0.4–9.2 % fewer rows in the export on 2026-09-30.
+- **Paimon-as-iceberg lags.** On the v3 default (Paimon 2.1, format 3,
+  64-bit deletion vectors) Paimon's Iceberg metadata lists every file above LSM
+  level 0 plus its deletion vectors, so the `paimon` arm trails the Paimon table by
+  about one checkpoint. On the v2 set it holds only the top LSM level and no
+  deletion vectors (`IcebergCommitCallback.shouldAddFileToIceberg`), so a reader
+  sees an older, fully merged view. In the hot window it can see fewer rows (H1)
+  or none, or miss the H8 key. Where its H1 row falls well short of the
+  `iceberg` arm's, the `paimon` arm's times describe lagged data, not the reader. The
+  snapshot suite saw 0.4–9.2 % fewer rows in the v2 metadata on 2026-09-30.
 - **Iceberg upsert writes an equality delete for every row**, inserts included.
   So even fresh-insert windows (order_items) pay a key anti-join on Iceberg,
-  even though the deletes mostly match nothing. Paimon resolved the key at
-  commit time (`changelog-producer = lookup`) and reads bitmaps.
+  even though the deletes mostly match nothing. Paimon resolves the key in its
+  LSM (lookup compaction writes deletion vectors; `changelog-producer = none`)
+  and reads bitmaps.
 - **Layout vs `updated_at` (H4, H5, H8, H9 orders side).** Iceberg files are
   written in commit order and prune well on `updated_at`. Paimon files are
   sorted by key, and compaction mixes old and new rows, so on Paimon the window
