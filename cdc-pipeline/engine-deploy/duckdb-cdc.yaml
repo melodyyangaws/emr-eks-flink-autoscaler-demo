@@ -1,0 +1,104 @@
+# Warm DuckDB server for the CDC query benchmark, rendered by deploy-duckdb-cdc.sh
+# (envsubst). A copy of throughput-benchmark/engine-deploy/duckdb-warm.yaml: the same
+# pod shape (the counterpart of the 3 StarRocks BEs), named duckdb-warm-cdc so it
+# never replaces or is mistaken for the throughput benchmark's duckdb-warm, and
+# without the throughput table names (the client sends fully rendered SQL).
+#
+# Image: DUCKDB_IMAGE (.bench-env; default the source-built DuckDB 2.0.0 image,
+# <account>.dkr.ecr.<region>.amazonaws.com/duckdb-cdc-server:2.0.0, built by
+# duckdb-image/build-duckdb-image.sh) runs as is: no pip install at start, so its
+# engine and its statically linked iceberg/httpfs/aws/avro are what runs.
+# DUCKDB_IMAGE empty: python:3.12-slim + pip duckdb==${DUCKDB_VERSION} (2.0.0
+# from PyPI) and awscli at every start, the extensions downloaded by the server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${NAME}
+  namespace: ${NAMESPACE}
+  labels: {app: ${NAME}}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}                # never two servers at once
+  selector:
+    matchLabels: {app: ${NAME}}
+  template:
+    metadata:
+      labels: {app: ${NAME}}
+      annotations:
+        karpenter.sh/do-not-disrupt: "true" # consolidation would drop the warm cache
+    spec:
+      serviceAccountName: starrocks-sa      # reuses StarRocks' IRSA role, which already reads both warehouses
+      terminationGracePeriodSeconds: 5
+      affinity:
+        podAntiAffinity:                    # one server per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions: [{key: app, operator: In, values: [${NAME}]}]
+            topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        kubernetes.io/arch: amd64                  # = StarRocks' BEs
+        karpenter.sh/nodepool: ${DUCKDB_NODEPOOL}  # driver-nodepool (= the BEs') up to 8xlarge; executor-memorynodepool beyond. do-not-disrupt above keeps the node
+        karpenter.k8s.aws/instance-family: m5      # = StarRocks' BEs: changing CPU family moved timings 20-36%
+        karpenter.k8s.aws/instance-size: ${DUCKDB_INSTANCE_SIZE}  # DUCKDB_INSTANCE_SIZE: the smallest m5 Karpenter fits ${DUCKDB_CPU} cpu / ${DUCKDB_POD_MEMORY} on
+        karpenter.sh/capacity-type: on-demand      # a spot reclaim would drop the warm cache
+      containers:
+      - name: duckdb
+        image: ${DUCKDB_POD_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          if [ "${DUCKDB_FROM_IMAGE}" = 1 ]; then
+            echo "DuckDB from the image (${DUCKDB_POD_IMAGE}): no pip install"
+          else
+            pip install --quiet --no-cache-dir --root-user-action=ignore duckdb==${DUCKDB_VERSION} awscli
+          fi
+          exec python3 -u /opt/bench/duckdb_cdc_server.py
+        ports: [{containerPort: 8080, name: http}]
+        readinessProbe:
+          httpGet: {path: /health, port: 8080}
+          periodSeconds: 10
+          failureThreshold: 3
+        env:
+        - {name: AWS_REGION,           value: "${AWS_REGION}"}
+        - {name: AWS_DEFAULT_REGION,   value: "${AWS_REGION}"}   # awscli 1.x reads this one
+        - {name: DUCKDB_MEMORY_LIMIT,  value: "${DUCKDB_MEMORY_LIMIT}"}
+        - {name: DUCKDB_THREADS,       value: "${DUCKDB_THREADS}"}
+        - {name: SPILL_DIR,            value: /scratch}
+        - {name: DUCKDB_MAX_TEMP_SIZE, value: "${DUCKDB_MAX_TEMP_SIZE}"}
+        - {name: CACHE_MODE,           value: "${CACHE_MODE}"}
+        - {name: CACHE_DIR,            value: /cache}
+        - {name: CACHE_DISK_BYTES,     value: "${CACHE_DISK_BYTES}"}
+        - {name: CACHE_MEM_BYTES,      value: "${CACHE_MEM_BYTES}"}
+        - {name: CACHE_BLOCK_BYTES,    value: "${CACHE_BLOCK_BYTES}"}
+        - {name: MAX_RESULT_ROWS,      value: "${MAX_RESULT_ROWS}"}
+        - {name: DUCKDB_IMAGE,         value: "${DUCKDB_IMAGE}"}   # empty = the pip fallback; reported by /health
+        # Iceberg v3: arms whose queries run with iceberg_unsafe_skip_puffin_verification
+        # = true (paimon on v3: Paimon's DV index files are bare blobs, not Puffin)
+        - {name: ICEBERG_FORMAT_VERSION,        value: "${ICEBERG_FORMAT_VERSION}"}
+        - {name: SKIP_PUFFIN_VERIFICATION_ARMS, value: "${SKIP_PUFFIN_VERIFICATION_ARMS}"}
+        resources:                          # requests = limits: Guaranteed QoS, no CPU burst over parity
+          requests: {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}
+          limits:   {cpu: "${DUCKDB_CPU}", memory: ${DUCKDB_POD_MEMORY}}
+        volumeMounts:
+        - {name: bench,   mountPath: /opt/bench}
+        - {name: scratch, mountPath: /scratch}
+        - {name: cache,   mountPath: /cache}
+      volumes:
+      - name: bench
+        configMap: {name: "${CM}"}          # duckdb_cdc_server.py
+      - name: scratch                       # spill space, sized above DUCKDB_MAX_TEMP_SIZE
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: gp3
+              resources: {requests: {storage: 200Gi}}
+      - name: cache                         # CACHE_MODE=on_disk only: CACHE_DISK_BYTES plus headroom
+        ephemeral:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              storageClassName: ${CACHE_STORAGE_CLASS}   # gp3-fast: 850 MB/s, see gp3-fast-sc.yaml
+              resources: {requests: {storage: ${CACHE_VOLUME}}}

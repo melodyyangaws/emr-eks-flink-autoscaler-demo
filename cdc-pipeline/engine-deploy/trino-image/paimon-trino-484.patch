@@ -1,0 +1,145 @@
+diff --git a/pom.xml b/pom.xml
+index 0adb18d..b84e2a0 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -24,7 +24,7 @@ under the License.
+     <parent>
+         <groupId>org.apache.paimon</groupId>
+         <artifactId>paimon-parent</artifactId>
+-        <version>1.4.2</version>
++        <version>2.1.0</version>
+     </parent>
+ 
+     <artifactId>paimon-trino-${trino.version}</artifactId>
+@@ -37,11 +37,11 @@ under the License.
+     </scm>
+ 
+     <properties>
+-        <paimon.version>1.4.2</paimon.version>
++        <paimon.version>2.1.0</paimon.version>
+         <target.java.version>25</target.java.version>
+         <jdk.test.version>25</jdk.test.version>
+-        <trino.version>483</trino.version>
+-        <airlift.version>439</airlift.version>
++        <trino.version>484</trino.version>
++        <airlift.version>451</airlift.version>
+         <slice.version>2.8</slice.version>
+         <extraJavaTestArgs>
+             -XX:+IgnoreUnrecognizedVMOptions
+@@ -67,10 +67,10 @@ under the License.
+         <maven.toolchains.plugin.version>3.1.0</maven.toolchains.plugin.version>
+         <hadoop.apache.version>3.3.5-3</hadoop.apache.version>
+         <junit5.version>5.8.1</junit5.version>
+-        <slf4j.version>2.0.13</slf4j.version>
++        <slf4j.version>2.0.20</slf4j.version>
+         <guava.version>31.1-jre</guava.version>
+         <commons-lang3.version>3.3.2</commons-lang3.version>
+-        <findbugs.version>1.3.9</findbugs.version>
++        <findbugs.version>3.0.2</findbugs.version>
+         <maven.checkstyle.version>3.1.2</maven.checkstyle.version>
+         <maven.compiler.version>3.10.1</maven.compiler.version>
+         <spotless.version>2.46.1</spotless.version>
+@@ -79,6 +79,22 @@ under the License.
+         <hive.storage.api.version>2.7.0</hive.storage.api.version>
+     </properties>
+ 
++    <!-- Trino 484's own dependency versions (trino-root, incl. airbase's BOMs:
++         netty, jackson, httpclient5, AWS SDK, jetty...), so the bundled
++         trino-filesystem-s3 etc. get the versions Trino's plugins ship and not
++         older ones by nearest-wins (httpclient5 5.2.1 lacked TlsSocketStrategy). -->
++    <dependencyManagement>
++        <dependencies>
++            <dependency>
++                <groupId>io.trino</groupId>
++                <artifactId>trino-root</artifactId>
++                <version>${trino.version}</version>
++                <type>pom</type>
++                <scope>import</scope>
++            </dependency>
++        </dependencies>
++    </dependencyManagement>
++
+     <dependencies>
+         <dependency>
+             <groupId>org.apache.paimon</groupId>
+diff --git a/src/main/java/org/apache/paimon/trino/TrinoMetadata.java b/src/main/java/org/apache/paimon/trino/TrinoMetadata.java
+index 0090c8a..f447655 100644
+--- a/src/main/java/org/apache/paimon/trino/TrinoMetadata.java
++++ b/src/main/java/org/apache/paimon/trino/TrinoMetadata.java
+@@ -276,13 +276,14 @@ public class TrinoMetadata implements ConnectorMetadata {
+     }
+ 
+     @Override
+-    public void finishMerge(
++    public Optional<ConnectorOutputMetadata> finishMerge(
+             ConnectorSession session,
+             ConnectorMergeTableHandle mergeTableHandle,
+             List<ConnectorTableHandle> sourceTableHandles,
+             Collection<Slice> fragments,
+             Collection<ComputedStatistics> computedStatistics) {
+         commit(session, (TrinoTableHandle) mergeTableHandle.getTableHandle(), fragments);
++        return Optional.empty();
+     }
+ 
+     @Override
+diff --git a/src/main/java/org/apache/paimon/trino/TrinoPageSinkProvider.java b/src/main/java/org/apache/paimon/trino/TrinoPageSinkProvider.java
+index d44c613..1a0f733 100644
+--- a/src/main/java/org/apache/paimon/trino/TrinoPageSinkProvider.java
++++ b/src/main/java/org/apache/paimon/trino/TrinoPageSinkProvider.java
+@@ -33,6 +33,7 @@ import io.trino.spi.connector.ConnectorMergeTableHandle;
+ import io.trino.spi.connector.ConnectorOutputTableHandle;
+ import io.trino.spi.connector.ConnectorPageSink;
+ import io.trino.spi.connector.ConnectorPageSinkId;
++import io.trino.spi.connector.MemoryContext;
+ import io.trino.spi.connector.ConnectorPageSinkProvider;
+ import io.trino.spi.connector.ConnectorSession;
+ import io.trino.spi.connector.ConnectorTableCredentials;
+@@ -115,7 +116,8 @@ public class TrinoPageSinkProvider implements ConnectorPageSinkProvider {
+             ConnectorSession session,
+             ConnectorMergeTableHandle mergeHandle,
+             Optional<ConnectorTableCredentials> tableCredentials,
+-            ConnectorPageSinkId pageSinkId) {
++            ConnectorPageSinkId pageSinkId,
++            MemoryContext memoryContext) {
+         TrinoTableHandle trinoTableHandle = (TrinoTableHandle) mergeHandle.getTableHandle();
+         Table table = trinoTableHandle.tableWithDynamicOptions(trinoCatalog, session);
+         return new TrinoMergeSink(
+diff --git a/src/main/java/org/apache/paimon/trino/TrinoPageSourceProvider.java b/src/main/java/org/apache/paimon/trino/TrinoPageSourceProvider.java
+index b54e7f3..981c98c 100644
+--- a/src/main/java/org/apache/paimon/trino/TrinoPageSourceProvider.java
++++ b/src/main/java/org/apache/paimon/trino/TrinoPageSourceProvider.java
+@@ -23,6 +23,7 @@ import org.apache.paimon.deletionvectors.DeletionVector;
+ import org.apache.paimon.fileindex.FileIndexPredicate;
+ import org.apache.paimon.fs.Path;
+ import org.apache.paimon.predicate.Predicate;
++import org.apache.paimon.schema.FileSystemSchemaManager;
+ import org.apache.paimon.schema.SchemaManager;
+ import org.apache.paimon.table.FileStoreTable;
+ import org.apache.paimon.table.Table;
+@@ -200,7 +201,7 @@ public class TrinoPageSourceProvider implements ConnectorPageSourceProvider {
+                 Optional<List<IndexFile>> indexFiles =
+                         readIndex ? paimonSplit.indexFiles() : Optional.empty();
+                 SchemaManager schemaManager =
+-                        new SchemaManager(fileStoreTable.fileIO(), fileStoreTable.location());
++                        new FileSystemSchemaManager(fileStoreTable.fileIO(), fileStoreTable.location());
+                 List<Type> type =
+                         columns.stream()
+                                 .map(s -> ((TrinoColumnHandle) s).getTrinoType())
+diff --git a/src/main/java/org/apache/paimon/trino/catalog/TrinoCatalog.java b/src/main/java/org/apache/paimon/trino/catalog/TrinoCatalog.java
+index 02c404f..36ba102 100644
+--- a/src/main/java/org/apache/paimon/trino/catalog/TrinoCatalog.java
++++ b/src/main/java/org/apache/paimon/trino/catalog/TrinoCatalog.java
+@@ -253,10 +253,12 @@ public class TrinoCatalog implements Catalog {
+     public boolean commitSnapshot(
+             Identifier identifier,
+             @Nullable String tableUuid,
++            @Nullable String baseSnapshotUuid,
+             Snapshot snapshot,
+             List<PartitionStatistics> statistics)
+             throws TableNotExistException {
+-        return current.commitSnapshot(identifier, tableUuid, snapshot, statistics);
++        return current.commitSnapshot(
++                identifier, tableUuid, baseSnapshotUuid, snapshot, statistics);
+     }
+ 
+     @Override

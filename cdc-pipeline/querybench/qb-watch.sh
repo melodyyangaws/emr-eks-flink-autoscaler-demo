@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Watch one CDC query test's runner (cdc-qb-runner) and shut the run down once
+# it ends. Not started by hand: `SUITE=hot|snapshot ./querybench/run.sh start`
+# starts it as the Job cdc-qb-watch right after the runner. Adapted from
+# throughput-benchmark/querybench/qb-watch.sh.
+#
+# Every WATCH_INTERVAL_S (300) it reads the runner's log; the test is over when
+# the runner prints "status: runner-exit=", or its Job or pod is gone or failed.
+#
+# Only a COMPLETED test is torn down: "status: runner-exit=0". Any other end (a
+# non-zero exit, a failed or vanished runner pod or Job) leaves the generator,
+# writers, job monitor, DuckDB and Trino RUNNING and prints a report: why it
+# ended, the runner's last error lines and what is still up. A setup error then
+# costs a fix and a re-run, not a new MySQL snapshot. Tear down by hand with
+# `./querybench/run.sh stop` (= this script's `teardown`, steps 1-6 below).
+#
+#   ./querybench/qb-watch.sh            watch (the cdc-qb-watch Job runs this)
+#   ./querybench/qb-watch.sh teardown   steps 1-6 now, no watching (run.sh stop)
+#
+# Teardown steps:
+#   1. scales the MySQL generator to 0 (STOP_GENERATOR=0 leaves it) and waits
+#      WRITER_DRAIN_S (180) for the writers to read the binlog tail;
+#   2. waits until each writer completed a checkpoint >= 60 s after the generator
+#      stopped (qb_wait_writers_committed), then suspends the CDC writers
+#      (SUSPEND_WRITERS=0 leaves them; they resume from their last checkpoint:
+#      upgradeMode last-state), so their tables match MySQL;
+#   3. scales the CDC job monitor (flink-cdc-monitor) to 0 once the writers stopped;
+#   4. takes duckdb-warm-cdc down (STOP_DUCKDB=0 leaves it);
+#   5. scales Trino's coordinator and workers to 0 (STOP_TRINO=0 leaves them):
+#      this pod has no helm, so not deploy-trino.sh down; the release stays,
+#      the cache volumes go with their pods, and run.sh start scales them back
+#      and runs deploy-trino.sh up;
+#   6. deletes the runner's ConfigMap and Secret.
+#
+# After a COMPLETED hot test (not on `teardown`), once the writers' TaskManagers
+# are gone, it compacts both formats once for the snapshot test:
+# `compaction/run.sh run both` (COMPACT_AFTER_HOT=0 skips it). The snapshot start
+# waits for this watcher, so the snapshot test reads the compacted tables.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/querybench.sh
+source "${HERE}/../lib/querybench.sh"
+case "$SUITE" in hot|snapshot) ;; *) qb_die "qb-watch needs SUITE=hot|snapshot, got '${SUITE}'" ;; esac
+WATCH_INTERVAL_S="${WATCH_INTERVAL_S:-300}"
+WATCH_RUNNER=cdc-qb-runner
+DUCK="$DUCKDB_NAME"
+MONITOR="${CDC_MONITOR:-flink-cdc-monitor}"
+
+test_over() {
+    local phase
+    kubectl get job "$WATCH_RUNNER" -n "$NAMESPACE" >/dev/null 2>&1 || { echo "runner Job ${WATCH_RUNNER} is gone"; return; }
+    phase=$(kubectl get pods -n "$NAMESPACE" -l job-name="$WATCH_RUNNER" -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+    case "$phase" in
+        Failed) echo "runner pod failed"; return ;;
+        "")     echo "runner pod is gone"; return ;;
+    esac
+    kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" 2>/dev/null | grep -m1 '^status: runner-exit=' || true
+}
+
+trino_down() {
+    local d ok=0
+    for d in trino-coordinator "$TRINO_WORKER_DEPLOY"; do
+        kubectl get deploy "$d" -n "$NAMESPACE" >/dev/null 2>&1 || continue
+        kubectl scale "deploy/${d}" -n "$NAMESPACE" --replicas=0 >/dev/null || ok=1
+    done
+    return $ok
+}
+
+teardown() {
+# The generator first, then the default drain (WRITER_DRAIN_S, 180 s), then a check that
+# each writer committed a checkpoint after the generator stopped, and only then the
+# writers: a later snapshot test or MySQL-gated compaction starts from tables that match
+# MySQL. (With WRITER_DRAIN_S=0 here, both formats stayed ~55 s behind on 2026-11-02.)
+gen_stopped_at=$(date +%s)
+( qb_stop_generator ) || qb_log "WARNING: could not stop the generator"
+( qb_wait_writers_committed "$gen_stopped_at" ) || qb_log "WARNING: suspending the writers without a commit after the generator stopped"
+if ( qb_stop_writers ); then
+    if [[ "${SUSPEND_WRITERS:-1}" == 0 ]]; then
+        qb_log "SUSPEND_WRITERS=0: job monitor left running"
+    elif ! kubectl get deployment "$MONITOR" -n "$NAMESPACE" >/dev/null 2>&1; then
+        qb_log "no ${MONITOR} deployment"
+    elif kubectl scale "deployment/${MONITOR}" -n "$NAMESPACE" --replicas=0 >/dev/null 2>&1; then
+        qb_log "job monitor stopped (${MONITOR} scaled to 0)"
+    else
+        qb_log "WARNING: could not stop the job monitor (${MONITOR})"
+    fi
+else
+    qb_log "WARNING: could not stop the writers (see above); job monitor left running"
+fi
+if [[ "${STOP_DUCKDB:-1}" == 0 ]]; then
+    qb_log "STOP_DUCKDB=0: ${DUCK} left running"
+elif kubectl delete deploy "$DUCK" -n "$NAMESPACE" --ignore-not-found --wait=false >/dev/null \
+     && kubectl delete configmap "$DUCK" -n "$NAMESPACE" --ignore-not-found >/dev/null; then
+    qb_log "${DUCK} stopped"
+else
+    qb_log "WARNING: could not stop ${DUCK}"
+fi
+if [[ "${STOP_TRINO:-1}" == 0 ]]; then
+    qb_log "STOP_TRINO=0: Trino left running"
+elif trino_down; then
+    qb_log "Trino scaled to 0 (run.sh start brings it back; engine-deploy/deploy-trino.sh down removes the release)"
+else
+    qb_log "WARNING: could not scale Trino to 0 (engine-deploy/deploy-trino.sh down by hand)"
+fi
+}
+
+# Step 6, apart: after the compaction, which reads the same bundle and .bench-env.local.
+delete_runner_config() {
+kubectl delete configmap "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
+    && kubectl delete secret "$WATCH_RUNNER" -n "$NAMESPACE" --ignore-not-found >/dev/null \
+    && qb_log "${WATCH_RUNNER}'s ConfigMap and Secret deleted" \
+    || qb_log "WARNING: could not delete ${WATCH_RUNNER}'s ConfigMap/Secret"
+}
+
+# The one-off compaction before the snapshot test: both formats, every table,
+# with the writers stopped (compaction/run.sh refuses while a writer still has
+# TaskManagers, so wait for them to go first). A failure leaves each table as
+# its last committed run left it; the snapshot start still waits for this
+# watcher, then pins whatever is committed.
+compact_once() {
+    local j deadline=$(( $(date +%s) + 600 ))
+    for j in $FLINK_JOBS; do
+        while kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep -q "^${j}-taskmanager-"; do
+            (( $(date +%s) < deadline )) || { qb_log "WARNING: ${j} TaskManagers still up after 600 s: no compaction"; return 1; }
+            sleep 15
+        done
+    done
+    qb_log "one-off compaction before the snapshot test: compaction/run.sh run both"
+    if "${HERE}/../compaction/run.sh" run both; then
+        qb_log "compaction done (results under ${QB_RESULTS_PREFIX}/compaction/)"
+    else
+        qb_log "WARNING: compaction failed (above); the snapshot test will read the tables as last committed"
+        return 1
+    fi
+}
+
+# What is still up after a failed test, one line each (read-only).
+report_running() {
+    local d st
+    for d in $FLINK_JOBS; do
+        st=$(kubectl get flinkdeployment "$d" -n "$NAMESPACE" -o jsonpath='{.status.jobStatus.state}/{.spec.job.state}' 2>/dev/null || true)
+        qb_log "  writer ${d}: ${st:-not deployed}"
+    done
+    for d in ${GENERATOR_RESOURCES:-statefulset/mysql-upsert-loadgen}; do
+        st=$(kubectl get "$d" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+        qb_log "  generator ${d}: ${st:-not deployed} ready"
+    done
+    for d in "$MONITOR" "$DUCK" trino-coordinator "$TRINO_WORKER_DEPLOY"; do
+        st=$(kubectl get deploy "$d" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null || true)
+        qb_log "  ${d}: ${st:-not deployed} ready"
+    done
+}
+
+if [[ "${1:-}" == teardown ]]; then
+    qb_log "teardown requested (${SUITE})"
+    teardown
+    delete_runner_config
+    echo "status: qb-teardown-done $(date -u)"
+    exit 0
+fi
+
+qb_log "cdc-qb-watch (${SUITE}): checking ${WATCH_RUNNER} every ${WATCH_INTERVAL_S}s"
+while :; do
+    why=$(test_over)
+    [[ -n "$why" ]] && break
+    last=$(kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" --tail=200 2>/dev/null | grep '\[querybench\]' | tail -1 || true)
+    qb_log "${SUITE} test still running: ${last:-no progress line yet}"
+    sleep "$WATCH_INTERVAL_S"
+done
+qb_log "${SUITE} test over: ${why}"
+
+if [[ "$why" == "status: runner-exit=0"* ]]; then
+    qb_log "${SUITE} test completed: tearing the run down"
+    teardown
+    if [[ "$SUITE" == hot && "${COMPACT_AFTER_HOT:-1}" != 0 ]]; then
+        compact_once || echo "status: qb-watch-compaction-failed $(date -u)"
+    fi
+    delete_runner_config
+    echo "status: qb-watch-done $(date -u)"
+else
+    qb_log "${SUITE} test did NOT complete (${why}): leaving everything RUNNING, no teardown"
+    qb_log "last runner errors:"
+    kubectl logs -n "$NAMESPACE" "job/${WATCH_RUNNER}" --tail=400 2>/dev/null \
+        | grep -E 'ERROR|FAILED|Exception|error:|refus|die' | tail -15 | sed 's/^/    /' \
+        || qb_log "    (runner log unavailable)"
+    qb_log "still running:"
+    report_running
+    qb_log "fix and re-run with SUITE=${SUITE} ./querybench/run.sh start, or tear down with SUITE=${SUITE} ./querybench/run.sh stop"
+    echo "status: qb-watch-failed-left-running $(date -u)"
+fi

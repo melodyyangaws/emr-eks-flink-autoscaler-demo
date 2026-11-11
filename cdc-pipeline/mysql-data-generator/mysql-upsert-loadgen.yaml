@@ -4,9 +4,11 @@
 # (db.m5.2xlarge, 500GB gp3, 12,000 IOPS), not a chosen target — see the
 # replicas: comment on the StatefulSet for the sweep that established it.
 #
-# Why this exists alongside mysql-data-generator.yaml
-# ---------------------------------------------------
-# The original generator tops out around 400 rows/sec. Two reasons, both fatal at
+# Why it replaced mysql-data-generator.yaml
+# -----------------------------------------
+# The original row-at-a-time INSERT/UPDATE/DELETE generator (Deployment
+# mysql-data-generator, removed 2026-11-02; in git history) tops out around
+# 400 rows/sec. Two reasons, both fatal at
 # 40k:
 #   1. It issues one cursor.execute() per order AND one per order item, so a
 #      "batch" of 10 orders is ~40 round trips. At ~1ms RTT to RDS that alone
@@ -47,7 +49,9 @@
 # A uniformly-random key stream would spread writes so thinly across 14M keys
 # that neither effect shows up, and the benchmark would measure raw ingest only.
 # So HOT_KEY_RATIO of the upserts land in a sliding window of the most recent
-# HOT_KEY_WINDOW keys, and the rest spread over the full range.
+# HOT_KEY_WINDOW keys, and the rest spread over the live range [MIN(pk), MAX(pk)]
+# (not [1, MAX]: after the tables are shrunk to their newest ~10% of ids, a cold
+# draw below MIN would INSERT at a deleted id and regrow the table).
 #
 # The skew is also the single biggest throughput lever, for a reason unrelated to
 # the format comparison: the non-hot remainder is uniform over ~100GB and misses
@@ -55,6 +59,49 @@
 # traffic consumed 43% of the instance's provisioned IOPS and capped the whole
 # generator at ~15,000 rows/s. At 0.95 with a 2,000,000-key window it runs at
 # ~58,300 rows/s. See the env-var comments on HOT_KEY_RATIO for the measurements.
+#
+# Why a share of rows re-write a key written seconds ago (RECENT_KEY_RATIO)
+# -------------------------------------------------------------------------
+# The Iceberg sink runs in upsert mode with write.distribution-mode=hash, so a
+# key always reaches the same writer subtask, and that writer emits a delete for
+# EVERY row it writes, inserts included (orders, measured: total-equality-deletes
+# 28.3M ~= total-records 28.8M). Which KIND of delete depends only on whether the
+# writer already wrote that key in the CURRENT, not-yet-committed checkpoint:
+# Iceberg's BaseEqualityDeltaWriter keeps an in-memory map of the rows it
+# inserted since the last commit; a key found there gets a POSITION delete (a
+# deletion vector on v3), any other key an EQUALITY delete. The map resets at
+# every checkpoint (60s here). The hot window repeats keys within minutes-to-
+# hours, not within one checkpoint, so only ~2% of deletes were positional
+# (total-position-deletes 0.5M against 28.3M equality).
+#
+# RECENT_KEY_RATIO makes about half of the deletes positional, which is the
+# v3 deletion-vector path the benchmark otherwise barely exercises: that share
+# of every batch re-writes keys this same worker thread wrote within the last
+# RECENT_KEY_MAX_AGE_S seconds, so most of them land in the same checkpoint as
+# their previous write. Paimon gets the identical stream and simply dedups the
+# repeats in its write buffer — that asymmetry is intended. See the env-var
+# comments for the derivation of the defaults.
+#
+# Why some rows are DELETEs (DELETE_RATIO), and only on orders / order_items
+# ----------------------------------------------------------------------------
+# Since the row-at-a-time mixed generator was removed (2026-11-02) nothing
+# emitted DELETE events, so neither sink's delete path was exercised by a real
+# -D. DELETE_RATIO of each orders / order_items batch is now a multi-row
+# DELETE ... WHERE pk IN (...) of existing keys. Flink CDC turns each deleted row
+# into a -D; the Iceberg upsert writer turns that into a delete of the key — a
+# POSITION delete (DV on v3) if it wrote the key earlier in the same checkpoint,
+# else an EQUALITY delete — and Paimon into a delete record that the merge drops.
+#
+# The foreign keys (orders_ibfk_1 orders->customers, order_items_ibfk_1/2
+# order_items->orders/products, re-added by the 2026-11-02 shrink) have no ON
+# DELETE clause, i.e. RESTRICT. So:
+#   - order_items is a leaf: deleted freely.
+#   - orders: the order's items are deleted first, in the same transaction.
+#     Orders whose id is a multiple of FK_PARENT_MOD are never deleted, and the
+#     orders FK sample that new order_items draw from is taken ONLY from those
+#     ids — so an insert can never reference an order another thread deleted.
+#   - customers / products: never deleted. See the DELETE_RATIO note in the
+#     script for why.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -64,10 +111,10 @@ data:
   upsert_loadgen.py: |
     #!/usr/bin/env python3
     """High-throughput MySQL upsert generator for CDC load testing."""
+    import bisect
     import os
     import random
     import string
-    import sys
     import threading
     import time
     from datetime import datetime
@@ -100,7 +147,11 @@ data:
     RATE          = int(os.environ.get('RATE_PER_POD', '5000'))    # rows/sec, this pod
     THREADS       = int(os.environ.get('THREADS', '4'))
     BATCH_ROWS    = int(os.environ.get('BATCH_ROWS', '500'))
-    UPSERT_RATIO  = float(os.environ.get('UPSERT_RATIO', '0.8'))   # rest are pure inserts
+    # Applies to the NON-recent share only (1 - RECENT_KEY_RATIO of each batch):
+    # of those rows, UPSERT_RATIO update an existing key drawn by pick_key()
+    # (hot window / cold tail) and the rest are new AUTO_INCREMENT inserts. So
+    # the stream-wide insert share is (1 - RECENT_KEY_RATIO) x (1 - UPSERT_RATIO).
+    UPSERT_RATIO  = float(os.environ.get('UPSERT_RATIO', '0.8'))
     # Defaults track the StatefulSet's env values so a run launched without them
     # does not silently fall back to the IOPS-bound 0.6 / 50,000 combination.
     HOT_KEY_RATIO = float(os.environ.get('HOT_KEY_RATIO', '0.95'))
@@ -133,6 +184,108 @@ data:
     # Never let a slice collapse to nothing when POD_COUNT > HOT_WINDOW.
     HOT_SLICE     = max(1, HOT_WINDOW // POD_COUNT)
 
+    # ── Recent-key re-writes (Iceberg position deletes) ─────────────────────
+    # RECENT_KEY_RATIO of the rows in each batch re-write a key THIS worker
+    # thread wrote (insert or upsert) within the last RECENT_KEY_MAX_AGE_S
+    # seconds. The Iceberg writer turns a re-write into a POSITION delete (a DV
+    # on v3) only if the previous write of that key is in the same, still open
+    # checkpoint; otherwise it is an equality delete like every first write.
+    #
+    # Same-checkpoint probability. Checkpoints are ~60s apart (interval 60s,
+    # min-pause 30s, so 60s whenever a checkpoint takes under 30s), and their
+    # boundaries are unrelated to the generator, so a re-write a seconds after
+    # the previous write shares its checkpoint with probability 1 - a/60. With
+    # ages spread evenly over [0, MAX_AGE] that averages 1 - MAX_AGE/120: 0.83
+    # at 20s, 0.75 at 30s, 0.50 at 60s. The age is never near 0, though: the
+    # previous write of a key is at least one same-table batch back for this
+    # thread. pick_table() keeps a thread on one table for TABLE_RUN_BATCHES
+    # batches so that gap is one batch (2.5-5s at 1,000-2,000 rows/s per
+    # thread) instead of ~10 batches for products. A smaller MAX_AGE raises
+    # the same-checkpoint share but empties the buffer more often (e.g. on the
+    # first batch of a run); the shortfall falls back to the normal path below,
+    # and the counter's recent= shows what was actually achieved.
+    #
+    # Keeping the buffer per thread means a re-write only touches a row whose
+    # previous statement (by this same connection, autocommit) has already
+    # committed, so it adds no cross-thread or cross-pod row-lock contention,
+    # and the row is still in the buffer pool, so it costs no read I/O.
+    #
+    # Why 0.6 for a 50% target: position share ~= RECENT_KEY_RATIO x (share
+    # of re-writes the buffer can serve, ~0.92) x (same-checkpoint
+    # probability, ~0.89) + the ~1-2% the hot window already produces. An
+    # offline simulation of this planner (real plan_keys/RecentKeys/
+    # pick_table, fake clock, fixed 60s checkpoint windows, 8 threads) gave,
+    # at ratio 0.6 / max age 20s / runs of 8:
+    #     rows/s per thread    500   1000   1500   2000   3000
+    #     position share      0.42   0.47   0.49   0.51   0.52
+    # with all four tables within +-0.03 of each other. Independent table
+    # draws (runs of 1) gave 0.38-0.47 overall and only 0.15-0.30 on products.
+    # A DESIGN TARGET, not a measurement: measure it from the Iceberg snapshot
+    # summaries (2-DATA-GEN-GUIDE.md) and adjust the ratio. 0 disables the
+    # feature and restores the old generator (with TABLE_RUN_BATCHES=1).
+    RECENT_RATIO   = float(os.environ.get('RECENT_KEY_RATIO', '0.6'))
+    RECENT_MAX_AGE = float(os.environ.get('RECENT_KEY_MAX_AGE_S', '20'))
+    # Entries per table per thread. Within a run one table gets all of a
+    # thread's rows: ~2,000 rows/s x 20s = ~40,000, so the bound bites only
+    # above ~2,500 rows/s per thread or a raised MAX_AGE (it drops the oldest,
+    # least useful entries). Caps memory near ~70 MB per pod (THREADS x 4 x
+    # this, ~45 bytes an entry).
+    RECENT_BUFFER  = int(os.environ.get('RECENT_KEY_BUFFER', '50000'))
+    # Consecutive batches a thread spends on one table before re-drawing it
+    # (see pick_table). 1 = an independent draw per batch, the old behaviour.
+    TABLE_RUN      = max(1, int(os.environ.get('TABLE_RUN_BATCHES', '8')))
+    # Read from the server at startup (sample_ids); new AUTO_INCREMENT ids of
+    # one statement are LAST_INSERT_ID(), +step, +2*step, ...
+    AUTOINC_STEP  = 1
+
+    # ── Deletes ─────────────────────────────────────────────────────────────
+    # DELETE_RATIO of the rows of every orders / order_items batch are deletes
+    # of existing keys, issued as one extra statement (a transaction for orders)
+    # after the batch's upsert. They are drawn like the writes: RECENT_KEY_RATIO
+    # of them from this thread's recent-key buffer (same-checkpoint -> Iceberg
+    # position delete / DV), the rest via pick_key() (hot window / cold tail ->
+    # equality delete). Because deletes split recent/older in the same
+    # proportion as writes, the stream's position-delete share stays where
+    # RECENT_KEY_RATIO put it (~50%); the simulation confirms it.
+    #
+    # Why 0.05. Large enough to be a visible event class (~3.75% of all rows,
+    # since orders + order_items are 75% of the mix, plus the deleted orders'
+    # items), small enough not to change what the benchmark mostly measures.
+    # Offline simulation (ratio 0.6 / 20s / runs of 8, items modelled at the
+    # source's 1.5 per pre-existing order): delete events 5.3-5.8% of all row
+    # events (own deletes ~3.5%, items ~2%), position-delete share 0.47-0.50 at
+    # 1,000-2,000 rows/s per thread against 0.48-0.52 without deletes.
+    # And it roughly balances the inserts: with UPSERT_RATIO 0.9 only ~4-5% of
+    # rows are new inserts, so 5% deletes keeps the fact tables near their
+    # current size instead of growing out of the buffer pool (the reason
+    # UPSERT_RATIO went to 0.9). Some deleted ids are later re-inserted by a
+    # pick_key() upsert, so the net effect is closer to flat than to shrinking.
+    #
+    # Why never customers / products. Their FKs are RESTRICT and they have
+    # children. The only rows provably unreferenced would be this thread's own
+    # fresh inserts (~4% of their rows), so a "safe" dimension delete is just
+    # insert-then-delete churn of rows nobody reads, and anything else needs a
+    # child-index probe per key or risks errno 1451 rolling the batch back.
+    # The CDC/sink delete path is identical for every table, so deleting from
+    # the two fact tables already exercises it; real e-commerce systems
+    # soft-delete customers and products (an update) anyway.
+    DELETE_RATIO   = float(os.environ.get('DELETE_RATIO', '0.05'))
+    DELETE_TABLES  = ('order_items', 'orders')
+    # Orders with order_id % FK_PARENT_MOD == 0 are the FK-parent pool: the
+    # orders sample that order_items inserts draw from comes only from them,
+    # and they are never deleted. A residue rather than "the newest N at
+    # startup" because it is the same set in every pod regardless of when each
+    # pod started; 16 keeps 15/16 of orders deletable.
+    FK_PARENT_MOD  = max(1, int(os.environ.get('FK_PARENT_MOD', '16')))
+    # An order with more items than this is skipped rather than deleted. Every
+    # earlier run drew order_items' parents from the newest 20,000 orders, so a
+    # few tens of thousands of orders carry most of the ~19M items (the source
+    # averages ~1.5 items per order, but very unevenly). Deleting one of those
+    # would turn a 250-key delete into a transaction over thousands of item rows,
+    # holding their locks against the order_items upserts. The count is one
+    # covering read of idx_order_id per batch.
+    ORDER_DELETE_MAX_ITEMS = int(os.environ.get('ORDER_DELETE_MAX_ITEMS', '20'))
+
     CITIES = ['Seattle', 'Portland', 'San Francisco', 'Los Angeles', 'Phoenix',
               'Denver', 'Austin', 'Houston', 'Dallas', 'Chicago', 'New York', 'Miami']
     STATES = ['WA', 'OR', 'CA', 'AZ', 'CO', 'TX', 'IL', 'NY', 'MA', 'FL']
@@ -145,16 +298,31 @@ data:
 
     # ── Shared counters ─────────────────────────────────────────────────────
     _lock = threading.Lock()
-    STATS = {'rows': 0, 'upserts': 0, 'inserts': 0, 'batches': 0, 'errors': 0}
+    # `recent` is a SUBSET of `upserts` (a re-write of an existing key is an
+    # upsert to MySQL). `deletes` is the keys put in DELETE statements, so
+    # upserts + inserts + deletes == rows (an order skipped for having too many
+    # items is in none of them, so rows can run slightly under BATCH_ROWS). `deleted` is the rows MySQL actually
+    # removed (rowcount): deletes that found their row, plus the order_items
+    # removed together with their orders — each one a -D in the binlog.
+    STATS = {'rows': 0, 'upserts': 0, 'inserts': 0, 'recent': 0, 'deletes': 0,
+             'deleted': 0, 'batches': 0, 'errors': 0}
     PER_TABLE = {}
 
-    def bump(table, rows, upserts, inserts):
+    def bump(table, rows, upserts, inserts, recent):
         with _lock:
             STATS['rows'] += rows
             STATS['upserts'] += upserts
             STATS['inserts'] += inserts
+            STATS['recent'] += recent
             STATS['batches'] += 1
             PER_TABLE[table] = PER_TABLE.get(table, 0) + rows
+
+    def bump_delete(table, requested, deleted):
+        with _lock:
+            STATS['rows'] += requested
+            STATS['deletes'] += requested
+            STATS['deleted'] += deleted
+            PER_TABLE[table] = PER_TABLE.get(table, 0) + requested
 
     def bump_error():
         with _lock:
@@ -165,6 +333,14 @@ data:
             try:
                 c = mysql.connector.connect(**DB)
                 c.autocommit = True
+                # READ COMMITTED for every statement of this session (2026-11-04): at the
+                # server's REPEATABLE READ default, INSERT ... ON DUPLICATE KEY UPDATE
+                # takes next-key / gap locks, and every batch's new rows land in the
+                # same gap at the top of the primary key, so all threads deadlocked
+                # there. The CDC stream (row-based binlog) is the same either way.
+                cur = c.cursor()
+                cur.execute("SET SESSION transaction_isolation = 'READ-COMMITTED'")
+                cur.close()
                 return c
             except mysql.connector.Error as e:
                 print(f"connect attempt {attempt+1} failed: {e}", flush=True)
@@ -181,14 +357,23 @@ data:
         order_items carry FOREIGN KEYs to them — an id that was deleted would
         abort the whole multi-row statement, so inserts must use ids known to
         exist rather than a random number below MAX.
+
+        MIN(pk) is read too, for the same price (the other end of the same
+        index). The tables are periodically shrunk to their newest ~10% of ids,
+        so [1, MAX] is mostly holes: a cold "upsert" drawn below MIN finds no
+        row, takes the INSERT path at that old id, and the table regrows. Each
+        range is therefore (MIN, MAX); an empty table reads as (1, 1).
         """
         conn = connect()
         cur = conn.cursor()
         ranges = {}
         for table, pk in (('customers', 'customer_id'), ('products', 'product_id'),
                           ('orders', 'order_id'), ('order_items', 'order_item_id')):
-            cur.execute(f"SELECT MAX({pk}) FROM {table}")
-            ranges[table] = cur.fetchone()[0] or 1
+            cur.execute(f"SELECT MIN({pk}), MAX({pk}) FROM {table}")
+            lo, hi = cur.fetchone()
+            hi = hi or 1
+            lo = min(lo or 1, hi)
+            ranges[table] = (lo, hi)
 
         # FK parents: a bounded sample, taken off the primary key in id order so
         # it is an index range scan and not a sort.
@@ -196,24 +381,52 @@ data:
         cust = [r[0] for r in cur.fetchall()]
         cur.execute("SELECT product_id FROM products ORDER BY product_id DESC LIMIT 20000")
         prod = [r[0] for r in cur.fetchall()]
-        cur.execute("SELECT order_id FROM orders ORDER BY order_id DESC LIMIT 20000")
+        # Orders only from the never-deleted FK-parent pool (see FK_PARENT_MOD):
+        # an order_items insert referencing an order some thread just deleted
+        # would fail errno 1452 and roll back its whole 5,000-row statement.
+        # Still a backward PK range scan; it reads ~FK_PARENT_MOD x 20,000 ids.
+        # (An int from the env, inlined: no params means no %-substitution.)
+        cur.execute(f"SELECT order_id FROM orders WHERE MOD(order_id, {FK_PARENT_MOD}) = 0"
+                    " ORDER BY order_id DESC LIMIT 20000")
         ordr = [r[0] for r in cur.fetchall()]
+        # Customers and products are never deleted, so their samples need no
+        # such filter.
+        # The recent-key buffer derives a statement's new ids from
+        # LAST_INSERT_ID() and the increment, so read the increment rather than
+        # assume 1. The lock mode is printed for the record: for a multi-row
+        # VALUES list the server knows the row count up front and reserves one
+        # id interval of that size for the statement, so the NULL-pk rows (all
+        # last, after explicit ids that are below the counter) get consecutive
+        # ids from LAST_INSERT_ID() — not yet verified against this RDS
+        # instance (check: recent re-writes should show as upserts, i.e.
+        # table row counts grow only by inserts=). If it does not hold, a derived
+        # id is either another pod's new row or an unused gap id — the re-write
+        # then updates that row or inserts at that id, harmless either way.
+        global AUTOINC_STEP
+        cur.execute("SELECT @@auto_increment_increment, @@innodb_autoinc_lock_mode")
+        step, lock_mode = cur.fetchone()
+        AUTOINC_STEP = max(1, int(step or 1))
         cur.close()
         conn.close()
         print(f"id ranges: {ranges}", flush=True)
         print(f"fk samples: customers={len(cust)} products={len(prod)} orders={len(ordr)}",
               flush=True)
+        print(f"auto_increment_increment={AUTOINC_STEP} "
+              f"innodb_autoinc_lock_mode={lock_mode}", flush=True)
         return ranges, cust, prod, ordr
 
-    def pick_key(max_id, rnd):
+    def pick_key(id_range, rnd):
         """Choose an existing primary key, skewed towards recent (hot) keys.
+
+        id_range is (MIN(pk), MAX(pk)) from sample_ids(). Every draw stays inside
+        it, so an "upsert" never lands on an id below MIN that no longer exists.
 
         When SHARD_HOT_KEYS is on, this pod's hot draws are confined to its own
         slice of the window so pods do not fight for the same rows — see the
         "Hot-window sharding" note above for the measurements behind that.
 
         The cold tail (1 - HOT_KEY_RATIO) stays deliberately unsharded and spans
-        the full key range: it is what keeps writes landing across every data
+        the full LIVE key range [MIN, MAX]: it is what keeps writes landing across every data
         file rather than only in the newest one, and it is uniform over millions
         of keys, so it contributes almost no lock contention anyway.
 
@@ -224,8 +437,9 @@ data:
         43% of the instance's entire 12,000-IOPS budget spent fetching pages the
         benchmark does not care about. Keep the tail small.
         """
+        min_id, max_id = id_range
         if rnd.random() < HOT_KEY_RATIO:
-            window_lo = max(1, max_id - HOT_WINDOW)
+            window_lo = max(min_id, max_id - HOT_WINDOW)
             if not SHARD_HOT:
                 return rnd.randint(window_lo, max_id)
             lo = window_lo + POD_ORDINAL * HOT_SLICE
@@ -236,9 +450,9 @@ data:
             if lo > max_id:
                 return rnd.randint(window_lo, max_id)
             return rnd.randint(lo, min(hi, max_id))
-        return rnd.randint(1, max_id)
+        return rnd.randint(min_id, max_id)
 
-    def plan_keys(max_id, n, rnd):
+    def plan_keys(id_range, n, rnd, recent=None, table=None):
         """Plan a batch's primary keys: existing ids ASCENDING, then inserts.
 
         The ordering is not cosmetic, it is the deadlock fix. InnoDB takes a row
@@ -253,23 +467,157 @@ data:
         Inserts (pk None -> AUTO_INCREMENT) go last: they take the auto-inc
         values above every existing key, so placing them at the end keeps the
         statement monotonic in key order too.
+
+        On a DELETE_TABLES table, DELETE_RATIO x n of the n rows are deletes
+        (planned first; executed by delete_batch() as a separate statement):
+        RECENT_KEY_RATIO of them from the recent-key buffer, the rest via
+        pick_key(). On orders, ids that are multiples of FK_PARENT_MOD are never
+        chosen for deletion (the FK-parent pool). Delete keys are distinct from
+        each other AND from the batch's upsert keys, and are sorted ascending
+        too, for the same lock-order reason.
+
+        The write rows are then planned in two parts:
+          1. RECENT_KEY_RATIO x n rows (stochastically rounded) re-write keys
+             from this thread's recent-key buffer for the table — the rows that
+             become Iceberg position deletes. If the buffer has fewer distinct
+             live keys (pod start, or a small table this thread has not written
+             within RECENT_KEY_MAX_AGE_S), the shortfall goes to part 2.
+          2. Every remaining row is an upsert via pick_key() with probability
+             UPSERT_RATIO, else a new insert — exactly the old behaviour.
+
+        Keys are DISTINCT within the batch. A key listed twice in one
+        ON DUPLICATE KEY UPDATE statement is updated twice inside one
+        transaction: wasted work, a misleading affected-rows count, and two
+        binlog events for one row write. A part-2 draw that collides is redrawn
+        a few times and becomes an insert if it keeps colliding (a handful per
+        batch at most — the hot slice is ~1M keys per pod).
+
+        Returns (sorted existing keys, n_insert, n_recent, sorted delete keys,
+        n_recent_deletes).
         """
-        keys = sorted(pick_key(max_id, rnd) for _ in range(n)
-                      if rnd.random() < UPSERT_RATIO)
-        return keys, n - len(keys)
+        nd = int(n * DELETE_RATIO + rnd.random()) if table in DELETE_TABLES else 0
+        protect = FK_PARENT_MOD if table == 'orders' else 0
+        seen, dels = set(), set()
+        pool = []
+        if recent is not None and RECENT_RATIO > 0:
+            # One draw serves both deletes and re-writes, so the two split the
+            # recent keys in proportion to their share of the batch.
+            pool = recent.sample(int(n * RECENT_RATIO + rnd.random()), rnd)
+            rnd.shuffle(pool)   # set order of ints follows their low bits
+        want_dr = int(nd * RECENT_RATIO + rnd.random())
+        for k in pool:
+            if len(dels) < want_dr and not (protect and k % protect == 0):
+                dels.add(k)
+            else:
+                seen.add(k)
+        n_del_recent = len(dels)
+        while len(dels) < nd:
+            for _try in range(8):
+                k = pick_key(id_range, rnd)
+                if k not in seen and k not in dels and not (protect and k % protect == 0):
+                    dels.add(k)
+                    break
+            else:
+                break       # give up; the row goes to the write path below
+        n_recent = len(seen)
+        ni = 0
+        for _ in range(n - len(dels) - n_recent):
+            if rnd.random() >= UPSERT_RATIO:
+                ni += 1
+                continue
+            for _try in range(8):
+                k = pick_key(id_range, rnd)
+                if k not in seen and k not in dels:
+                    seen.add(k)
+                    break
+            else:
+                ni += 1
+        return sorted(seen), ni, n_recent, sorted(dels), n_del_recent
+
+    class RecentKeys:
+        """Keys one worker thread wrote to one table, with commit timestamps.
+
+        Append-only parallel lists in commit order (so timestamps are sorted),
+        with a moving head: expiring entries older than RECENT_KEY_MAX_AGE_S is
+        a bisect, and the dead prefix is dropped once it is most of the list.
+        A key re-written later appears again with the newer timestamp; the old
+        entry is harmless (the key's real last write is even more recent) and
+        sample() dedups. Not thread-safe by design — one instance per thread
+        per table is the whole point (no shared keys, no shared locks).
+        """
+        __slots__ = ('ts', 'keys', 'head', 'clock')
+
+        def __init__(self, clock=time.monotonic):
+            self.ts, self.keys, self.head, self.clock = [], [], 0, clock
+
+        def _trim(self):
+            self.head = max(self.head,
+                            bisect.bisect_left(self.ts, self.clock() - RECENT_MAX_AGE,
+                                               self.head),
+                            len(self.keys) - RECENT_BUFFER)
+            if self.head > 4096 and self.head * 2 > len(self.keys):
+                del self.ts[:self.head]
+                del self.keys[:self.head]
+                self.head = 0
+
+        def add(self, keys):
+            if not keys:
+                return
+            self.ts.extend([self.clock()] * len(keys))
+            self.keys.extend(keys)
+            self._trim()
+
+        def discard(self, keys):
+            """Forget deleted keys so they are not re-written as upserts.
+
+            Rebuilds the live part of the lists: O(buffer), a few ms at the
+            50,000 cap, once per delete statement. Without it a recent
+            "re-write" of a deleted key would take the INSERT path and quietly
+            undo the delete.
+            """
+            if not keys:
+                return
+            self._trim()
+            drop = set(keys)
+            live = [(t, k) for t, k in zip(self.ts[self.head:], self.keys[self.head:])
+                    if k not in drop]
+            self.ts = [t for t, _ in live]
+            self.keys = [k for _, k in live]
+            self.head = 0
+
+        def sample(self, k, rnd):
+            """Up to k DISTINCT live keys, uniform over live entries."""
+            self._trim()
+            lo, hi = self.head, len(self.keys)
+            if k <= 0 or hi <= lo:
+                return []
+            if k >= hi - lo:
+                return list(set(self.keys[lo:hi]))
+            out, keys = set(), self.keys
+            # Rejection on duplicates; a bounded number of extra draws keeps a
+            # buffer that is mostly repeats of a few keys from spinning.
+            for _ in range(2 * k + 16):
+                out.add(keys[rnd.randrange(lo, hi)])
+                if len(out) >= k:
+                    break
+            return list(out)
 
     def rand_text(rnd, n):
         return ''.join(rnd.choice(string.ascii_lowercase) for _ in range(n))
 
     # ── Batch builders ──────────────────────────────────────────────────────
-    # Each returns (sql, params, n_upsert, n_insert). Upsert rows carry an
+    # Each returns (sql, params, existing_keys, n_insert, n_recent, delete_keys,
+    # n_recent_deletes); recent is this thread's RecentKeys for the table (None
+    # = no recent re-writes). n_recent of the existing keys are re-writes from
+    # it. delete_keys (empty except on DELETE_TABLES) are executed separately
+    # by delete_batch() after the upsert. Upsert rows carry an
     # explicit existing PK so MySQL takes the ON DUPLICATE KEY UPDATE path;
     # insert rows pass NULL for the AUTO_INCREMENT PK so MySQL assigns a new one.
 
-    def batch_orders(rnd, ranges, cust, prod, ordr, n):
+    def batch_orders(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni = plan_keys(ranges['orders'], n, rnd)
-        nu = len(keys)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['orders'], n, rnd, recent,
+                                            'orders')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -294,12 +642,12 @@ data:
             " total_amount=VALUES(total_amount), payment_method=VALUES(payment_method),"
             " shipping_address=VALUES(shipping_address)"
         )
-        return sql, params, nu, ni
+        return sql, params, keys, ni, nr, dels, ndr
 
-    def batch_order_items(rnd, ranges, cust, prod, ordr, n):
+    def batch_order_items(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni = plan_keys(ranges['order_items'], n, rnd)
-        nu = len(keys)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['order_items'], n, rnd, recent,
+                                            'order_items')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -320,12 +668,12 @@ data:
             " ON DUPLICATE KEY UPDATE quantity=VALUES(quantity),"
             " unit_price=VALUES(unit_price)"
         )
-        return sql, params, nu, ni
+        return sql, params, keys, ni, nr, dels, ndr
 
-    def batch_customers(rnd, ranges, cust, prod, ordr, n):
+    def batch_customers(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni = plan_keys(ranges['customers'], n, rnd)
-        nu = len(keys)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['customers'], n, rnd, recent,
+                                            'customers')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s,%s,%s,%s)")
             # email carries a UNIQUE KEY. Always generate a globally unique value
@@ -353,12 +701,12 @@ data:
             " phone=VALUES(phone), address=VALUES(address), city=VALUES(city),"
             " state=VALUES(state), zip_code=VALUES(zip_code)"
         )
-        return sql, params, nu, ni
+        return sql, params, keys, ni, nr, dels, ndr
 
-    def batch_products(rnd, ranges, cust, prod, ordr, n):
+    def batch_products(rnd, ranges, cust, prod, ordr, n, recent=None):
         rows, params = [], []
-        keys, ni = plan_keys(ranges['products'], n, rnd)
-        nu = len(keys)
+        keys, ni, nr, dels, ndr = plan_keys(ranges['products'], n, rnd, recent,
+                                            'products')
         for pk in keys + [None] * ni:
             rows.append("(%s,%s,%s,%s,%s,%s)")
             params.extend([
@@ -377,7 +725,7 @@ data:
             " price=VALUES(price), stock_quantity=VALUES(stock_quantity),"
             " description=VALUES(description)"
         )
-        return sql, params, nu, ni
+        return sql, params, keys, ni, nr, dels, ndr
 
     # Table mix, weighted to resemble the shape of the existing data (order_items
     # is the largest table, customers/products the smallest). The weights decide
@@ -393,10 +741,85 @@ data:
     _names    = [m[1] for m in MIX]
     _weights  = [m[2] for m in MIX]
 
+    def pick_table(rnd, run):
+        """Weighted table choice, held for TABLE_RUN_BATCHES consecutive batches.
+
+        run is this thread's [table index, batches left]. The long-run mix is
+        unchanged (each run's table is drawn with the MIX weights). What the
+        run changes is how long ago this thread last wrote the table: with one
+        independent draw per batch, products (10%) comes back after ~10
+        batches, i.e. ~25-50s at 1,000-2,000 rows/s per thread — past
+        RECENT_KEY_MAX_AGE_S and often past the checkpoint, so its recent-key
+        buffer is empty or its re-writes become equality deletes. Inside a run
+        the previous same-table batch is one batch (a few seconds) back, so a
+        re-write shares its checkpoint ~95% of the time; only the first batch
+        of a run has nothing recent to draw on. With independent draws the
+        offline simulation put products/customers at 0.15-0.35 position share
+        against 0.5-0.6 for order_items.
+        """
+        if run[1] <= 0:
+            run[0] = rnd.choices(range(len(MIX)), weights=_weights, k=1)[0]
+            run[1] = TABLE_RUN
+        run[1] -= 1
+        return _builders[run[0]], _names[run[0]]
+
+    def delete_batch(conn, cur, name, dels):
+        """Delete `dels` (sorted, distinct) from `name`.
+
+        Returns (keys actually put in the DELETE, rows removed incl. items).
+
+        One transaction at READ COMMITTED, whatever the server default:
+          - RC takes no gap locks for these searches. Under REPEATABLE READ a
+            key that is already gone (a cold draw on a hole, or a key another
+            thread deleted) leaves a gap lock, and for orders the child delete
+            through idx_order_id would gap-lock the range above the highest
+            referenced order_id, blocking every new order_items insert behind it.
+          - orders: orders with more than ORDER_DELETE_MAX_ITEMS items are
+            dropped from the list first (a plain non-locking read). Then the
+            remaining orders' items go (the FKs are RESTRICT, not CASCADE), then
+            the orders, so the parent delete never sees a child. No new item can
+            reference a deletable order in between: inserts only use
+            FK_PARENT_MOD orders, which are never deleted.
+        A deadlock or lock-wait timeout rolls back both statements together;
+        the caller retries the whole call, which is idempotent.
+        """
+        ph = ",".join(["%s"] * len(dels))
+        conn.start_transaction(isolation_level='READ COMMITTED')
+        try:
+            removed = 0
+            if name == 'orders':
+                cur.execute(f"SELECT order_id, COUNT(*) FROM order_items"
+                            f" WHERE order_id IN ({ph}) GROUP BY order_id", dels)
+                heavy = {o for o, c in cur.fetchall() if c > ORDER_DELETE_MAX_ITEMS}
+                if heavy:
+                    dels = [o for o in dels if o not in heavy]
+                if not dels:
+                    conn.commit()
+                    return dels, 0
+                ph = ",".join(["%s"] * len(dels))
+                cur.execute(f"DELETE FROM order_items WHERE order_id IN ({ph})", dels)
+                removed += max(0, cur.rowcount)
+                cur.execute(f"DELETE FROM orders WHERE order_id IN ({ph})", dels)
+            else:
+                cur.execute(f"DELETE FROM order_items WHERE order_item_id IN ({ph})", dels)
+            removed += max(0, cur.rowcount)
+            conn.commit()
+            return dels, removed
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
     def worker(idx, ranges, cust, prod, ordr, rate, stop_at):
         rnd = random.Random(os.getpid() * 1000 + idx)
         conn = connect()
         cur = conn.cursor()
+        # This thread's own recent-key buffers, one per table. Never shared:
+        # see the RECENT_KEY_RATIO note at the top for why that matters.
+        recent = {n: RecentKeys() for n in _names} if RECENT_RATIO > 0 else {}
+        run = [0, 0]
         # Token bucket: tokens accrue at `rate` rows/sec and a batch spends
         # BATCH_ROWS of them. Sleeping for the shortfall (rather than a fixed
         # interval) keeps the long-run average at the target even when an
@@ -412,9 +835,11 @@ data:
                 continue
             tokens -= BATCH_ROWS
 
-            builder = rnd.choices(_builders, weights=_weights, k=1)[0]
-            name = _names[_builders.index(builder)]
-            sql, params, nu, ni = builder(rnd, ranges, cust, prod, ordr, BATCH_ROWS)
+            builder, name = pick_table(rnd, run)
+            buf = recent.get(name)
+            sql, params, keys, ni, nr, dels, ndr = builder(rnd, ranges, cust, prod,
+                                                           ordr, BATCH_ROWS, buf)
+            nu = len(keys)
             # Deadlock (1213) and lock-wait timeout (1205) roll back the WHOLE
             # multi-row statement, so dropping the batch costs BATCH_ROWS rows off
             # the achieved rate — that is exactly why the first run landed at
@@ -425,7 +850,21 @@ data:
             for attempt in range(4):
                 try:
                     cur.execute(sql, params)
-                    bump(name, BATCH_ROWS, nu, ni)
+                    # nu + ni is BATCH_ROWS minus the batch's delete keys —
+                    # always the real number of rows in the statement, whatever
+                    # plan_keys() did with colliding draws.
+                    bump(name, nu + ni, nu, ni, nr)
+                    # Only COMMITTED rows enter the buffer (autocommit: the
+                    # statement returning means its locks are released), with
+                    # the commit time as their age. New rows' ids come from
+                    # LAST_INSERT_ID(): the NULL-pk rows are last in the
+                    # statement and get one consecutive interval.
+                    if buf is not None:
+                        first = cur.lastrowid
+                        if ni and first:
+                            keys = keys + list(range(first, first + ni * AUTOINC_STEP,
+                                                     AUTOINC_STEP))
+                        buf.add(keys)
                     break
                 except mysql.connector.Error as e:
                     bump_error()
@@ -443,6 +882,33 @@ data:
                     if e.errno not in (1213, 1205):
                         print(f"[w{idx}] {name}: {e}", flush=True)
                     break
+
+            # Deletes: a separate statement after the upsert (a transaction for
+            # orders), same retry policy. 1451 (child row exists) is retried
+            # too: it can only come from a race the FK-parent pool rules out,
+            # and if it ever shows up it is visible in errors= and the log.
+            for attempt in range(4 if dels else 0):
+                try:
+                    done, removed = delete_batch(conn, cur, name, dels)
+                    bump_delete(name, len(done), removed)
+                    if buf is not None:
+                        buf.discard(done)
+                    break
+                except mysql.connector.Error as e:
+                    bump_error()
+                    if e.errno in (1213, 1205, 1451) and attempt < 3:
+                        continue
+                    if e.errno in (2006, 2013, 2055):
+                        try:
+                            cur.close(); conn.close()
+                        except Exception:
+                            pass
+                        conn = connect()
+                        cur = conn.cursor()
+                        break
+                    if e.errno not in (1213, 1205):
+                        print(f"[w{idx}] {name} delete: {e}", flush=True)
+                    break
         try:
             cur.close(); conn.close()
         except Exception:
@@ -455,6 +921,13 @@ data:
         print(f"  threads     : {THREADS}   batch rows: {BATCH_ROWS}", flush=True)
         print(f"  upsert ratio: {UPSERT_RATIO}  hot-key ratio: {HOT_KEY_RATIO}"
               f"  hot window: {HOT_WINDOW}", flush=True)
+        print(f"  recent keys : ratio {RECENT_RATIO}  max age {RECENT_MAX_AGE:g}s"
+              f"  buffer {RECENT_BUFFER}/table/thread  table run {TABLE_RUN} batches"
+              f"  (upsert ratio applies to the other {1 - RECENT_RATIO:.2f})",
+              flush=True)
+        print(f"  deletes     : ratio {DELETE_RATIO} of {'/'.join(DELETE_TABLES)} rows"
+              f"  (orders: items first, ids %{FK_PARENT_MOD}==0 kept as FK parents;"
+              f" customers/products never)", flush=True)
         print(f"  table mix   : " + ", ".join(f"{n}={w}%" for _, n, w in MIX), flush=True)
         print("=" * 70, flush=True)
 
@@ -487,7 +960,9 @@ data:
             print(f"[{int(now - t0):5d}s] rows={snap['rows']:,} "
                   f"inst={inst:,.0f}/s avg={avg:,.0f}/s "
                   f"upserts={snap['upserts']:,} inserts={snap['inserts']:,} "
-                  f"batches={snap['batches']:,} errors={snap['errors']} | {mix}",
+                  f"recent={snap['recent']:,} deletes={snap['deletes']:,} "
+                  f"deleted={snap['deleted']:,} batches={snap['batches']:,} "
+                  f"errors={snap['errors']} | {mix}",
                   flush=True)
 
         print("load generation finished", flush=True)
@@ -537,7 +1012,7 @@ spec:
   # that 32 pods (128 connections) reached. Throughput here is set by BATCH_ROWS
   # (rows per commit), not by how many clients are connected.
   #
-  # Pod count is deliberately NOT the throughput knob. find-rds-ceiling.sh swept
+  # Pod count is deliberately NOT the throughput knob. A replica ramp swept
   # 8/16/24/32/40 replicas against db.m5.2xlarge (500GB gp3, 12,000 IOPS):
   #
   #   replicas  conns  target    achieved  errors   write_iops  rds_cpu
@@ -549,24 +1024,7 @@ spec:
   # Past 32 replicas the extra pods only bought row-lock contention — that is what
   # the errors column counts, and why 40 replicas is SLOWER than 32. Adding
   # clients to an already-saturated server cannot help.
-  #
-  # CORRECTION: this sweep was originally read as "the wall is InnoDB's
-  # single-writer commit path", because it only looked at WriteIOPS. That was
-  # wrong. Performance Insights puts the commit path at effectively zero load
-  # (wait/io/file/sql/binlog 0.043, MYSQL_BIN_LOG::COND_done 0.003) while
-  # wait/io/table/sql/handler sits at 26.3 — plain storage I/O. The missing term
-  # was READS: ReadIOPS 5,655 + WriteIOPS 6,518 = 11,878 of 12,000 provisioned.
-  # The instance was IOPS-saturated, not commit-bound, and the reads came from the
-  # cold-tail key distribution (see the HOT_KEY_RATIO note below). Fixing that
-  # alone took throughput from ~15,000 to ~58,300 rows/s at these same 8 replicas
-  # and moved the bottleneck to CPU (26% -> 78%).
-  #
-  # So the same rows are moved with 4x fewer connections by committing in larger
-  # batches: 32 connections x 2,000-row batches instead of 128 x 500. Fewer,
-  # bigger commits amortize the redo-log flush that is the actual bottleneck, and
-  # cut the lock-timeout errors that 128 competing writers produced. See
-  # bench-results/rds-ceiling-20260923T081657Z.csv.
-  replicas: 8
+  replicas: 24
   selector:
     matchLabels:
       app: mysql-upsert-loadgen
@@ -631,77 +1089,76 @@ spec:
         # command-line argument or a literal in this manifest.
         - name: MYSQL_HOST
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: hostname }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_HOST }
         - name: MYSQL_USER
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: username }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_USER }
         - name: MYSQL_PASSWORD
           valueFrom:
-            secretKeyRef: { name: mysql-credentials, key: password }
+            secretKeyRef: { name: mysql-credentials, key: MYSQL_PASSWORD }
         - name: MYSQL_DATABASE
           value: "ecommerce"
-        # 8 pods x 100,000 = 800,000 rows/sec of TARGET. RATE is a token-bucket
-        # ceiling, not a promise, and this target is far above anything this
-        # instance has delivered (best measured: 94,327 at 8 pods). Setting it
-        # well past the achievable rate is deliberate — the bucket then never
-        # binds, so the pods run flat out and whatever they reach is the real
-        # limit of MySQL plus the driver rather than an artifact of the generator
-        # throttling itself. Do not read this number as a throughput claim:
-        # measure `inst=` from the pod logs. `avg=` is a lifetime average and is
-        # useless after a settings change.
-        #
-        # 800k/s is NOT reachable on a single db.m5.2xlarge, and the arithmetic
-        # says so before the test does. Measured per-row cost is 0.198 write
-        # IOPS/row and 3.36 KB/row, so 800k rows/s needs ~158,400 IOPS and
-        # ~2,625 MB/s. The gp3 volume is provisioned at 64,000 IOPS (gp3's
-        # maximum), which caps sustained throughput near ~323,000 rows/s — and
-        # that ceiling was confirmed once already, at ~330,000 rows/s with
-        # WriteIOPS reading 65,310 of 64,000 (102%). Reaching 800k needs either
-        # io2 with more IOPS on a bigger instance, or sharding across ~3
-        # instances. Expect this target to be clipped by storage, and read the
-        # gap between target and `inst=` as the headroom measurement it is.
         - name: RATE_PER_POD
           value: "80000"
         - name: THREADS
           value: "8"
-        # 10,000 -> 5,000. REVERTED: 10,000 was tried and measured WORSE, which
-        # settles the lock-hold question the earlier note left open.
-        #
-        # The reasoning for going up was that the bottleneck is commits/sec
-        # against the redo log, so fewer, larger commits move the same rows with
-        # fewer flushes. That holds up to about 5,000 and then inverts, because a
-        # batch is ONE transaction holding every row lock it touches for the
-        # whole statement. At 10,000 rows the hold window is long enough that
-        # 8 threads x 8 pods = 64 concurrent writers collide constantly.
-        #
-        # Measured at 10,000 (per pod, 240s after rollout): inst= 4,000/s against
-        # a 100,000/s target, with 53 of 130 batches erroring — a ~40% batch
-        # failure rate. Aggregate across 8 pods was ~30,000/s, an order of
-        # magnitude below where 5,000 had been running.
-        #
-        # The errors are 1213 (deadlock) and 1205 (lock-wait timeout), NOT the
-        # 1153 max_allowed_packet breach the previous note worried about. Those
-        # two errnos are retried silently in worker() and never printed, so they
-        # only show up in the `errors=` counter — which is why this looked like a
-        # stall rather than an error storm. Each rollback discards the entire
-        # multi-row statement, so a failed batch costs BATCH_ROWS rows off the
-        # achieved rate, and the 4 retry attempts serialize behind the same
-        # contention that caused the first failure.
-        #
-        # RDS was NOT the wall here, which is what makes this conclusive: during
-        # the 10,000 run WriteIOPS sat at 7,900-11,800 of 64,000 provisioned
-        # (~18%), WriteThroughput ~134-205 MB/s of 2,500, and WriteLatency 0.
-        # Storage had ~5x headroom and the generator still could not use it.
-        # DiskQueueDepth 18-76 alongside idle IOPS is the signature of requests
-        # queued behind lock waits rather than behind the device.
-        #
         # 5,000 is the measured optimum for this workload shape. Do not raise it
-        # again without also reducing concurrency (THREADS x replicas); the two
+        # without also reducing concurrency (THREADS x replicas); the two
         # multiply into the collision rate.
         - name: BATCH_ROWS
-          value: "5000"
+          value: "2000"
+        # Of the rows that are NOT recent re-writes (1 - RECENT_KEY_RATIO = 40%),
+        # 90% update a hot/cold key from pick_key() and 10% are new inserts.
+        # Stream-wide that is at most 60% recent re-writes, 36% hot/cold upserts
+        # and 4% inserts (the simulation achieved ~55% recent; a short buffer
+        # hands its rows to this split), so the source tables grow at ~4-5% of
+        # the row rate. Raised 0.5 -> 0.9 on 2026-11-02: at 0.5 (50% inserts, no
+        # recent re-writes) 4 pods inserted ~370M rows in 4 h, the tables
+        # outgrew the buffer pool and the rate fell from ~85K to ~30K rows/s.
         - name: UPSERT_RATIO
-          value: "0.5"
+          value: "0.9"
+        # 2026-11-02, Iceberg v3. Share of each batch that re-writes a key this
+        # thread wrote in the last RECENT_KEY_MAX_AGE_S seconds, so that about
+        # half of the Iceberg writer's deletes become POSITION deletes (DVs on
+        # v3) instead of the ~2% measured before (orders: 0.5M position vs 28.3M
+        # equality). 0.6 rather than 0.5 because not every re-write can be
+        # served or lands in the same checkpoint; the derivation and the offline
+        # simulation (0.47-0.51 position share at 1,000-2,000 rows/s per thread)
+        # are in the RECENT_KEY_RATIO note in the script. A design target, not a
+        # measurement: check added-position-deletes against
+        # added-equality-deletes in the Iceberg snapshot summaries and adjust.
+        #
+        # Expected side effects, not yet measured: re-written rows are hot in
+        # the buffer pool and were committed by this same connection, so there is
+        # no new read I/O and no new row-lock contention; but fewer rows are new
+        # inserts and more are updates (an update writes undo + redo for the old
+        # row image), so achieved rows/s may shift either way. Paimon receives
+        # the same stream and collapses the repeats in its write buffer, which
+        # is the intended asymmetry, not a Paimon problem.
+        - name: RECENT_KEY_RATIO
+          value: "0.3"
+        # Well under the 60s checkpoint interval: a re-write of a key last
+        # written a seconds ago shares its checkpoint with probability 1 - a/60.
+        - name: RECENT_KEY_MAX_AGE_S
+          value: "20"
+        # Batches in a row a thread spends on one table. Long-run table mix is
+        # unchanged; it keeps the previous same-table batch one batch back so the
+        # small tables (products 10%, customers 15%) get recent keys too. 1 is the
+        # old one-draw-per-batch behaviour.
+        - name: TABLE_RUN_BATCHES
+          value: "8"
+        # 2026-11-03. Share of every orders / order_items batch that is a DELETE
+        # of existing keys (customers / products are never deleted: their FKs are
+        # RESTRICT and they have children). Stream-wide ~3.75% of rows, plus the
+        # items deleted with their orders. Roughly matches the ~4-5% insert share
+        # so the fact tables stay near their size. The deletes are drawn
+        # recent/older like the writes, so the Iceberg position-delete share stays
+        # ~50% (simulation: 0.47-0.50 at 1,000-2,000 rows/s per thread, about one
+        # point under the same run without deletes). FK handling, the
+        # FK_PARENT_MOD pool and ORDER_DELETE_MAX_ITEMS are explained in the
+        # script's Deletes note. 0 turns deletes off. Not yet measured on RDS.
+        - name: DELETE_RATIO
+          value: "0.05"
         # 0.6 -> 0.95, and the window 50,000 -> 2,000,000. Together these took
         # aggregate throughput from ~15,000 rows/s to ~58,300 (3.9x). Both move
         # the same direction, for two different reasons:
@@ -724,7 +1181,7 @@ spec:
         # comparison exists to measure is preserved, and in fact strengthened,
         # since a larger share of writes is now repeat-key.
         - name: HOT_KEY_RATIO
-          value: "0.6"
+          value: "0.3"
         # 5,000,000 — sized to the BUFFER POOL, which is the constraint that
         # actually governs this number. Everything above is still true, but it
         # missed the ceiling: a window only behaves as "hot" while the rows it
@@ -764,14 +1221,14 @@ spec:
         # Re-derive this if the instance class or row width changes:
         #   window = 0.65 x buffer_pool_bytes / avg_row_bytes
         - name: HOT_KEY_WINDOW
-          value: "5000000"
+          value: "20000000"
         - name: REPORT_SECONDS
           value: "15"
         # Run forever. Was 3600 for a bounded one-hour measurement, but the
         # StatefulSet restarts each pod the moment it self-exits, so the pods
         # cycled 4-5 times and every "average rows/sec" reading was diluted by
         # a fresh ramp-up. Bound a measurement window by scaling the StatefulSet
-        # down instead, which stops all 8 pods at the same moment without the
+        # down instead, which stops all pods at the same moment without the
         # restart loop.
         - name: DURATION_SECONDS
           value: "0"
@@ -781,7 +1238,7 @@ spec:
         # convoy comes back; if it drifts high, part of the window goes unwritten
         # (harmless, just less hot-key pressure than intended).
         - name: POD_COUNT
-          value: "8"
+          value: "24"
         - name: SHARD_HOT_KEYS
           value: "true"
         # Pure-Python protocol fallback. Leave false to use the C extension,

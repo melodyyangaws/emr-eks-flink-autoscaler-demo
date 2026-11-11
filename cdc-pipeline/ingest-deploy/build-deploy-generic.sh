@@ -1,0 +1,958 @@
+#!/bin/bash
+###############################################################################
+# Generic Flink CDC Deployment Script
+#
+# Supports deploying to:
+# - Paimon lakehouse (file-based catalog on S3)
+# - Iceberg lakehouse (AWS Glue catalog)
+# - Both lakehouses simultaneously
+#
+# Uses generic SQL executor with modular SQL scripts
+###############################################################################
+
+set -e
+# Every path below (sql-scripts/, k8s/, docker/, the templates and their
+# *-deployed.yaml renders) is relative to this directory, cdc-pipeline/ingest-deploy/.
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" >&2
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+# Default values
+LAKEHOUSE_FORMAT=${LAKEHOUSE_FORMAT:-both}
+
+# Default the region rather than leaving it unset. An empty AWS_REGION renders
+# empty into the manifests, and the AWS SDK then silently falls back to
+# us-east-1 ("No region info found, using SDK default region: us-east-1") — which
+# does not fail loudly, it hangs on cross-region Glue calls.
+export AWS_REGION=${AWS_REGION:-us-west-2}
+export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
+
+# EMR on EKS release of the base image AND the emrReleaseLabel. 7.14.0 is the
+# newest release with Flink (EMR 8.x is Spark-only): Flink 1.20.0-amzn-8, Java 17.
+export EMR_VERSION=${EMR_VERSION:-7.14.0}
+
+# Table set selection. On this branch the DEFAULT is the Iceberg v3 set:
+#   (defaults)                                -> format v3, *_v3 databases + state
+#   ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX=    -> the original v2 set
+#
+# ICEBERG_FORMAT_VERSION: Iceberg table format version written by the sink DDL
+# (2 or 3). Rendered into both JobManagers; the executor substitutes it into
+# sql-scripts/iceberg/*.sql. An existing table cannot change format, so v3 and
+# v2 runs need different SESSION_SUFFIX values (fresh Glue DBs and Flink state).
+export ICEBERG_FORMAT_VERSION=${ICEBERG_FORMAT_VERSION:-3}
+
+# SESSION_SUFFIX: appended to both Glue database names
+# (flink_paimon_db${SESSION_SUFFIX}, flink_iceberg_db${SESSION_SUFFIX}) and to the
+# Flink checkpoint / savepoint / HA / log paths (flink/cdc-paimon${SESSION_SUFFIX}/
+# ...), so one table set never touches, or restores state from, another.
+# When UNSET, taken from cdc-pipeline/.bench-env (the value the query benchmark
+# and the monitor use), else empty. It names the session only; the Iceberg format
+# version is ICEBERG_FORMAT_VERSION.
+if [[ -z "${SESSION_SUFFIX+set}" ]]; then
+    SESSION_SUFFIX=$(bash -c 'source "$1" >/dev/null 2>&1 || exit 1; [[ -n "${SESSION_SUFFIX+set}" ]] || exit 1; printf %s "$SESSION_SUFFIX"' \
+                      _ "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.bench-env") || SESSION_SUFFIX=""
+fi
+export SESSION_SUFFIX
+
+# PAIMON_DV_BITMAP64: Paimon 'deletion-vectors.bitmap64', derived from the
+# format version and not a setting of its own. The v3 export needs 64-bit DVs;
+# StarRocks' native Paimon reader cannot decode them, so v2 gets false.
+if [[ "$ICEBERG_FORMAT_VERSION" == "3" ]]; then PAIMON_DV_BITMAP64=true; else PAIMON_DV_BITMAP64=false; fi
+export PAIMON_DV_BITMAP64
+
+# Check required environment variables
+check_env_vars() {
+    log "Checking required environment variables..."
+
+    local required_vars=(
+        "AWS_REGION"
+        "AWS_ACCOUNT_ID"
+        "BUCKET_NAME"
+        "EMR_EXECUTION_ROLE_ARN"
+    )
+    # MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD are never needed here: the writers
+    # read them from Secret ${MYSQL_ENV_SECRET_NAME} (envFrom) at pod start. Port
+    # and database are rendered.
+    export MYSQL_PORT="${MYSQL_PORT:-3306}" MYSQL_DATABASE="${MYSQL_DATABASE:-ecommerce}"
+    [[ "$MYSQL_PORT" =~ ^[0-9]+$ ]] || error "MYSQL_PORT must be a number (got '${MYSQL_PORT}')"
+    [[ "$MYSQL_DATABASE" =~ ^[A-Za-z0-9_]+$ ]] || error "MYSQL_DATABASE must be a plain identifier (got '${MYSQL_DATABASE}')"
+
+    local missing_vars=()
+    for var in "${required_vars[@]}"; do
+        if [[ -z "${!var}" ]]; then
+            missing_vars+=("$var")
+        fi
+    done
+
+    # Both values end up inside S3 paths, Glue database names and SQL
+    # identifiers, so reject anything that is not a plain identifier fragment.
+    [[ "$ICEBERG_FORMAT_VERSION" =~ ^[23]$ ]] || \
+        error "ICEBERG_FORMAT_VERSION must be 2 or 3 (got '${ICEBERG_FORMAT_VERSION}')"
+    # Same rule as lib/common.sh and monitoring/deploy-monitor.sh: empty or < 100 characters.
+    (( ${#SESSION_SUFFIX} < 100 )) || error "SESSION_SUFFIX must be empty or under 100 characters (got ${#SESSION_SUFFIX})"
+
+    # Paimon write path, as INSERT hints (04-cdc-pipelines.sql), so they apply to
+    # existing tables too. Buffer defaults = 2 x each table's target file size
+    # (32 MiB dimension / 64 MiB fact tables), so 64mb / 128mb.
+    # PAIMON_WRITE_ONLY=true turns off inline compaction AND snapshot expiry: files
+    # and snapshots then pile up until something compacts the tables; say so with
+    # any result. PAIMON_WRITE_BUFFER_SIZE (e.g. 256mb) overrides every table;
+    # unset, the dimension tables get 64mb and the fact tables 128mb.
+    export PAIMON_WRITE_ONLY="${PAIMON_WRITE_ONLY:-false}"
+    export PAIMON_WRITE_BUFFER_SPILLABLE="${PAIMON_WRITE_BUFFER_SPILLABLE:-true}"
+    export PAIMON_WRITE_BUFFER_SIZE_DIM="${PAIMON_WRITE_BUFFER_SIZE:-64mb}"
+    export PAIMON_WRITE_BUFFER_SIZE_FACT="${PAIMON_WRITE_BUFFER_SIZE:-128mb}"
+    local v
+    for v in PAIMON_WRITE_ONLY PAIMON_WRITE_BUFFER_SPILLABLE; do
+        [[ "${!v}" == true || "${!v}" == false ]] || error "$v must be true or false (got '${!v}')"
+    done
+    [[ "$PAIMON_WRITE_BUFFER_SIZE_DIM" =~ ^[0-9]+(kb|mb|gb)$ ]] || \
+        error "PAIMON_WRITE_BUFFER_SIZE must be a Paimon MemorySize like '256mb' (got '${PAIMON_WRITE_BUFFER_SIZE}')"
+    # S3A upload shape for Paimon's S3FileIO (catalog options in
+    # sql-scripts/paimon/01-catalog-setup.sql). Paimon builds its S3AFileSystem
+    # from a bare Configuration, so EMR's core-site.xml never applies; without
+    # these, hadoop-aws's own defaults do. Same defaults as throughput-benchmark.
+    export S3A_MULTIPART_SIZE="${S3A_MULTIPART_SIZE:-16M}"
+    export S3A_MULTIPART_THRESHOLD="${S3A_MULTIPART_THRESHOLD:-16M}"
+    export S3A_ACTIVE_BLOCKS="${S3A_ACTIVE_BLOCKS:-6}"
+    for v in S3A_MULTIPART_SIZE S3A_MULTIPART_THRESHOLD; do
+        [[ "${!v}" =~ ^[0-9]+[KMG]$ ]] || error "$v must be a Hadoop size like '16M' (got '${!v}')"
+    done
+    [[ "$S3A_ACTIVE_BLOCKS" =~ ^[0-9]+$ ]] || error "S3A_ACTIVE_BLOCKS must be an integer (got '${S3A_ACTIVE_BLOCKS}')"
+    # The same upload shape for Iceberg's S3FileIO, DERIVED so the formats cannot
+    # drift (a fair-comparison variable): part size in bytes; one pool per JVM,
+    # so active blocks x 4 slots per TaskManager.
+    local n="${S3A_MULTIPART_SIZE%?}" u="${S3A_MULTIPART_SIZE: -1}"
+    case "$u" in K) n=$(( n * 1024 )) ;; M) n=$(( n * 1024 * 1024 )) ;; G) n=$(( n * 1024 * 1024 * 1024 )) ;; esac
+    export ICEBERG_S3_MULTIPART_SIZE_BYTES="${ICEBERG_S3_MULTIPART_SIZE_BYTES:-$n}"
+    export ICEBERG_S3_MULTIPART_THREADS="${ICEBERG_S3_MULTIPART_THREADS:-$(( S3A_ACTIVE_BLOCKS * 4 ))}"
+    (( ICEBERG_S3_MULTIPART_SIZE_BYTES >= 5 * 1024 * 1024 )) || \
+        error "S3A_MULTIPART_SIZE must be >= 5M (S3A and S3FileIO floor; got ${S3A_MULTIPART_SIZE})"
+
+    if [[ ${#missing_vars[@]} -gt 0 ]]; then
+        error "Missing required environment variables: ${missing_vars[*]}"
+    fi
+
+    log "✓ All required environment variables are set"
+}
+
+# Display configuration
+display_config() {
+    log "Configuration:"
+    echo "  AWS Region:       $AWS_REGION"
+    echo "  AWS Account ID:   $AWS_ACCOUNT_ID"
+    echo "  S3 Bucket:        $BUCKET_NAME"
+    echo "  MySQL:            ${MYSQL_DATABASE} on port ${MYSQL_PORT}; host/user/password from Secret ${MYSQL_ENV_SECRET_NAME:-mysql-credentials}"
+    echo "  Namespace:        ${NAMESPACE:-emr-flink}"
+    echo "  EMR Version:      ${EMR_VERSION}"
+    echo "  Lakehouse Format: ${LAKEHOUSE_FORMAT}"
+    echo "  DB/state suffix:  ${SESSION_SUFFIX:-(none)}"
+
+    if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
+        echo "  Paimon Warehouse: s3://${BUCKET_NAME}/paimon-warehouse/"
+        echo "  Paimon Database:  flink_paimon_db${SESSION_SUFFIX}"
+        echo "  Paimon write:     write-only=${PAIMON_WRITE_ONLY} spillable=${PAIMON_WRITE_BUFFER_SPILLABLE} buffer=${PAIMON_WRITE_BUFFER_SIZE_DIM}/${PAIMON_WRITE_BUFFER_SIZE_FACT} (dim/fact)"
+        echo "  S3A upload:       multipart ${S3A_MULTIPART_SIZE} (threshold ${S3A_MULTIPART_THRESHOLD}), ${S3A_ACTIVE_BLOCKS} active blocks/stream, disk buffer"
+        echo "  Paimon DV 64-bit: ${PAIMON_DV_BITMAP64}"
+    fi
+
+    if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
+        echo "  Iceberg Warehouse: s3://${BUCKET_NAME}/iceberg-warehouse/"
+        echo "  Glue Databases:    flink_paimon_db${SESSION_SUFFIX}, flink_iceberg_db${SESSION_SUFFIX}"
+        echo "  Iceberg format:    v${ICEBERG_FORMAT_VERSION}"
+    fi
+}
+
+# Create ECR repository
+create_ecr_repo() {
+    local repo_name=$1
+    log "Creating ECR repository: $repo_name"
+
+    if aws ecr describe-repositories --repository-names "$repo_name" --region "$AWS_REGION" &>/dev/null; then
+        log "✓ ECR repository already exists: $repo_name"
+    else
+        aws ecr create-repository \
+            --repository-name "$repo_name" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "$AWS_REGION" || error "Failed to create ECR repository"
+        log "✓ ECR repository created: $repo_name"
+    fi
+}
+
+# Build and push the Flink CDC image.
+#
+# The build always runs in-cluster with Kaniko — there is no local-docker path.
+# The image is ~6 GB, more than a typical laptop has free, and building remotely
+# means no Docker daemon, no ECR docker login, and no dependence on the laptop's
+# architecture. Requires ServiceAccount image-builder-sa in $NAMESPACE (IRSA ->
+# a role allowed to push to ECR and read the build context from S3).
+build_and_push_image() {
+    local emr_version=${EMR_VERSION}
+    local repo_name="emr-flink-cdc-paimon"
+    # Tag must match the image reference in flink-cdc-*-sql.yaml (:${IMAGE_TAG})
+    local image_tag=${IMAGE_TAG:-$emr_version}
+    local image_uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}:${image_tag}"
+
+    create_ecr_repo "$repo_name"
+
+    # Multi-platform build. PLATFORMS is a space-separated list of GOARCH values.
+    # Default to both because executor-memorynodepool provisions Graviton
+    # (m8g/m9g/m9gd) as well as x86: a single-arch image leaves TaskManagers
+    # dying with exitCode=255 on whichever arch it lacks, and the JobManager
+    # survives, so the job churns TaskManagers and surfaces a misleading
+    # NoResourceAvailableException.
+    local platforms=${PLATFORMS:-"amd64 arm64"}
+
+    # One Kaniko pod per architecture, each scheduled ON that architecture.
+    # Kaniko cannot cross-build (it executes the Dockerfile's RUN steps natively)
+    # and cannot emit a manifest list, so each arch is built separately and the
+    # results are stitched into one index afterwards.
+    #
+    # Kaniko can only push to a tag, never to a bare digest, so each arch build
+    # lands on a throwaway tag first. Those tags are deleted once the index is
+    # published — the repository is left with exactly ONE tag, ${image_tag},
+    # which is a manifest list serving both architectures. The per-arch child
+    # manifests stay reachable by digest through the index; ECR does not garbage
+    # collect a manifest that an index in the same repository references.
+    local count=0 arch
+    for arch in $platforms; do
+        build_image_with_kaniko "$repo_name" "${image_uri}-${BUILD_TAG_SUFFIX}${arch}" \
+            "$emr_version" "$arch"
+        count=$((count + 1))
+    done
+
+    if [[ $count -eq 1 ]]; then
+        # Single platform requested: retag rather than build a pointless index.
+        retag_image "$repo_name" "${image_tag}-${BUILD_TAG_SUFFIX}${platforms}" "$image_tag"
+    else
+        create_manifest_list "$repo_name" "$image_tag" "$platforms"
+    fi
+
+    delete_build_tags "$repo_name" "$image_tag" "$platforms"
+
+    log "✓ Image built and pushed: $image_uri (single tag, ${platforms// //})"
+    echo "$image_uri"
+}
+
+# Prefix for the disposable per-arch tags. Anything under this prefix is build
+# scaffolding, never something a manifest should reference.
+BUILD_TAG_SUFFIX="buildstage-"
+
+# Drop the throwaway per-arch tags so the repository shows only the single
+# multi-arch tag.
+#
+# batch-delete-image on a per-arch tag is REJECTED once the index exists:
+#   ImageReferencedByManifestList: Requested image referenced by manifest list
+# ECR treats "delete this tag" as "delete this digest" when the tag is the only
+# reference, and it refuses because the published index points at that digest.
+#
+# The way through is to first re-point each per-arch tag at the INDEX digest
+# (put-image with the same tag but the manifest-list body — ECR allows moving a
+# tag). The tag is then just a duplicate alias of ${image_tag}, deleting it
+# touches no unique digest, and the child manifests are left untagged but still
+# referenced by the index, which is exactly how buildx leaves a repository.
+#
+# Note there is deliberately no lifecycle policy expiring untagged images on
+# this repository: such a rule WOULD delete these children and silently break
+# the multi-arch tag.
+# The manifest list (index) body stored under <repo>:<tag>; empty or "None"
+# when the tag is missing or is not a manifest list.
+get_index_manifest() {
+    local repo_name=$1 image_tag=$2
+    aws ecr batch-get-image --repository-name "$repo_name" \
+        --image-ids imageTag="$image_tag" \
+        --accepted-media-types \
+            "application/vnd.docker.distribution.manifest.list.v2+json" \
+            "application/vnd.oci.image.index.v1+json" \
+        --region "$AWS_REGION" \
+        --query 'images[0].imageManifest' --output text 2>/dev/null
+}
+
+delete_build_tags() {
+    local repo_name=$1 image_tag=$2 platforms=$3
+    local arch ids=()
+
+    local list
+    list=$(get_index_manifest "$repo_name" "$image_tag")
+
+    if [[ -n "$list" && "$list" != "None" ]]; then
+        for arch in $platforms; do
+            # Move the build tag onto the index digest, making it redundant.
+            aws ecr put-image --repository-name "$repo_name" \
+                --image-tag "${image_tag}-${BUILD_TAG_SUFFIX}${arch}" \
+                --image-manifest "$list" \
+                --image-manifest-media-type \
+                    "application/vnd.docker.distribution.manifest.list.v2+json" \
+                --region "$AWS_REGION" >/dev/null 2>&1 || true
+            ids+=("imageTag=${image_tag}-${BUILD_TAG_SUFFIX}${arch}")
+        done
+
+        aws ecr batch-delete-image \
+            --repository-name "$repo_name" \
+            --image-ids "${ids[@]}" \
+            --region "$AWS_REGION" >/dev/null 2>&1 || true
+    fi
+
+    verify_multiarch_tag "$repo_name" "$image_tag" "$platforms"
+}
+
+# Confirm ${image_tag} is still a manifest list and that every child manifest is
+# still pullable by digest after the build tags were removed. Without this the
+# tag cleanup could silently leave a dangling index that only fails at pod
+# scheduling time, which is exactly the class of failure that cost a day here
+# (an arch mismatch surfaces as NoResourceAvailableException, naming neither the
+# image nor the architecture).
+verify_multiarch_tag() {
+    local repo_name=$1 image_tag=$2 platforms=$3
+
+    local list
+    list=$(get_index_manifest "$repo_name" "$image_tag")
+    [[ -n "$list" && "$list" != "None" ]] || \
+        error "${repo_name}:${image_tag} is not a manifest list"
+
+    local arch
+    for arch in $platforms; do
+        local child_digest
+        child_digest=$(printf '%s' "$list" | python3 -c "
+import sys, json
+arch = '$arch'
+for m in json.load(sys.stdin)['manifests']:
+    if m['platform']['architecture'] == arch:
+        print(m['digest'])
+        break
+")
+        [[ -n "$child_digest" ]] || \
+            error "${repo_name}:${image_tag} has no ${arch} entry"
+        aws ecr batch-get-image --repository-name "$repo_name" \
+            --image-ids imageDigest="$child_digest" --region "$AWS_REGION" \
+            --query 'images[0].imageId.imageDigest' --output text 2>/dev/null \
+            | grep -q "$child_digest" \
+            || error "${arch} child ${child_digest} is no longer pullable from ${repo_name}"
+        log "✓ ${image_tag} -> linux/${arch} ${child_digest:0:19}…"
+    done
+
+    log "✓ Verified ${repo_name}:${image_tag} is one tag serving ${platforms// //}"
+}
+
+# Combine the per-arch tags into one multi-platform manifest list under the
+# plain tag, so Kubernetes pulls the right arch on every node automatically.
+#
+# Done with the ECR API rather than `docker manifest`/`buildx imagetools`: there
+# is deliberately no Docker daemon in this workflow (see build_and_push_image).
+# ECR accepts a manifest list via put-image as long as every child manifest is
+# already present in the repository, which the per-arch builds guarantee.
+create_manifest_list() {
+    local repo_name=$1
+    local image_tag=$2
+    local platforms=$3
+
+    log "Creating multi-platform manifest list ${repo_name}:${image_tag} (${platforms})..."
+
+    local manifests_json="" digest size media_type
+    for arch in $platforms; do
+        # Fetch the child manifest exactly as stored; the digest must be over the
+        # identical bytes ECR holds, so ask for the raw manifest and hash that.
+        local raw
+        raw=$(aws ecr batch-get-image \
+                --repository-name "$repo_name" \
+                --image-ids imageTag="${image_tag}-${BUILD_TAG_SUFFIX}${arch}" \
+                --accepted-media-types \
+                    "application/vnd.docker.distribution.manifest.v2+json" \
+                    "application/vnd.oci.image.manifest.v1+json" \
+                --region "$AWS_REGION" \
+                --query 'images[0].imageManifest' --output text 2>/dev/null) \
+            || error "Could not read manifest for ${image_tag}-${BUILD_TAG_SUFFIX}${arch}"
+        [[ -n "$raw" && "$raw" != "None" ]] || \
+            error "Missing per-arch build-stage image ${image_tag}-${BUILD_TAG_SUFFIX}${arch}; build it first"
+
+        digest="sha256:$(printf '%s' "$raw" | shasum -a 256 | cut -d' ' -f1)"
+        size=$(printf '%s' "$raw" | wc -c | tr -d ' ')
+        media_type=$(printf '%s' "$raw" | python3 -c "import sys,json;print(json.load(sys.stdin)['mediaType'])")
+
+        [[ -n "$manifests_json" ]] && manifests_json+=","
+        manifests_json+="{\"mediaType\":\"${media_type}\",\"size\":${size},\"digest\":\"${digest}\",\"platform\":{\"architecture\":\"${arch}\",\"os\":\"linux\"}}"
+    done
+
+    local list_json="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.list.v2+json\",\"manifests\":[${manifests_json}]}"
+
+    aws ecr put-image \
+        --repository-name "$repo_name" \
+        --image-tag "$image_tag" \
+        --image-manifest "$list_json" \
+        --image-manifest-media-type "application/vnd.docker.distribution.manifest.list.v2+json" \
+        --region "$AWS_REGION" >/dev/null 2>&1 \
+        || aws ecr put-image \
+            --repository-name "$repo_name" \
+            --image-tag "$image_tag" \
+            --image-manifest "$list_json" \
+            --image-manifest-media-type "application/vnd.docker.distribution.manifest.list.v2+json" \
+            --region "$AWS_REGION" >/dev/null \
+        || error "Failed to put manifest list ${repo_name}:${image_tag}"
+
+    log "✓ Manifest list pushed: ${repo_name}:${image_tag}"
+}
+
+# Point an additional tag at an image that is already in the repository, without
+# rebuilding or pulling it.
+retag_image() {
+    local repo_name=$1 source_ref=$2 new_tag=$3
+    # Accepts either a full image URI or a bare tag.
+    local source_tag=${source_ref##*:}
+
+    local raw
+    raw=$(aws ecr batch-get-image --repository-name "$repo_name" \
+            --image-ids imageTag="$source_tag" --region "$AWS_REGION" \
+            --query 'images[0].imageManifest' --output text) \
+        || error "Could not read manifest for ${source_tag}"
+
+    aws ecr put-image --repository-name "$repo_name" --image-tag "$new_tag" \
+        --image-manifest "$raw" --region "$AWS_REGION" >/dev/null 2>&1 || true
+    log "✓ Tagged ${repo_name}:${new_tag} -> ${source_tag}"
+}
+
+# Build the image inside the EKS cluster with Kaniko.
+# The Dockerfile is shipped to S3 as a tarball build context, then a one-shot Pod
+# builds it and pushes straight to ECR.
+build_image_with_kaniko() {
+    local repo_name=$1
+    local image_uri=$2
+    local emr_version=$3
+    # Target architecture (amd64|arm64). The pod is pinned to a node of this arch
+    # so Kaniko runs the Dockerfile's RUN steps natively — it cannot cross-build.
+    local target_arch=${4:-amd64}
+    local namespace=${NAMESPACE:-emr-flink}
+    local pod_name="flink-cdc-image-build-${target_arch}"
+    local context_s3="s3://${BUCKET_NAME}/flink/build/flink-cdc-build-context.tar.gz"
+    local context_tar="/tmp/flink-cdc-build-context.tar.gz"
+
+    log "Building ${target_arch} image in-cluster with Kaniko (namespace: ${namespace})..."
+
+    if ! kubectl get serviceaccount image-builder-sa -n "$namespace" &>/dev/null; then
+        error "ServiceAccount image-builder-sa not found in ${namespace}. It needs an
+       eks.amazonaws.com/role-arn annotation for a role that can push to ECR."
+    fi
+
+    # Pack the Dockerfile and docker/patched-jars/ (the PR #10329 Paimon jars,
+    # git-ignored; patched-jars/README.md): every other dependency is fetched from
+    # Maven/ECR at build time.
+    if ! ls docker/patched-jars/*.jar &>/dev/null; then
+        error "no jar in ingest-deploy/docker/patched-jars/: fetch them with
+       aws s3 cp --recursive s3://${BUCKET_NAME}/flink/build/patched-jars/ ingest-deploy/docker/patched-jars/
+       (or rebuild them, ingest-deploy/docker/patched-jars/README.md)"
+    fi
+    log "Packing build context -> ${context_s3}"
+    tar -czf "$context_tar" -C docker Dockerfile.cdc-paimon patched-jars || error "Failed to pack build context"
+    aws s3 cp "$context_tar" "$context_s3" --region "$AWS_REGION" >&2 || \
+        error "Failed to upload build context to S3"
+
+    kubectl delete pod "$pod_name" -n "$namespace" --ignore-not-found --timeout=120s >&2
+
+    # Pin the builder to the architecture it is building for: Kaniko executes the
+    # Dockerfile's RUN steps in the running container, so an arm64 image must be
+    # assembled on an arm64 node (and vice versa). The Kaniko executor image and
+    # both base images (EMR flink, amazonlinux:2023) are multi-arch, so the same
+    # Dockerfile works unchanged on either — every JAR it downloads is pure Java.
+    kubectl apply -n "$namespace" -f - >&2 <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod_name}
+  namespace: ${namespace}
+spec:
+  restartPolicy: Never
+  serviceAccountName: image-builder-sa
+  nodeSelector:
+    kubernetes.io/arch: ${target_arch}
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.23.2
+    args:
+    - "--context=${context_s3}"
+    - "--dockerfile=Dockerfile.cdc-paimon"
+    - "--destination=${image_uri}"
+    - "--build-arg=EMR_VERSION=${emr_version}"
+    - "--cache=false"
+    - "--verbosity=info"
+    env:
+    - name: AWS_REGION
+      value: ${AWS_REGION}
+    - name: AWS_SDK_LOAD_CONFIG
+      value: "true"
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi
+    volumeMounts:
+    - name: workspace
+      mountPath: /kaniko/.cache
+  volumes:
+  - name: workspace
+    emptyDir:
+      sizeLimit: 40Gi
+EOF
+
+    log "Waiting for Kaniko build to finish (this takes several minutes)..."
+    local deadline=$((SECONDS + 1800))
+    local phase=""
+    while (( SECONDS < deadline )); do
+        phase=$(kubectl get pod "$pod_name" -n "$namespace" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        case "$phase" in
+            Succeeded) log "✓ Kaniko ${target_arch} build succeeded"; return 0 ;;
+            Failed)
+                kubectl logs "$pod_name" -n "$namespace" --tail=60 >&2 || true
+                error "Kaniko ${target_arch} build failed (pod ${pod_name})" ;;
+        esac
+        sleep 20
+    done
+
+    error "Kaniko ${target_arch} build timed out after 30m (pod ${pod_name}, last phase: ${phase:-unknown})"
+}
+
+# Upload PyFlink executor and SQL scripts to S3
+upload_scripts_to_s3() {
+    log "Uploading PyFlink executor and SQL scripts to S3..."
+
+    # Upload generic executor
+    local executor_s3_path="s3://${BUCKET_NAME}/flink/scripts/flink-cdc-executor.py"
+    aws s3 cp flink-cdc-executor.py "$executor_s3_path" --region "$AWS_REGION" || \
+        error "Failed to upload executor to S3"
+    log "✓ Executor uploaded: $executor_s3_path"
+
+    # Upload common CDC source scripts
+    aws s3 sync sql-scripts/common/ "s3://${BUCKET_NAME}/flink/sql-scripts/common/" \
+        --region "$AWS_REGION" --delete || \
+        error "Failed to upload common SQL scripts"
+    log "✓ Common SQL scripts uploaded"
+
+   # Upload Paimon scripts if needed
+    if [[ "$LAKEHOUSE_FORMAT" == "paimon" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
+        aws s3 sync sql-scripts/paimon/ "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/" \
+            --region "$AWS_REGION" --delete || \
+            error "Failed to upload Paimon SQL scripts"
+
+        # Copy common scripts to Paimon directory
+        aws s3 cp "s3://${BUCKET_NAME}/flink/sql-scripts/common/02-cdc-sources.sql" \
+            "s3://${BUCKET_NAME}/flink/sql-scripts/paimon/02-cdc-sources.sql" \
+            --region "$AWS_REGION"
+        log "✓ Paimon SQL scripts uploaded"
+    fi
+
+    # Upload Iceberg scripts if needed
+    if [[ "$LAKEHOUSE_FORMAT" == "iceberg" || "$LAKEHOUSE_FORMAT" == "both" ]]; then
+        aws s3 sync sql-scripts/iceberg/ "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/" \
+            --region "$AWS_REGION" --delete || \
+            error "Failed to upload Iceberg SQL scripts"
+        
+        # Copy common scripts to Iceberg directory
+        aws s3 cp "s3://${BUCKET_NAME}/flink/sql-scripts/common/02-cdc-sources.sql" \
+            "s3://${BUCKET_NAME}/flink/sql-scripts/iceberg/02-cdc-sources.sql" \
+            --region "$AWS_REGION"    
+        log "✓ Iceberg SQL scripts uploaded"
+    fi
+}
+
+# Create AWS Glue database for Iceberg
+create_glue_database() {
+    local glue_db="flink_iceberg_db${SESSION_SUFFIX}"
+
+    log "Creating AWS Glue database: $glue_db"
+
+    # Check if database exists
+    if aws glue get-database --name "$glue_db" --region "$AWS_REGION" &>/dev/null; then
+        log "✓ Glue database already exists: $glue_db"
+    else
+        aws glue create-database \
+            --database-input "{\"Name\":\"$glue_db\",\"Description\":\"Flink CDC Iceberg lakehouse\"}" \
+            --region "$AWS_REGION" || error "Failed to create Glue database"
+        log "✓ Glue database created: $glue_db"
+    fi
+}
+
+# Create the "ebs-sc" StorageClass that task-local recovery by EBS needs.
+#
+# One-off, cluster-scoped, idempotent: run it once per EKS cluster. With
+# `task.local-recovery.ebs.enable: "true"` EMR auto-creates one PVC per
+# TaskManager with the hardcoded storageClassName "ebs-sc" — the name is not
+# configurable. Without the class, TaskManager pods stay Pending with
+# "failed to get storage class, StorageClass storage.k8s.io \"ebs-sc\" not found".
+# Neither writer enables local recovery any more (state.backend.type: hashmap
+# since 2026-11-02), so nothing in this pipeline uses the class today; the step
+# is kept so render/deploy still leave the cluster as before.
+create_ebs_storage_class() {
+    local manifest="k8s/ebs-sc-storageclass.yaml"
+
+    if kubectl get storageclass ebs-sc &>/dev/null; then
+        log "✓ StorageClass ebs-sc already exists"
+        return 0
+    fi
+
+    log "Creating StorageClass ebs-sc (gp3) for Flink task-local recovery..."
+    [[ -f "$manifest" ]] || error "Manifest not found: $manifest"
+    kubectl apply -f "$manifest" >&2 || error "Failed to create StorageClass ebs-sc"
+    log "✓ StorageClass ebs-sc created"
+}
+
+# Install Kyverno and the single-AZ policy for Flink CDC jobs.
+#
+# One-off, cluster-scoped, idempotent: run it once per EKS cluster. Karpenter
+# chooses an AZ per node independently, so without this a job's JobManager and
+# TaskManagers land in different AZs — cross-AZ transfer cost on every heartbeat
+# and shuffle, and an unfair paimon-vs-iceberg comparison when only one of the two
+# jobs happens to be split. The policy mutates TaskManager pods with a required
+# zone podAffinity keyed on the per-deployment label
+# eks-subscription.amazonaws.com/emr.internal.id. See
+# k8s/kyverno-flink-az-affinity.yaml for the full rationale.
+install_kyverno_az_policy() {
+    local policy="k8s/kyverno-flink-az-affinity.yaml"
+
+    if kubectl get crd clusterpolicies.kyverno.io &>/dev/null; then
+        log "✓ Kyverno already installed"
+    else
+        log "Installing Kyverno via Helm..."
+        command -v helm >/dev/null || error "helm not found; needed to install Kyverno"
+        helm repo add kyverno https://kyverno.github.io/kyverno/ >&2 2>/dev/null || true
+        helm repo update kyverno >&2 || true
+        helm upgrade --install kyverno kyverno/kyverno \
+            --namespace kyverno --create-namespace --wait --timeout 10m >&2 || \
+            error "Failed to install Kyverno"
+        log "✓ Kyverno installed"
+    fi
+
+    log "Applying ClusterPolicy flink-cdc-single-az..."
+    [[ -f "$policy" ]] || error "Policy not found: $policy"
+    kubectl apply -f "$policy" >&2 || error "Failed to apply $policy"
+    log "✓ ClusterPolicy flink-cdc-single-az applied"
+}
+
+# Generate FlinkDeployment YAML
+generate_flink_deployment() {
+    local format=$1
+    local template_file="flink-cdc-${format}-sql.yaml"
+    local output_file="flink-cdc-${format}-deployed.yaml"
+
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] Generating FlinkDeployment manifest for ${format}..." >&2
+
+    if [[ ! -f "$template_file" ]]; then
+        error "Template file not found: $template_file"
+    fi
+
+    # Substitute environment variables.
+    # NOTE: MYSQL_PASSWORD is deliberately NOT substituted — the manifest pulls it
+    # in via `envFrom: secretRef: ${MYSQL_ENV_SECRET_NAME}` so no credential is
+    # ever written to the generated file.
+    #
+    # CAPACITY: driver-nodepool needs limits.cpu >= 256 to host BOTH jobs. Each job
+    # is parallelism 16 / 4 slots per TM = 4 TMs x (4 cpu, 32Gi), plus a 4-cpu/16Gi
+    # JM, so the pair needs ~40 cpu and ~288Gi of schedulable room. At the original
+    # limits.cpu: 128 the pool wedged: Karpenter counts the limit against PROVISIONED
+    # NODE CAPACITY, not pod requests, so 5 nodes (127.3 allocatable cpu) exhausted it
+    # while only 55.5 cpu was actually requested. New TMs then failed to schedule
+    #   "all available instance types exceed limits for nodepool (NodePool=driver-nodepool)"
+    # and the job sat at RUNNING with half its tasks never deployed (209/408 running,
+    # 189 failed), aborting every checkpoint with "Not all required tasks are
+    # currently running" -- no error, no restart, just a silent stall. Karpenter drift
+    # eviction made it worse, cycling TMs 778 times because replacements had nowhere
+    # to land. Raise with:
+    #   kubectl patch nodepool driver-nodepool --type=merge -p '{"spec":{"limits":{"cpu":256}}}'
+    # Pass the value UNQUOTED: '{"cpu":"256"}' is parsed as a quantity and can land as
+    # 25600. Verify with: kubectl get nodepool driver-nodepool -o jsonpath='{.spec.limits}'
+    sed -e "s|\${AWS_REGION}|${AWS_REGION}|g" \
+        -e "s|\${AWS_ACCOUNT_ID}|${AWS_ACCOUNT_ID}|g" \
+        -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
+        -e "s|\${EMR_EXECUTION_ROLE_ARN}|${EMR_EXECUTION_ROLE_ARN}|g" \
+        -e "s|\${EMR_VERSION}|${EMR_VERSION}|g" \
+        -e "s|\${IMAGE_TAG}|${IMAGE_TAG:-${EMR_VERSION}}|g" \
+        -e "s|\${ICEBERG_FORMAT_VERSION}|${ICEBERG_FORMAT_VERSION}|g" \
+        -e "s|\${SESSION_SUFFIX}|${SESSION_SUFFIX}|g" \
+        -e "s|\${PAIMON_DV_BITMAP64}|${PAIMON_DV_BITMAP64}|g" \
+        -e "s|\${MYSQL_PORT}|${MYSQL_PORT}|g" \
+        -e "s|\${MYSQL_DATABASE}|${MYSQL_DATABASE}|g" \
+        -e "s|\${MYSQL_ENV_SECRET_NAME}|${MYSQL_ENV_SECRET_NAME:-mysql-credentials}|g" \
+        -e "s|\${JM_NODEPOOL}|${JM_NODEPOOL:-driver-nodepool}|g" \
+        -e "s|\${TM_NODEPOOL}|${TM_NODEPOOL:-executor-memorynodepool}|g" \
+        -e "s|\${PAIMON_WRITE_ONLY}|${PAIMON_WRITE_ONLY}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SPILLABLE}|${PAIMON_WRITE_BUFFER_SPILLABLE}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SIZE_DIM}|${PAIMON_WRITE_BUFFER_SIZE_DIM}|g" \
+        -e "s|\${PAIMON_WRITE_BUFFER_SIZE_FACT}|${PAIMON_WRITE_BUFFER_SIZE_FACT}|g" \
+        -e "s|\${S3A_MULTIPART_SIZE}|${S3A_MULTIPART_SIZE}|g" \
+        -e "s|\${S3A_MULTIPART_THRESHOLD}|${S3A_MULTIPART_THRESHOLD}|g" \
+        -e "s|\${S3A_ACTIVE_BLOCKS}|${S3A_ACTIVE_BLOCKS}|g" \
+        -e "s|\${ICEBERG_S3_MULTIPART_SIZE_BYTES}|${ICEBERG_S3_MULTIPART_SIZE_BYTES}|g" \
+        -e "s|\${ICEBERG_S3_MULTIPART_THREADS}|${ICEBERG_S3_MULTIPART_THREADS}|g" \
+        "$template_file" > "$output_file"
+
+    # Fail loudly on an unsubstituted or empty placeholder. Left alone, an empty
+    # region or bucket renders as a blank value that Kubernetes accepts happily
+    # and the job only fails minutes later, with an error naming a heartbeat
+    # timeout rather than the missing variable.
+    if grep -qE '\$\{[A-Z_]+\}' "$output_file"; then
+        error "Unsubstituted placeholders remain in ${output_file}:
+$(grep -nE '\$\{[A-Z_]+\}' "$output_file" | head)"
+    fi
+    if grep -qE '^\s+value: ""\s*$' "$output_file"; then
+        error "Empty env value(s) rendered into ${output_file}:
+$(grep -nB2 -E '^\s+value: ""\s*$' "$output_file" | head)"
+    fi
+
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ✓ FlinkDeployment manifest generated: $output_file" >&2
+    echo "$output_file"
+}
+
+# Deploy FlinkDeployment
+deploy_flink_job() {
+    local namespace=${NAMESPACE:-emr-flink}
+    local manifest_file=$1
+
+    log "Deploying FlinkDeployment to Kubernetes..."
+
+    kubectl apply -f "$manifest_file" -n "$namespace" || \
+        error "Failed to deploy FlinkDeployment"
+
+    log "✓ FlinkDeployment applied successfully"
+}
+
+# Monitor deployment status
+monitor_deployment() {
+    local namespace=${NAMESPACE:-emr-flink}
+    local deployment_name=$1
+
+    log "Monitoring deployment status for: $deployment_name"
+    echo ""
+
+    log "FlinkDeployment status:"
+    kubectl get flinkdeployment "$deployment_name" -n "$namespace" || true
+
+    echo ""
+    log "Pods:"
+    kubectl get pods -n "$namespace" -l app="$deployment_name" || true
+
+    echo ""
+    log "To view logs, run:"
+    echo "  kubectl logs -f -l app=$deployment_name -n $namespace"
+
+    echo ""
+    log "To access Flink UI, run:"
+    echo "  kubectl port-forward svc/${deployment_name}-rest 8081:8081 -n $namespace"
+    echo "  Then open: http://localhost:8081"
+}
+
+# Cleanup function
+cleanup_deployment() {
+    local namespace=${NAMESPACE:-emr-flink}
+    local format=${2:-both}
+
+    warn "This will delete the Flink CDC job(s)!"
+    read -p "Are you sure? (yes/no): " -r
+    echo
+
+    if [[ $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+        log "Cleaning up..."
+
+        if [[ "$format" == "paimon" || "$format" == "both" ]]; then
+            kubectl delete -f flink-cdc-paimon-deployed.yaml -n "$namespace" || true
+        fi
+
+        if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
+            kubectl delete -f flink-cdc-iceberg-deployed.yaml -n "$namespace" || true
+        fi
+
+        log "✓ Cleanup complete"
+    else
+        log "Cleanup cancelled"
+    fi
+}
+
+# Main function
+main() {
+    local action=${1:-help}
+    local format=${LAKEHOUSE_FORMAT:-both}
+
+    echo "============================================================================"
+    echo "  Flink CDC Generic Deployment Tool"
+    echo "============================================================================"
+    echo ""
+
+    case $action in
+        build)
+            check_env_vars
+            display_config
+            build_and_push_image
+            upload_scripts_to_s3
+            ;;
+
+        render)
+            # Render the manifests without applying them.
+            #
+            # `deploy both` applies paimon, waits for it to reconcile, then applies
+            # iceberg — the two jobs start ~30s apart. That is fine normally, but it
+            # invalidates a paimon-vs-iceberg benchmark: with scan.startup.mode =
+            # initial, whichever job starts first snapshots a smaller MySQL table and
+            # gets a head start on the binlog. Render first, then apply both
+            # manifests in one kubectl call so their snapshot phases overlap:
+            #
+            #   ./ingest-deploy/build-deploy-generic.sh render
+            #   kubectl apply -n emr-flink -f ingest-deploy/flink-cdc-paimon-deployed.yaml \
+            #                              -f ingest-deploy/flink-cdc-iceberg-deployed.yaml
+            check_env_vars
+            display_config
+            create_ebs_storage_class
+            install_kyverno_az_policy
+
+            if [[ "$format" == "paimon" || "$format" == "both" ]]; then
+                generate_flink_deployment "paimon" >/dev/null
+            fi
+            if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
+                create_glue_database
+                generate_flink_deployment "iceberg" >/dev/null
+            fi
+
+            info "Manifests rendered but NOT applied. Apply both at once with:"
+            echo "  kubectl apply -n ${NAMESPACE:-emr-flink} \\"
+            [[ "$format" == "paimon"  || "$format" == "both" ]] && echo "    -f ingest-deploy/flink-cdc-paimon-deployed.yaml \\"
+            [[ "$format" == "iceberg" || "$format" == "both" ]] && echo "    -f ingest-deploy/flink-cdc-iceberg-deployed.yaml"
+            ;;
+
+        deploy)
+            check_env_vars
+            display_config
+            create_ebs_storage_class
+            install_kyverno_az_policy
+
+            if [[ "$format" == "paimon" || "$format" == "both" ]]; then
+                log "Deploying Paimon lakehouse..."
+                manifest=$(generate_flink_deployment "paimon")
+                deploy_flink_job "$manifest"
+                monitor_deployment "flink-cdc-paimon"
+            fi
+
+            if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
+                log "Deploying Iceberg lakehouse..."
+                create_glue_database
+                manifest=$(generate_flink_deployment "iceberg")
+                deploy_flink_job "$manifest"
+                monitor_deployment "flink-cdc-iceberg"
+            fi
+            ;;
+
+        all)
+            check_env_vars
+            display_config
+            build_and_push_image
+            upload_scripts_to_s3
+            create_ebs_storage_class
+            install_kyverno_az_policy
+
+            if [[ "$format" == "paimon" || "$format" == "both" ]]; then
+                log "Deploying Paimon lakehouse..."
+                manifest=$(generate_flink_deployment "paimon")
+                deploy_flink_job "$manifest"
+            fi
+
+            if [[ "$format" == "iceberg" || "$format" == "both" ]]; then
+                log "Deploying Iceberg lakehouse..."
+                create_glue_database
+                manifest=$(generate_flink_deployment "iceberg")
+                deploy_flink_job "$manifest"
+            fi
+
+            if [[ "$format" == "paimon" ]]; then
+                monitor_deployment "flink-cdc-paimon"
+            elif [[ "$format" == "iceberg" ]]; then
+                monitor_deployment "flink-cdc-iceberg"
+            else
+                info "Deployed both Paimon and Iceberg. Monitor separately:"
+                echo "  kubectl get flinkdeployment -n emr-flink"
+            fi
+            ;;
+
+        cleanup)
+            cleanup_deployment "$@"
+            ;;
+
+        monitor)
+            format=${2:-paimon}
+            if [[ "$format" == "paimon" ]]; then
+                monitor_deployment "flink-cdc-paimon"
+            elif [[ "$format" == "iceberg" ]]; then
+                monitor_deployment "flink-cdc-iceberg"
+            else
+                kubectl get flinkdeployment -n emr-flink
+            fi
+            ;;
+
+        help|*)
+            echo "Usage: $0 {build|render|deploy|all|cleanup|monitor} [FORMAT]"
+            echo ""
+            echo "Commands:"
+            echo "  build    - Build Docker image and upload scripts to S3"
+            echo "  render   - Render manifests only (apply both at once for a fair benchmark)"
+            echo "  deploy   - Deploy Flink job to Kubernetes"
+            echo "  all      - Build and deploy (complete setup)"
+            echo "  cleanup  - Remove deployed resources"
+            echo "  monitor  - Show deployment status"
+            echo ""
+            echo "Formats:"
+            echo "  paimon   - Deploy Paimon lakehouse only"
+            echo "  iceberg  - Deploy Iceberg lakehouse only"
+            echo "  both     - Deploy both lakehouses (default)"
+            echo ""
+            echo "Set format with:"
+            echo "  export LAKEHOUSE_FORMAT=paimon  # or iceberg or both"
+            echo ""
+            echo "Required environment variables:"
+            echo "  AWS_REGION, AWS_ACCOUNT_ID, BUCKET_NAME,"
+            echo "  EMR_EXECUTION_ROLE_ARN (MySQL host/user/password come from Secret mysql-credentials)"
+            echo ""
+            echo "Optional:"
+            echo "  EMR_VERSION            (default: 7.14.0; image tag and emrReleaseLabel)"
+            echo "  ICEBERG_FORMAT_VERSION (default: 3; 2 or 3)"
+            echo "  SESSION_SUFFIX          (default when unset: cdc-pipeline/.bench-env's; set empty for the v2 set)"
+            echo "  -> ICEBERG_FORMAT_VERSION=2 SESSION_SUFFIX= selects the original v2 tables"
+            echo ""
+            echo "Examples:"
+            echo "  # Deploy Paimon only"
+            echo "  export LAKEHOUSE_FORMAT=paimon"
+            echo "  $0 all"
+            echo ""
+            echo "  # Deploy Iceberg only"
+            echo "  export LAKEHOUSE_FORMAT=iceberg"
+            echo "  $0 all"
+            echo ""
+            echo "  # Deploy both"
+            echo "  export LAKEHOUSE_FORMAT=both"
+            echo "  $0 all"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    log "Done!"
+}
+
+# Run main function
+main "$@"

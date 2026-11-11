@@ -2,7 +2,8 @@
 
 ## Overview
 
-This guide walks you through creating and configuring a MySQL database as the source for Flink CDC to Paimon pipeline.
+This guide walks you through creating and configuring a MySQL database as the source for the Flink CDC pipelines (Paimon and Iceberg).
+The step-by-step run that uses it is [README.md](README.md).
 
 ## Architecture Context
 
@@ -43,15 +44,33 @@ This guide walks you through creating and configuring a MySQL database as the so
 ## Step 1: Create RDS MySQL Instance
 
 > **To reproduce the benchmark instance, use Option B.** The live instance is
-> `flink-cdc-mysql-8-0`: **db.m5.2xlarge** (8 vCPU, 32 GB), **MySQL 8.0.45**,
-> **500 GB gp3 with 64,000 provisioned IOPS and 2,500 MB/s throughput**, single-AZ,
-> initial database `ecommerce`. The default gp3 allocation (12,000 IOPS) is *not*
+> `flink-cdc-mysql-8-0`: **db.r6i.4xlarge** (16 vCPU, 128 GiB, buffer pool 92 GiB;
+> it was db.m5.2xlarge, 8 vCPU / 32 GB, for the runs up to the 2026-11-02 dry run),
+> **MySQL 8.0.45**, **500 GB gp3 with 64,000 provisioned IOPS and 2,500 MB/s
+> throughput**, single-AZ, initial database `ecommerce`. The default gp3 allocation (12,000 IOPS) is *not*
 > enough: a load-generator run against it saturated at ReadIOPS + WriteIOPS ≈
 > 11,878 of 12,000, and the throughput ceiling was storage, not row-lock
 > contention — see
 > [2-DATA-GEN-GUIDE.md](./2-DATA-GEN-GUIDE.md).
 > Option A below is the smaller Dev/POC shape and will not reproduce the numbers
 > in the benchmark guides.
+
+> **State of the live source.** The `ecommerce` tables were shrunk to about **10%
+> of their rows**, keeping the newest ids, by a copy-and-swap: copy the rows to keep
+> into a new table, then swap names with `RENAME TABLE`. It was done twice on
+> 2026-11-02 (to ~37.5M rows, then, after the generator regrew it to ~491M, to
+> 49.36M); the procedure is in [README Step 4a](README.md#step-4a-shrink-the-source-to-10-only-when-it-outgrew-the-buffer-pool),
+> and no script in the repo does it. Two consequences:
+>
+> - **RDS allocated storage cannot shrink.** The instance is still billed for
+>   500 GB, even though the data now uses a fraction of it. Only a new instance
+>   (snapshot restore or dump/load into a smaller allocation) reduces it.
+> - **Restart the upsert generator after any shrink.** It reads `MIN(id)` /
+>   `MAX(id)` once at pod start and draws cold keys from that range. See
+>   [2-DATA-GEN-GUIDE.md](./2-DATA-GEN-GUIDE.md#the-cold-tail-spans-minpk-maxpk-not-1-maxpk).
+>
+> Both Flink jobs use `scan.startup.mode = initial`, so a fresh table set
+> (`SESSION_SUFFIX`) snapshots whatever the source holds when the jobs start.
 
 ### Option A: Using AWS Console (Dev/POC shape — smaller than the benchmark instance)
 
@@ -72,10 +91,9 @@ This guide walks you through creating and configuring a MySQL database as the so
 
 5. **Settings**
    ```
-   DB instance identifier: flink-cdc-mysql
+   DB instance identifier: flink-cdc-mysql-8-0
    Master username: admin
-   Master password: YourSecurePassword123!
-   Confirm password: YourSecurePassword123!
+   Master password: <choose one; keep it in a password manager, not in a file>
    ```
 
 6. **DB Instance Class**
@@ -141,7 +159,7 @@ export SUBNET_1=subnet-xxxxx  # Private subnet 1
 export SUBNET_2=subnet-yyyyy  # Private subnet 2
 export DB_NAME=ecommerce
 export DB_USERNAME=admin
-export DB_PASSWORD='YourSecurePassword123!'
+read -rs -p 'master password: ' DB_PASSWORD; echo    # from a prompt, never a file or shell history
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 # 2. Create security group for RDS
@@ -193,7 +211,7 @@ aws rds create-db-subnet-group \
 
 aws rds create-db-instance \
     --db-instance-identifier flink-cdc-mysql-8-0 \
-    --db-instance-class db.m5.2xlarge \
+    --db-instance-class db.r6i.4xlarge \
     --engine mysql \
     --engine-version 8.0.45 \
     --master-username $DB_USERNAME \
@@ -216,6 +234,7 @@ aws rds create-db-instance \
     --performance-insights-retention-period 7 \
     --db-name $DB_NAME \
     --region $AWS_REGION
+unset DB_PASSWORD
 
 # 6. Wait for RDS instance to become available (5-10 minutes)
 echo "Waiting for RDS instance to be available..."
@@ -265,8 +284,8 @@ Launch a Cloudshell from RDS console, ensure the Cloudshell is associated with t
 # Install MySQL client if not already installed
 sudo dnf install mariadb105 -y  # Amazon Linux 2023
 
-# Connect to RDS
-mysql -h $MYSQL_HOST -u $DB_USERNAME -p$DB_PASSWORD
+# Connect to RDS (prompts for the master password)
+mysql -h $MYSQL_HOST -u $DB_USERNAME -p
 
 # You should see:
 # MySQL [(none)]>
@@ -375,7 +394,7 @@ aws rds modify-db-parameter-group \
 
 # Apply to RDS instance (requires reboot)
 aws rds modify-db-instance \
-    --db-instance-identifier flink-cdc-mysql \
+    --db-instance-identifier flink-cdc-mysql-8-0 \
     --db-parameter-group-name mysql-cdc-params \
     --apply-immediately
 ``` -->
@@ -418,8 +437,8 @@ SHOW GRANTS FOR 'cdcuser'@'%';
 # Exit MySQL and reconnect as CDC user
 exit;
 
-# Test connection with CDC user
-mysql -h $MYSQL_HOST -u cdcuser -p"$MYSQL_PASSWORD";
+# Test connection with CDC user (prompts for its password)
+mysql -h $MYSQL_HOST -u cdcuser -p
 # If successful, you're ready for CDC!
 exit;
 ```
@@ -431,8 +450,8 @@ exit;
 ### 3.1 Create Database (if not created during RDS setup)
 
 ```sql
--- Connect as admin user
-mysql -h $MYSQL_HOST -u $DB_USERNAME -p$DB_PASSWORD
+-- Connect as admin user (prompts for the password)
+mysql -h $MYSQL_HOST -u $DB_USERNAME -p
 
 -- Create database
 CREATE DATABASE IF NOT EXISTS ecommerce
@@ -499,7 +518,7 @@ CREATE TABLE products (
 -- Purpose: Order transactions (fact table)
 -- ============================================================================
 CREATE TABLE orders (
-    order_id INT PRIMARY KEY AUTO_INCREMENT,
+    order_id BIGINT PRIMARY KEY AUTO_INCREMENT,   -- BIGINT since 2026-11-06: INT ran out (README Troubleshooting, error 1467)
     customer_id INT NOT NULL,
     order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total_amount DECIMAL(12, 2) NOT NULL,
@@ -520,8 +539,8 @@ CREATE TABLE orders (
 -- Purpose: Order line items (fact table)
 -- ============================================================================
 CREATE TABLE order_items (
-    order_item_id INT PRIMARY KEY AUTO_INCREMENT,
-    order_id INT NOT NULL,
+    order_item_id BIGINT PRIMARY KEY AUTO_INCREMENT,   -- BIGINT since 2026-11-06
+    order_id BIGINT NOT NULL,
     product_id INT NOT NULL,
     quantity INT NOT NULL,
     unit_price DECIMAL(10, 2) NOT NULL,
@@ -643,33 +662,7 @@ INSERT INTO products (product_name, category, price, stock_quantity, description
 ('Throw Pillow Set', 'Home & Garden', 39.99, 200, 'Set of 4 decorative throw pillows');
 
 -- Verify
-SELECT COUNT(*) as product_count FROM products;
-INSERT INTO products (product_name, category, price, stock_quantity, description) VALUES
--- Electronics
-('Laptop Pro 15"', 'Electronics', 1299.99, 50, 'High-performance laptop with 16GB RAM'),
-('Smartphone X', 'Electronics', 899.99, 100, 'Latest smartphone with 5G capability'),
-('Wireless Headphones', 'Electronics', 199.99, 150, 'Noise-canceling wireless headphones'),
-('4K Monitor', 'Electronics', 449.99, 75, '27-inch 4K UHD monitor'),
-('Gaming Keyboard', 'Electronics', 129.99, 200, 'Mechanical RGB gaming keyboard'),
--- Clothing
-('Cotton T-Shirt', 'Clothing', 24.99, 500, 'Comfortable 100% cotton t-shirt'),
-('Denim Jeans', 'Clothing', 59.99, 300, 'Classic fit denim jeans'),
-('Running Shoes', 'Clothing', 89.99, 250, 'Lightweight running shoes'),
-('Winter Jacket', 'Clothing', 149.99, 100, 'Waterproof winter jacket'),
-('Baseball Cap', 'Clothing', 19.99, 400, 'Adjustable baseball cap'),
--- Books
-('Python Programming Guide', 'Books', 39.99, 200, 'Comprehensive Python programming book'),
-('Data Science Handbook', 'Books', 49.99, 150, 'Complete guide to data science'),
-('Cloud Computing Essentials', 'Books', 44.99, 175, 'AWS and cloud computing fundamentals'),
-('Mystery Novel', 'Books', 14.99, 300, 'Bestselling mystery thriller'),
-('Cookbook Delights', 'Books', 29.99, 250, '500 delicious recipes'),
--- Home & Garden
-('Coffee Maker', 'Home & Garden', 79.99, 120, '12-cup programmable coffee maker'),
-('Vacuum Cleaner', 'Home & Garden', 199.99, 80, 'Bagless upright vacuum cleaner'),
-('LED Desk Lamp', 'Home & Garden', 34.99, 300, 'Adjustable LED desk lamp'),
-('Garden Tool Set', 'Home & Garden', 89.99, 150, '10-piece garden tool set'),
-('Throw Pillow Set', 'Home & Garden', 39.99, 200, 'Set of 4 decorative throw pillows');
-
+SELECT COUNT(*) as product_count FROM products;   -- 20
 ```
 
 ### 4.3 Insert Sample Orders and Order Items
@@ -686,8 +679,11 @@ VALUES
 
 -- Order 2: Jane Doe's order
 INSERT INTO orders (customer_id, total_amount, order_status, payment_method, shipping_address)
-VALUES (2, 989.98, 'SHIPPED', 'PAYPAL', '456 Oak A
-'e
+VALUES (2, 989.98, 'SHIPPED', 'PAYPAL', '456 Oak Ave, Seattle, WA 98102');
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+    (LAST_INSERT_ID(), 2, 1, 899.99),   -- Smartphone X
     (LAST_INSERT_ID(), 8, 1, 89.99);    -- Running Shoes
 
 -- Order 3: Mike Johnson's order
@@ -763,7 +759,7 @@ SELECT 'order_items', COUNT(*) FROM order_items;
 -- | customers   |        10 |
 -- | products    |        20 |
 -- | orders      |         5 |
--- | order_items |        11 |
+-- | order_items |        13 |
 -- +-------------+-----------+
 
 -- 5. Test a simple UPDATE to verify binlog captures changes
@@ -774,36 +770,7 @@ SHOW MASTER STATUS;
 -- Should show current binlog file and position
 ```
 
-## Step 6: Test Connection from EKS
-
-Before running Flink CDC, test that your EKS pods can reach the MySQL database. Run the followings from your local terminal, not in cloudshell.
-
-```bash
-# Deploy a test pod in the same namespace
-kubectl run mysql-test --rm -it --restart=Never \
-  --image=mysql:8.0.45 \
-  --namespace=emr-flink \
-  --command -- bash
-# after login to the pod, set the RDS host name
-MYSQL_HOST=xxxxxxxxx
-# Inside the pod, test connection:
-mysql -h $MYSQL_HOST -u cdcuser -p"$MYSQL_PASSWORD" -e "SELECT COUNT(*) FROM ecommerce.customers;"
-
-# If successful, you'll see:
-# +----------+
-# | COUNT(*) |
-# +----------+
-# |       10 |
-# +----------+
-
-# Exit the pod
-exit;
-```
-
----
-
-
-## Step 7. Export Environment Variables for Flink CDC in Local Terminal
+## Step 6: Export the endpoint for the local scripts
 
 ```bash
 # Export these for use with Flink CDC deployment
@@ -814,22 +781,51 @@ export MYSQL_HOST=$(aws rds describe-db-instances \
     --output text \
     --region $AWS_REGION)
 
-export MYSQL_PORT=3306
-export MYSQL_DATABASE=ecommerce
-export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
+# The endpoint is account-specific: keep it in the git-ignored .bench-env.local.
+# MYSQL_PORT / MYSQL_DATABASE / MYSQL_USER are already in .bench-env.
+echo "export MYSQL_HOST=$MYSQL_HOST" >> .bench-env.local
+```
 
-# Save to a file for easy reuse
-cat > mysql-cdc-env.sh <<EOF
-export MYSQL_HOST=$MYSQL_HOST
-export MYSQL_PORT=3306
-export MYSQL_DATABASE=ecommerce
-export MYSQL_USER=cdcuser
-export MYSQL_PASSWORD='<YOUR_CDC_PASSWORD>'   # do not commit a real value
-EOF
+No file holds the password. It goes into the one Kubernetes Secret (Step 7).
 
-chmod +x mysql-cdc-env.sh
-echo $MYSQL_HOST
+---
+
+## Step 7: Create the Kubernetes Secret
+
+The upsert generator and both Flink jobs share **one** Secret in `emr-flink`,
+`mysql-credentials`, with keys `MYSQL_HOST`, `MYSQL_USER` and `MYSQL_PASSWORD`.
+No password is ever written into a file or a manifest, rendered or not. Create
+it from a prompt as in [README Step 0](README.md#step-0-one-time-setup), which
+also covers rotating the password; why the keys are env-var names (`envFrom`)
+is in [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md, What render substitutes](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#what-render-substitutes).
+
+Check: `kubectl get secret mysql-credentials -n emr-flink -o jsonpath='{.data}' | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)))'`
+prints `['MYSQL_HOST', 'MYSQL_PASSWORD', 'MYSQL_USER']` (key names only).
+
+If it is missing, a JobManager does not report a credential error: it sits in
+`CreateContainerConfigError` (`secret "mysql-credentials" not found` shows only
+in `kubectl describe pod`) while the FlinkDeployment looks like `RECONCILING` /
+`DEPLOYED`. `deploy-data-generator.sh` refuses to deploy without it.
+
+---
+
+## Step 8: Test the connection from EKS
+
+Before running Flink CDC, test that pods in `emr-flink` can reach the database
+with the credentials in the Secret. The pod gets the host and user from the
+Secret (`envFrom`) and the password as `MYSQL_PWD`, which the `mysql` client
+reads, so the password is never on a command line or on the laptop:
+
+```bash
+kubectl run mysql-test -n emr-flink --rm -i --restart=Never --image=mysql:8.0.45 \
+  --overrides='{"spec":{"containers":[{"name":"mysql-test","image":"mysql:8.0.45",
+    "envFrom":[{"secretRef":{"name":"mysql-credentials"}}],
+    "env":[{"name":"MYSQL_PWD","valueFrom":{"secretKeyRef":{"name":"mysql-credentials","key":"MYSQL_PASSWORD"}}}],
+    "command":["sh","-c","mysql -h \"$MYSQL_HOST\" -u \"$MYSQL_USER\" -e \"SELECT COUNT(*) FROM ecommerce.customers\""]}]}}'
+
+# If successful, you'll see:
+# COUNT(*)
+# 10
 ```
 
 ---
@@ -846,7 +842,7 @@ aws ec2 describe-security-groups \
 
 # 2. Check RDS is in the same VPC as EKS
 aws rds describe-db-instances \
-    --db-instance-identifier flink-cdc-mysql \
+    --db-instance-identifier flink-cdc-mysql-8-0 \
     --query 'DBInstances[0].DBSubnetGroup.VpcId'
 
 # 3. Test DNS resolution
@@ -869,13 +865,13 @@ This is rare for RDS, but if you see `log_bin = OFF`:
 ```bash
 # Check parameter group
 aws rds describe-db-instances \
-    --db-instance-identifier flink-cdc-mysql \
+    --db-instance-identifier flink-cdc-mysql-8-0 \
     --query 'DBInstances[0].DBParameterGroups'
 
 # RDS MySQL 8.0+ has binlog enabled by default
 # If not, you need to enable automated backups (this enables binlog)
 aws rds modify-db-instance \
-    --db-instance-identifier flink-cdc-mysql \
+    --db-instance-identifier flink-cdc-mysql-8-0 \
     --backup-retention-period 7 \
     --apply-immediately
 ```
@@ -905,6 +901,7 @@ FLUSH PRIVILEGES;
 ✅ **Database schema deployed** (4 tables)
 ✅ **Sample data loaded** for testing
 ✅ **CDC readiness verified**
+✅ **Secret created**: `mysql-credentials` (generator and Flink jobs)
 
 Your MySQL database is now ready to be the source for Flink CDC! 🎉
 
@@ -912,49 +909,19 @@ Your MySQL database is now ready to be the source for Flink CDC! 🎉
 
 ## Next Steps
 
-1. **[Build and deploy the Flink CDC jobs](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)** — build the
+1. **[Build and deploy the Flink CDC jobs](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md)**: build the
    image, upload the SQL scripts, and start the Paimon and Iceberg pipelines.
-2. **[Generate streaming data](./2-DATA-GEN-GUIDE.md)** — two workloads share one script:
+2. **[Generate streaming data](./2-DATA-GEN-GUIDE.md)**: the upsert load generator.
+   Run it from `cdc-pipeline/`:
 
    ```bash
-   # mixed: INSERT/UPDATE/DELETE, ~400 rows/s. The only workload that emits DELETEs,
-   # so this is the one that proves CDC handles all three event types.
+   # batched ON DUPLICATE KEY UPDATE across 24 pods (StatefulSet mysql-upsert-loadgen),
+   # the storage-format benchmark load, plus DELETEs on orders / order_items
+   # (DELETE_RATIO). RATE_PER_POD is a token-bucket ceiling, not an achieved rate:
+   # read the actual rate from the pods' `inst=` line.
    ./mysql-data-generator/deploy-data-generator.sh deploy
    ./mysql-data-generator/deploy-data-generator.sh stop
-
-   # upsert: batched ON DUPLICATE KEY UPDATE across 8 pods (StatefulSet). The
-   # storage-format benchmark load. The manifest's RATE_PER_POD is a token-bucket
-   # ceiling, not an achieved rate — read the actual rate from the pods' `inst=`
-   # line (see 2-DATA-GEN-GUIDE.md).
-   ./mysql-data-generator/deploy-data-generator.sh deploy upsert
-   ./mysql-data-generator/deploy-data-generator.sh stop upsert
    ```
 
-   Both read `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_PASSWORD` from the `mysql-credentials`
-   secret, which the script creates from this guide's exported variables on first run.
-
-### Secret required by the Flink CDC jobs
-
-The data generators and the Flink jobs read the CDC password from **two different
-secrets**, and only the generator's is created for you. Create the Flink one before
-deploying either pipeline:
-
-```bash
-kubectl create secret generic flink-cdc-mysql-env \
-    --namespace emr-flink \
-    --from-literal=MYSQL_PASSWORD="${MYSQL_PASSWORD}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-```
-
-The key must be named `MYSQL_PASSWORD`: both `flink-cdc-*-sql.yaml` manifests pull it
-in with `envFrom: secretRef`, which maps every key in the secret to an env var of the
-same name, so the name inside the secret *is* the env var the job reads.
-
-If this secret is missing, the JobManager pod does not report a credential error — it
-sits in `CreateContainerConfigError` with `secret "flink-cdc-mysql-env" not found` only
-in `kubectl describe pod`, while the FlinkDeployment shows a healthy-looking
-`RECONCILING` / `DEPLOYED`.
-
-Override the name with `MYSQL_ENV_SECRET_NAME` if you use a different one.
-3. **[Monitor the pipelines](./3-MONITOR.md)** — job status, throughput, checkpoints, table stats.
-4. **[Query with StarRocks](./4-STARROCKS-OLAP-ENGINE.md)** — the Paimon vs Iceberg comparison.
+3. **[Monitor the pipelines](./3-MONITOR.md)**: job status, throughput, checkpoints, table stats.
+4. **[Query benchmark: DuckDB vs Trino](./querybench/README.md)**: both engines on the Iceberg tables and on Paimon-as-iceberg (Athena, v2 sets only: [README, Athena](./README.md#athena)).

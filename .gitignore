@@ -1,5 +1,4 @@
 # Local environment / credentials
-cdc-pipeline/mysql-cdc-env.sh
 
 # Deployed snapshots with resolved secrets, account IDs and bucket names.
 # Unanchored so it also catches subdirectories such as
@@ -9,7 +8,6 @@ cdc-pipeline/mysql-cdc-env.sh
 
 # Runtime logs
 *.log
-cdc-pipeline/bench-results
 #python
 *pycache*
 # Account-specific values for throughput-benchmark/.bench-env
@@ -37,5 +35,8 @@ venv/
 .pytest_cache/
 # throughput-benchmark/querybench/run.sh writes this while bundling a Job, then deletes it
 throughput-benchmark/.qb-runner-cmd.sh
+# cdc-pipeline/querybench/run.sh writes this while bundling a Job, then deletes it
+cdc-pipeline/.qb-runner-cmd.sh
 # GenAI tool
 *claude
+cdc-pipeline/ingest-deploy/docker/patched-jars/*.jar
