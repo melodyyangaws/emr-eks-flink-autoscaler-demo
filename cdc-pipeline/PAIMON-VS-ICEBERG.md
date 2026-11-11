@@ -6,10 +6,24 @@ Both **Apache Paimon** and **Apache Iceberg** are open table formats that enable
 
 > **Latest measured results:** the 2026-11-10 `_v3` round,
 > [bench-results/QUERYBENCH-SUMMARY-20261110-v3.md](bench-results/QUERYBENCH-SUMMARY-20261110-v3.md)
-> (DuckDB and Trino on Iceberg v3 and on Paimon-as-iceberg, hot and snapshot suites).
-> The reader findings of [2026-11-02](#iceberg-v3-on-emr-714-findings-of-2026-11-02) are
-> partly superseded (marked there). The StarRocks-era benchmark below
+> (Flink CDC from RDS MySQL at ~38,400 row changes/s into Paimon 2.1 and Iceberg v3,
+> same buckets and file settings; DuckDB 2.0 and Trino 484 of equal size, both reading
+> Paimon as Paimon-as-iceberg). The reader findings of
+> [2026-11-02](#iceberg-v3-on-emr-714-findings-of-2026-11-02) are partly superseded
+> (marked there). The StarRocks-era benchmark below
 > ([Performance Benchmarks](#performance-benchmarks)) is historical.
+
+### CDC results in brief (2026-11-10, `_v3`)
+
+| Question | Result |
+|---|---|
+| **Live, changing data** (hot queries, writers running) | Paimon **7.1× faster** than Iceberg v3 on DuckDB and **41% faster** on Trino; **86% / 40% cheaper** per query |
+| **Settled data** (writers stopped, both fully compacted) | Paimon **52% faster** on DuckDB, about the same on Trino; on the first (cold) query **42% / 38% faster** |
+| **Ingest** | Parity: both kept up with ~56,000 change events/s, no backpressure. Median checkpoint: Paimon 2.3 s (10.4 s before the [write-path tuning](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#sink-table-settings-paimon-vs-iceberg)), Iceberg 1.6 s |
+| **Why live Iceberg queries are slower** | In 16 minutes Iceberg wrote 33.5M delete markers (25.5M equality deletes, 10,305 delete files) that every read must apply until a compaction; Paimon wrote none (it merges while writing) and stored 22% fewer rows |
+| **Maintenance** | One full compaction: Paimon 12.6 min, 4 TaskManagers per table, est. **$0.36**; Iceberg 27.9 min, 16 TaskManagers (96 GiB on the fact tables), est. **$4.18** (EC2 + EMR on EKS uplift): **91% cheaper** with Paimon |
+| **Storage** | After full compaction Paimon is **15% larger** (17.4 vs 15.2 GiB): each row also stores a key copy, a sequence number and a change type (`data-file.thin-mode`, off by default, drops the key copy) |
+| **Query engine** | Trino suits bucketed Iceberg (**3.5× faster** than DuckDB on live data); DuckDB suits Paimon (**45% faster** than Trino) |
 
 ## Quick Comparison
 
@@ -17,12 +31,13 @@ Both **Apache Paimon** and **Apache Iceberg** are open table formats that enable
 |--------|-------------------|-------------------|
 | **Primary Focus** | Streaming-first lakehouse | Batch-first with streaming support |
 | **Best For** | Real-time data warehouses, streaming analytics | Data lakes, batch analytics, time travel |
-| **Catalog** | File-based (S3) | AWS Glue, Hive, Nessie, REST |
+| **Catalog** | AWS Glue(partially),file-based(s3) | AWS Glue, Hive, Nessie, REST |
 | **Maturity** | Newer (2023) | Mature (2017, Netflix) |
 | **Community** | Growing, Flink-native | Large, multi-engine |
-| **Write Performance** | Faster for streaming | Optimized for batch |
-| **Read Performance** | Excellent for recent data | Excellent for all data |
-| **Compaction** | Built-in, automatic | Manual or scheduled |
+| **Write Performance** | CDC ingest at parity with Iceberg (2026-11-10); merges while writing | CDC ingest at parity; writes every version plus a delete marker |
+| **Read Performance** | Live CDC data 7.1× (DuckDB) / 41% (Trino) faster than Iceberg v3; settled data 52% faster (DuckDB) or on par (Trino) | Close to Paimon once fully compacted; slow on live CDC data until then |
+| **Compaction** | Built-in, automatic; full compaction measured 91% cheaper | Separate job (manual, scheduled or S3 Tables managed) |
+| **Storage (CDC, compacted)** | 15% larger (per-row merge columns) | Smaller |
 | **Schema Evolution** | Full support | Full support |
 | **Time Travel** | Snapshot-based | Snapshot + timestamp |
 | **ACID Transactions** | Yes | Yes |
@@ -258,6 +273,7 @@ SELECT * FROM customers /*+ OPTIONS(
 - Optimized for recent data reads
 - Excellent streaming performance
 - Built-in changelog consumption
+- Measured (2026-11-10, CDC): on live data, read through its Iceberg metadata by standard Iceberg readers, 7.1× faster than Iceberg v3 on DuckDB and 41% faster on Trino
 
 #### Iceberg
 ```sql
@@ -274,6 +290,7 @@ SELECT * FROM customers /*+ OPTIONS(
 - Excellent for time travel queries
 - Better for historical data scans
 - Native Athena Query integration
+- Measured (2026-11-10, CDC): live reads have to apply every equality delete written since the last compaction (25.5M in 16 minutes), so they are the slow side; after a full compaction it is about on par with Paimon on Trino and 52% slower on DuckDB. On bucketed tables Trino reads it 3.5× faster than DuckDB
 
 ### 5. Compaction
 
@@ -295,6 +312,7 @@ stores it and ignores it.)
 - Automatic small file merging
 - Background compaction threads
 - No manual intervention needed
+- Measured (2026-11-10, CDC): the one-off full compaction before the snapshot test still ran for Paimon too (all 4 tables in 12.6 min, 4 TaskManagers each, est. $0.36 including the EMR on EKS uplift), against 27.9 min and est. $4.18 for Iceberg
 
 #### Iceberg
 **A separate compaction job.** Here: once, before the snapshot test, with the
@@ -321,6 +339,7 @@ CREATE TABLE orders (...) WITH (
 - Manual compaction required
 - Can schedule in Glue or use S3Tables's automatic fully managed compaction
 - Large default compaction target file size (512MB), suits to batch.
+- Measured (2026-11-10, CDC): 27.9 min for the 4 tables on 16 TaskManagers per table, the fact tables on 96 GiB TaskManagers because a rewrite task holds a data file's equality deletes in memory; est. $4.18 including the EMR on EKS uplift. It removed 17,931 delete files
 
 ### 6. Schema Evolution
 
@@ -531,9 +550,12 @@ no DuckDB cache); removed 2026-11-09.
   2026-11-04, when the continuous `iceberg-maintain` job, removed 2026-11-06, had its
   rewrites 404 on a planned metadata.json deleted ~3 commits later). A reader still
   has to pin one metadata version for the length of a query (`querybench/pin.sh` copies it).
-- **Freshness.** With DVs on, lookup compaction moves level 0 up at every checkpoint,
-  so the v3 Iceberg metadata trails the table by about one checkpoint without forced
-  full compaction. With `PAIMON_WRITE_ONLY=true` nothing leaves level 0 until a
+- **Freshness.** With DVs on and Paimon's defaults, lookup compaction moves level 0 up at
+  every checkpoint, so the v3 Iceberg metadata trails the table by about one checkpoint
+  without forced full compaction. With the write-path tuning (since 2026-11-11:
+  `lookup-wait = false`, `lookup-compact = gentle`, `max-interval = 3`) it can trail by
+  up to ~3 checkpoints; `max-interval = 1` restores the one-checkpoint bound at a higher
+  checkpoint cost. With `PAIMON_WRITE_ONLY=true` nothing leaves level 0 until a
   compaction, so it would list nothing new (one reason `false` is the default).
 
 ### Write-side asymmetries kept on purpose
@@ -548,7 +570,10 @@ These differences remain by design. Report them next to every result:
 | Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 16 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; fixed rather than dynamic because DuckDB's former native Paimon reader refused dynamic buckets) | Since 2026-11-09, `bucket(N, <id>)` with Paimon's N and key (8 on customers / products per category, 16 per date on orders / order_items), added to the partition spec by `flink-cdc-executor.py` (Flink DDL cannot declare it). `write.distribution-mode = hash` keys rows by the partition value, so each bucket goes to one writer; Flink's key hashing spreads the 16 buckets unevenly over 12 writers (some get none). Before, each date partition went to one writer, so today's changes went through a single writer |
 | Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; `compaction/run.sh` once before the snapshot test (writers stopped) |
 | Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only in `compaction/run.sh`, with the same 12 h / keep-5 rule. Paimon's writer does not expire while suspended |
-| Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |
+| Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint: on `_v3`, 24% of deletes were DVs (8.0M) and 76% equality deletes (25.5M). The sink's equality-delete-to-DV converter is not enabled |
+| Buckets as seen by Iceberg readers | Paimon-as-iceberg's partition spec has no bucket field (Paimon 2.1's Iceberg export cannot publish one; buckets are only `bucket-N/` directories), so Iceberg readers get no bucket pruning on an id predicate | `bucket[N](id)` is a partition field, so readers prune 15 of 16 buckets on `order_id = X` |
+| Bucket function | Paimon's own hash (`bucket-function.type` default; `mod` and `hive` also exist) | Iceberg's murmur3 `bucket[N]`: same N, but a key lands in a different bucket number. No shared function exists; no performance effect |
+| Row order inside files | sorted by primary key (LSM levels and full compaction), so files cover disjoint key ranges within a bucket | unsorted: the Flink sink does not sort in hash mode and `cdc-compact.py` bin-packs without sorting |
 | Glue integration | EMR's Glue Hive metastore client (`aws.glue.enabled: "true"`, the one intended `flinkConfiguration` difference) | Iceberg's own `GlueCatalog` |
 | Schema details | `TIMESTAMP(6)`; partition columns `order_date_str`, `created_date_str` | `TIMESTAMP(3)`; partition columns `order_dt`, `created_dt` |
 | Paimon-only knobs | write buffers (64/128 MB, spillable unless `PAIMON_WRITE_BUFFER_SPILLABLE=false` as in `.bench-env`; `INSERT` hints), `num-sorted-run.compaction-trigger = 8`, `sink.writer-coordinator.enabled`; since 2026-11-11 `lookup-wait = false`, `lookup-compact = gentle` (`max-interval = 3`), `num-sorted-run.stop-trigger = 16`, `file.compression.per.level = 0:lz4` ([1-BUILD guide](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#sink-table-settings-paimon-vs-iceberg)): checkpoints 10.4 s → 2.3 s; Paimon-as-iceberg may trail by up to ~3 checkpoints | — |

@@ -15,8 +15,8 @@ The detailed guides it links to, one topic each:
 | [1-BUILD-DEPLOY-FLINK-APP-GUIDE.md](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md) | the writers: operator, image, rendering, job sizing, paired sink settings |
 | [2-DATA-GEN-GUIDE.md](2-DATA-GEN-GUIDE.md) | the upsert load generator and its settings |
 | [3-MONITOR.md](3-MONITOR.md) | the job monitor and how its numbers are computed |
-| [querybench/README.md](querybench/README.md) | the hot and snapshot tests, the arms, pins, summary, knobs |
-| [engine-deploy/README.md](engine-deploy/README.md), [engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md) | the query engines, their sizing and images |
+| [4-Startup Query Engines](engine-deploy/README.md), [engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md) | the query engines, their sizing and images |
+| [5-QUERY-PERFORMANCE-TEST](querybench/README.md) | the hot and snapshot tests, the arms, pins, summary, knobs |
 | [ingest-deploy/docker/patched-jars/README.md](ingest-deploy/docker/patched-jars/README.md) | the patched Paimon jar in the writer image |
 | [PAIMON-VS-ICEBERG.md](PAIMON-VS-ICEBERG.md) | format comparison, v3 reader findings, write-side asymmetries |
 
