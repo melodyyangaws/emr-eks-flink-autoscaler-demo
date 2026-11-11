@@ -13,6 +13,8 @@ Features:
 - StatementSet for multiple INSERT statements (required in Application mode)
 - Support for both streaming and batch modes
 - Catalog-agnostic (Paimon, Iceberg, or custom)
+- Iceberg bucket partitions: a CREATE TABLE with 'bench.bucket' / 'bench.bucket-key'
+  gets bucket(N, key) added to its partition spec (Flink DDL cannot declare it)
 
 Usage:
   python flink-cdc-executor.py --sql-dir s3://bucket/scripts/
@@ -216,12 +218,54 @@ class FlinkCDCExecutor:
 
             result = self.table_env.execute_sql(sql_stripped)
             print("   ✓ Executed successfully")
+            if re.match(r"CREATE\s+TABLE\b", sql_stripped, re.IGNORECASE):
+                self.add_iceberg_bucket(sql_stripped)
             return result
 
         except Exception as e:
             print(f"   ❌ Error executing SQL: {e}")
             print(f"   Full SQL:\n{sql}")
             raise
+
+    def add_iceberg_bucket(self, sql: str):
+        """
+        bucket(N, key) on an Iceberg table, the counterpart of Paimon's 'bucket' /
+        'bucket-key': Flink DDL only declares identity partitions, so a CREATE TABLE
+        that sets 'bench.bucket' = '<N>' and 'bench.bucket-key' = '<column>' gets the
+        field added through the Iceberg API (FlinkCatalog.catalog()) right after it,
+        before any INSERT runs. Only on an empty table: on one with data the old files
+        would stay unbucketed, so it is left as is with a warning (the sink DDL is
+        CREATE TABLE IF NOT EXISTS: a new SESSION_SUFFIX gets the buckets). The
+        Flink sink in hash mode keys rows by the partition value, so each bucket of a
+        partition goes to one writer, as each Paimon bucket does.
+        """
+        n = re.search(r"'bench\.bucket'\s*=\s*'(\d+)'", sql)
+        key = re.search(r"'bench\.bucket-key'\s*=\s*'(\w+)'", sql)
+        if not (n and key):
+            return
+        n, key = int(n.group(1)), key.group(1)
+        name = re.match(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([`\w.]+)", sql, re.IGNORECASE).group(1)
+        parts = name.replace("`", "").split(".")
+        catalog = parts[-3] if len(parts) == 3 else self.table_env.get_current_catalog()
+        database = parts[-2] if len(parts) >= 2 else self.table_env.get_current_database()
+        table_name = parts[-1]
+
+        from pyflink.java_gateway import get_gateway
+        jvm = get_gateway().jvm
+        ice = self.table_env._j_tenv.getCatalog(catalog).get().catalog()
+        # parse(String), not of(String...): Py4J cannot call a varargs method with plain
+        # arguments ("Method of([class java.lang.String, ...]) does not exist", _v3bucket).
+        table = ice.loadTable(jvm.org.apache.iceberg.catalog.TableIdentifier.parse(f"{database}.{table_name}"))
+        spec = table.spec().toString().replace("\n", " ")
+        if any(f.transform().toString().startswith("bucket[") for f in table.spec().fields()):
+            print(f"   ✓ {database}.{table_name}: already bucketed ({spec})")
+            return
+        if table.currentSnapshot() is not None:
+            print(f"   ⚠ {database}.{table_name} holds data: bucket({n}, {key}) not added, spec stays {spec}")
+            return
+        table.updateSpec().addField(jvm.org.apache.iceberg.expressions.Expressions.bucket(key, n)).commit()
+        table.refresh()
+        print(f"   ✓ {database}.{table_name}: partition spec now {table.spec().toString().replace(chr(10), ' ')}")
 
     def execute_pending_inserts(self):
         """

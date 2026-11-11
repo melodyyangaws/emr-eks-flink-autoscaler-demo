@@ -5,9 +5,9 @@
 source** with **iceberg, httpfs, aws and avro statically linked** into the
 Python module (no CLI), plus awscli 1.46.2, the `cache_httpfs` community
 extension preinstalled, and the **`paimon` extension built from source** (a
-loadable extension, installed, unsigned) that reads the Flink-written Paimon
-tables natively; the server no longer loads it (the harness reads Paimon only as
-Paimon-as-iceberg, see [below](#the-paimon-extension-native-paimon-reads)). One tag, a manifest list for **linux/amd64 and linux/arm64**.
+loadable extension, installed, unsigned). Nothing in the harness loads the
+`paimon` extension: it reads Paimon only as Paimon-as-iceberg (see
+[below](#the-paimon-extension-in-the-image-unused)). One tag, a manifest list for **linux/amd64 and linux/arm64**.
 
 | File | What |
 |---|---|
@@ -195,20 +195,18 @@ that a v3 deletion-vector file is a real Puffin container.
 - "Unsafe": a wrong offset gives wrong deletes silently, so keep the
   zero-scan and cross-arm row checks on.
 
-## The `paimon` extension (native Paimon reads)
+## The `paimon` extension (in the image, unused)
 
-`paimon_scan('s3://…/paimon-warehouse/<db>.db/<table>')` (or `ATTACH
-'s3://…/paimon-warehouse' AS p (TYPE paimon)`) reads a Paimon table directly:
-its snapshot, manifests, LSM levels and deletion vectors. Paimon's Iceberg
-metadata (Paimon-as-iceberg) is not involved. It is polardb/duckdb-paimon on
-[paimon-cpp](https://github.com/apache/paimon-cpp) (C++, no JVM).
-
-**Not used by the harness.** Native Paimon (`paimon_native`, DuckDB paimon_scan /
-Trino paimon connector) was tried on _v3, 2026-11-08: correct rows but 4–29×
-slower than Paimon-as-iceberg (no file skipping, no DuckDB cache); removed
-2026-11-09. `duckdb_cdc_server.py` neither loads the extension nor creates a
-`TYPE paimon` secret; the extension stays in the image, and the notes below
-describe it for hand use.
+The image bundles polardb/duckdb-paimon on
+[paimon-cpp](https://github.com/apache/paimon-cpp) (C++, no JVM), a loadable
+extension that reads a Paimon table's own snapshot, manifests, LSM levels and
+deletion vectors, without Paimon's Iceberg metadata. **Nothing in the harness uses
+it**: `duckdb_cdc_server.py` neither loads it nor creates a secret for it, and the
+`paimon` arm reads Paimon-as-iceberg through the `iceberg` extension. It stays in
+the image only because the image was not rebuilt. History: native Paimon reading
+(this extension and Trino's Paimon connector) was tried on _v3, 2026-11-08: same
+rows, but 4–29× slower than Paimon-as-iceberg (no file skipping, no DuckDB cache);
+removed 2026-11-09. The notes below record how the extension was built.
 
 **Why built from source.** The community binary (`INSTALL paimon FROM
 community`, 0.1.3 = duckdb-paimon `6762e34b` + paimon-cpp `53f9c86d`) is
@@ -240,28 +238,3 @@ If paimon-cpp's sub-build fails, the RUN prints every non-empty ExternalProject
 installed where `INSTALL` would put it (`~/.duckdb/extensions/v2.0.0/<platform>/`);
 a connection that loads it needs `allow_unsigned_extensions=true`. The community
 0.1.3 cannot read these tables.
-
-**S3 and credentials.** paimon-cpp has its own S3 client (aws-c-auth), not
-httpfs. So `cache_httpfs` and the `irsa` S3 secret do not apply to it. It needs
-a secret of `TYPE paimon` (until 2026-11-09 the server created one from the
-same STS web-identity keys as its `irsa` S3 secret). By hand,
-`PROVIDER credential_chain` works in the pod, because the chain
-includes STS web identity (IRSA):
-
-```sql
-CREATE SECRET p (TYPE paimon, PROVIDER credential_chain, region 'us-west-2',
-                 scope 's3://<bucket>/paimon-warehouse');
-```
-
-**Verified 2026-11-03** in `duckdb-warm-cdc` (writers suspended), on
-that day's Paimon table set (a historical check; today's tables have 8 / 16
-buckets). The two tables are bucket 32, primary-key, DVs bitmap64,
-changelog-producer none:
-
-| Table (snapshot) | `total_record_count` | `count(*)` | `count(pk)` / `count(DISTINCT pk)` |
-|---|---|---|---|
-| customers (169, COMPACT) | 38,468,242 | 29,304,790 (7.3 s, metadata) | 29,304,790 / 29,304,790 (39.8 s) |
-| orders (170, COMPACT) | 66,920,258 | 57,444,969 (7.8 s, metadata) | 57,444,969 / 57,444,969 on `order_id` (46.6 s); 57,444,969 distinct `(order_date_str, order_id)` (15.3 s) |
-
-There are no duplicate keys, so deletion vectors and merge are applied.
-`total_record_count` also counts rows that DVs and compaction superseded.

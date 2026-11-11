@@ -6,7 +6,7 @@ MySQL RDS → Flink CDC (EMR on EKS) → **Apache Paimon** and **Apache Iceberg*
 
 This file is the end-to-end runbook. The results of each round are in
 [bench-results/](bench-results/) (the latest:
-[QUERYBENCH-SUMMARY-20261107-v3final.md](bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)).
+[QUERYBENCH-SUMMARY-20261110-v3.md](bench-results/QUERYBENCH-SUMMARY-20261110-v3.md)).
 The detailed guides it links to, one topic each:
 
 | Guide | Canonical for |
@@ -168,7 +168,7 @@ verifies all of it read-only.
 | Item | Requirement |
 |---|---|
 | S3 bucket `BUCKET_NAME` | Versioned; holds the warehouses, Flink state and logs, the patched jars (`flink/build/patched-jars/`), pins, results, monitor reports (Step 13 for cleanup) |
-| ECR images | `emr-flink-cdc-paimon:7.14.0` (multi-arch, Step 3a), `duckdb-cdc-server:2.0.0` with the `paimon` extension (multi-arch, Step 3b), `trino-cdc:484-paimon-2.1.0` with the Paimon connector (amd64, `engine-deploy/trino-image/build-trino-image.sh`). No ECR lifecycle rule that expires untagged images: the per-arch children of a multi-arch tag are untagged |
+| ECR images | `emr-flink-cdc-paimon:7.14.0` (multi-arch, Step 3a), `duckdb-cdc-server:2.0.0` (multi-arch, Step 3b; bundles the `paimon` extension, unused), `trino-cdc:484-paimon-2.1.0` (amd64; bundles the Paimon connector, unused; `engine-deploy/trino-image/build-trino-image.sh`). No ECR lifecycle rule that expires untagged images: the per-arch children of a multi-arch tag are untagged |
 | Executor + SQL on S3 | `s3://$BUCKET_NAME/flink/scripts/flink-cdc-executor.py` and `flink/sql-scripts/{paimon,iceberg}/`, uploaded by `build` (Step 3a) after any change |
 
 **MySQL source** ([0-MYSQL-SETUP-GUIDE.md](0-MYSQL-SETUP-GUIDE.md))
@@ -218,7 +218,7 @@ for t in bash git kubectl helm aws python3 envsubst uv; do command -v $t >/dev/n
 
 Check the [Prerequisites](#prerequisites) first. Run every command from `cdc-pipeline/`. Each step says what it does, how to
 check it, how long it takes and the usual failure. **(measured)** times are
-from the 2026-11-03 and 2026-11-07 runs; **(estimate)** otherwise.
+from the 2026-11-03, 2026-11-07 and 2026-11-10 (`_v3`) runs; **(estimate)** otherwise.
 
 **The whole run at a glance**
 
@@ -234,7 +234,7 @@ from the 2026-11-03 and 2026-11-07 runs; **(estimate)** otherwise.
 | 7 | Monitor | `monitoring/deploy-monitor.sh` (or let Step 9 do it) | 1–2 min |
 | 8 | Query engines (optional, Step 9 does it) | `deploy-duckdb-cdc.sh up`, `deploy-trino.sh up` | 5–20 min |
 | 9 | Hot test | `SUITE=hot ./querybench/run.sh start` | ~35 min after the 30 min writer wait |
-| 10 | Snapshot test | `SUITE=snapshot ./querybench/run.sh start` | ~50 min, after the hot watcher's compaction (~25 min on 2026-11-07) |
+| 10 | Snapshot test | `SUITE=snapshot ./querybench/run.sh start` | ~25 min, after the hot watcher's compaction (~32 min on 2026-11-10) |
 | 11 | Summary | `./querybench/run.sh summary` | a few min |
 | 12 | Teardown | `SUITE=hot ./querybench/run.sh stop` | 2–5 min |
 | 13 | Clean up the old table set | Glue + S3 removal | minutes–1 h |
@@ -359,7 +359,7 @@ What the image contains: [1-BUILD guide, Step 4](1-BUILD-DEPLOY-FLINK-APP-GUIDE.
 ```
 
 Compiles DuckDB 2.0.0 with iceberg, httpfs, aws, avro and the paimon extension
-for amd64 and arm64 in parallel: 14–21 min per architecture at the default
+(bundled, unused since 2026-11-09) for amd64 and arm64 in parallel: 14–21 min per architecture at the default
 `COMPILE_JOBS=60` (measured 2026-11-03). See
 [engine-deploy/duckdb-image/README.md](engine-deploy/duckdb-image/README.md).
 The Trino image (`trino-cdc:484-paimon-2.1.0`) is built the same way by
@@ -435,6 +435,12 @@ database, prints the Paimon write and S3A upload settings, and fails on any
 - **Re-deploying is delete + create, never `apply` over a live CR**: EMR stages `jarURI` on CREATE only, and an apply over an existing FlinkDeployment empties `/opt/flink/usrlib` (`NoSuchFileException: /tmp/pyflink/...`). Delete, wait for the pods, clear the HA ConfigMaps (Step 4), apply again ([1-BUILD guide, Step 7](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#step-7--re-deploy-after-a-change)).
 - **Pause / resume** (no new snapshot; restores the last checkpoint): `kubectl patch flinkdeployment <job> -n emr-flink --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'` (or `"running"`).
 
+**Paimon write-path tuning (since 2026-11-11, new tables only):** `lookup-wait = false`,
+`lookup-compact = gentle` (`max-interval = 3`), `num-sorted-run.stop-trigger = 16`,
+`file.compression.per.level = 0:lz4`. Paimon's checkpoints no longer wait for its
+lookup compaction: median 10.4 s → 2.3 s on `_v3`. Paimon-as-iceberg may then trail
+by up to ~3 checkpoints. Details: [1-BUILD guide, Sink table settings](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#sink-table-settings-paimon-vs-iceberg).
+
 Both jobs are identical in sizing (parallelism 12, 6 TaskManagers × 2 slots
 of 8 cpu / 32 Gi, 60 s checkpoints, operator chaining off; the full list:
 [1-BUILD guide, Current job sizing](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#current-job-sizing)).
@@ -443,10 +449,19 @@ merges files (every checkpoint adds data files, equality-delete files and
 deletion vectors); Paimon compacts and expires inline. Both formats are
 compacted once, by the hot test's watcher, before the snapshot test (Step 10).
 
+**Both formats bucket by the id column** with the same N, within the same
+partitions: 8 on `customers` and `products`, 16 per date on `orders` and
+`order_items`. Iceberg has had `bucket(N, <id>)` in its partition spec since
+2026-11-09, on new tables only; until then Iceberg's hash-mode sink wrote each
+date partition with one writer. A new set needs the changed executor and SQL on
+S3 first (Step 3a; upload-only commands in the 1-BUILD guide's Step 5, no image
+rebuild). Details: [1-BUILD guide, Buckets](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#buckets).
+
 - **Check:**
   - `kubectl get flinkdeployment -n emr-flink`: `flink-cdc-paimon` and `flink-cdc-iceberg` `RUNNING` / `STABLE`.
   - `aws glue get-tables --database-name flink_iceberg_db${SESSION_SUFFIX} --query 'TableList[].Name'` lists 4 tables, and the same for `flink_paimon_db${SESSION_SUFFIX}`.
   - No `Access denied` in `kubectl logs deploy/flink-cdc-iceberg -n emr-flink -c flink-main-container`.
+  - The same log has `✓ <db>.<table>: partition spec now ...` for each new Iceberg table; `⚠ ... holds data: bucket(...) not added` = a reused set that stays unbucketed.
 - **Time:** both writers `RUNNING` / `STABLE` about **8 min** after the apply (measured at parallelism 32, 16 TaskManagers; now 12, 6 TaskManagers per writer). The initial snapshot (~50M rows plus what the generator added) then runs for tens of minutes (estimate).
 - **If it fails:** see [Troubleshooting](#troubleshooting): a missing or stale Secret, an apply over an existing CR, a leftover HA ConfigMap, nodepool limits, or (Paimon) a JobManager `OutOfMemoryError: Metaspace` (metaspace is 512m in both manifests).
 
@@ -469,7 +484,7 @@ and the `config` / `upsert-mix` / `recent-mix` / `delete-mix` commands:
 same Secret `mysql-credentials` as the writers, and refuses to deploy without it.
 
 - **Check:** `status` prints a rate per pod; `errors=` against `batches=` is the failure share (MySQL 1213/1205 retries are silent).
-- **Rate:** the source, not the writers, sets the ingest rate. Measured: 2026-11-03, 4 pods ≈ 89K rows/s and 8 pods ≈ 79K rows/s in total (past a few pods, extra pods added lock contention); 2026-11-07 (`_v3final`, 24 pods, the current values): both writers ingested ~100K rows/s (job monitor) with no backpressure.
+- **Rate:** the source, not the writers, sets the ingest rate. Measured: 2026-11-03, 4 pods ≈ 89K rows/s and 8 pods ≈ 79K rows/s in total (past a few pods, extra pods added lock contention); 2026-11-10 (`_v3`, 24 pods, the current values): the generator wrote ~38.4K rows/s (its own counters, from the pods' logs in CloudWatch Container Insights) and both writers' sources read ~56K change events/s with no backpressure. The job monitor counts change events, and an UPDATE is 2 events (-U and +U), so its rate is above the generator's rows/s (the 2026-11-07 "~100K rows/s" was events too).
 - **Time:** pods ready in 1–2 min (estimate).
 - **If it fails:** `Secret mysql-credentials not found` / `has no key` = Step 0. Rows below the shrink cutoff = pods not restarted after a shrink (`kubectl rollout restart statefulset/mysql-upsert-loadgen -n emr-flink`).
 
@@ -503,16 +518,18 @@ them back. Details: [3-MONITOR.md](3-MONITOR.md).
 ```
 
 The benchmark runs `ENGINES` (`duckdb trino`) × `FORMATS` (default
-`iceberg paimon`): four arms, two per engine.
+`iceberg paimon`; `both` and `all` are aliases): four arms, two per engine.
+Any other `FORMATS` value fails fast.
 
 | `FORMATS` value | Reads |
 |---|---|
 | `iceberg` | the Iceberg tables, `flink_iceberg_db<suffix>` |
 | `paimon` | **Paimon-as-iceberg**: Paimon's Iceberg v3 metadata through an Iceberg reader (DuckDB `iceberg_scan`, Trino's `iceberg` catalog) |
 
-Native Paimon (`paimon_native`, DuckDB paimon_scan / Trino paimon connector)
-was tried on _v3, 2026-11-08: correct rows but 4–29× slower than
-Paimon-as-iceberg (no file skipping, no DuckDB cache); removed 2026-11-09.
+History: native Paimon reading (a `paimon_native` arm through DuckDB's paimon
+extension and Trino's `paimon` catalog) was tried on _v3, 2026-11-08: correct
+rows but 4–29× slower than Paimon-as-iceberg (no file skipping, no DuckDB cache);
+removed 2026-11-09, and its settings now stop the run with an error.
 Each arm's table expression, the pins and the validity rules:
 [querybench/README.md, The four arms](querybench/README.md#the-four-arms).
 
@@ -554,7 +571,7 @@ keep one). Then, once the writers' TaskManagers are gone, it runs the
 logs why. A manual `run.sh stop` does the same teardown, without the compaction.
 
 - **Check:** the runner logs `status: results-uploaded ...`, the watcher `status: qb-watch-done` (`qb-watch-compaction-failed` before it = a compaction failed, and the snapshot start then refuses).
-- **Time (measured 2026-11-07):** about 21 min of querying; with the engines' start-up ~35 min after the writer wait.
+- **Time (measured 2026-11-10):** about 16 min of querying (21 min on 2026-11-07); with the engines' start-up ~25–35 min after the writer wait.
 - **If it fails:** `./querybench/run.sh logs`; [querybench/README.md, After a failure](querybench/README.md#6-after-a-failure). A failure inside `start` stops before any Job ("no query Job left running").
 
 The continuous Iceberg compaction job `iceberg-maintain` (the
@@ -624,12 +641,16 @@ Knobs (set on the hot `run.sh start` line, they reach the watcher): `COMPACT_TAB
 **Measured 2026-11-07** (`_v3final`, run 20261107T162100Z): Iceberg `customers`
 675 s (1,410 delete files, 31.1M equality deletes → 0), `products` 119 s,
 `orders` 348 s, `order_items` 226 s (132.0M equality deletes); Paimon 122–139 s
-per table. The snapshot test therefore measures both formats fully compacted.
+per table. **Measured 2026-11-10** (`_v3`, run 20261110T163643Z): Iceberg 245–577 s per
+table (`order_items` 577 s, 237M equality deletes → 0), 27.9 min in total; Paimon
+159–273 s, 12.6 min. Estimated cost, EC2 plus the EMR on EKS uplift: Iceberg $4.18,
+Paimon $0.36 (Iceberg runs 16 TaskManagers per table, 96 GiB on the fact tables;
+Paimon 4). The snapshot test therefore measures both formats fully compacted.
 (Superseded: the 2026-11-04 attempt was stopped part-way, before Iceberg's
 `customers` rewrite finished.)
 
 - **Check:** `status: results-uploaded ...` and `status: runner-exit=0`.
-- **Time (measured):** ~48 min from `start` to the runner's exit (2026-11-03); about 10 min of querying on 2026-11-07.
+- **Time (measured):** ~22 min from `start` to the runner's exit, about 9 min of querying (2026-11-10).
 - **If it fails:** `compaction FAILED: ...` → `./compaction/run.sh logs <fmt> <table>`, fix, `./compaction/run.sh down`, re-run that table (`COMPACT_TABLES=<t> ./compaction/run.sh run <fmt>`). `no date before <today> in the orders and order_items partitions` → `SNAPSHOT_DT=YYYY-MM-DD`. `snapshot slice: no 10-min bucket holds rows in every format` → lower `SNAPSHOT_SLICE_MINUTES` or set `S_FROM` / `S_TO`.
 
 ## Step 11: Summary
@@ -642,9 +663,19 @@ per table. The snapshot test therefore measures both formats fully compacted.
 ```
 
 Writes **`bench-results/QUERYBENCH-SUMMARY-<YYYYMMDD><tag>.md`** with the bucket
-and account redacted: run configuration, headline, query latency per suite
-(snapshot: cold pass and warm median), the compaction results, ingest
-throughput and delete mix, table state, conclusions. The ingest JSON goes to
+and account redacted: run configuration (table formats and how they are added to the
+image, writers, ingest window, source, generator, query engines, buckets), a
+plain-English headline with the speed (geometric means) and estimated-cost
+comparison tables, query latency per suite with an estimated cost (US$) per query
+and arm and a total row (snapshot: cold pass and warm median), the compaction
+results with their estimated cost (EC2 plus the EMR on EKS uplift), ingest
+throughput and what each format stored, table state, conclusions. Costs are
+on-demand list prices (AWS Pricing API, us-west-2), query time only.
+
+The Generator row reports the CDC sources' rate in **change events/s** (an UPDATE is
+2 events). The generator's own rows/s is in its pod logs (CloudWatch Container
+Insights, `mysql-upsert-loadgen` streams); `summarize.py` does not read it, so add it
+by hand when the summary needs it. The ingest JSON goes to
 `s3://.../cdc-session<tag>/<session>-summary/`, and every raw result stays in
 its run's S3 prefix. Section by section and where each number comes from:
 [querybench/README.md, Summary](querybench/README.md#4-summary).
@@ -747,6 +778,7 @@ registered Paimon's v2 Iceberg metadata in a separate Glue database for Athena (
 - `order_date`, `created_at` and `updated_at` default to `CURRENT_TIMESTAMP`.
 - `customers.email` is UNIQUE. The generators use UUID-based emails.
 - `orders.order_id`, `order_items.order_item_id` and `order_items.order_id` are BIGINT (since 2026-11-06); `customer_id` and `product_id` are INT. DDL: [0-MYSQL-SETUP-GUIDE.md, Step 3](0-MYSQL-SETUP-GUIDE.md#step-3-create-database-schema).
+- Both formats bucket by the id column with the same N (Iceberg since 2026-11-09, new tables only): Paimon `'bucket'` / `'bucket-key'`, Iceberg `bucket(N, <id>)` in its partition spec, added by `flink-cdc-executor.py`. Per-table N, how it is added, and why: [1-BUILD guide, Buckets](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#buckets).
 - The partition columns differ by format: Paimon `order_date_str` / `created_date_str`, Iceberg `order_dt` / `created_dt`. Both are `DATE_FORMAT()` strings and are part of the primary key.
 
 ## Troubleshooting
@@ -765,6 +797,7 @@ Query-side symptoms (arms, pins, slices, Trino and DuckDB errors) are in
 | New table options have no effect | `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table. Use a new `SESSION_SUFFIX` |
 | TaskManagers die with `exitCode=255`, `NoResourceAvailableException` | The image is single-arch on a mixed-arch pool. Rebuild with both `PLATFORMS` |
 | Pods Pending, `exceed limits for nodepool` | Karpenter counts provisioned capacity against the NodePool `limits.cpu`. Raise it, e.g. `kubectl patch nodepool driver-nodepool --type=merge -p '{"spec":{"limits":{"cpu":512}}}'` (unquoted number) |
+| Both JobManagers replaced mid-run, jobs back from a checkpoint ~3 min later | Karpenter replaced a `Drifted` driver node (a new EKS AMI under `al2023@latest`): `kubectl get events -A \| grep Drifted`. The JobManager pods carry `karpenter.sh/do-not-disrupt` since 2026-11-11; for a manifest rendered before that, redeploy, or pin the EC2NodeClass AMI ([1-BUILD guide, Job cycles RUNNING → RESTARTING](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#job-cycles-running--restarting--created--running)) |
 | Job cycles RUNNING → RESTARTING for no visible reason | Karpenter consolidation evicting a TaskManager (`failover-strategy: full` restarts all). Check that `karpenter.sh/do-not-disrupt` is on the running TaskManager pods |
 | `AWSGlueClientFactory - No region info found ... us-east-1` + `401` on the JobManager | Noise. The job reaches RUNNING anyway. Look elsewhere for a restart cause |
 | Operator CRD delete hangs | A CR is stuck on its finalizer. `kubectl patch flinkdeployment <n> -n <ns> --type=merge -p '{"metadata":{"finalizers":null}}'` |

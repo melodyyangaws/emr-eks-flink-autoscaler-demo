@@ -4,8 +4,8 @@
 
 Both **Apache Paimon** and **Apache Iceberg** are open table formats that enable building data lakehouses on S3. This guide helps you choose the right format for your Flink CDC use case.
 
-> **Latest measured results:** the 2026-11-07 `_v3final` round,
-> [bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md](bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)
+> **Latest measured results:** the 2026-11-10 `_v3` round,
+> [bench-results/QUERYBENCH-SUMMARY-20261110-v3.md](bench-results/QUERYBENCH-SUMMARY-20261110-v3.md)
 > (DuckDB and Trino on Iceberg v3 and on Paimon-as-iceberg, hot and snapshot suites).
 > The reader findings of [2026-11-02](#iceberg-v3-on-emr-714-findings-of-2026-11-02) are
 > partly superseded (marked there). The StarRocks-era benchmark below
@@ -155,13 +155,17 @@ CREATE TABLE orders (
     order_date_str STRING,  -- Must create partition column
     ...
     PRIMARY KEY (order_date_str, order_id) NOT ENFORCED
-) PARTITIONED BY (order_date_str)
+) PARTITIONED BY (order_date_str) WITH (
+    'bucket' = '16',            -- 16 fixed buckets per date partition
+    'bucket-key' = 'order_id'   -- one writer per bucket
+)
 ```
 
 **Characteristics:**
 - Must manually create partition columns
 - String-based partitions
 - Partition pruning requires explicit column in WHERE clause
+- Buckets are a table option, separate from the partition columns
 
 #### Iceberg
 ```sql
@@ -174,14 +178,34 @@ CREATE TABLE orders (
 ) PARTITIONED BY (DAYS(order_date))  -- Automatic!
 ```
 
-This pipeline does not use a transform: Flink SQL's `PARTITIONED BY` takes columns
+This pipeline does not use a date transform: Flink SQL's `PARTITIONED BY` takes columns
 only, and an upsert table's partition column must be in its primary key, so the
 Iceberg sinks partition by a `DATE_FORMAT()` string column too (`order_dt`,
 `created_dt`; `ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql`).
 
+**Buckets (since 2026-11-09, new tables only).** In Iceberg a bucket is a partition
+transform, `bucket(N, col)`, not a table option. Each sink table now gets one with
+Paimon's N and bucket key:
+
+| Table | Paimon | Iceberg partition spec |
+|---|---|---|
+| `customers` | `bucket = 8`, key `customer_id` | `bucket(8, customer_id)` |
+| `products` | `category`, `bucket = 8`, key `product_id` | `category`, `bucket(8, product_id)` |
+| `orders` | `order_date_str`, `bucket = 16`, key `order_id` | `order_dt`, `bucket(16, order_id)` |
+| `order_items` | `created_date_str`, `bucket = 16`, key `order_item_id` | `created_dt`, `bucket(16, order_item_id)` |
+
+Flink DDL cannot declare `bucket()`, so the sink DDL declares it as
+`'bench.bucket'` / `'bench.bucket-key'` table properties, and
+`ingest-deploy/flink-cdc-executor.py` (`add_iceberg_bucket()`) adds the field
+through the Iceberg API (`updateSpec().addField(bucket(N, key))`) right after the
+`CREATE TABLE`, while the table is still empty. A table that already holds data
+keeps its spec, with a warning; a new `SESSION_SUFFIX` gets the buckets. Before
+2026-11-09 the Iceberg tables had no buckets (customers unpartitioned, the others
+by `category` or date only). Not yet run on the cluster.
+
 **Characteristics:**
 - **Hidden partitioning** - no extra columns needed
-- Function-based transforms: DAYS(), MONTHS(), YEARS(), HOURS()
+- Function-based transforms: DAYS(), MONTHS(), YEARS(), HOURS(), and bucket(N, col)
 - Partition pruning automatic in WHERE clauses
 - Can evolve partition spec without rewriting data
 
@@ -475,10 +499,10 @@ Iceberg metadata in the 2026-11-02 hot test.
 **Superseded since:** both engines now read Paimon as *Paimon-as-iceberg* (the
 `paimon` arm, [querybench/README.md, The four arms](querybench/README.md#the-four-arms)):
 DuckDB reads it since the patched `paimon-flink-1.20` (2026-11-07; the `_v3final`
-round ran DuckDB and Trino on it). Native Paimon (`paimon_native`, DuckDB
-paimon_scan / Trino paimon connector) was tried on _v3, 2026-11-08: correct rows
-but 4–29× slower than Paimon-as-iceberg (no file skipping, no DuckDB cache);
-removed 2026-11-09.
+round ran DuckDB and Trino on it). Paimon is read only that way. Native Paimon
+reading (DuckDB's Paimon extension, Trino's Paimon connector) was tried on _v3,
+2026-11-08: same rows, but 4–29× slower than Paimon-as-iceberg (no file skipping,
+no DuckDB cache); removed 2026-11-09.
 
 ### Paimon-as-iceberg: behaviours to know
 
@@ -521,13 +545,13 @@ These differences remain by design. Report them next to every result:
 
 | Difference | Paimon | Iceberg |
 |---|---|---|
-| Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 16 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; dynamic buckets are unreadable by DuckDB's Paimon reader) | `write.distribution-mode = hash` on a date-partitioned upsert table sends each date partition to one writer, so today's changes go through a single writer. At the dry run's source-limited rate both kept up; above it, that single writer is the expected ceiling |
+| Writer parallelism | fixed buckets, one writer each: 8 on the dimension tables (per category on `products`), 16 per date partition on the fact tables (until 2026-11-04 `bucket = 32`; fixed rather than dynamic because DuckDB's former native Paimon reader refused dynamic buckets) | Since 2026-11-09, `bucket(N, <id>)` with Paimon's N and key (8 on customers / products per category, 16 per date on orders / order_items), added to the partition spec by `flink-cdc-executor.py` (Flink DDL cannot declare it). `write.distribution-mode = hash` keys rows by the partition value, so each bucket goes to one writer; Flink's key hashing spreads the 16 buckets unevenly over 12 writers (some get none). Before, each date partition went to one writer, so today's changes went through a single writer |
 | Compaction | inline, in the writer (LSM lookup compaction, deletion vectors) | none in the sink; `compaction/run.sh` once before the snapshot test (writers stopped) |
 | Snapshot expiry timing | in the writer, at commit time (`snapshot.expire.execution-mode = async`) | only in `compaction/run.sh`, with the same 12 h / keep-5 rule. Paimon's writer does not expire while suspended |
 | Row-level deletes | deletion vectors in Paimon's index files | equality deletes for rows from earlier checkpoints, DVs (v3) or position deletes (v2) for rows rewritten within one checkpoint. The sink's equality-delete-to-DV converter is not enabled |
 | Glue integration | EMR's Glue Hive metastore client (`aws.glue.enabled: "true"`, the one intended `flinkConfiguration` difference) | Iceberg's own `GlueCatalog` |
 | Schema details | `TIMESTAMP(6)`; partition columns `order_date_str`, `created_date_str` | `TIMESTAMP(3)`; partition columns `order_dt`, `created_dt` |
-| Paimon-only knobs | write buffers (64/128 MB, spillable unless `PAIMON_WRITE_BUFFER_SPILLABLE=false` as in `.bench-env`; `INSERT` hints), `num-sorted-run.compaction-trigger = 8`, `sink.writer-coordinator.enabled` | — |
+| Paimon-only knobs | write buffers (64/128 MB, spillable unless `PAIMON_WRITE_BUFFER_SPILLABLE=false` as in `.bench-env`; `INSERT` hints), `num-sorted-run.compaction-trigger = 8`, `sink.writer-coordinator.enabled`; since 2026-11-11 `lookup-wait = false`, `lookup-compact = gentle` (`max-interval = 3`), `num-sorted-run.stop-trigger = 16`, `file.compression.per.level = 0:lz4` ([1-BUILD guide](./1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#sink-table-settings-paimon-vs-iceberg)): checkpoints 10.4 s → 2.3 s; Paimon-as-iceberg may trail by up to ~3 checkpoints | — |
 
 ---
 

@@ -156,7 +156,10 @@ with the meter as a separate "Source rate meter" row.)
 the share of the window's samples in which any vertex reported `HIGH`; the median over the
 samples of the CDC sources' highest subtask `backPressuredRatio`, in ms per second (how long
 a source waited on its downstream); and the median of the writers' highest subtask `busyRatio`
-in ms/s (near 1,000 = one writer saturated: Iceberg's single writer per date partition).
+in ms/s (near 1,000 = one writer saturated: on Iceberg sets created until 2026-11-09, the
+single writer per date partition; newer sets bucket each date 16 ways, like Paimon, spread
+unevenly over the 12 writers, see the
+[1-BUILD guide, Buckets](1-BUILD-DEPLOY-FLINK-APP-GUIDE.md#buckets)).
 `-` = no RUNNING sample in the window. JSON: `backpressured_sample_ratio` (unchanged),
 `source_backpressured_ms_per_s`, `writer_busy_max_ms_per_s`.
 

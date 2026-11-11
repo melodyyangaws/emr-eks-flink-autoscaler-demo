@@ -107,7 +107,10 @@ The runner (`hot-interleave.sh`; its header is the authoritative description):
 
 The pins file `hot-interleave-<STAMP>.pins` records the window, every pin,
 `data_wait_s`, the H8 key, `queries_started_at` and `finished_at`, and the
-generator's state before and after.
+generator's state before and after. Each pin's table state (snapshot id,
+commit time, `total-*` counts, and a note with `format-version=`,
+`operation=` and `spec=`, the default partition spec) goes to
+`tables-<STAMP>.tsv` ([Output](#output)).
 
 **Done** looks like this in the runner log, then the watcher's teardown (it
 checks every `WATCH_INTERVAL_S`, 300 s, so up to 5 min later):
@@ -228,15 +231,16 @@ Paimon's manifests are zstd Avro), else `python3` (then Paimon file counts are
 blank). A failure there never stops the summary: the ingest section says
 "Not available: <reason>". `INGEST=0` skips it.
 
-The summary, modelled on `bench-results/SUMMARY-20260927.md` (the latest:
-[QUERYBENCH-SUMMARY-20261107-v3final.md](../bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)):
+The summary (the latest:
+[QUERYBENCH-SUMMARY-20261110-v3.md](../bench-results/QUERYBENCH-SUMMARY-20261110-v3.md)):
 
 | Section | What | From |
 |---|---|---|
-| Run configuration | Flink parallelism / TMs / checkpoint interval, source RDS class and storage, generator (pods × `RATE_PER_POD`, `BATCH_ROWS`, `UPSERT_RATIO`, `RECENT_KEY_RATIO`), engines, table set, runs, ingest window | `ingest-deploy/flink-cdc-*-deployed.yaml`; `aws rds describe-db-instances` (host from `MYSQL_HOST`, `.bench-env.local`); the live StatefulSet's env (else `mysql-upsert-loadgen.yaml`) and the `.pins` `generator_before=` replicas; the `.pins` run-meta lines |
-| 1. Headline | computed sentences: Trino / DuckDB per format, Paimon / Iceberg per engine, arms that errored on every query, ingest throughput (rows/s, MB/s: the job monitor's when it has reports for the window, else table metadata, labelled so) and the delete mix | the sections below |
-| 2. Query latency | the compaction results before the snapshot test; per suite: median seconds per query and arm, Trino / DuckDB ratio, geometric means (snapshot: cold pass too); queries recovered as OK after a lost Trino result stream | `compaction/*.json`, `duckdb_warm-<STAMP>.csv`, `trino-<STAMP>.csv` |
-| 3. Ingest | **Throughput**: rows/s and data size/s per format, median (max) over the job-monitor reports overlapping the window, plus median checkpoint duration and max backpressure share; "job-monitor reports not available for this window" when there are none. **From table metadata**: rows/s and MB/s (rows / bytes committed ÷ window seconds), rows, write commits and median interval, new data and delete files, equality and position deletes, compaction commits; RDS CPU over the window | job-monitor reports and `ingest_stats.py`, below |
+| Buckets | a row of the run-configuration table: N per table, in plain words (Iceberg since 2026-11-09 has the same N and key as Paimon). The write-side differences that remain are in [../PAIMON-VS-ICEBERG.md](../PAIMON-VS-ICEBERG.md#write-side-asymmetries-kept-on-purpose), not in the summary | `tables-<STAMP>.tsv` (`buckets_row` in `summarize.py`) |
+| Run configuration | Open Table Format(OTF) (Iceberg and Paimon versions, how they are added to the EMR on EKS Flink image; first row), Flink parallelism / TMs / checkpoint interval, ingest window, source RDS class and storage, generator (pods × `RATE_PER_POD`, the CDC sources' change events/s), query engines, table set, buckets, runs | `ingest-deploy/flink-cdc-*-deployed.yaml`, `ingest-deploy/docker/Dockerfile.cdc-paimon`, the `.pins` files, the ingest JSON |
+| 1. Headline | plain-English bullets computed from the results (which format and which query engine was faster, by how much, numbers in bold), ingest, why live Iceberg queries are slower; then **Speed** (every geometric mean: hot warm, snapshot warm, snapshot cold) and **Estimated cost** (each suite's total cost, A vs B in %) tables | computed (`plain_headline`, `geo_summary`) |
+| 2. Query latency | the compaction results before the snapshot test, with TaskManagers and estimated cost (US$): job duration × pod requests × (EC2 + EMR on EKS uplift), and a total per format; per suite: median seconds per query and arm with an estimated cost (US$) column after each arm (seconds × the engine's EC2 on-demand node price; query time only) and a total row, Trino / DuckDB ratios (snapshot: the cold pass too); queries recovered as OK after a lost Trino result stream | `compaction/*.json`, the runs' CSVs, `EC2_PRICE_H` / `POD_*_H` / `EMR_*_H` in `summarize.py` |
+| 3. Ingest | **Throughput**: change events/s (an UPDATE counts twice) and data size/s per format, median (max) over the job-monitor reports overlapping the window, median checkpoint duration and max backpressure share, then a plain-English **Outcome** line; "job-monitor reports not available for this window" when there are none. **From table metadata**: rows/s and MB/s (rows / bytes committed ÷ window seconds), rows, write commits and median interval, new data and delete files, equality and position deletes, compaction commits. **What each format stored**: rows saved, old versions (delete markers), data size while loading and after the full compaction, source RDS CPU, in plain words | job-monitor reports, `ingest_stats.py`, `compaction/*.json` |
 | 4. Table state | per table at the window end: records, files, deletes, retained snapshots | `ingest_stats.py` |
 | Conclusions / Open items | one line per measured result; arms that failed, row gaps, missing suites or monitor reports | computed |
 | Details (`<details>`) | Trino server-side breakdown, data scanned, result equality and first rows, every pin (tables TSV), DuckDB restarts, the `.pins` files, ingest per table | as before |
@@ -356,7 +360,8 @@ scripts print. Pipeline-side symptoms: [../README.md, Troubleshooting](../README
 
 `ENGINES` × `FORMATS`, by default `duckdb trino` × `iceberg paimon`: two arms
 per engine, Iceberg and Paimon-as-iceberg. `ENGINES=duckdb|trino` and
-`FORMATS` (`iceberg` and/or `paimon`, space- or comma-separated) select a
+`FORMATS` (`iceberg` and/or `paimon`, space- or comma-separated; `both` and
+`all` mean both; any other value, a removed one included, stops the run) select a
 subset for either suite; `ENGINES` order is the run order. `paimon` reads the
 Paimon tables through their Iceberg v3 metadata (Paimon-as-iceberg), with the
 same Iceberg readers as `iceberg`. `lib/querybench.sh` (`_qb_resolve_formats`,
@@ -369,11 +374,11 @@ same Iceberg readers as `iceberg`. `lib/querybench.sh` (`_qb_resolve_formats`,
 | `duckdb:paimon` | DuckDB, `iceberg_scan` with `iceberg_unsafe_skip_puffin_verification` (Paimon's DV files are not real Puffin containers) | Paimon-as-iceberg, `paimon-warehouse/iceberg/<PAIMON_DB>/<t>` (`PMNICE_ROOT`) | `iceberg_scan('<copy of the pinned v<N>.metadata.json>')` |
 | `trino:paimon` | Trino 484, catalog `iceberg` (the Paimon tables' Glue entries, `table_type=ICEBERG`) | the same | `iceberg.<PAIMON_DB>.<t> FOR VERSION AS OF BIGINT '<N>'` |
 
-History: native Paimon (`paimon_native`, DuckDB paimon_scan / Trino paimon
-connector) was tried on _v3, 2026-11-08: correct rows but 4–29× slower than
-Paimon-as-iceberg (no file skipping, no DuckDB cache); removed 2026-11-09. The
-`paimon` arm's readers of 2026-11-04 to 2026-11-06 were native as well
-(`PAIMON_READER=native`, removed with it).
+History: native Paimon reading (`paimon_native`, DuckDB paimon_scan / Trino's
+paimon connector; the `paimon` arm also read that way from 2026-11-04 to
+2026-11-06 under `PAIMON_READER=native`) was tried on _v3, 2026-11-08: the same
+rows, 4–29× slower than Paimon-as-iceberg (no file skipping, no DuckDB cache).
+Removed 2026-11-09; earlier summaries say which reader they used.
 
 - **One pin per format, both engines.** `pin.sh` copies each Iceberg table's
   current metadata.json to `s3://$BUCKET_NAME/querybench-pins/...` and reads its
@@ -412,6 +417,20 @@ The sink DDLs are paired setting by setting
 The write-side differences kept on purpose (writer parallelism, compaction,
 snapshot-expiry timing; state them with every result) are in
 [../PAIMON-VS-ICEBERG.md](../PAIMON-VS-ICEBERG.md#write-side-asymmetries-kept-on-purpose).
+
+**Buckets (table sets created since 2026-11-09).** The Iceberg tables carry
+`bucket(N, <id>)` partition fields with Paimon's `N` and bucket key: customers
+`bucket(8, customer_id)`; products `category` + `bucket(8, product_id)`; orders
+`order_dt` + `bucket(16, order_id)`; order_items `created_dt` +
+`bucket(16, order_item_id)`. Flink DDL cannot declare them, so
+`ingest-deploy/flink-cdc-executor.py` adds them through the Iceberg API from the
+`'bench.bucket'` / `'bench.bucket-key'` properties in
+`ingest-deploy/sql-scripts/iceberg/03-iceberg-sinks.sql`, only on an empty
+table: a table set created before keeps its unbucketed spec (a new
+`SESSION_SUFFIX` gets the buckets). Hash distribution then sends each bucket of a
+partition to one writer, as Paimon does; until 2026-11-09 it sent each date
+partition to ONE writer. Which spec a run read is in `tables-<STAMP>.tsv`
+(`spec=` in the note column).
 
 The engines have equal CPU and memory (about 81 cpu / 342 GiB each, from
 `.bench-env`) and about 450 GiB of disk cache each; Trino's extra coordinator,
@@ -541,7 +560,7 @@ In `s3://$BUCKET_NAME/querybench-results/cdc-session<set tag>/<STAMP>-<suite>/`:
 | `trino-<STAMP>-queries.csv` | every Trino pass: query id, elapsed, queued, execution, CPU, physical input, error |
 | `*-rows.tsv`, `*-firstrows.csv` | result rows of the last timed pass |
 | `duckdb_warm-<STAMP>-events.csv`, `*.log` | DuckDB restarts and cold queries; every pass |
-| `tables-<STAMP>.tsv` | pinned snapshots' state per pin tag × format × table |
+| `tables-<STAMP>.tsv` | pinned snapshots' state per pin tag × format × table: `pin_tag`, `format`, `table`, `snapshot_id`, `commit_ms`, the snapshot's `total-*` counts, and `note` (`format-version=N operation=<op> spec=<default partition spec>`, e.g. `spec=order_dt,bucket[16](order_id)`, `none` when unpartitioned; since 2026-11-09), plus any pin warning |
 | `hot-interleave-<STAMP>.pins` / `snapshot-<STAMP>.pins` | windows, pins, H8 key, gates, writer and generator state, `queries_started_at` (hot) and `finished_at` |
 | hot: `*-p<N>.csv`, `hot-interleave-<STAMP>.log` | every pass (p0 = warm-up) |
 
@@ -551,12 +570,13 @@ copies: `s3://$BUCKET_NAME/querybench-pins/cdc-session<set tag>/<tag>/<format>/<
 
 ## Caveats
 
-1. **Native Paimon is not an arm**: dropped 2026-11-09 for speed, not
-   correctness (history note in [The four arms](#the-four-arms)).
-2. **Runs before 2026-11-07 read Paimon differently:** natively from
-   2026-11-04 to 2026-11-06 (DuckDB paimon_scan / Trino's paimon connector),
-   through the Iceberg metadata before that (on v2, a top-level-only view);
-   their summaries say which.
+1. **Runs before 2026-11-07 read Paimon differently** (history note in
+   [The four arms](#the-four-arms); before 2026-11-04 through the Iceberg
+   metadata, on v2 a top-level-only view); their summaries say which.
+2. **Iceberg layout depends on the table set.** Sets created before 2026-11-09
+   have no bucket field (one writer per date partition, no bucket pruning on
+   id lookups such as H8); a comparison across sets with a different `spec=` in
+   `tables-<STAMP>.tsv` must say so.
 3. **The hot window (30 s) and the S4 slice (10 min)** are sized from earlier
    runs' H1 and S4 rows; recheck them when the generator rate changes.
 4. **The coordinator runs the CLI** (≤ 512 MB heap) during the timed window,

@@ -258,6 +258,14 @@ def aws(*a):
 STATE_KEYS = ("total-records", "total-data-files", "total-delete-files", "total-equality-deletes",
               "total-position-deletes", "total-files-size")
 out, state = [], []
+def spec_of(meta):
+    """The default partition spec as 'order_dt,bucket[16](order_id)' ('none' if unpartitioned)."""
+    names = {f["id"]: f["name"] for sc in meta.get("schemas", []) for f in sc.get("fields", [])}
+    spec = next((p for p in meta.get("partition-specs", []) if p.get("spec-id") == meta.get("default-spec-id")), {})
+    fs = ["%s%s" % ("" if f.get("transform") == "identity" else f.get("transform", "?"),
+                    names.get(f.get("source-id"), "?") if f.get("transform") == "identity" else "(%s)" % names.get(f.get("source-id"), "?"))
+          for f in spec.get("fields", [])]
+    return ",".join(fs) or "none"
 def pin(fmt, t, loc, want_sid=None):
     """Copy <loc>; returns the pinned snapshot id."""
     key = "%s/%s/%s/%s/%s" % (prefix, tag, fmt, t, loc.rsplit("/", 1)[1])
@@ -279,7 +287,7 @@ def pin(fmt, t, loc, want_sid=None):
         print("  [querybench] WARNING: %s %s metadata is format-version %s, not ICEBERG_FORMAT_VERSION=%s (%s)"
               % (fmt, t, fv, E.get("ICEBERG_FORMAT_VERSION", "3"), loc), file=sys.stderr)
     state.append([fmt, t, sid, ts] + [sm.get(k, "") for k in STATE_KEYS]
-                 + ["format-version=%s operation=%s%s" % (fv, sm.get("operation", "?"), note.replace(" ", "_"))])
+                 + ["format-version=%s operation=%s spec=%s%s" % (fv, sm.get("operation", "?"), spec_of(meta), note.replace(" ", "_"))])
     F, T = fmt.upper(), t.upper()
     out.extend(["QB_PIN_META_%s_%s=s3://%s/%s" % (F, T, bucket, key), "QB_PIN_SNAP_%s_%s=%s" % (F, T, sid),
                 "QB_PIN_COMMIT_MS_%s_%s=%s" % (F, T, ts), "QB_PIN_FORMAT_VERSION_%s_%s=%s" % (F, T, fv)])

@@ -6,7 +6,7 @@ one snapshot run (querybench/run.sh summary gathers them from S3).
                [--hot <STAMP>] [--snapshot <STAMP>] [--iceberg-format-version 3] [--warmup 1]
                [--ingest <ingest_stats.py JSON>] [--ingest-error <why it is missing>] --out <md>
 
-Layout (modelled on bench-results/SUMMARY-20260927.md): Run configuration;
+Layout: Run configuration;
 1. Headline (computed bullets); 2. Query latency (median per query and arm,
 geometric means); 3. Ingest (Paimon vs Iceberg over the run's window, from
 ingest_stats.py); 4. Table state at the window end; Conclusions / Open items;
@@ -79,6 +79,45 @@ def read_tables(d):
     return tps, hdr, [r for r in t[1:] if f is None or f >= len(r) or r[f] != DROPPED_ARM]
 ENGINE = {"duckdb_warm": "DuckDB", "trino": "Trino"}
 WARMUP = [1]   # --warmup
+
+# ── Cost. On-demand Linux EC2 prices, us-west-2, US$/h (AWS Pricing API, 2026-11-11).
+# The engines run one pod per node, so they are priced per node: query time ×
+# the hourly price of every node the engine holds (DuckDB: its one node; Trino:
+# workers + coordinator). Idle time between queries is not counted.
+EC2_PRICE_H = {"m5.2xlarge": 0.384, "m5.4xlarge": 0.768, "m5.8xlarge": 1.536, "m5.12xlarge": 2.304,
+               "m5.16xlarge": 3.072, "m5.24xlarge": 4.608}
+# The compaction pods share Karpenter nodes, so they are priced by their requests:
+# a linear fit to m6g.xlarge (US$0.154/h, 4 vCPU / 16 GiB) and r6g.xlarge
+# (US$0.2016/h, 4 vCPU / 32 GiB), i.e. US$0.02662 per vCPU-hour + US$0.002975 per GiB-hour.
+POD_VCPU_H, POD_GIB_H = 0.02662, 0.002975
+# EMR on EKS uplift on top of EC2, for the compaction jobs (EMR on EKS Flink jobs;
+# the query engines are plain pods and pay EC2 only). AWS Pricing API, us-west-2,
+# 2026-11-11: USW2-EMR-EKS-EC2-vCPUHours / -GBHours.
+EMR_VCPU_H, EMR_GB_H = 0.007084, 0.000777875
+# compaction/run.sh defaults, for result JSONs written before cdc-compact.py recorded
+# its own shape (2026-11-11): JM 4 vCPU / 8 GiB; TM 8 vCPU; 4 slots on Paimon, 1 on
+# Iceberg; 96 GiB TMs on Iceberg orders / order_items, else 32 GiB.
+COMPACT_DEFAULTS = {"jm_cpu": 4, "jm_memory_gi": 8, "tm_cpu": 8, "slots": {"paimon": 4, "iceberg": 1},
+                    "tm_memory_gi": 32, "big_tm_memory_gi": 96, "big_tm_tables": ("orders", "order_items")}
+
+
+def engine_rates(meta):
+    """{engine: (US$ per second, description)} for the engines whose nodes have a known price."""
+    out = {}
+    d = EC2_PRICE_H.get(meta.get("duckdb_ec2") or "")
+    if d:
+        out["duckdb_warm"] = (d / 3600, "DuckDB 1 × %s = US$%.3f/h" % (meta["duckdb_ec2"], d))
+    nw = int(meta["trino_workers"]) if str(meta.get("trino_workers", "")).isdigit() else None
+    w, c = EC2_PRICE_H.get(meta.get("trino_worker_ec2") or ""), EC2_PRICE_H.get(meta.get("trino_coord_ec2") or "")
+    if nw and w and c:
+        h = nw * w + c
+        out["trino"] = (h / 3600, "Trino %d × %s + 1 × %s (coordinator) = US$%.3f/h" % (
+            nw, meta["trino_worker_ec2"], meta["trino_coord_ec2"], h))
+    return out
+
+
+def usd(x):
+    return "%.5f" % x if x < 0.01 else "%.4f" % x
 
 
 def read_csv(path):
@@ -202,8 +241,8 @@ def recover_finished_hot(d, data):
         out.append((arm, q, lost))
     return out
 
-def suite_section(suite, d, stamp):
-    """(main lines, details lines, stats) for one suite."""
+def suite_section(suite, d, stamp, rates=None):
+    """(main lines, details lines, stats) for one suite. rates: engine_rates(meta)."""
     main, det = [], []
     st = {"suite": suite, "stamp": stamp, "geo": {}, "bad": {}, "invalid": [], "gaps": [], "queries": 0,
           "ok": False}
@@ -239,15 +278,45 @@ def suite_section(suite, d, stamp):
         r, v = data.get((ea[0], ea[1], q)), secs(ea, q)
         return "%.2f" % v if v is not None else (r["status"] if r else "-")
 
+    # Cost: query seconds × the engine's node price, one "estimated cost (US$)" column after each arm
+    # and a total row at the bottom (the queries every arm ran OK), as the compaction table.
+    rates_ = rates or {}
+    priced = bool(arms) and all(ea[0] in rates_ for ea in arms)
+    cost = lambda ea, q, key: secs(ea, q, key) * rates_[ea[0]][0] if priced and secs(ea, q, key) is not None else None
+    def arm_heads():
+        return " | ".join(HEAD[ea] + (" | estimated cost (US$)" if priced else "") for ea in arms)
+    def arm_cells(q, key, fmt=lambda v: "%.2f" % v, missing=lambda ea, q: "-"):
+        out = []
+        for ea in arms:
+            v = secs(ea, q, key)
+            out.append(fmt(v) if v is not None else missing(ea, q))
+            if priced:
+                c = cost(ea, q, key)
+                out.append(usd(c) if c is not None else "-")
+        return out
+    def total_row(key, n_extra):
+        both = [q for q in queries if all(secs(ea, q, key) is not None for ea in arms)]
+        if not priced or not both:
+            return []
+        cells = []
+        st.setdefault("cost_total", {})[key] = {ea: sum(cost(ea, q, key) for q in both) for ea in arms}
+        st["rates"] = rates_
+        for ea in arms:
+            cells += ["**%.2f**" % sum(secs(ea, q, key) for q in both), "**$%s**" % usd(sum(cost(ea, q, key) for q in both))]
+        return ["| **total, %d queries** | %s |" % (len(both), " | ".join(cells + [""] * n_extra))]
+    def cost_note():
+        return (" Cost (US$) = seconds × the engine's EC2 on-demand price (%s); query time only, idle time between "
+                "queries is not counted." % "; ".join(rates_[e][1] for e in ("duckdb_warm", "trino") if e in rates_)) if priced else ""
+
     main.append("Median of the timed passes, seconds (DuckDB: execute + fetch in the server; Trino: elapsed - queued). "
-                "Ratio > 1 = Trino slower.\n")
+                "Ratio > 1 = Trino slower.%s\n" % cost_note())
     ratio_cols = [(fmt, ("trino", fmt), ("duckdb_warm", fmt)) for fmt in FORMATS
                   if ("trino", fmt) in arms and ("duckdb_warm", fmt) in arms
                   and any(secs(("trino", fmt), q) and secs(("duckdb_warm", fmt), q) for q in queries)]
-    main.append("| query | " + " | ".join(HEAD[ea] for ea in arms) + "".join(" | Trino / DuckDB, %s" % f for f, _, _ in ratio_cols) + " |")
-    main.append("|---" + "|---:" * (len(arms) + len(ratio_cols)) + "|")
+    main.append("| query | " + arm_heads() + "".join(" | Trino / DuckDB, %s" % f for f, _, _ in ratio_cols) + " |")
+    main.append("|---" + "|---:" * (len(arms) * (2 if priced else 1) + len(ratio_cols)) + "|")
     for q in queries:
-        cells = [cell(ea, q) for ea in arms]
+        cells = arm_cells(q, "median_ms", missing=lambda ea, q: cell(ea, q))
         for ea in arms:
             r = data.get((ea[0], ea[1], q))
             if r and r["status"] != "OK":
@@ -256,6 +325,7 @@ def suite_section(suite, d, stamp):
             x, y = secs(a, q), secs(b, q)
             cells.append("**%.2f**" % (x / y) if x is not None and y else "-")
         main.append("| %s | %s |" % (q, " | ".join(cells)))
+    main += total_row("median_ms", len(ratio_cols))
     main.append("")
     if st["bad"]:
         main.append("Not OK (recorded, never compared): " + "; ".join(
@@ -277,11 +347,7 @@ def suite_section(suite, d, stamp):
             if rs:
                 lines.append("| %s | %s | **%.2f** | %d |" % (eng, fmt, g, len(rs)))
         return lines
-    geo_lines = geo_table("median_ms", st["geo"])
-    if geo_lines:
-        main.append("Geometric mean of time A / time B over the queries both ran OK "
-                    "(A is the first one named in the \"vs\" column; > 1 = A slower):\n")
-        main += ["| engine | format | A / B | queries |", "|---|---|---:|---:|"] + geo_lines + [""]
+    geo_table("median_ms", st["geo"])        # fills st["geo"]; shown in geo_summary()
 
     # ── cold start: its own category (snapshot suite: pass 0 right after both
     # engines' caches were emptied, one sample per query, timed as cold_ms).
@@ -289,29 +355,24 @@ def suite_section(suite, d, stamp):
     if any(secs(ea, q, "cold_ms") is not None for ea in arms for q in queries):
         main.append("#### %s suite, cold start (first pass after both engines' caches were emptied)\n" % suite)
         main.append("One timed sample per query and arm (not a median), so noisier than the warm table above. "
-                    "Seconds; ratios > 1 = the first named slower.\n")
+                    "Seconds; ratios > 1 = the first named slower.%s\n" % cost_note())
         fmt_cols = [("Paimon / Iceberg, %s" % ENGINE[e], (e, "paimon"), (e, "iceberg"))
                     for e in ("duckdb_warm", "trino")
                     if (e, "paimon") in arms and (e, "iceberg") in arms]
         eng_cols = [(f, ("trino", f), ("duckdb_warm", f)) for f in FORMATS if ("trino", f) in arms and ("duckdb_warm", f) in arms]
-        main.append("| query | " + " | ".join(HEAD[ea] for ea in arms)
+        main.append("| query | " + arm_heads()
                     + "".join(" | Trino / DuckDB, %s" % f for f, _, _ in eng_cols)
                     + "".join(" | %s" % h for h, _, _ in fmt_cols) + " |")
-        main.append("|---" + "|---:" * (len(arms) + len(eng_cols) + len(fmt_cols)) + "|")
+        main.append("|---" + "|---:" * (len(arms) * (2 if priced else 1) + len(eng_cols) + len(fmt_cols)) + "|")
         for q in queries:
-            cells = []
-            for ea in arms:
-                v = secs(ea, q, "cold_ms")
-                cells.append("%.2f" % v if v is not None else "-")
+            cells = arm_cells(q, "cold_ms")
             for _, a, b in eng_cols + fmt_cols:
                 x, y = secs(a, q, "cold_ms"), secs(b, q, "cold_ms")
                 cells.append("**%.2f**" % (x / y) if x is not None and y else "-")
             main.append("| %s | %s |" % (q, " | ".join(cells)))
+        main += total_row("cold_ms", len(eng_cols) + len(fmt_cols))
         main.append("")
-        cold_lines = geo_table("cold_ms", st["geo_cold"])
-        if cold_lines:
-            main.append("Cold start, geometric mean of time A / time B over the queries both ran OK:\n")
-            main += ["| engine | format | A / B | queries |", "|---|---|---:|---:|"] + cold_lines + [""]
+        geo_table("cold_ms", st["geo_cold"])  # fills st["geo_cold"]; shown in geo_summary()
 
     # ── details: Trino's server-side breakdown (timed passes)
     det.append("<details><summary>%s: Trino server-side breakdown, data scanned, result equality</summary>\n" % suite)
@@ -501,7 +562,7 @@ def ingest_totals(ing):
     return out
 
 
-def ingest_section(ing, err):
+def ingest_section(ing, err, work=None):
     """(main lines, details lines, totals) for the Ingest + Table state sections."""
     main3, main4, det = ["## 3. Ingest\n"], ["## 4. Table state\n"], []
     if not ing or not ing.get("window"):
@@ -539,10 +600,17 @@ def ingest_section(ing, err):
     else:
         main3.append("Job-monitor reports not available for this window (reports were pod-local before the S3 upload "
                      "was added); next run. The table-metadata numbers below cover the same window.\n")
-    main3.append("Rows/s is the ingest rate: the CDC sources' rate meter (`numRecordsOutPerSecond`). Both jobs read "
-                 "the same MySQL change stream, so equal rows/s means both kept up; a lower one means backpressure from "
-                 "its writers. What each format committed (Paimon merges re-written keys first, Iceberg writes every "
-                 "version plus a delete) is in the table-metadata section below.\n")
+    mon_ = {f: (ing.get("monitor") or {}).get(f) or {} for f in ("paimon", "iceberg")}
+    if all(m.get("rows_per_s_median") for m in mon_.values()):
+        bp = [m.get("backpressured_ratio_max") for m in mon_.values()]
+        main3.append("**Outcome:** both writers %s: each read the same MySQL change stream at about %s change events a "
+                     "second (an UPDATE counts as 2 events, so this is above the rows MySQL wrote)%s. Checkpoints, the "
+                     "moment each writer makes its new data visible, took %s for Paimon and %s for Iceberg (median).\n" % (
+                         "kept up" if bp and all(x == 0 for x in bp) else "read",
+                         num(round(sum(m["rows_per_s_median"] for m in mon_.values()) / 2, -3)),
+                         ", with no backlog" if bp and all(x == 0 for x in bp) else "",
+                         "%.1f s" % (mon_["paimon"]["checkpoint_ms_median"] / 1000) if mon_["paimon"].get("checkpoint_ms_median") else "-",
+                         "%.1f s" % (mon_["iceberg"]["checkpoint_ms_median"] / 1000) if mon_["iceberg"].get("checkpoint_ms_median") else "-"))
 
     # From the table metadata: what each format committed.
     main3.append("**From table metadata** (each table's commit history over the window)\n")
@@ -570,24 +638,37 @@ def ingest_section(ing, err):
         except (TypeError, KeyError):
             main3.append("| %s | - | - |" % name)
     main3.append("")
+    # What each format stored, in plain words (the per-table numbers are in the details).
+    main3.append("**What each format stored**\n")
     notes = []
     if p.get("rows") and i.get("rows"):
-        notes.append("Paimon committed **%.0f%%** of Iceberg's rows: the other %.0f%% were re-writes of a key it "
-                     "merged before committing. Iceberg commits each of them and a delete for the version it "
-                     "replaces." % (100 * p["rows"] / i["rows"], 100 - 100 * p["rows"] / i["rows"]))
-    if pos_share is not None and i.get("rows"):
-        dl = i["position_deletes"] + i["equality_deletes"]
-        notes.append("Iceberg wrote %s deletes for %s committed rows (%s); **%.0f%%** were position deletes (DVs: the "
-                     "old row was in the same checkpoint's files), the rest equality deletes, which every read must "
-                     "join by key until a compaction." % (
-                         mill(dl), mill(i["rows"]), "one per row" if abs(dl - i["rows"]) <= 0.005 * i["rows"]
-                         else "%.0f%% of rows" % (100.0 * dl / i["rows"]), 100 * pos_share))
-    if p.get("compaction_commits") and p.get("compaction_dv_index_files") is not None:
-        notes.append("Paimon's DV index files are rewritten per bucket by each inline compaction (%s commits); "
-                     "the live ones at the window end are in 4." % num(p["compaction_commits"]))
+        notes.append("**Rows saved:** Iceberg saved every version of every changed row, %s rows (about %s a second). "
+                     "Paimon saved %s (%.0f%% of Iceberg's): when the same row changed more than once within a checkpoint "
+                     "(60 s), it kept only the latest version." % (
+                         mill(i["rows"]), num(i["rate"]), mill(p["rows"]), 100 * p["rows"] / i["rows"]))
+    if i.get("rows") and i.get("equality_deletes") is not None:
+        dl = (i.get("position_deletes") or 0) + i["equality_deletes"]
+        notes.append("**Old versions:** for each changed row Iceberg also wrote a delete marker for the version it "
+                     "replaces, %s markers in this window, and every query has to check them until a compaction "
+                     "removes them. Paimon wrote none: it merges old versions away while loading (%s small merges "
+                     "in the window)." % (mill(dl), num(p.get("compaction_commits")) if p.get("compaction_commits") is not None else "its inline"))
+    sz = compacted_gib(work) if work else {}
+    if p.get("byte_rate") and i.get("byte_rate"):
+        txt = ("**Data size:** while loading, Paimon wrote about %.0f%% %s bytes than Iceberg (%s vs %s of new files)"
+               % (abs(100 * p["byte_rate"] / i["byte_rate"] - 100), "more" if p["byte_rate"] > i["byte_rate"] else "fewer",
+                  mbs(p["byte_rate"]), mbs(i["byte_rate"])))
+        if sz.get("paimon") and sz.get("iceberg"):
+            txt += ("; after both were fully compacted, Paimon's tables were %.0f%% %s (%.1f vs %.1f GiB) for the same rows"
+                    % (abs(100 * sz["paimon"] / sz["iceberg"] - 100), "bigger" if sz["paimon"] > sz["iceberg"] else "smaller",
+                       sz["paimon"], sz["iceberg"]))
+        txt += (". Each Paimon row also stores a copy of its key, a version number and a change type, which it needs to "
+                "merge changes (`data-file.thin-mode`, off by default, would drop the key copy); its newest files are also "
+                "lz4- rather than zstd-compressed (`file.compression.per.level = 0:lz4`).")
+        notes.append(txt)
     rds = (ing.get("config") or {}).get("rds") or {}
     if rds.get("cpu_avg") is not None:
-        notes.append("Source RDS CPU over the window: %s%% average, %s%% max." % (rds["cpu_avg"], rds["cpu_max"]))
+        notes.append("**Source database:** RDS CPU averaged %s%% over the window (%s%% max), so MySQL was not the limit."
+                     % (rds["cpu_avg"], rds["cpu_max"]))
     main3 += ["- " + n for n in notes] + [""]
 
     # Table state
@@ -662,6 +743,117 @@ def query_seconds(d, txt):
     return (max(x[1] for x in q) - min(x[0] for x in q)).total_seconds() + duck / 1000
 
 
+def iceberg_specs(work):
+    """{table: Iceberg partition spec} from the pins' tables-<STAMP>.tsv ('spec=...' notes)."""
+    specs = {}
+    for f in glob.glob(os.path.join(work, "**", "tables-*.tsv"), recursive=True):
+        for r in read_csv_tsv(f):
+            m = re.search(r"\bspec=(\S+)", r.get("note") or "")
+            if r.get("format") == "iceberg" and m:
+                specs[r["table"]] = m.group(1)
+    return specs
+
+
+def buckets_row(work):
+    """One short line: N and key per table, from the Iceberg specs (Paimon's DDL pairs them)."""
+    specs = iceberg_specs(work)
+    per = []
+    for t in TABLES:
+        m = re.search(r"bucket\[(\d+)\]\((\w+)\)", specs.get(t, ""))
+        if not m:
+            continue
+        rest = [x for x in specs[t].split(",") if not x.startswith("bucket[")]
+        part = ("day" if rest[0].endswith("_dt") else rest[0]) if rest else ""
+        per.append("%s %s%s" % (t.replace("_", " "), m.group(1), " per " + part if part else ""))
+    if not per:
+        return None
+    return ("Both OTF formats split each table into the same fixed number of buckets by its ID: %s. "
+            "Each bucket is written by one Flink writer." % ", ".join(per))
+
+
+def read_csv_tsv(path):
+    with open(path) as f:
+        return list(csv.DictReader((l for l in f if l.strip()), delimiter="\t"))
+
+
+GAIN_RE = re.compile(r"(?<![*\w.])(\d+(?:\.\d+)?(?:×| times|%) (?:faster|slower|as long|cheaper|more expensive))")
+
+
+def bold_gains(text):
+    """Bold the numbers that state an advantage or a slowdown ('7 times faster', '41% faster',
+    '1.7× as long'), leaving the bullet's bold label alone."""
+    return GAIN_RE.sub(r"**\1**", text)
+
+
+def geo_summary(sts):
+    """One table of every geometric mean (hot warm, snapshot warm, snapshot cold): per
+    pair, the geometric mean of the per-query time ratios over the queries both arms
+    ran OK. Replaces the per-suite tables."""
+    cols = [("Trino / DuckDB, Iceberg", ("trino", "iceberg"), ("duckdb_warm", "iceberg")),
+            ("Trino / DuckDB, Paimon", ("trino", "paimon"), ("duckdb_warm", "paimon")),
+            ("Paimon / Iceberg, DuckDB", ("duckdb_warm", "paimon"), ("duckdb_warm", "iceberg")),
+            ("Paimon / Iceberg, Trino", ("trino", "paimon"), ("trino", "iceberg"))]
+    rows = []
+    for st in sts:
+        if not st.get("ok"):
+            continue
+        for key, label in (("geo", "warm"), ("geo_cold", "cold start")):
+            geo = st.get(key) or {}
+            vals = [geo.get((a, b)) or (None, 0) for _, a, b in cols]
+            if any(g for g, _ in vals):
+                ns = sorted({n for g, n in vals if g})
+                rows.append("| %s, %s | %s | %s |" % (st["suite"].capitalize(), label, " | ".join(
+                    "**%.2f**" % g if g else "-" for g, _ in vals), "/".join(str(n) for n in ns)))
+    if not rows:
+        return []
+    # Estimated cost: each suite's total cost (the latency tables' total rows), A vs B in %.
+    crow = []
+    for st in sts:
+        for key, label in (("median_ms", "warm"), ("cold_ms", "cold start")):
+            tot = (st.get("cost_total") or {}).get(key)
+            if not tot:
+                continue
+            cells = []
+            for _, a, b in cols:
+                if tot.get(a) and tot.get(b):
+                    d = 100 * (tot[a] / tot[b] - 1)
+                    cells.append("about the same" if abs(d) < 5 else "%.0f%% %s" % (abs(d), "cheaper" if d < 0 else "more"))
+                else:
+                    cells.append("-")
+            crow.append("| %s, %s | %s |" % (st["suite"].capitalize(), label, " | ".join(cells)))
+    rt = next((st["rates"] for st in sts if st.get("rates")), {})
+    pr = (rt["trino"][0] / rt["duckdb_warm"][0]) if rt.get("trino") and rt.get("duckdb_warm") else None
+    cost_tbl = (["**Estimated cost**: A's total query cost against B's for the same suite (the total rows of the latency "
+                 "tables: query time × the engines' EC2 on-demand price).%s\n" % (
+                     " Comparing formats on one engine, cost follows time; comparing engines, Trino's cluster costs %.0f%% "
+                     "more per second than DuckDB's node." % (100 * (pr - 1)) if pr else ""),
+                 "| suite | " + " | ".join(c for c, _, _ in cols) + " |",
+                 "|---" + "|---:" * len(cols) + "|"] + crow + [""]) if crow else []
+    return (["**Speed: geometric mean of the time ratios**\n",
+             "Per pair: the geometric mean of time A / time B over the queries both ran OK (A is named first; "
+             "> 1 = A slower, < 1 = A faster).\n",
+             "| suite | " + " | ".join(c for c, _, _ in cols) + " | queries |",
+             "|---" + "|---:" * (len(cols) + 1) + "|"] + rows + [""] + cost_tbl)
+
+
+def compacted_gib(work):
+    """{format: GiB of data after the newest full compaction of each table} from compaction/*.json."""
+    newest = {}
+    for f in glob.glob(os.path.join(work, "compaction", "*.json")):
+        try:
+            r = json.load(open(f))
+        except Exception:
+            continue
+        k = (r.get("format"), (r.get("table") or "").split(".")[-1])
+        stamp = os.path.basename(f).split("-", 1)[0]
+        if r.get("status") == "OK" and (r.get("after") or {}).get("bytes") and stamp >= newest.get(k, ("", None))[0]:
+            newest[k] = (stamp, r["after"]["bytes"])
+    out = {}
+    for (fmt, _), (_, b) in newest.items():
+        out[fmt] = out.get(fmt, 0) + b / 2**30
+    return out if len({t for _, t in newest}) and all(sum(1 for f, _ in newest if f == x) == 4 for x in out) else {}
+
+
 def compaction_section(work):
     """compaction/run.sh's per-table JSONs (<STAMP>-<fmt>-<table>.json): per format and
     table the newest run."""
@@ -676,39 +868,76 @@ def compaction_section(work):
     if not runs:
         return []
     gib = lambda b: "%.2f" % ((b or 0) / 2**30)
-    stamps = sorted({r["_stamp"] for rs in runs.values() for r in rs})
+    stamps = sorted({max(r["_stamp"] for r in rs) for rs in runs.values()})   # the runs the table shows
     L = ["### Compaction before the snapshot test (run%s %s)\n" % ("s" if len(stamps) > 1 else "", ", ".join(stamps)),
          "`compaction/run.sh`, writers stopped: Paimon `sys.compact` (full); Iceberg data files with deletes rewritten with them "
          "applied and the delete files removed, then snapshots expired (12 h, keep 5). One row per table: its newest run.\n",
-         "| format | table | status | duration (s) | data files (files) | GiB | rows in files (rows) | delete files (files) | eq deletes (rows) | pos deletes (rows) |",
-         "|---|---|---|---:|---|---|---|---|---:|---:|"]
+         "Cost: the job's duration × its pods' requests (JobManager + TaskManagers): "
+         "EC2 US$%.5f per vCPU-hour and US$%.6f per GiB-hour (a linear fit to on-demand m6g / r6g, us-west-2), plus "
+         "EMR on EKS US$%.6f per vCPU-hour and US$%.9f per GB-hour (us-west-2).\n"
+         % (POD_VCPU_H, POD_GIB_H, EMR_VCPU_H, EMR_GB_H),
+         "| format | table | duration (s) | TaskManagers | estimated cost (US$) | data files (files) | GiB | rows in files (rows) | delete files (files) | eq deletes (rows) | pos deletes (rows) |",
+         "|---|---|---:|---|---:|---|---|---|---|---:|---:|"]
+    totals = {}
     for (fmt, table), rs in sorted(runs.items()):
         rs.sort(key=lambda r: r["_stamp"])
         r = rs[-1]
         b, a = r.get("before", {}), r.get("after", {})
         arrow = lambda k, fmt=lambda x: "{:,}".format(x or 0): "%s -> %s" % (fmt(b.get(k)), fmt(a.get(k))) if a else fmt(b.get(k))
-        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            fmt, table, r.get("status"), r.get("duration_s"),
+        tms, shape, cost = compaction_cost(fmt, table, r)
+        if cost is not None:
+            totals.setdefault(fmt, [0.0, 0.0])
+            totals[fmt][0] += cost
+            totals[fmt][1] += r.get("duration_s") or 0
+        # no status column: a run that did not finish OK says so next to its table
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            fmt, table if r.get("status") == "OK" else "%s (**%s**)" % (table, r.get("status")), r.get("duration_s"), "%d × %s" % (tms, shape) if tms else "-",
+            usd(cost) if cost is not None else "-",
             arrow("data_files"), arrow("bytes", gib), arrow("records_in_files"), arrow("delete_files"),
             "{:,}".format(b.get("equality_deletes") or 0), "{:,}".format(b.get("position_deletes") or 0)))
+    for fmt, (c, sec) in sorted(totals.items()):
+        L.append("| **%s total** | | **%.1f** | | **$%s** | | | | | | |" % (fmt, sec, usd(c)))
     return L + [""]
 
 
+def compaction_cost(fmt, table, r):
+    """(TaskManagers, 'vCPU / GiB' per TM, US$) of one compaction run, from the shape the
+    result JSON records (cdc-compact.py, since 2026-11-11) or compaction/run.sh's defaults."""
+    res, dfl = r.get("resources") or {}, COMPACT_DEFAULTS
+    tm_cpu = float(res.get("tm_cpu") or dfl["tm_cpu"])
+    big = fmt == "iceberg" and table in dfl["big_tm_tables"]
+    tm_mem = float(res.get("tm_memory_gi") or (dfl["big_tm_memory_gi"] if big else dfl["tm_memory_gi"]))
+    slots = int(res.get("tm_slots") or dfl["slots"].get(fmt, 1))
+    par = int(r.get("parallelism") or r.get("parallelism_cap") or 0)
+    dur = r.get("duration_s")
+    if not par or dur is None:
+        return None, None, None
+    tms = -(-par // slots)
+    cpu_h, gib_h = POD_VCPU_H + EMR_VCPU_H, POD_GIB_H + EMR_GB_H     # EC2 + EMR on EKS uplift
+    jm = float(res.get("jm_cpu") or dfl["jm_cpu"]) * cpu_h + float(res.get("jm_memory_gi") or dfl["jm_memory_gi"]) * gib_h
+    tm = tm_cpu * cpu_h + tm_mem * gib_h
+    return tms, "%g vCPU / %g GiB" % (tm_cpu, tm_mem), dur / 3600 * (jm + tms * tm)
+
+
 def actual_rate(ing):
-    """The generator's achieved rate, all 4 tables: what the CDC sources read from the
-    binlog (the job monitor's rate meter, median over the ingest window). Each MySQL
-    write is one change event, so with no backpressure this is the producer's rate."""
+    """What the CDC sources read from the binlog, all 4 tables (the job monitor's rate
+    meter, median over the ingest window). These are change EVENTS, not MySQL rows: an
+    UPDATE arrives as two (-U and +U), an INSERT or DELETE as one, so this is well above
+    the rows/s the generator wrote (on _v3, 55.7K events/s against 38.4K rows/s from the
+    generator's own counters). The generator's rate is not read here: its counters are
+    in its pod logs (2-DATA-GEN-GUIDE.md, deploy-data-generator.sh status)."""
     mon = {f: m for f, m in ((ing or {}).get("monitor") or {}).items() if m and m.get("rows_per_s_median")}
     if not mon:
         return ""
     v = [mon[f]["rows_per_s_median"] for f in ("paimon", "iceberg") if f in mon]
     bp = [mon[f].get("backpressured_ratio_max") for f in mon]
-    return "; actual about **%s rows/s** across the 4 tables (the CDC sources' read rate, median over the ingest window: %s%s)" % (
+    return ("; the CDC sources read about **%s change events/s** across the 4 tables (median over the ingest window: %s%s; "
+            "an UPDATE is 2 events, -U and +U, so MySQL wrote fewer rows/s than this)") % (
         num(round(sum(v) / len(v))), ", ".join("%s %s" % (f.capitalize(), num(mon[f]["rows_per_s_median"])) for f in ("paimon", "iceberg") if f in mon),
         ", no backpressure" if bp and all(x == 0 for x in bp) else "")
 
 
-def config_table(meta, ing, sts, fv):
+def config_table(meta, ing, sts, fv, work=None):
     cfg = (ing or {}).get("config") or {}
     rows = []
     fl = cfg.get("flink") or {}
@@ -759,22 +988,32 @@ def config_table(meta, ing, sts, fv):
     duck = "DuckDB %s (%s CPU / %s%s), warm" % (   # the image tag only: "duckdb-cdc-server:2.0.0" -> 2.0.0
         (meta.get("duckdb_image") or "pip").split("/")[-1].split(":")[-1], meta.get("duckdb_cpu", "?"), meta.get("duckdb_pod_memory", "?"),
         ", on one `%s`" % meta["duckdb_ec2"] if meta.get("duckdb_ec2") else "")
-    rows.append(("Engines", "%s; %s" % (duck, trino)))
+    rows.append(("Query Engines", "%s; %s" % (duck, trino)))
     sfx = (meta.get("cdc_db_suffix") or "").lstrip("_")   # the session, e.g. _v3final -> v3final
     rows.append(("Table set", "%s: `%s` / `%s`; %s" % (
         "2 databases with a session suffix %s (4 tables in each DB)" % sfx if sfx else "2 databases (4 tables in each DB)",
         meta.get("iceberg_db", "?"), meta.get("paimon_db", "?"),
         "Paimon has iceberg integration turned on by default, so downstream tools can either use Iceberg connector to query "
         "Paimon's Iceberg metadata or use Paimon connector to query Paimon's native metadata")))
+    b = buckets_row(work) if work else None
+    if b:
+        rows.append(("Buckets", b))
     # The Iceberg library the Flink writer runs: the writer image's ARG ICEBERG_VERSION
     # (it replaces EMR's bundled Iceberg, which cannot commit to v3 tables).
     dfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ingest-deploy", "docker", "Dockerfile.cdc-paimon")
     try:
-        ice = re.search(r"^ARG ICEBERG_VERSION=(\S+)", open(dfile).read(), re.M).group(1)
-    except (OSError, AttributeError):
-        ice = None
-    rows.append(("Iceberg", "table format v%d; Flink writer library Apache Iceberg %s (`iceberg-flink-runtime-1.20`, replacing "
-                 "EMR's bundled 1.10.1)" % (fv, ice or "?")))
+        dtxt = open(dfile).read()
+    except OSError:
+        dtxt = ""
+    grab = lambda pat: (re.search(pat, dtxt, re.M) or [None, None])[1]
+    ice, pai = grab(r"^ARG ICEBERG_VERSION=(\S+)"), grab(r"PAIMON_VERSION=(\S+?)\s")
+    emr = grab(r"^ARG EMR_VERSION=(\S+)")
+    rows.insert(0, ("Open Table Format(OTF)",   # first row of the table
+                 "Iceberg v%d, Flink writer Apache Iceberg %s (`iceberg-flink-runtime-1.20`, replacing EMR's bundled 1.10.1); "
+                 "Apache Paimon %s (`paimon-flink-1.20`, patched with the apache/paimon PR #10329 backport, + `paimon-s3`). "
+                 "Both are added as jars to `/usr/lib/flink/lib` of the EMR on EKS %s Flink base image "
+                 "(`public.ecr.aws/emr-on-eks/flink/emr-%s-flink`) by `ingest-deploy/docker/Dockerfile.cdc-paimon`"
+                 % (fv, ice or "?", pai or "?", emr or "?", emr or "?")))
     for s in sts:
         if s["ok"]:
             span = s.get("pin_span")
@@ -789,7 +1028,9 @@ def config_table(meta, ing, sts, fv):
                     hhmm(span[0]), hhmm(span[1]))) if span else "")))
     w = (ing or {}).get("window")
     if w:
-        rows.append(("Ingest window", "%s to %s" % (w["from"], w["to"])))
+        # right under "Flink writers" (or last if there is no writer row)
+        at = next((k + 1 for k, r in enumerate(rows) if r[0] == "Flink writers"), len(rows))
+        rows.insert(at, ("Ingest window", "%s to %s" % (w["from"], w["to"])))
     out = ["**Run configuration**\n", "| | |", "|---|---|"]
     out += ["| %s | %s |" % r for r in rows]
     return out + [""]
@@ -857,7 +1098,7 @@ def headline(sts, tot, mon=None):
     mp, mi = (mon or {}).get("paimon") or {}, (mon or {}).get("iceberg") or {}
     if mp.get("rows_per_s_median") and mi.get("rows_per_s_median"):
         hb.append("Ingest throughput (job monitor, median of %d / %d reports): Paimon **%s rows/s, %s**; Iceberg "
-                  "**%s rows/s, %s** (rows/s = the CDC sources' rate meter, the ingest rate; bytes/s = committed)." % (mp["reports"], mi["reports"], num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")),
+                  "**%s rows/s, %s** (rows/s = the CDC sources' rate meter, change events with an UPDATE counted twice; bytes/s = committed)." % (mp["reports"], mi["reports"], num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")),
                                        num(mi["rows_per_s_median"]), mbs(mi.get("bytes_per_s_median"))))
         con.append("Ingest (job monitor): Paimon %s rows/s, %s; Iceberg %s rows/s, %s." % (
             num(mp["rows_per_s_median"]), mbs(mp.get("bytes_per_s_median")), num(mi["rows_per_s_median"]), mbs(mi.get("bytes_per_s_median"))))
@@ -886,7 +1127,7 @@ def geo_of(st, key, a, b):
     return ((st or {}).get(key) or {}).get((a, b), (None, 0))
 
 
-def plain_headline(sts, tot, mon=None):
+def plain_headline(sts, tot, mon=None, bucketed=False):
     """The Headline in plain English, for readers who do not know the formats or
     engines: what was compared, who was faster and by how much, from this run's
     geometric means (so it follows the data). The technical bullets stay under it."""
@@ -926,83 +1167,99 @@ def plain_headline(sts, tot, mon=None):
         t = g(snap, "geo", ("trino", "paimon"), ("trino", "iceberg"))
         parts = both(d, t)
         if parts:
-            out.append("**Questions about settled data (snapshot test: loading stopped and both formats were fully compacted, i.e. every pending change merged into clean files):** %s. "
+            out.append("**Questions about settled data (snapshot test: ingestion stopped and both formats were fully compacted, i.e. every pending change merged into clean files):** %s. "
                        "After full compaction, the two formats are close." % "; ".join(parts))
-    # The query tools: DuckDB vs Trino, where the gap is widest.
-    gaps = []
-    for st in by.values():
-        for key, when in (("geo", "with warmed-up tools"), ("geo_cold", "on the very first question after a restart")):
-            for f, name in (("iceberg", "Iceberg"), ("paimon", "Paimon")):
-                r = g(st, key, ("trino", f), ("duckdb_warm", f))
-                if r:
-                    gaps.append((r, st["suite"], when, name))
-    if gaps:
-        r, suite, when, name = max(gaps)
-        out.append("**The query tool matters too:** DuckDB answered faster than Trino almost everywhere; the biggest gap "
-                   "was on %s %s data %s, where Trino took about %.1f times as long." % (
-                       name, "live" if suite == "hot" else "settled", when, r))
+    # The query tools: who was faster per format, warm (live / settled) and cold.
+    def who(r):
+        if r < 0.9:
+            return "Trino was about %.1f× faster" % (1 / r)
+        if r > 1.1:
+            return "DuckDB was about %.1f× faster" % r
+        return "the two were about equal"
+    per = []
+    for f, name in (("iceberg", "the bucketed Iceberg tables" if bucketed else "Iceberg"), ("paimon", "Paimon")):
+        rs = [(g(st, "geo", ("trino", f), ("duckdb_warm", f)), label)
+              for st, label in ((hot, "live data"), (snap, "settled data")) if st]
+        rs = [(r, label) for r, label in rs if r]
+        if rs and (all(r < 0.9 for r, _ in rs) or all(r > 1.1 for r, _ in rs)):   # one winner: name it once
+            win = "Trino" if rs[0][0] < 1 else "DuckDB"
+            per.append("on %s, %s was about %s" % (name, win, " and ".join(
+                "%.1f× faster on %s" % (1 / r if r < 1 else r, label) for r, label in rs)))
+        elif rs:
+            per.append("on %s, %s" % (name, " and ".join("%s on %s" % (who(r), label) for r, label in rs)))
+    cold = [(g(snap, "geo_cold", ("trino", f), ("duckdb_warm", f)), n) for f, n in (("iceberg", "Iceberg"), ("paimon", "Paimon"))] if snap else []
+    cold = [(r, n) for r, n in cold if r]
+    if cold and all(r > 1.1 for r, _ in cold):
+        per.append("on the very first question after a cold start DuckDB was faster on both (Trino took %s as long)" % (
+            (lambda lo, hi: "about %s×" % lo if lo == hi else "%s–%s×" % (lo, hi))(
+                "%.1f" % min(r for r, _ in cold), "%.1f" % max(r for r, _ in cold))))
+    elif cold:
+        per.append("after a cold start, " + ", ".join("%s on %s" % (who(r), n) for r, n in cold))
+    if per:
+        out.append("**The query tool matters too:** " + "; ".join(per) + ".")
     mp, mi = (mon or {}).get("paimon") or {}, (mon or {}).get("iceberg") or {}
     i = (tot or {}).get("iceberg") or {}
     if mp.get("rows_per_s_median") and mi.get("rows_per_s_median"):
         lo, hi = sorted([mp["rows_per_s_median"], mi["rows_per_s_median"]])
-        out.append("**Loading the data:** both formats kept up with the incoming orders, at about %s changes a second "
+        out.append("**Loading the data:** both formats kept up with the incoming orders, at about %s change events a second "
                    "each%s." % (num(round((lo + hi) / 2, -3)),
                                 "" if hi / lo < 1.1 else " (Paimon %s, Iceberg %s)" % (num(mp["rows_per_s_median"]), num(mi["rows_per_s_median"]))))
     if i.get("equality_deletes"):
-        out.append("**Why live questions are slower on Iceberg:** for every changed order, Iceberg writes the new version "
+        out.append("**Why live queries are slower on Iceberg:** for every changed order, Iceberg writes the new version "
                    "plus a note saying \"ignore the old one\" (%s such notes in this test). Until a compaction merges them away, every "
                    "question has to read those notes. Paimon replaces old versions as it goes, so it has none." % (
                        "%.0f million" % (i["equality_deletes"] / 1e6) if i["equality_deletes"] >= 1e6 else num(i["equality_deletes"])))
     return out
 
 def bottom_line(sts):
-    """The use-case verdict, computed from this run's geometric means (so it states
-    what the numbers show, including where they disagree with the expected story):
-    which format fits the hot (live, merge-on-read) and the snapshot (compacted)
-    use case on each engine, and where the engine choice matters most."""
+    """The verdict in plain words, computed from this run's geometric means: which
+    format suits live data (hot) and settled data (snapshot, after a full compaction),
+    and which query engine suits which format. 'N% faster' = the other one's time /
+    this one's time - 1; 'N× faster' from 2× up; within 10% = about the same."""
     by = {s["suite"]: s for s in sts if s.get("ok")}
-    pa = "Paimon-as-iceberg"
-    fmt_r = lambda st, key, e: geo_of(st, key, (e, "paimon"), (e, "iceberg"))
+    fmt_r = lambda st, key, e: geo_of(st, key, (e, "paimon"), (e, "iceberg"))[0] if st else None
+    def gain(x):   # x = slower time / faster time (> 1)
+        return "%.1f×" % x if x >= 2 else "%.0f%%" % (100 * (x - 1))
+    def cmp(r, a, b):   # r = a's time / b's time
+        if r is None:
+            return None
+        if 0.9 <= r <= 1.1:
+            return "%s and %s were about the same speed" % (a, b)
+        return "%s was %s faster than %s" % ((a, gain(1 / r), b) if r < 1 else (b, gain(r), a))
     out = []
-    hot = by.get("hot")
+    hot, snap = by.get("hot"), by.get("snapshot")
     if hot:
-        d, t = fmt_r(hot, "geo", "duckdb_warm")[0], fmt_r(hot, "geo", "trino")[0]
-        if d and t and d < 1 and t < 1:
-            out.append("**Hot queries (live tables, merge-on-read): %s fits this use case.** It answered in %.2f× Iceberg's "
-                       "time on DuckDB and %.2f× on Trino (%.1f× / %.1f× faster): Paimon's inline compaction keeps the files "
-                       "it exposes merged, while Iceberg applies every equality delete written since its last compaction at "
-                       "read time." % (pa, d, t, 1 / d, 1 / t))
-        elif d or t:
-            out.append("Hot queries: %s / Iceberg = %s on DuckDB, %s on Trino (no format clearly ahead)." % (
-                pa, "%.2f×" % d if d else "n/a", "%.2f×" % t if t else "n/a"))
-    snap = by.get("snapshot")
+        d, t = fmt_r(hot, "geo", "duckdb_warm"), fmt_r(hot, "geo", "trino")
+        lead = ("**Live, changing data (hot queries): Paimon is the better fit.** " if d and t and d < 0.9 and t < 0.9
+                else "**Live, changing data (hot queries):** ")
+        bits = [x for x in (d and "with DuckDB, " + cmp(d, "Paimon", "Iceberg"), t and "with Trino, " + cmp(t, "Paimon", "Iceberg")) if x]
+        if bits:
+            txt = "; ".join(bits)
+            out.append(lead + txt[:1].upper() + txt[1:] + ". Paimon tidies up changed rows while it loads them; "
+                       "Iceberg leaves that work to every query until a separate clean-up (compaction) runs.")
     if snap:
-        dw, dc = fmt_r(snap, "geo", "duckdb_warm")[0], fmt_r(snap, "geo_cold", "duckdb_warm")[0]
-        tw, tc = fmt_r(snap, "geo", "trino")[0], fmt_r(snap, "geo_cold", "trino")[0]
-        if dw and dw >= 1 and (dc is None or dc >= 1):
-            out.append("**Snapshot queries (compacted tables): Iceberg fits this use case better with DuckDB as the engine.** "
-                       "%s took %.2f× Iceberg's time warm%s on DuckDB." % (pa, dw, " and %.2f× cold" % dc if dc else ""))
-        elif dw:
-            out.append("Snapshot queries on DuckDB: %s took %.2f× Iceberg's time warm%s (Iceberg not ahead here)." % (
-                pa, dw, " and %.2f× cold" % dc if dc else ""))
-        if tw:
-            out.append("On Trino the snapshot comparison %s: %s took %.2f× Iceberg's time warm%s." % (
-                "goes the other way" if tw < 1 else "agrees", pa, tw, " and %.2f× cold" % tc if tc else ""))
-    # Where the engine matters most: the largest Trino / DuckDB ratio over every
-    # suite, warm or cold, and format.
-    gaps = []
-    for st in by.values():
-        for key, label in (("geo", "warm"), ("geo_cold", "cold")):
-            for f in FORMATS:
-                r, n = geo_of(st, key, ("trino", f), ("duckdb_warm", f))
-                if r:
-                    gaps.append((r, st["suite"], label, f, n))
-    if gaps:
-        r, suite, label, f, n = max(gaps)
-        out.append("**The engine matters most in the %s %s%s pass:** there Trino took **%.1f×** DuckDB's time on %s "
-                   "(geometric mean of %d queries), the largest engine gap in this run." % (
-                       label, suite, " (first query after the caches were emptied)" if label == "cold" else "",
-                       r, {"iceberg": "Iceberg", "paimon": pa}[f], n))
+        bits = []
+        for e, name in (("duckdb_warm", "DuckDB"), ("trino", "Trino")):
+            w, c = fmt_r(snap, "geo", e), fmt_r(snap, "geo_cold", e)
+            if w:
+                bits.append("with %s, %s%s" % (name, cmp(w, "Paimon", "Iceberg"),
+                                               " (first query after a restart: %s)" % cmp(c, "Paimon", "Iceberg").split(" was ")[-1].replace(" than Iceberg", "")
+                                               if c and not (0.9 <= c <= 1.1) and c < 1 else ""))
+        if bits:
+            out.append("**Settled data (after a full clean-up of both tables):** the gap mostly closes; " + "; ".join(bits) + ".")
+    # Which engine suits which format: Trino / DuckDB per format, live data first.
+    bits = []
+    for f, name in (("iceberg", "Iceberg"), ("paimon", "Paimon")):
+        r = None
+        for st in (hot, snap):
+            if st and r is None:
+                r = geo_of(st, "geo", ("trino", f), ("duckdb_warm", f))[0]
+        if r and not (0.9 <= r <= 1.1):
+            bits.append("%s for %s (%s faster than %s%s)" % (
+                "Trino" if r < 1 else "DuckDB", name, gain(1 / r if r < 1 else r), "DuckDB" if r < 1 else "Trino",
+                " on live data" if hot else ""))
+    if bits:
+        out.append("**Choice of query engine:** " + "; ".join(bits) + ".")
     return out
 
 def main():
@@ -1038,11 +1295,11 @@ def main():
     for suite, stamp in (("hot", a.hot), ("snapshot", a.snapshot)):
         d = os.path.join(a.work, suite)
         if os.path.isdir(d):
-            m, dd, s = suite_section(suite, d, stamp)
+            m, dd, s = suite_section(suite, d, stamp, engine_rates(meta))
             lat += m
             det += dd
             sts.append(s)
-    ing_main, ing_det, tot = ingest_section(ing, ing_err)
+    ing_main, ing_det, tot = ingest_section(ing, ing_err, a.work)
     mon = {f: m for f, m in ((ing or {}).get("monitor") or {}).items() if m and m.get("reports")}
     hb, con, opn = headline(sts, tot, mon)
     if ing and ing.get("window") and not mon:
@@ -1059,13 +1316,10 @@ def main():
     L = ["# CDC query benchmark: %s\n" % a.session,
          "Warm DuckDB vs Trino on the four CDC tables Flink writes, on native Iceberg and on Paimon-as-iceberg "
          "(cdc-pipeline/querybench/); both engines of a format read the same pinned snapshot per table.\n"]
-    L += config_table(meta, ing, sts, fv)
-    L += ["Known write-side differences (table settings are otherwise paired; querybench/README.md): Paimon writes "
-          "orders/order_items with one writer per bucket (16 per date partition), Iceberg's hash distribution sends each date partition "
-          "to ONE writer; Paimon compacts and expires snapshots inline; Iceberg is not compacted during ingest; both get one full "
-          "compaction (compaction/run.sh, run by the hot test's watcher) before the snapshot test.\n", "---\n"]
-    ph = plain_headline(sts, tot, mon)
-    L += ["## 1. Headline\n"] + ["- " + b for b in (ph or ["No suite results."])] + [""]
+    L += config_table(meta, ing, sts, fv, a.work)
+    L += ["---\n"]
+    ph = [bold_gains(x) for x in plain_headline(sts, tot, mon, bool(buckets_row(a.work)))]
+    L += ["## 1. Headline\n"] + ["- " + b for b in (ph or ["No suite results."])] + [""] + geo_summary(sts)
     if hb:
         L += ["<details><summary>The same results, technical version</summary>\n"] + ["- " + b for b in hb] + ["", "</details>\n"]
     L += ["## 2. Query latency\n"] + compaction_section(a.work) + lat

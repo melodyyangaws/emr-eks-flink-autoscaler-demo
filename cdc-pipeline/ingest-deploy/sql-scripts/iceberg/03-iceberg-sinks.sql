@@ -61,6 +61,11 @@
 -- Partitioning: Explicit DATE STRING partition columns computed via
 -- DATE_FORMAT() in the pipeline INSERT statements (04-cdc-pipelines.sql).
 -- Partition columns MUST be in PRIMARY KEY for hash distribution + upsert.
+-- Buckets (2026-11-09): every table also gets bucket(N, <id>) with Paimon's N and
+-- bucket-key ('bench.bucket' / 'bench.bucket-key' below; the executor adds the
+-- field, since Flink DDL cannot). Before, hash mode keyed by the date partition
+-- alone, so ONE writer took the whole current date of orders / order_items. The
+-- bucket's source column is in the PRIMARY KEY, as hash + upsert requires.
 --
 -- Environment variables:
 --   GLUE_DATABASE: default flink_iceberg_db; the manifest sets
@@ -73,10 +78,10 @@ USE CATALOG iceberg_catalog;
 USE ${GLUE_DATABASE:flink_iceberg_db};
 
 -- ============================================================================
--- Table: customers (Dimension Table — unpartitioned)
+-- Table: customers (Dimension Table — bucket(8, customer_id))
 -- ============================================================================
 -- Low cardinality, frequent updates (address/phone changes).
--- Unpartitioned: small enough that partition overhead isn't justified.
+-- No date partition (small); bucket(8, customer_id) since 2026-11-09, as Paimon's 8 buckets.
 CREATE TABLE IF NOT EXISTS customers (
     customer_id INT,
     customer_name STRING,
@@ -99,6 +104,12 @@ CREATE TABLE IF NOT EXISTS customers (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
+    -- bucket(8, customer_id) in the partition spec (2026-11-09): 8 buckets on customer_id, as Paimon's 'bucket' = '8' / 'bucket-key' = 'customer_id'.
+    -- Flink DDL cannot declare bucket(); flink-cdc-executor.py adds it to the empty
+    -- table right after this CREATE. Hash mode keys rows by the partition value, so
+    -- each bucket goes to one writer, like a Paimon bucket.
+    'bench.bucket' = '8',
+    'bench.bucket-key' = 'customer_id',
     -- 32 MB on the dimension tables (64 MB on orders/order_items; 2026-11-04,
     -- was 64 / 128), paired with Paimon's target-file-size.
     'write.target-file-size-bytes' = '33554432',
@@ -124,13 +135,15 @@ CREATE TABLE IF NOT EXISTS customers (
     'commit.manifest-merge.enabled' = 'true',
     -- 5, not the default 100: pairs with Paimon's manifest.merge-min-count = 5.
     'commit.manifest.min-count-to-merge' = '5',
+    -- snappy, not the default gzip: pairs with Paimon's metadata.iceberg.manifest-compression.
+    'write.manifest.compression-codec' = 'snappy',
     -- truncate(16), not 'full': pairs with Paimon's metadata.stats-mode. 'full'
     -- gave Iceberg exact min/max for file pruning that Paimon does not get.
     'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
--- Table: products (Dimension Table — partitioned by category)
+-- Table: products (Dimension Table — partitioned by category, bucket(8, product_id))
 -- ============================================================================
 -- Medium cardinality, updates on stock_quantity and price.
 -- Partitioned by category for query pruning (WHERE category = 'Electronics').
@@ -152,6 +165,12 @@ CREATE TABLE IF NOT EXISTS products (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
+    -- bucket(8, product_id) in the partition spec (2026-11-09): 8 buckets per category on product_id, as Paimon's.
+    -- Flink DDL cannot declare bucket(); flink-cdc-executor.py adds it to the empty
+    -- table right after this CREATE. Hash mode keys rows by the partition value, so
+    -- each bucket goes to one writer, like a Paimon bucket.
+    'bench.bucket' = '8',
+    'bench.bucket-key' = 'product_id',
     'write.target-file-size-bytes' = '33554432',
     'write.parquet.compression-codec' = 'zstd',
     'write.parquet.compression-level' = '1',
@@ -163,11 +182,12 @@ CREATE TABLE IF NOT EXISTS products (
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     'commit.manifest.min-count-to-merge' = '5',
+    'write.manifest.compression-codec' = 'snappy',
     'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
--- Table: orders (Fact Table — partitioned by order_dt)
+-- Table: orders (Fact Table — partitioned by order_dt, bucket(16, order_id))
 -- ============================================================================
 -- High write volume, mostly inserts + status updates.
 -- Explicit order_dt STRING column computed from order_date via DATE_FORMAT().
@@ -190,6 +210,12 @@ CREATE TABLE IF NOT EXISTS orders (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
+    -- bucket(16, order_id) in the partition spec (2026-11-09): 16 buckets per order_dt on order_id, as Paimon's 16 per date partition.
+    -- Flink DDL cannot declare bucket(); flink-cdc-executor.py adds it to the empty
+    -- table right after this CREATE. Hash mode keys rows by the partition value, so
+    -- each bucket goes to one writer, like a Paimon bucket.
+    'bench.bucket' = '16',
+    'bench.bucket-key' = 'order_id',
     -- 64 MB on the fact tables (32 MB on customers/products; 2026-11-04,
     -- was 128 / 64), paired with Paimon's target-file-size.
     'write.target-file-size-bytes' = '67108864',
@@ -203,11 +229,12 @@ CREATE TABLE IF NOT EXISTS orders (
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     'commit.manifest.min-count-to-merge' = '5',
+    'write.manifest.compression-codec' = 'snappy',
     'write.metadata.metrics.default' = 'truncate(16)'
 );
 
 -- ============================================================================
--- Table: order_items (Fact Table — partitioned by created_dt)
+-- Table: order_items (Fact Table — partitioned by created_dt, bucket(16, order_item_id))
 -- ============================================================================
 -- Highest write volume (multiple items per order), append-heavy.
 -- Explicit created_dt STRING column computed from created_at via DATE_FORMAT().
@@ -229,6 +256,12 @@ CREATE TABLE IF NOT EXISTS order_items (
     'write.update.mode' = 'merge-on-read',
     'write.merge.mode' = 'merge-on-read',
     'write.distribution-mode' = 'hash',
+    -- bucket(16, order_item_id) in the partition spec (2026-11-09): 16 buckets per created_dt on order_item_id, as Paimon's.
+    -- Flink DDL cannot declare bucket(); flink-cdc-executor.py adds it to the empty
+    -- table right after this CREATE. Hash mode keys rows by the partition value, so
+    -- each bucket goes to one writer, like a Paimon bucket.
+    'bench.bucket' = '16',
+    'bench.bucket-key' = 'order_item_id',
     'write.target-file-size-bytes' = '67108864',
     'write.parquet.compression-codec' = 'zstd',
     'write.parquet.compression-level' = '1',
@@ -240,5 +273,6 @@ CREATE TABLE IF NOT EXISTS order_items (
     'commit.manifest.target-size-bytes' = '8388608',
     'commit.manifest-merge.enabled' = 'true',
     'commit.manifest.min-count-to-merge' = '5',
+    'write.manifest.compression-codec' = 'snappy',
     'write.metadata.metrics.default' = 'truncate(16)'
 );

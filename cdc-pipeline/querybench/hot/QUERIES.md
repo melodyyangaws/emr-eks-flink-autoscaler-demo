@@ -2,7 +2,7 @@
 
 Run while the CDC writers and the upsert generator are live. Each file holds one
 query; file name = query name; name order = run order. Every query runs
-unchanged on **DuckDB 2.0** and **Trino 484** on every arm: the native Iceberg v3
+unchanged on **DuckDB 2.0** and **Trino 484** on every arm: the Iceberg v3
 tables and Paimon-as-iceberg (`paimon`); see
 [../README.md, The four arms](../README.md#the-four-arms).
 Every table reference has an alias (`AS o`, `AS oi`), so a placeholder can
@@ -31,7 +31,7 @@ Fact tables only: `customers` and `products` are not read (see Open points).
 | `H5_hot_wide_row` | orders | All 9 columns of the same rows as H4, as a checksum (UTF-8 bytes of the text columns via `BYTE_LEN_OPEN`/`BYTE_LEN_CLOSE`). H5/H4 is the all-columns tax. | — |
 | `H6_hot_product_agg` | order_items | Per-product `COUNT(DISTINCT order_id)`, up to ~20k groups: the hash table. | `leading-col-is-label` |
 | `H7_hot_status_category_rank` | order_items ⋈ orders ⋈ products | Multi-step hot query: both fact tables merged-on-read over the window, `ROW_NUMBER()` per order (`dup_versions` must be 0: a superseded version returned), a 3-way join to the category, a status × category aggregate, then `RANK()` and a per-status window `SUM`, top 3 categories per status. Replaces the old count-only `H7_hot_mor_dedup` (2026-11-04). | `leading-col-is-label` |
-| `H8_hot_pk_lookup` | orders | Primary-key point lookup of an order updated in the window. The merge-on-read worst case on Iceberg: it grows with the equality deletes in that key's partition since the last compaction. | — |
+| `H8_hot_pk_lookup` | orders | Primary-key point lookup of an order updated in the window. The merge-on-read worst case on Iceberg: it grows with the equality deletes in that key's partition since the last compaction. On table sets created since 2026-11-09 it reads only the key's `bucket(16, order_id)`, about 1/16 of the partition (below). | — |
 | `H9_hot_join` | order_items ⋈ orders | Items inserted in the window joined to orders changed in the window, by status. Both sides merge at once; dynamic join filters prune the orders side. | `leading-col-is-label` |
 
 ## Placeholders
@@ -114,6 +114,18 @@ holds far more equality deletes, so H8's Iceberg time depends on it. This query
 has no partition filter, so it reads `updated_at` across the whole table (same
 read as H4; not yet timed).
 
+H8 itself filters on the key's partition and `order_id` (`H8_hot_pk_lookup.sql`
+explains the cost). On Iceberg it is the files that might hold the key plus the
+equality deletes to apply: those carry keys from the generator's cold tail
+(uniform over all ids), so their `order_id` bounds span the whole range and
+cannot be skipped, and the reader loads the partition's equality deletes newer
+than every candidate file. On table sets created before 2026-11-09 that is the
+whole date partition. On sets created since, orders is also partitioned by
+`bucket(16, order_id)` (Paimon's bucket count and key), so the `order_id = `
+filter narrows the files and deletes to one bucket, about 1/16 of the
+partition, as Paimon reads one bucket; the delete-bounds cost stays within it. Check which layout a run had in
+`tables-<STAMP>.tsv` (`spec=` in the note; [../README.md, Output](../README.md#output)).
+
 ## Things that can make an arm look fast or slow
 
 - **Paimon-as-iceberg lags.** On the v3 default (Paimon 2.1, format 3,
@@ -137,7 +149,8 @@ read as H4; not yet timed).
   formats.
 - **Delete-set size is set by compaction state, not by the window.** H8 above
   all. Record each pinned snapshot's data-file, delete-file and
-  equality-delete counts (Iceberg), and its levels (Paimon), next to the times.
+  equality-delete counts and partition spec (Iceberg), and its levels (Paimon),
+  next to the times.
   An uncompacted Iceberg order_items OOMed both engines on a bare `COUNT(*)` in
   2026-09; the window filters keep H1–H7 and H9 bounded by the deletes
   committed after the window, but H8 is not bounded that way.

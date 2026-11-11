@@ -60,6 +60,14 @@ spec:
       memory: 8Gi
       cpu: 4
     podTemplate:
+      metadata:
+        annotations:
+          # Also on the JobManager (2026-11-11): a new EKS AMI (memoryec2 uses
+          # al2023@latest) made Karpenter replace the drifted driver node under both
+          # writers' JobManagers mid-run on _v3; HA recovered the jobs, but each job
+          # restarted from its last checkpoint. do-not-disrupt blocks voluntary
+          # disruption (drift, consolidation) while the pod runs.
+          karpenter.sh/do-not-disrupt: "true"
       spec:
         nodeSelector:
           karpenter.sh/capacity-type: on-demand
@@ -74,6 +82,13 @@ spec:
             value: "s3://${BUCKET_NAME}/iceberg-warehouse/"
           - name: GLUE_DATABASE
             value: "${GLUE_DATABASE}"
+          # The job's shape, recorded in the result JSON (the summary's cost column).
+          - name: COMPACT_TM_CPU
+            value: "${TM_CPU}"
+          - name: COMPACT_TM_MEMORY
+            value: "${TM_MEMORY}"
+          - name: COMPACT_TM_SLOTS
+            value: "${TM_SLOTS}"
           - name: ICEBERG_FORMAT_VERSION
             value: "${ICEBERG_FORMAT_VERSION}"
           - name: AWS_REGION

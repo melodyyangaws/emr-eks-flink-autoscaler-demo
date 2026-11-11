@@ -100,11 +100,13 @@ scaled to 0). Use the steps below to start, check or remove an engine by hand.
 
 ### The image (`trino-image/`)
 
-The harness reads Paimon only as Paimon-as-iceberg, through the `iceberg`
-catalog, and configures no `paimon` catalog. Native Paimon (`paimon_native`,
-DuckDB paimon_scan / Trino paimon connector) was tried on _v3, 2026-11-08:
-correct rows but 4–29× slower than Paimon-as-iceberg (no file skipping, no
-DuckDB cache); removed 2026-11-09. The image still bundles the connector:
+The image bundles a Paimon connector, but **nothing in the harness uses it**:
+`trino-values.yaml` defines only the `iceberg` catalog, and the `paimon` arm reads
+Paimon-as-iceberg through it. The connector stays because the image was not
+rebuilt. History: native Paimon reading (this connector and DuckDB's Paimon
+extension) was tried on _v3, 2026-11-08: same rows, but 4–29× slower than
+Paimon-as-iceberg (no file skipping, no DuckDB cache); removed 2026-11-09. How
+the image is built:
 
 Trino ships no Paimon connector, and apache/paimon-trino has no release.
 `trino-image/Dockerfile` builds it from source: the open PR #127 head (Trino 483 /

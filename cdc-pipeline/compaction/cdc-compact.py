@@ -251,6 +251,17 @@ def iceberg(a, result):
     log(f"expiry: {result['snapshots_after_expiry']} snapshot(s) left ({result['expire_s']} s)")
 
 
+def resources():
+    """The job's pod shape (cdc-compact.yaml: JobManager 4 vCPU / 8 GiB; the TaskManager
+    values come from compaction/run.sh through COMPACT_TM_*), for the summary's cost."""
+    mem = os.environ.get("COMPACT_TM_MEMORY", "")
+    m = re.fullmatch(r"([0-9.]+)(Gi|Mi)", mem)
+    gi = (float(m.group(1)) / (1024 if m.group(2) == "Mi" else 1)) if m else None
+    num = lambda k: float(os.environ[k]) if re.fullmatch(r"[0-9.]+", os.environ.get(k, "")) else None
+    return {"jm_cpu": 4, "jm_memory_gi": 8, "tm_cpu": num("COMPACT_TM_CPU"), "tm_memory_gi": gi,
+            "tm_slots": int(num("COMPACT_TM_SLOTS")) if num("COMPACT_TM_SLOTS") else None}
+
+
 def main():
     ap = argparse.ArgumentParser(description="One-off full compaction of one CDC table (Paimon or Iceberg).")
     ap.add_argument("--format", required=True, choices=("paimon", "iceberg"))
@@ -265,7 +276,7 @@ def main():
     a = ap.parse_args()
 
     result = {"format": a.format, "table": f"{os.environ.get('GLUE_DATABASE')}.{a.table}",
-              "parallelism_cap": a.parallelism, "started": now()}
+              "parallelism_cap": a.parallelism, "started": now(), "resources": resources()}
     t0 = time.time()
     status = 0
     try:

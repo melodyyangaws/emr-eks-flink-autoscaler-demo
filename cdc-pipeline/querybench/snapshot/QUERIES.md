@@ -4,7 +4,7 @@ Analytics on a pinned snapshot of the four CDC tables (MySQL `ecommerce` →
 Flink CDC → Paimon / Iceberg), writers stopped. Modelled on
 `throughput-benchmark/querybench/snapshot/`: one query per file, file name =
 query name, name order = run order. Every query runs unchanged on **DuckDB 2.0**
-and **Trino 484** on every arm: the native Iceberg v3 tables and Paimon-as-iceberg
+and **Trino 484** on every arm: the Iceberg v3 tables and Paimon-as-iceberg
 (`paimon`), both formats after the one-off
 compaction ([../README.md, The four arms](../README.md#the-four-arms)). The SQL is the subset both engines accept and print
 alike; the one difference SQL cannot hide is a dialect key. The rules and the
@@ -28,7 +28,7 @@ Each fact table then had a single partition (`2026-09-27`), so the
 partition-bounded queries read the whole table. Current sizes are in each run's
 summary (Table state, compaction results).
 
-| Table | Iceberg (current snapshot) | Paimon native, 2026-09-30 |
+| Table | Iceberg (current snapshot) | Paimon, 2026-09-30 |
 |---|---|---|
 | order_items | 381.7M records, 137 data + 124 delete files, 365.2M equality + 16.5M position deletes. **Not compacted.** | 144.3M rows |
 | orders | 95.2M, 2 data files, 0 deletes (Athena OPTIMIZE 2026-09-28) | 95.2M |
@@ -59,8 +59,8 @@ it needs no partition placeholder.
 - **Paimon-as-iceberg is complete only after a full compaction**
   ([../README.md, Paimon-as-iceberg coverage](../README.md#the-four-arms)); the
   one-off full compaction before this suite makes it complete. On the v2 set
-  (top-level files only) it showed 0.4–9.2% fewer rows than the native Paimon
-  reader at the same snapshot id on 2026-09-30: a reader of it then does less
+  (top-level files only) it showed 0.4–9.2% fewer rows than the Paimon table read
+  directly at the same snapshot id on 2026-09-30: a reader of it then does less
   work, and its time looks like a speed-up.
 - **Cross-format counts need both pipelines drained to one binlog position.**
   The two formats are written by separate Flink jobs. Unless both caught up
@@ -82,7 +82,10 @@ it needs no partition placeholder.
   than Paimon's. This is a real format cost, so keep it.
 - **File layout after compaction.** `compaction/run.sh` rewrites Iceberg files per
   partition into groups of up to the target size (64 MB on the fact tables; on
-  2026-09-28 Athena's bin-pack produced 2 files of ~800 MB for orders). Paimon
+  2026-09-28 Athena's bin-pack produced 2 files of ~800 MB for orders). On table
+  sets created since 2026-11-09 an Iceberg partition is date × `bucket(16, <id>)`,
+  so a fact-table date keeps at least 16 file groups, like Paimon's 16 buckets
+  (`spec=` in `tables-<STAMP>.tsv` shows which). Paimon
   keeps 16 buckets per fact-table partition (32 before 2026-11-04), sorted by
   key. S4's slice pruning depends on this layout, so record it with the result
   (the summary's compaction table has the file counts).

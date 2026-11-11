@@ -532,27 +532,84 @@ existing table alone), so they take effect with a fresh `SESSION_SUFFIX`.
 | Previous `metadata.json` kept: 100 (3 until 2026-11-04) | `metadata.iceberg.previous-versions-max = 100`, `metadata.iceberg.delete-after-commit.enabled = true` (Paimon-as-iceberg; Paimon's default kept 0) | `write.metadata.previous-versions-max = 100`, `write.metadata.delete-after-commit.enabled = true` |
 | Manifest merge after 5 | `manifest.merge-min-count = 5`; Iceberg metadata: `metadata.iceberg.compaction.min.file-num = 5`, `max.file-num = 50` | `commit.manifest-merge.enabled = true`, `commit.manifest.min-count-to-merge = 5` (default 100) |
 | Manifest target size, 8 MB | `manifest.target-file-size = 8mb` | `commit.manifest.target-size-bytes = 8388608` |
+| Manifest compression: snappy (Iceberg since 2026-11-11, new tables; gzip before) | `metadata.iceberg.manifest-compression = snappy` (Paimon-as-iceberg manifests) | `write.manifest.compression-codec = snappy` |
 | Column stats `truncate(16)` | `metadata.stats-mode = truncate(16)` | `write.metadata.metrics.default = truncate(16)` (was `full`) |
 | Target data file: 32 MB (customers, products), 64 MB (orders, order_items); 64 / 128 MB until 2026-11-04 | `target-file-size = 32mb` / `64mb` | `write.target-file-size-bytes = 33554432` / `67108864` |
 | Parquet row group: 8 MB / 16 MB | `parquet.block.size = 8388608` / `16777216` | `write.parquet.row-group-size-bytes = 8388608` / `16777216` |
 | Compression | `file.compression = zstd`, `file.compression.zstd-level = 1` | `write.parquet.compression-codec = zstd`, `write.parquet.compression-level = 1` |
 | Changelog | `changelog-producer = none` (nothing reads one, and Iceberg writes none) | none written |
 | Iceberg format version | `metadata.iceberg.format-version = ${ICEBERG_FORMAT_VERSION}` | `format-version = ${ICEBERG_FORMAT_VERSION}` |
+| Buckets on the id column, same N (Iceberg since 2026-11-09, [Buckets](#buckets)) | `bucket = 8` / `16`, `bucket-key = <id>` | `bench.bucket = 8` / `16`, `bench.bucket-key = <id>`: the executor adds `bucket(N, <id>)` to the partition spec |
 
-Paimon-only settings without an Iceberg counterpart: fixed `bucket` 8 (dimension
-tables; per category on `products`) / 16 per date partition (fact tables), `bucket = 32`
-until 2026-11-04, `deletion-vectors.enabled = true`,
+Paimon-only settings without an Iceberg counterpart: `bucket = 32` until 2026-11-04
+(now paired, above), `deletion-vectors.enabled = true`,
 `deletion-vectors.bitmap64 = ${PAIMON_DV_BITMAP64}`,
-`write-buffer-size` (64 / 128 MB) / `write-buffer-spillable` (also `INSERT` hints, below),
-`num-sorted-run.compaction-trigger = 8`,
+`write-buffer-size` (64 / 128 MB) / `write-buffer-spillable` (`false` in the DDL since 2026-11-11, as in `.bench-env`; the `INSERT` hints, below, set the effective value),
+`num-sorted-run.compaction-trigger = 8`, the write-path tuning below,
 `snapshot.expire.execution-mode = async`, `sink.writer-coordinator.enabled = true`,
 `metadata.iceberg.storage = hive-catalog` (the Iceberg v3 metadata, registered in
-Glue as `table_type=ICEBERG`) and `metadata.iceberg.manifest-compression = snappy`
-(a codec every Iceberg reader of it has). Iceberg-only: `write.upsert.enabled = true`, `write.distribution-mode = hash`,
+Glue as `table_type=ICEBERG`). Iceberg-only: `write.upsert.enabled = true`, `write.distribution-mode = hash`,
 and the `write.{delete,update,merge}.mode = merge-on-read` properties. The
 write-side differences that are kept on purpose (writer parallelism, compaction,
 snapshot-expiry timing) are listed in
 [PAIMON-VS-ICEBERG.md](./PAIMON-VS-ICEBERG.md#write-side-asymmetries-kept-on-purpose).
+
+**Paimon write-path tuning (since 2026-11-11, `_v3`; new tables only).** With deletion
+vectors on, Paimon's writers run a lookup compaction and, by default, every
+checkpoint waited for it (`lookup-wait = true`): on `_v3bucket` the Paimon checkpoint
+median was 10.4 s against Iceberg's 1.1 s, and its sources were held back ~200 ms/s.
+
+| Option | Default | Now | Why |
+|---|---|---|---|
+| `lookup-wait` | `true` | `false` | the commit no longer waits for the lookup compaction; it finishes between checkpoints |
+| `lookup-compact` | `radical` | `gentle` | less compaction per checkpoint |
+| `lookup-compact.max-interval` | unset | `3` | forces level-0 files up at least every 3 checkpoints, so Paimon-as-iceberg (level > 0 files only) trails by at most ~3 checkpoints |
+| `num-sorted-run.stop-trigger` | trigger + 3 = 11 | `16` | fewer write stalls while compaction catches up (the post-snapshot backlog) |
+| `file.compression.per.level` | zstd-1 on every level | `0:lz4` | level-0 files are rewritten by the next compaction; the levels readers see stay zstd-1 |
+
+Measured on `_v3` (2026-11-10, parallelism 12, same source and generator):
+Paimon checkpoint median **2.27 s** (was 10.4 s), Iceberg 1.58 s; both sources at
+~55 K rows/s with no backpressure; hot-query ratios Paimon-as-iceberg / Iceberg
+0.14 (DuckDB) and 0.71 (Trino), as on `_v3bucket` (0.11 / 0.75); rows differed
+between the formats on 7 of 9 hot queries, also as before
+([QUERYBENCH-SUMMARY-20261110-v3.md](bench-results/QUERYBENCH-SUMMARY-20261110-v3.md)).
+
+### Buckets
+
+Both OTF formats split each table by its id column into the same number of buckets,
+within the same partitions (Iceberg since 2026-11-09; new tables only):
+
+| Table | Partition | Paimon `bucket` / `bucket-key` | Iceberg partition spec |
+|---|---|---|---|
+| `customers` | none | 8 / `customer_id` | `bucket(8, customer_id)` |
+| `products` | `category` | 8 / `product_id` | `category`, `bucket(8, product_id)` |
+| `orders` | the order date (`order_date_str` / `order_dt`) | 16 / `order_id` | `order_dt`, `bucket(16, order_id)` |
+| `order_items` | the creation date (`created_date_str` / `created_dt`) | 16 / `order_item_id` | `created_dt`, `bucket(16, order_item_id)` |
+
+Flink DDL declares only identity partitions, so `03-iceberg-sinks.sql` states the
+bucket as table properties, `'bench.bucket' = '<N>'` and `'bench.bucket-key' =
+'<column>'`. Right after each `CREATE TABLE`, `flink-cdc-executor.py`
+(`add_iceberg_bucket`) loads the table through the Iceberg API and adds
+`bucket(N, <column>)` to its spec, before any `INSERT` runs. It does so only while
+the table has no snapshot. A table that already holds data keeps its spec, and the
+job log shows `⚠ <db>.<table> holds data: bucket(N, <key>) not added, spec stays ...`;
+`✓ ... partition spec now ...` or `✓ ... already bucketed` is the normal line. Since
+the DDL is `CREATE TABLE IF NOT EXISTS`, a table set from before 2026-11-09 stays
+unbucketed; a new `SESSION_SUFFIX` gets the buckets.
+
+Why: Iceberg 1.12's Flink sink in `hash` mode keys rows by the partition value. Until
+2026-11-09 that value was the date alone, so **one writer** took the whole current
+date of `orders` and of `order_items`, which receives nearly all new rows. With the
+bucket in the spec, each (date, bucket) goes to one writer, like a Paimon bucket.
+Flink's key hashing spreads the 16 buckets of a date unevenly over the 12 writer
+subtasks, so the writers do not get equal shares of the current date.
+
+The query benchmark's pin step records each Iceberg table's current spec in
+`tables-<STAMP>.tsv` (note `spec=...`, for example `order_dt,bucket[16](order_id)`),
+and the summary's write-side sentence follows it. Not yet run on the cluster: the
+first bucketed session (a new suffix) is the test. Upload the changed executor and
+SQL first ([Step 5](#step-5--upload-sql-or-executor-changes-without-a-rebuild); no
+image rebuild needed).
 
 ---
 
@@ -563,7 +620,7 @@ variables.
 
 | Setting | Value |
 |---|---|
-| JobManager | 1 replica, `highAvailabilityEnabled: true`, 8 Gi / 4 cpu, `driver-nodepool`, on-demand |
+| JobManager | 1 replica, `highAvailabilityEnabled: true`, 8 Gi / 4 cpu, `driver-nodepool`, on-demand, annotated `karpenter.sh/do-not-disrupt: "true"` (since 2026-11-11) |
 | TaskManager | 32 Gi / 8 cpu, `taskmanager.numberOfTaskSlots: 2`, `executor-memorynodepool`, on-demand, annotated `karpenter.sh/do-not-disrupt: "true"` |
 | Job parallelism | 12 (`job.parallelism` and `--parallelism 12`; 32 until 2026-11-04, then 16, then 24 until 2026-11-05), so 6 TMs per job |
 | `parallelism.default` / `pipeline.max-parallelism` | 4 / 128 |
@@ -723,6 +780,17 @@ restarts the whole graph. The TaskManager pods now carry
 `karpenter.sh/do-not-disrupt: "true"`, which stops voluntary consolidation of their
 nodes. If evictions still show up, check that the rendered manifest has the
 annotation under `taskManager.podTemplate.metadata.annotations`.
+
+The JobManagers (both writers and `compaction/cdc-compact.yaml`) carry the same
+annotation since 2026-11-11. On `_v3` the EC2NodeClass `memoryec2`
+(`amiSelectorTerms: al2023@latest`) picked up a new EKS AMI (`v20261107`), Karpenter
+marked every older node `Drifted` and replaced the `driver-nodepool` node that held
+both JobManagers (`Disrupting NodeClaim: Drifted`). HA brought both jobs back from
+their last checkpoint about 3 minutes later, which restarts the hot test's
+`WRITERS_UP_S` clock. The annotation only blocks voluntary disruption (drift,
+consolidation, expiry) while the pod runs; Karpenter replaces the node once the
+writers stop. To avoid image changes during a run altogether, pin the AMI in the
+EC2NodeClass (`alias: al2023@v<date>`, a cluster-side change) and move it between runs.
 
 The pool's instance mix still fragments: a TaskManager requests about 8100m cpu /
 32868Mi, so a 4xlarge fits 1 TM, an 8xlarge 3, a 12xlarge 5 and a 16xlarge 7 (six do

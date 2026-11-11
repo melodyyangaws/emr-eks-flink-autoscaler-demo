@@ -83,8 +83,9 @@
 -- order_items): one bucket per writer subtask at parallelism 16, so the
 -- current date partition, which takes nearly all new rows, uses every writer. Fixed, not dynamic ('bucket' = '-1'): DuckDB's paimon extension
 -- (paimon-cpp) refuses dynamic-bucket primary-key tables ("do not support pk
--- table bucket=-1 in scan process", _v3r2). One writer per bucket. Iceberg has no
--- buckets (write.distribution-mode = hash). Like every option here: new tables only.
+-- table bucket=-1 in scan process", _v3r2). One writer per bucket. Iceberg gets the
+-- same N and key as bucket(N, <id>) partitions (2026-11-09, 03-iceberg-sinks.sql).
+-- Like every option here: new tables only.
 -- bucket-key = the table's id column: the primary key minus the partition column,
 -- which is Paimon's default anyway (a primary-key table's bucket key must be a
 -- subset of its primary key); explicit so the high-cardinality choice is visible.
@@ -147,8 +148,22 @@ CREATE TABLE IF NOT EXISTS customers (
     -- Write buffer = 2 x the target file size.
     'target-file-size' = '32mb',
     'write-buffer-size' = '64mb',
-    'write-buffer-spillable' = 'true',
+    -- false, as PAIMON_WRITE_BUFFER_SPILLABLE in .bench-env (the INSERT hint in
+    -- 04-cdc-pipelines.sql sets the effective value; this is the table default).
+    'write-buffer-spillable' = 'false',
     'num-sorted-run.compaction-trigger' = '8',
+    -- Write-path tuning (2026-11-11, _v3): checkpoints no longer wait for the lookup
+    -- compaction (lookup-wait; default true held every checkpoint 10-14 s on _v3bucket
+    -- and backpressured the sources ~200 ms/s). gentle mode + max-interval 3 still
+    -- forces L0 up every 3 checkpoints, bounding how far Paimon-as-iceberg (level > 0
+    -- only) trails. stop-trigger 16 (default trigger + 3 = 11) avoids write stalls in
+    -- the post-snapshot catch-up. L0 files are rewritten by the next compaction, so
+    -- lz4 there; the levels readers see stay zstd-1.
+    'lookup-wait' = 'false',
+    'lookup-compact' = 'gentle',
+    'lookup-compact.max-interval' = '3',
+    'num-sorted-run.stop-trigger' = '16',
+    'file.compression.per.level' = '0:lz4',
     -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
     -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
     -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
@@ -226,8 +241,22 @@ CREATE TABLE IF NOT EXISTS products (
     -- Write buffer = 2 x the target file size.
     'target-file-size' = '32mb',
     'write-buffer-size' = '64mb',
-    'write-buffer-spillable' = 'true',
+    -- false, as PAIMON_WRITE_BUFFER_SPILLABLE in .bench-env (the INSERT hint in
+    -- 04-cdc-pipelines.sql sets the effective value; this is the table default).
+    'write-buffer-spillable' = 'false',
     'num-sorted-run.compaction-trigger' = '8',
+    -- Write-path tuning (2026-11-11, _v3): checkpoints no longer wait for the lookup
+    -- compaction (lookup-wait; default true held every checkpoint 10-14 s on _v3bucket
+    -- and backpressured the sources ~200 ms/s). gentle mode + max-interval 3 still
+    -- forces L0 up every 3 checkpoints, bounding how far Paimon-as-iceberg (level > 0
+    -- only) trails. stop-trigger 16 (default trigger + 3 = 11) avoids write stalls in
+    -- the post-snapshot catch-up. L0 files are rewritten by the next compaction, so
+    -- lz4 there; the levels readers see stay zstd-1.
+    'lookup-wait' = 'false',
+    'lookup-compact' = 'gentle',
+    'lookup-compact.max-interval' = '3',
+    'num-sorted-run.stop-trigger' = '16',
+    'file.compression.per.level' = '0:lz4',
     -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
     -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
     -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
@@ -297,8 +326,22 @@ CREATE TABLE IF NOT EXISTS orders (
     -- Write buffer = 2 x the target file size.
     'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
-    'write-buffer-spillable' = 'true',
+    -- false, as PAIMON_WRITE_BUFFER_SPILLABLE in .bench-env (the INSERT hint in
+    -- 04-cdc-pipelines.sql sets the effective value; this is the table default).
+    'write-buffer-spillable' = 'false',
     'num-sorted-run.compaction-trigger' = '8',
+    -- Write-path tuning (2026-11-11, _v3): checkpoints no longer wait for the lookup
+    -- compaction (lookup-wait; default true held every checkpoint 10-14 s on _v3bucket
+    -- and backpressured the sources ~200 ms/s). gentle mode + max-interval 3 still
+    -- forces L0 up every 3 checkpoints, bounding how far Paimon-as-iceberg (level > 0
+    -- only) trails. stop-trigger 16 (default trigger + 3 = 11) avoids write stalls in
+    -- the post-snapshot catch-up. L0 files are rewritten by the next compaction, so
+    -- lz4 there; the levels readers see stay zstd-1.
+    'lookup-wait' = 'false',
+    'lookup-compact' = 'gentle',
+    'lookup-compact.max-interval' = '3',
+    'num-sorted-run.stop-trigger' = '16',
+    'file.compression.per.level' = '0:lz4',
     -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
     -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
     -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)
@@ -367,8 +410,22 @@ CREATE TABLE IF NOT EXISTS order_items (
     -- Write buffer = 2 x the target file size.
     'target-file-size' = '64mb',
     'write-buffer-size' = '128mb',
-    'write-buffer-spillable' = 'true',
+    -- false, as PAIMON_WRITE_BUFFER_SPILLABLE in .bench-env (the INSERT hint in
+    -- 04-cdc-pipelines.sql sets the effective value; this is the table default).
+    'write-buffer-spillable' = 'false',
     'num-sorted-run.compaction-trigger' = '8',
+    -- Write-path tuning (2026-11-11, _v3): checkpoints no longer wait for the lookup
+    -- compaction (lookup-wait; default true held every checkpoint 10-14 s on _v3bucket
+    -- and backpressured the sources ~200 ms/s). gentle mode + max-interval 3 still
+    -- forces L0 up every 3 checkpoints, bounding how far Paimon-as-iceberg (level > 0
+    -- only) trails. stop-trigger 16 (default trigger + 3 = 11) avoids write stalls in
+    -- the post-snapshot catch-up. L0 files are rewritten by the next compaction, so
+    -- lz4 there; the levels readers see stay zstd-1.
+    'lookup-wait' = 'false',
+    'lookup-compact' = 'gentle',
+    'lookup-compact.max-interval' = '3',
+    'num-sorted-run.stop-trigger' = '16',
+    'file.compression.per.level' = '0:lz4',
     -- Lookup cache of the deletion-vector lookup compaction: the local disk cache
     -- capped at 8gb (default unlimited) on the TaskManager volume. The in-memory
     -- cache stays at its 256mb default: 512mb per writer task (16 per TaskManager)

@@ -164,7 +164,7 @@ throughput. The `_v3final` figure is the writers' ingest rate, not the generator
 own `inst=` sum: about 5% of the 1,920,000 rows/s target. Both writers kept up
 with no backpressure, so the source side (generator plus RDS) set the rate; RDS CPU
 averaged 34.9% (max 44.9%) over the ingest window, so on this instance the limit
-was not CPU ([the summary](bench-results/QUERYBENCH-SUMMARY-20261107-v3final.md)).
+was not CPU (the 2026-11-07 `_v3final` summary, since removed from `bench-results/`).
 
 ### Step 3 — Restart the pods after a source shrink
 
